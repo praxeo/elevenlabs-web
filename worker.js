@@ -1,18 +1,26 @@
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/transcribe" && request.method === "POST") {
-      return handleTranscribe(request);
+      return handleTranscribe(request, env);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      return new Response(INDEX_HTML, {
-        headers: {
-          "content-type": "text/html; charset=utf-8",
-          "cache-control": "no-store",
-        },
-      });
+      // "Shared mode" is on only when BOTH a shared key and an access code are
+      // configured as Worker secrets. The flag is injected into the page so the
+      // UI knows whether to show the access-code field. Served no-store, so it
+      // is never cached.
+      const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
+      return new Response(
+        INDEX_HTML.replace("__SHARED_MODE__", sharedMode ? "true" : "false"),
+        {
+          headers: {
+            "content-type": "text/html; charset=utf-8",
+            "cache-control": "no-store",
+          },
+        }
+      );
     }
 
     if (url.pathname === "/favicon.ico") {
@@ -23,14 +31,32 @@ export default {
   },
 };
 
-async function handleTranscribe(request) {
+async function handleTranscribe(request, env) {
   try {
     const incoming = await request.formData();
 
-    const apiKey = String(incoming.get("api_key") || "").trim();
+    // Key resolution: a client-provided key always wins (bring-your-own). When
+    // none is given, fall back to the shared server key — but only if a matching
+    // access code is supplied. Setting a server key WITHOUT an access code leaves
+    // shared mode off (fail-safe: the shared key is never exposed un-gated).
+    const clientKey  = String(incoming.get("api_key") || "").trim();
+    const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
+    const serverPass = (env && env.APP_PASSPHRASE) || "";
+
+    let apiKey = clientKey;
+    if (!apiKey && serverKey && serverPass) {
+      const given = String(incoming.get("passphrase") || "");
+      if (!safeEqual(given, serverPass)) {
+        return json({ error: "Invalid or missing access code." }, 401);
+      }
+      apiKey = serverKey;
+    }
+
     const file = incoming.get("file");
 
-    if (!apiKey) return json({ error: "Missing ElevenLabs API key." }, 400);
+    if (!apiKey) {
+      return json({ error: "No ElevenLabs API key available (none provided, and no shared key/access code configured)." }, 400);
+    }
     if (!file || typeof file === "string") return json({ error: "No audio file uploaded." }, 400);
     if (file.size < 1024) return json({ error: "Recording too short or empty." }, 400);
     if (file.size > 25 * 1024 * 1024) return json({ error: "Recording too large." }, 413);
@@ -111,6 +137,15 @@ async function handleTranscribe(request) {
       500
     );
   }
+}
+
+// Constant-time string compare for the access code (avoids leaking match
+// progress via timing). Length check is fine for this threat model.
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
+  let out = 0;
+  for (let i = 0; i < a.length; i++) out |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return out === 0;
 }
 
 function json(obj, status = 200) {
@@ -245,12 +280,17 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <label for="apiKey">ElevenLabs API key</label>
+      <div id="accessCodeRow" style="display:none">
+        <label for="accessCode">Access code</label>
+        <input id="accessCode" type="password" placeholder="access code" autocomplete="off" />
+      </div>
+
+      <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
       <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
 
       <label class="checkbox">
         <input type="checkbox" id="saveApiKey" />
-        Save API key in this browser
+        Remember on this browser
       </label>
 
       <div class="row" style="margin-top: 10px;">
@@ -430,7 +470,15 @@ right lower quadrant"></textarea>
 
 <script>
 (() => {
+  // Injected by the Worker at serve time (see fetch handler). True when a shared
+  // server key + access code are configured; the access-code field is shown and
+  // an API key is no longer required to dictate.
+  const SHARED_MODE      = (__SHARED_MODE__);
+
   const apiKeyEl         = document.getElementById("apiKey");
+  const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
+  const accessCodeEl     = document.getElementById("accessCode");
+  const accessCodeRow    = document.getElementById("accessCodeRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
   const forgetKeyBtn     = document.getElementById("forgetKeyBtn");
 
@@ -500,9 +548,10 @@ right lower quadrant"></textarea>
   // AHK side returns instantly instead of waiting out its ClipWait timeout.
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
-  const STORE_KEY           = "scribe_v2_transcripts_v9";
-  const SETTINGS_KEY        = "scribe_v2_settings_v9";
-  const API_KEY_STORAGE_KEY = "elevenlabs_api_key_browser_v9";
+  const STORE_KEY              = "scribe_v2_transcripts_v9";
+  const SETTINGS_KEY           = "scribe_v2_settings_v9";
+  const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
+  const ACCESS_CODE_STORAGE_KEY = "scribe_v2_access_code_v9";
 
   /* ───── Audio cue helpers ───── */
 
@@ -615,8 +664,10 @@ right lower quadrant"></textarea>
 
     if (saveApiKeyEl.checked) {
       localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyEl.value.trim());
+      if (accessCodeEl) localStorage.setItem(ACCESS_CODE_STORAGE_KEY, accessCodeEl.value.trim());
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
+      localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
     }
   }
 
@@ -643,6 +694,8 @@ right lower quadrant"></textarea>
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
+        const ac = localStorage.getItem(ACCESS_CODE_STORAGE_KEY);
+        if (ac && accessCodeEl) accessCodeEl.value = ac;
       }
     } catch (e) {}
   }
@@ -870,10 +923,15 @@ right lower quadrant"></textarea>
     stopRequested = false;
 
     const apiKey = apiKeyEl.value.trim();
-    if (!apiKey) {
+    if (!apiKey && !(SHARED_MODE && accessCodeEl.value.trim())) {
       await writeSentinel();
-      setStatus("Enter your ElevenLabs API key first.", "err");
-      apiKeyEl.focus();
+      if (SHARED_MODE) {
+        setStatus("Enter the access code first.", "err");
+        accessCodeEl.focus();
+      } else {
+        setStatus("Enter your ElevenLabs API key first.", "err");
+        apiKeyEl.focus();
+      }
       failBeep();
       return;
     }
@@ -959,9 +1017,9 @@ right lower quadrant"></textarea>
     }
 
     const apiKey = apiKeyEl.value.trim();
-    if (!apiKey) {
+    if (!apiKey && !(SHARED_MODE && accessCodeEl.value.trim())) {
       await writeSentinel();
-      setStatus("Missing API key.", "err");
+      setStatus(SHARED_MODE ? "Missing access code." : "Missing API key.", "err");
       failBeep();
       return;
     }
@@ -978,7 +1036,8 @@ right lower quadrant"></textarea>
     audioPreviewEl.src = lastAudioUrl;
 
     const form = new FormData();
-    form.append("api_key", apiKey);
+    if (apiKey) form.append("api_key", apiKey);                       // BYO key overrides
+    if (SHARED_MODE) form.append("passphrase", accessCodeEl.value.trim());
     form.append("file", blob, "recording.webm");
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", String(noVerbatimEl.checked));
@@ -1054,10 +1113,12 @@ right lower quadrant"></textarea>
 
   forgetKeyBtn.onclick = () => {
     apiKeyEl.value = "";
+    if (accessCodeEl) accessCodeEl.value = "";
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
+    localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
     saveSettingsNow();
-    setStatus("API key removed from this browser.", "ok");
+    setStatus(SHARED_MODE ? "Saved access code / key removed from this browser." : "API key removed from this browser.", "ok");
   };
 
   clearBtn.onclick = () => {
@@ -1146,6 +1207,12 @@ right lower quadrant"></textarea>
   window.addEventListener("beforeunload", () => {
     try { releaseAudio(); } catch (e) {}
   });
+
+  if (SHARED_MODE) {
+    accessCodeRow.style.display = "";
+    if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared access in use)";
+    apiKeyEl.placeholder = "optional — leave blank to use the access code";
+  }
 
   loadSettings();
   updateGateLabels();

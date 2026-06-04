@@ -43,7 +43,14 @@ A self-contained, low-latency medical dictation system built on Cloudflare Worke
 - **Browser app** – vanilla HTML/CSS/JS embedded in the Worker. It captures audio via `getUserMedia`, applies a real‑time gate/filter, and sends chunks to the Worker.
 - **AutoHotkey v2 script** – handles the push‑to‑talk logic: registers the browser window, sends start/stop signals, waits for the transcript, and pastes it into Cerner.
 
-All state (settings, API key, history) is stored in the browser’s `localStorage`. The ElevenLabs API key must be provided in the app (or saved locally).
+All state (settings, API key/access code, history) is stored in the browser’s `localStorage`.
+
+**Key resolution** (per transcription request, decided in the Worker):
+1. If the browser sends an API key (bring-your-own), that key is used.
+2. Otherwise, if the Worker has a **shared key + access code** configured (see [Shared access](#shared-access-no-api-key-for-your-users)) and the browser sends a matching access code, the shared key is used.
+3. Otherwise the request is rejected (no key available).
+
+So power users can still paste their own ElevenLabs key (overriding everything), while invited users just enter a short access code — no API key needed.
 
 ---
 
@@ -58,6 +65,53 @@ All state (settings, API key, history) is stored in the browser’s `localStorag
    If you ever see `“No event handlers registered”`, the Worker failed to *parse* – usually an unescaped backtick inside the `INDEX_HTML` template literal. Check the Wrangler output for the line number.
 
 The app is served directly from the Worker; no additional hosting is needed.
+
+---
+
+## Shared access (no API key for your users)
+
+By default every user pastes their own ElevenLabs API key. If you want to let
+specific people (e.g. a colleague) dictate **without an API key** — billing the
+usage to one shared key you control — configure two Worker **secrets**:
+
+| Secret | Purpose |
+| --- | --- |
+| `ELEVENLABS_API_KEY` | The shared ElevenLabs key requests fall back to. |
+| `APP_PASSPHRASE` | A short **access code** that authorizes use of that shared key. |
+
+```bash
+npx wrangler secret put ELEVENLABS_API_KEY   # paste the shared ElevenLabs key
+npx wrangler secret put APP_PASSPHRASE        # choose a short access code
+npx wrangler deploy
+```
+
+(You can also set these in the Cloudflare dashboard: **Workers → your Worker →
+Settings → Variables and Secrets**, type **Secret**. The binding names must be
+exactly `ELEVENLABS_API_KEY` and `APP_PASSPHRASE`.)
+
+Then share the Worker URL **and** the access code with your user (out-of-band —
+a text/Signal message, not committed anywhere). They open the page, type the
+access code once (tick *Remember on this browser* so it persists), and dictate.
+
+**How it works / why it’s safe to share a `*.workers.dev` URL:** the access-code
+check runs **inside the Worker**, which serves every request — so there is no
+custom domain or Cloudflare Access to set up, and no `workers.dev` "bypass" to
+worry about. "Shared mode" turns on only when **both** secrets are set; setting
+the key without an access code leaves it off (fail-safe — the shared key is never
+exposed un-gated). The access code field appears in the UI only in shared mode.
+
+- **Power users still bring their own key.** If a key is typed into the
+  (optional) API-key field, it overrides the shared key — your existing AHK
+  workflow is unchanged.
+- **Anyone with the URL + the code can spend against your key.** That is the
+  intended trade-off; keep your ElevenLabs account usage limits in place as the
+  cost backstop. To rotate the code, re-run `npx wrangler secret put APP_PASSPHRASE`.
+- **To turn shared access off:** delete the secrets
+  (`npx wrangler secret delete APP_PASSPHRASE`) and redeploy; the app reverts to
+  bring-your-own-key only.
+
+> Local testing: put `ELEVENLABS_API_KEY=...` and `APP_PASSPHRASE=...` in a
+> `.dev.vars` file (git-ignored) and run `npx wrangler dev`.
 
 ---
 

@@ -1,0 +1,7 @@
+# Wrangler local dev secrets (ELEVENLABS_API_KEY, APP_PASSPHRASE, etc.)
+.dev.vars
+.dev.vars.*
+
+# Wrangler / Node
+.wrangler/
+node_modules/

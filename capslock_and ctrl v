@@ -1,0 +1,8 @@
+*XButton2::
+{
+    Click
+    Sleep 100            ; let focus settle AND clipboard sync catch up
+    SendEvent "^v"
+}
+
+XButton1::SendEvent "{Enter}"

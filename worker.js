@@ -963,11 +963,11 @@ right lower quadrant"></textarea>
       "audio/ogg;codecs=opus",
     ].find((type) => MediaRecorder.isTypeSupported(type));
 
+    const opts = { audioBitsPerSecond: 16000 };   // 16 kbps – enough for speech
+    if (preferred) opts.mimeType = preferred;
+
     try {
-      mediaRecorder = new MediaRecorder(
-        destNode.stream,
-        preferred ? { mimeType: preferred } : undefined
-      );
+      mediaRecorder = new MediaRecorder(destNode.stream, opts);
     } catch (e) {
       await writeSentinel();
       setStatus("MediaRecorder failed in this browser.", "err");

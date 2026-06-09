@@ -66,7 +66,7 @@ async function handleTranscribe(request, env) {
     // ── Fixed dictation config: English, short-form, single speaker ──
     form.append("model_id", "scribe_v2");
     form.append("file", file, "recording.webm");
-    form.append("file_format", "other");   // MediaRecorder = WebM/Opus, not PCM
+    form.append("file_format", String(incoming.get("file_format") || "other"));   // ← CHANGED to respect client hint
     form.append("language_code", "en");     // English only -> skip auto-detection
     form.append("diarize", "false");
     form.append("num_speakers", "1");
@@ -804,6 +804,75 @@ right lower quadrant"></textarea>
     await clipboardWrite(DICTATION_SENTINEL);
   }
 
+  /* ───── Silence trimming helpers ───── */
+
+  async function trimSilence(blob, threshold = 0.005, minKeepSamples = 0) {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    try { await ctx.resume(); } catch (_) {}
+
+    const arrayBuf = await blob.arrayBuffer();
+    const audioBuf = await ctx.decodeAudioData(arrayBuf);
+    const channel = audioBuf.getChannelData(0);
+
+    let start = 0;
+    let end = channel.length;
+
+    for (let i = 0; i < channel.length; i++) {
+      if (Math.abs(channel[i]) >= threshold) { start = i; break; }
+    }
+    for (let i = channel.length - 1; i >= 0; i--) {
+      if (Math.abs(channel[i]) >= threshold) { end = i + 1; break; }
+    }
+
+    start = Math.max(0, Math.min(start, channel.length - minKeepSamples));
+    end = Math.max(end, minKeepSamples, start + 1);
+
+    const trimmed = ctx.createBuffer(1, end - start, audioBuf.sampleRate);
+    trimmed.copyToChannel(channel.subarray(start, end), 0);
+
+    const wav = encodeWAV(trimmed);
+    ctx.close();
+    return new Blob([wav], { type: "audio/wav" });
+  }
+
+  function encodeWAV(buffer) {
+    const numChannels = 1;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length;
+    const dataLen = length * 2;
+    const buf = new ArrayBuffer(44 + dataLen);
+    const view = new DataView(buf);
+
+    writeStr(view, 0, "RIFF");
+    view.setUint32(4, 36 + dataLen, true);
+    writeStr(view, 8, "WAVE");
+    writeStr(view, 12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * numChannels * 2, true);
+    view.setUint16(32, numChannels * 2, true);
+    view.setUint16(34, 16, true);
+    writeStr(view, 36, "data");
+    view.setUint32(40, dataLen, true);
+
+    const samples = buffer.getChannelData(0);
+    let offset = 44;
+    for (let i = 0; i < length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+    return buf;
+  }
+
+  function writeStr(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
   /* ───── Warm audio graph: mic → high‑pass → analyser + hysteresis gate → recorder ─────
      Built ONCE and kept alive so the hotkey only has to start a MediaRecorder. */
 
@@ -1026,11 +1095,30 @@ right lower quadrant"></textarea>
 
     sending = true;
     recordBtn.disabled = true;
-    setStatus("Transcribing with Scribe v2...", "warn");
+    setStatus("Trimming and transcribing...", "warn");   // Updated status text
 
-    const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" });
+    // ── Trim silence and convert to WAV before sending ──
+    const mimeType = (chunks[0] && chunks[0].type) || "audio/webm";
+    let blob = new Blob(chunks, { type: mimeType });
+    let fileFormat = "other";    // fallback format
+    let fileName = "recording.webm";
+
+    try {
+      blob = await trimSilence(blob, 0.005, 0);
+      fileFormat = "wav";
+      fileName = "recording.wav";
+      // double‑check the trimmed blob isn't too tiny (might happen with very soft speech)
+      if (blob.size < 1024) throw new Error("Trimmed audio too short");
+    } catch (e) {
+      // If trimming fails (e.g. decode error), fall back to original blob
+      console.warn("Trim failed, sending original audio", e);
+      blob = new Blob(chunks, { type: mimeType });
+      fileFormat = "other";
+      fileName = "recording.webm";
+    }
+    // ── End of trimming block ──
+
     lastAudioBlob = blob;
-
     if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
     lastAudioUrl = URL.createObjectURL(blob);
     audioPreviewEl.src = lastAudioUrl;
@@ -1038,7 +1126,8 @@ right lower quadrant"></textarea>
     const form = new FormData();
     if (apiKey) form.append("api_key", apiKey);                       // BYO key overrides
     if (SHARED_MODE) form.append("passphrase", accessCodeEl.value.trim());
-    form.append("file", blob, "recording.webm");
+    form.append("file", blob, fileName);
+    form.append("file_format", fileFormat);                           // tell the Worker what format
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", String(noVerbatimEl.checked));
     form.append("tag_audio_events", String(tagEventsEl.checked));

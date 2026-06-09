@@ -542,7 +542,7 @@ right lower quadrant"></textarea>
   let historyVisible = false;
 
   const METER_MAX    = 0.12;
-  const HOLD_SECONDS = 0.9;
+  const HOLD_SECONDS = 0.4;
 
   // Written to the clipboard when a dictation fails/produces nothing, so the
   // AHK side returns instantly instead of waiting out its ClipWait timeout.

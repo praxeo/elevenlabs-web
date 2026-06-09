@@ -58,6 +58,7 @@ async function handleTranscribe(request, env) {
     form.append("model_id", "scribe_v2");
     form.append("file", file, "recording.webm");
     form.append("file_format", String(incoming.get("file_format") || "other"));
+
     form.append("language_code", "en");
     form.append("diarize", "false");
     form.append("num_speakers", "1");
@@ -261,7 +262,6 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <!-- Wrap password fields to suppress browser warnings -->
       <form onsubmit="return false" style="display:contents;">
         <div id="accessCodeRow" style="display:none">
           <label for="accessCode">Access code</label>
@@ -780,75 +780,6 @@ right lower quadrant"></textarea>
     await clipboardWrite(DICTATION_SENTINEL);
   }
 
-  /* ───── Silence trimming helpers ───── */
-
-  async function trimSilence(blob, threshold = 0.005, minKeepSamples = 0) {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-    try { await ctx.resume(); } catch (_) {}
-
-    const arrayBuf = await blob.arrayBuffer();
-    const audioBuf = await ctx.decodeAudioData(arrayBuf);
-    const channel = audioBuf.getChannelData(0);
-
-    let start = 0;
-    let end = channel.length;
-
-    for (let i = 0; i < channel.length; i++) {
-      if (Math.abs(channel[i]) >= threshold) { start = i; break; }
-    }
-    for (let i = channel.length - 1; i >= 0; i--) {
-      if (Math.abs(channel[i]) >= threshold) { end = i + 1; break; }
-    }
-
-    start = Math.max(0, Math.min(start, channel.length - minKeepSamples));
-    end = Math.max(end, minKeepSamples, start + 1);
-
-    const trimmed = ctx.createBuffer(1, end - start, audioBuf.sampleRate);
-    trimmed.copyToChannel(channel.subarray(start, end), 0);
-
-    const wav = encodeWAV(trimmed);
-    ctx.close();
-    return new Blob([wav], { type: "audio/wav" });
-  }
-
-  function encodeWAV(buffer) {
-    const numChannels = 1;
-    const sampleRate = buffer.sampleRate;
-    const length = buffer.length;
-    const dataLen = length * 2;
-    const buf = new ArrayBuffer(44 + dataLen);
-    const view = new DataView(buf);
-
-    writeStr(view, 0, "RIFF");
-    view.setUint32(4, 36 + dataLen, true);
-    writeStr(view, 8, "WAVE");
-    writeStr(view, 12, "fmt ");
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, numChannels, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * numChannels * 2, true);
-    view.setUint16(32, numChannels * 2, true);
-    view.setUint16(34, 16, true);
-    writeStr(view, 36, "data");
-    view.setUint32(40, dataLen, true);
-
-    const samples = buffer.getChannelData(0);
-    let offset = 44;
-    for (let i = 0; i < length; i++) {
-      const s = Math.max(-1, Math.min(1, samples[i]));
-      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
-      offset += 2;
-    }
-    return buf;
-  }
-
-  function writeStr(view, offset, str) {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  }
-
   /* ───── Warm audio graph: mic → high‑pass → analyser + hysteresis gate → recorder ───── */
 
   async function ensureAudio() {
@@ -1007,7 +938,9 @@ right lower quadrant"></textarea>
       "audio/ogg;codecs=opus",
     ].find((type) => MediaRecorder.isTypeSupported(type));
 
-    const opts = { audioBitsPerSecond: 16000 };
+    // 64 kbps Opus is plenty for speech and transcribes well.
+    // (Was 16000 — that is a *bitrate*, not a sample rate, and far too low.)
+    const opts = { audioBitsPerSecond: 64000 };
     if (preferred) opts.mimeType = preferred;
 
     try {
@@ -1070,25 +1003,23 @@ right lower quadrant"></textarea>
 
     sending = true;
     recordBtn.disabled = true;
-    setStatus("Trimming and transcribing...", "warn");
+    setStatus("Transcribing...", "warn");
 
+    // Send the recorded container as-is. ElevenLabs decodes it server-side
+    // (file_format "other" accepts all common audio/video formats). No raw-PCM
+    // conversion — that path mislabeled 48 kHz audio as 16 kHz and broke output.
     const mimeType = (chunks[0] && chunks[0].type) || "audio/webm";
-    let blob = new Blob(chunks, { type: mimeType });
-    let fileFormat = "other";
-    let fileName = "recording.webm";
+    const blob = new Blob(chunks, { type: mimeType });
+    const fileFormat = "other";
+    const fileName = mimeType.includes("ogg") ? "recording.ogg" : "recording.webm";
 
-    try {
-      blob = await trimSilence(blob, 0.005, 0);
-      fileFormat = "wav";
-      fileName = "recording.wav";
-      if (blob.size < 1024) throw new Error("Trimmed audio too short");
-    } catch (e) {
-      // 🔍 Show the exact error so we can debug this
-      setStatus("Trim failed: " + (e && e.message ? e.message : String(e)), "err");
-      console.error("Trim error:", e);
-      blob = new Blob(chunks, { type: mimeType });
-      fileFormat = "other";
-      fileName = "recording.webm";
+    if (blob.size < 1024) {
+      await writeSentinel();
+      setStatus("Recording too short or empty.", "err");
+      failBeep();
+      sending = false;
+      recordBtn.disabled = false;
+      return;
     }
 
     lastAudioBlob = blob;
@@ -1218,8 +1149,9 @@ right lower quadrant"></textarea>
     }
     const a = document.createElement("a");
     const url = URL.createObjectURL(lastAudioBlob);
+    const ext = (lastAudioBlob.type || "").includes("ogg") ? "ogg" : "webm";
     a.href = url;
-    a.download = "last-recording.webm";
+    a.download = "last-recording." + ext;
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1284,3 +1216,4 @@ right lower quadrant"></textarea>
 </script>
 </body>
 </html>`;
+

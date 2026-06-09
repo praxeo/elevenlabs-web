@@ -7,10 +7,6 @@ export default {
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
-      // "Shared mode" is on only when BOTH a shared key and an access code are
-      // configured as Worker secrets. The flag is injected into the page so the
-      // UI knows whether to show the access-code field. Served no-store, so it
-      // is never cached.
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
       return new Response(
         INDEX_HTML.replace("__SHARED_MODE__", sharedMode ? "true" : "false"),
@@ -35,10 +31,6 @@ async function handleTranscribe(request, env) {
   try {
     const incoming = await request.formData();
 
-    // Key resolution: a client-provided key always wins (bring-your-own). When
-    // none is given, fall back to the shared server key — but only if a matching
-    // access code is supplied. Setting a server key WITHOUT an access code leaves
-    // shared mode off (fail-safe: the shared key is never exposed un-gated).
     const clientKey  = String(incoming.get("api_key") || "").trim();
     const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
     const serverPass = (env && env.APP_PASSPHRASE) || "";
@@ -63,11 +55,10 @@ async function handleTranscribe(request, env) {
 
     const form = new FormData();
 
-    // ── Fixed dictation config: English, short-form, single speaker ──
     form.append("model_id", "scribe_v2");
     form.append("file", file, "recording.webm");
-    form.append("file_format", String(incoming.get("file_format") || "other"));   // ← CHANGED to respect client hint
-    form.append("language_code", "en");     // English only -> skip auto-detection
+    form.append("file_format", String(incoming.get("file_format") || "other"));
+    form.append("language_code", "en");
     form.append("diarize", "false");
     form.append("num_speakers", "1");
     form.append("temperature", "0");
@@ -77,17 +68,11 @@ async function handleTranscribe(request, env) {
       String(incoming.get("timestamps_granularity") || "none")
     );
 
-    // no_verbatim: default TRUE (clean dictation). Only false if client opts out.
     const noVerbatim = incoming.get("no_verbatim") !== "false";
     form.append("no_verbatim", String(noVerbatim));
 
-    // tag_audio_events: default FALSE (clean clinical text).
     form.append("tag_audio_events", String(incoming.get("tag_audio_events") === "true"));
 
-    // ── Keyterms: ElevenLabs expects a LIST OF STRINGS. ──
-    // Append each as its own "keyterms" field (how the SDK serializes a list).
-    // NEVER join into one string — that created a single giant keyterm and
-    // tripped the "at most 4 spaces" validation error.
     let keyterms = [];
     try {
       keyterms = JSON.parse(String(incoming.get("keyterms_json") || "[]"));
@@ -98,10 +83,8 @@ async function handleTranscribe(request, env) {
     const seen = new Set();
     keyterms = (Array.isArray(keyterms) ? keyterms : [])
       .filter((t) => typeof t === "string")
-      // strip forbidden chars (< > { } [ ] \) and collapse whitespace ("after normalisation")
       .map((t) => t.trim().replace(/[<>{}\[\]\\]/g, "").replace(/\s+/g, " "))
       .filter(Boolean)
-      // docs: <50 chars, <=5 words each
       .filter((t) => t.length < 50 && t.split(" ").length <= 5)
       .filter((t) => {
         const k = t.toLowerCase();
@@ -112,7 +95,7 @@ async function handleTranscribe(request, env) {
       .slice(0, 1000);
 
     for (const term of keyterms) {
-      form.append("keyterms", term);   // one field per keyterm == list of strings
+      form.append("keyterms", term);
     }
 
     const eleven = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
@@ -139,8 +122,6 @@ async function handleTranscribe(request, env) {
   }
 }
 
-// Constant-time string compare for the access code (avoids leaking match
-// progress via timing). Length check is fine for this threat model.
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let out = 0;
@@ -280,13 +261,16 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <div id="accessCodeRow" style="display:none">
-        <label for="accessCode">Access code</label>
-        <input id="accessCode" type="password" placeholder="access code" autocomplete="off" />
-      </div>
+      <!-- Wrap password fields to suppress browser warnings -->
+      <form onsubmit="return false" style="display:contents;">
+        <div id="accessCodeRow" style="display:none">
+          <label for="accessCode">Access code</label>
+          <input id="accessCode" type="password" placeholder="access code" autocomplete="off" />
+        </div>
 
-      <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
-      <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+        <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
+        <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+      </form>
 
       <label class="checkbox">
         <input type="checkbox" id="saveApiKey" />
@@ -470,9 +454,6 @@ right lower quadrant"></textarea>
 
 <script>
 (() => {
-  // Injected by the Worker at serve time (see fetch handler). True when a shared
-  // server key + access code are configured; the access-code field is shown and
-  // an API key is no longer required to dictate.
   const SHARED_MODE      = (__SHARED_MODE__);
 
   const apiKeyEl         = document.getElementById("apiKey");
@@ -544,8 +525,6 @@ right lower quadrant"></textarea>
   const METER_MAX    = 0.12;
   const HOLD_SECONDS = 0.4;
 
-  // Written to the clipboard when a dictation fails/produces nothing, so the
-  // AHK side returns instantly instead of waiting out its ClipWait timeout.
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
   const STORE_KEY              = "scribe_v2_transcripts_v9";
@@ -592,8 +571,6 @@ right lower quadrant"></textarea>
     statusEl.textContent = msg;
   }
 
-  // One term PER LINE. Whitespace collapsed; forbidden chars stripped;
-  // <=5 words / <50 chars each.
   function parseKeyterms(raw) {
     return raw
       .split(/[\\r\\n]+/)
@@ -799,7 +776,6 @@ right lower quadrant"></textarea>
     return ok;
   }
 
-  // Silent clipboard write of the failure marker (no status spam).
   async function writeSentinel() {
     await clipboardWrite(DICTATION_SENTINEL);
   }
@@ -873,8 +849,7 @@ right lower quadrant"></textarea>
     }
   }
 
-  /* ───── Warm audio graph: mic → high‑pass → analyser + hysteresis gate → recorder ─────
-     Built ONCE and kept alive so the hotkey only has to start a MediaRecorder. */
+  /* ───── Warm audio graph: mic → high‑pass → analyser + hysteresis gate → recorder ───── */
 
   async function ensureAudio() {
     if (stream && audioCtx && audioCtx.state !== "closed" && destNode) {
@@ -1032,7 +1007,7 @@ right lower quadrant"></textarea>
       "audio/ogg;codecs=opus",
     ].find((type) => MediaRecorder.isTypeSupported(type));
 
-    const opts = { audioBitsPerSecond: 16000 };   // 16 kbps – enough for speech
+    const opts = { audioBitsPerSecond: 16000 };
     if (preferred) opts.mimeType = preferred;
 
     try {
@@ -1095,28 +1070,26 @@ right lower quadrant"></textarea>
 
     sending = true;
     recordBtn.disabled = true;
-    setStatus("Trimming and transcribing...", "warn");   // Updated status text
+    setStatus("Trimming and transcribing...", "warn");
 
-    // ── Trim silence and convert to WAV before sending ──
     const mimeType = (chunks[0] && chunks[0].type) || "audio/webm";
     let blob = new Blob(chunks, { type: mimeType });
-    let fileFormat = "other";    // fallback format
+    let fileFormat = "other";
     let fileName = "recording.webm";
 
     try {
       blob = await trimSilence(blob, 0.005, 0);
       fileFormat = "wav";
       fileName = "recording.wav";
-      // double‑check the trimmed blob isn't too tiny (might happen with very soft speech)
       if (blob.size < 1024) throw new Error("Trimmed audio too short");
     } catch (e) {
-      // If trimming fails (e.g. decode error), fall back to original blob
-      console.warn("Trim failed, sending original audio", e);
+      // 🔍 Show the exact error so we can debug this
+      setStatus("Trim failed: " + (e && e.message ? e.message : String(e)), "err");
+      console.error("Trim error:", e);
       blob = new Blob(chunks, { type: mimeType });
       fileFormat = "other";
       fileName = "recording.webm";
     }
-    // ── End of trimming block ──
 
     lastAudioBlob = blob;
     if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
@@ -1124,10 +1097,10 @@ right lower quadrant"></textarea>
     audioPreviewEl.src = lastAudioUrl;
 
     const form = new FormData();
-    if (apiKey) form.append("api_key", apiKey);                       // BYO key overrides
+    if (apiKey) form.append("api_key", apiKey);
     if (SHARED_MODE) form.append("passphrase", accessCodeEl.value.trim());
     form.append("file", blob, fileName);
-    form.append("file_format", fileFormat);                           // tell the Worker what format
+    form.append("file_format", fileFormat);
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", String(noVerbatimEl.checked));
     form.append("tag_audio_events", String(tagEventsEl.checked));
@@ -1153,7 +1126,6 @@ right lower quadrant"></textarea>
       const rawText = data.text || data.transcript || "";
       const cleaned = cleanTranscript(rawText);
 
-      // Empty / silent recording: signal failure instead of copying nothing.
       if (!cleaned.trim()) {
         await writeSentinel();
         setStatus("No speech detected.", "warn");

@@ -2,11 +2,12 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/api/transcribe" && request.method === "POST") {
+    if (url.pathname === "/api/transcribe") {
       return handleTranscribe(request, env);
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
+      // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
       return new Response(
         INDEX_HTML.replace("__SHARED_MODE__", sharedMode ? "true" : "false"),
@@ -19,6 +20,28 @@ export default {
       );
     }
 
+    if (url.pathname === "/manifest.webmanifest") {
+      return new Response(JSON.stringify(MANIFEST), {
+        headers: {
+          "content-type": "application/manifest+json",
+          "cache-control": "public, max-age=3600",
+        },
+      });
+    }
+
+    if (url.pathname === "/icon-192.png" || url.pathname === "/icon-512.png") {
+      const b64 = url.pathname === "/icon-192.png" ? ICON_192_B64 : ICON_512_B64;
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return new Response(bytes, {
+        headers: {
+          "content-type": "image/png",
+          "cache-control": "public, max-age=86400",
+        },
+      });
+    }
+
     if (url.pathname === "/favicon.ico") {
       return new Response(null, { status: 204 });
     }
@@ -28,98 +51,136 @@ export default {
 };
 
 async function handleTranscribe(request, env) {
-  try {
-    const incoming = await request.formData();
+  // Scribe Realtime uses WebSockets. Verify handshake upgrade
+  if (request.headers.get("Upgrade") !== "websocket") {
+    return new Response("Expected WebSocket upgrade", { status: 400 });
+  }
 
-    const clientKey  = String(incoming.get("api_key") || "").trim();
+  // Create client/server pair early so we can safely report errors back to the browser UI
+  const [clientWs, workerWs] = new WebSocketPair();
+
+  // Helper to accept client socket and send a JSON error frame before closing
+  const returnWsError = (errorMsg) => {
+    workerWs.accept();
+    workerWs.send(JSON.stringify({ message_type: "error", error: errorMsg }));
+    workerWs.close(1008, "handshake_failed");
+    return new Response(null, { status: 101, webSocket: clientWs });
+  };
+
+  try {
+    const url = new URL(request.url);
+
+    const clientKey  = String(url.searchParams.get("api_key") || "").trim();
     const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
-    const serverPass = (env && env.APP_PASSPHRASE) || "";
+    const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
 
     let apiKey = clientKey;
     if (!apiKey && serverKey && serverPass) {
-      const given = String(incoming.get("passphrase") || "");
+      const given = String(url.searchParams.get("passphrase") || "").trim();
       if (!safeEqual(given, serverPass)) {
-        return json({ error: "Invalid or missing access code." }, 401);
+        return returnWsError("Unauthorized passphrase");
       }
       apiKey = serverKey;
     }
 
-    const file = incoming.get("file");
-
     if (!apiKey) {
-      return json({ error: "No ElevenLabs API key available (none provided, and no shared key/access code configured)." }, 400);
+      return returnWsError("Missing ElevenLabs API Key configuration");
     }
-    if (!file || typeof file === "string") return json({ error: "No audio file uploaded." }, 400);
-    if (file.size < 1024) return json({ error: "Recording too short or empty." }, 400);
-    if (file.size > 25 * 1024 * 1024) return json({ error: "Recording too large." }, 413);
 
-    const form = new FormData();
+    const noVerbatim = url.searchParams.get("no_verbatim") !== "false";
+    const includeTimestamps = url.searchParams.get("timestamps") !== "none";
+    
+    // Dynamic Server-side VAD variables from UI [3]
+    const vadSilence = url.searchParams.get("vad_silence_threshold_secs");
+    const vadThreshold = url.searchParams.get("vad_threshold");
+    const minSpeech = url.searchParams.get("min_speech_duration_ms");
 
-    form.append("model_id", "scribe_v2");
-    form.append("file", file, "recording.webm");
-    form.append("file_format", String(incoming.get("file_format") || "other"));
-
-    form.append("language_code", "en");
-    form.append("diarize", "false");
-    form.append("num_speakers", "1");
-    form.append("temperature", "0");
-
-    form.append(
-      "timestamps_granularity",
-      String(incoming.get("timestamps_granularity") || "none")
-    );
-
-    const noVerbatim = incoming.get("no_verbatim") !== "false";
-    form.append("no_verbatim", String(noVerbatim));
-
-    form.append("tag_audio_events", String(incoming.get("tag_audio_events") === "true"));
-
+    // Parse and clean vocab keyterms
     let keyterms = [];
     try {
-      keyterms = JSON.parse(String(incoming.get("keyterms_json") || "[]"));
+      keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]");
     } catch {
       keyterms = [];
     }
 
     const seen = new Set();
-    keyterms = (Array.isArray(keyterms) ? keyterms : [])
+    const cleanedKeyterms = (Array.isArray(keyterms) ? keyterms : [])
       .filter((t) => typeof t === "string")
       .map((t) => t.trim().replace(/[<>{}\[\]\\]/g, "").replace(/\s+/g, " "))
       .filter(Boolean)
-      .filter((t) => t.length < 50 && t.split(" ").length <= 5)
+      .filter((t) => t.length <= 20 && t.split(" ").length <= 5)
       .filter((t) => {
         const k = t.toLowerCase();
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
       })
-      .slice(0, 1000);
+      .slice(0, 50);
 
-    for (const term of keyterms) {
-      form.append("keyterms", term);
+    // Construct backend connection parameters for ElevenLabs Scribe Realtime v2
+    const elevenParams = new URLSearchParams();
+    elevenParams.append("model_id", "scribe_v2_realtime");
+    elevenParams.append("audio_format", "pcm_16000");
+    elevenParams.append("language_code", "en");
+    elevenParams.append("commit_strategy", "vad");
+    elevenParams.append("no_verbatim", String(noVerbatim));
+    elevenParams.append("include_timestamps", String(includeTimestamps));
+
+    // Dynamic Scribe tuning parameters [3]
+    if (vadSilence) elevenParams.append("vad_silence_threshold_secs", vadSilence);
+    if (vadThreshold) elevenParams.append("vad_threshold", vadThreshold);
+    if (minSpeech) elevenParams.append("min_speech_duration_ms", minSpeech);
+
+    for (const term of cleanedKeyterms) {
+      elevenParams.append("keyterms", term);
     }
 
-    const eleven = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-      method: "POST",
-      headers: { "xi-api-key": apiKey },
-      body: form,
+    // Connect to ElevenLabs using secure Workers fetch
+    const backendWsUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elevenParams.toString();
+
+    const backendResponse = await fetch(backendWsUrl, {
+      headers: {
+        "Upgrade": "websocket",
+        "xi-api-key": apiKey,
+      }
     });
 
-    const responseText = await eleven.text();
+    if (backendResponse.status !== 101) {
+      const errText = await backendResponse.text();
+      return returnWsError(`ElevenLabs Connection Error (${backendResponse.status}): ${errText}`);
+    }
 
-    return new Response(responseText, {
-      status: eleven.status,
-      headers: {
-        "content-type":
-          eleven.headers.get("content-type") || "application/json; charset=utf-8",
-        "cache-control": "no-store",
-      },
+    const backendWs = backendResponse.webSocket;
+    if (!backendWs) {
+      return returnWsError("Could not retrieve backend WebSocket");
+    }
+
+    backendWs.accept();
+    workerWs.accept();
+
+    // Bind events - forward messages between browser and ElevenLabs
+    workerWs.addEventListener("message", (event) => {
+      backendWs.send(event.data);
+    });
+
+    backendWs.addEventListener("message", (event) => {
+      workerWs.send(event.data);
+    });
+
+    workerWs.addEventListener("close", () => {
+      backendWs.close();
+    });
+
+    backendWs.addEventListener("close", () => {
+      workerWs.close();
+    });
+
+    return new Response(null, {
+      status: 101,
+      webSocket: clientWs,
     });
   } catch (err) {
-    return json(
-      { error: "Worker transcription proxy failed.", message: err?.message || String(err) },
-      500
-    );
+    return returnWsError(`Worker initialization failed: ${err?.message || String(err)}`);
   }
 }
 
@@ -130,21 +191,37 @@ function safeEqual(a, b) {
   return out === 0;
 }
 
-function json(obj, status = 200) {
-  return new Response(JSON.stringify(obj, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    },
-  });
-}
+// Web app manifest so the page is installable as a standalone app
+// (Chrome/Edge: address-bar install icon, or menu -> "Install app").
+const MANIFEST = {
+  name: "Scribe Realtime Dictation",
+  short_name: "Dictation",
+  description: "Push-to-talk realtime medical dictation via ElevenLabs Scribe v2",
+  start_url: "/",
+  display: "standalone",
+  background_color: "#0b0d10",
+  theme_color: "#0b0d10",
+  icons: [
+    { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
+  ],
+};
+
+const ICON_192_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAYAAABS3GwHAAAEb0lEQVR42u3dPVIbURRE4ZlXLME5iSMiSB2xJhbiNRGRQkREQs4ecILKKkpiZjT/r78T2VUGiVGf1/dKMmqbFbm5u/9sEM/r82O71m23wo5kKdo1Q//+9uKRRnP9+3Y1Gdqlgi/sGCvFHCK0go9kEdo5gi/0WEKGKURopwy/4GNpEcZKUIQfe+M4a2OfXWwFH8ltUIQfyW1QhB/JEhThR7IERfiRLEERfiRLUC75xsBeJBglwMEg4cdeJehqgSL8SJagdM39QA2cy3Qx9yN5HyhGHySPQsXlQTLF6Y/kFtAA0AA/bclAbRxnvQzdmoG9j0FGIOBYAMsvUpdhDQANABAAIACQRWsBRiKHX6eiAWAEAggAEADI4solWJaHp4/Of/P3zy8XigA5ge/6GkIQICL4Xd+LCASICj4RLMHCv+LtEACbDSUJjECRwTcSaQDh1wYEAAjg1NUCBBA2EhBAyEhAAIAATlctQACAANGnqhYgAEAAgAAAAfLmaXsAAQACAAQACAAQACAAQAAQwCUAAQACAAQACAAQACAAQACAAAABAAIABAAIABAAIABAAIAAAAEAAgAEqIK9fg6vzw8mAEAAgAAAAXLmafM/AQACJJ6qTn8CAARIPF2d/gSIDZnwEyA2bMJPAIAAiaeu0/9yrlyCacK3xmfyCr4GiG0D4SdArATCbwSKHIkEnwCRIgg+AaoZi/oIIfAEsCfAEgwQACAAQADAEjwVx8/GpC6mrkGYAOeegnx4+ogLwPdrcfh72nW4Sg09tELEDtD3QUwSxaFgCQZyBNACw3/GlF1AA0ADaIGMFnD6a4BYCSy+BBh0stUUmCE/S9rrABqgcgmc/ASIPuFcGwKMHoX2eIoOvd+pB0PsCDT0Ad+TBEPva3Ir2gEqk8DMT4BZT74tB+yS+5a+E8U3wKUSbEmES++PJwQIMCoIa4sw5vaFnwCTBWJpEcbenvD/x+8F+haMMcGa8z+TTCWY8BNgVgnOBXYLT7sKPwEGBWXKEK65Kwi+HSA2OMKvATbXBoKvAZyk7qsG0AaCTwAiCD4B9j8WLS2D0BMgTgahJ8Bul1Dv0d8mngVaUIq+oRZ+AgAEAAgAEAAgAEAAgAAAAQACAAQACAAQABiGd4N+sbVfdbgE3nSnAUAAgAAAAQACAAQACAAQAKgZL4R94UUhDQAQAIgS4PX5sW2aprn+fetqIIJD1l+fH1sNACMQQACAAECgABZhJC7AGgAa4JwhQK2n/0kBDpUA1M5x1o1AMAJ9N8MYhNqXXw0AnBJACyDl9O9sABKglvD3boBzpgB75lymS9cXaAHUOPr0GoFIgJrD3ymAfQA1zv2DBDg2iATYU/j77LK9GoAEqDH8g0YgEqC28A8SgASoLfyDBSABagp/0zTNqBe8bu7uPw9/fn978WhgN8G/uAG0AWoJ/+gGONUE2gBLBH+K8E8mwDkRyICpQz9V8GcRgAjYS/BnFeAnEUiBPmGfO/iLCDBEBmCp0K8iACmwdthP8Q9NZS5TPi79vAAAAABJRU5ErkJggg==";
+
+const ICON_512_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAgAAAAIACAYAAAD0eNT6AAAOYklEQVR42u3dPVYcWRKA0aIOS8DHwZKFXCytiYWwJixcsLDkyGcPaqvPkRBVlT8vX76IuNec6emBzFLF9yILdHVgM9++//jtKgAs9/76fOUqbMOFNeQBxIEAwLAHEAUCwMA38AEEgQAw8AEQBALA0AdADAgAg/+zXz/f/AkDWOH27l4ICIAxh74hD5AnDirFQIlvtNXgN+wBakRBhRBI/Q22GPyGPkDdGMgcAim/sTWD38AHEAQVQiDVN7R08Bv6AGKgWgik+EYMfgCEQKEAWDL4DX0AWsVA5BAI+4XPHf4GPwBbhEDUCAj3RRv8AAiBYgEwZ/gb/AD0DoFIERDiCzX4ARACxQJg6vA3+AEYKQRGj4Cj4Q8A002dOaP/bbND1onBD4BtQLENgOEPgG1AsQ3AlAtk8AMQdRsw0iZgmA2A4Q9A9m3ASJuA3UvEyh+AapuAEbYBu/6fO/UDUDkE9oyA3R4BGP4AZDb6I4FdAsDwB0AE7BsB3QPA8AdABOwfAV2fPVz6Bg1+ADK79LmAnp8J6LYBMPwBsA14G2YT0CUADH8AGCsCNg8Awx8AxouA48gXAACqRkDoADhXMIY/ACLgbbctwGYBYPgDwLgRsEkAjPjXHgJARFvN1GPvL9TpHwDmzcYtIuA40jcIACKgj6YB4Lk/AGwTAa23AM0CwPAHgDgR0CQAfOgPAPpoNXM3/wyA0z8AjDc7VweA1T8A9I2AFluAVQFg+ANAzAg4urwAUM/iAHD6B4C4W4BFAWD4A0DsCPAIAAAKmh0ATv8AEH8LcOzxhQEAY83aWQHgN/4BwJjmzugmGwCnfwCItQWYHABO/wCQZwuwegPg9A8A8bYAkwLA6R8Acm0BVm0AnP4BIOYW4GIAOP0DQL4twOINgNM/AMTdAhyd/gGg3hZg0QbA6R8AYm8B/GVAAFDQyQCw/geA2M7N8tkbAOt/ABjLktl8dPoHgHpbgFkbAKd/AMixBfAhQAAo6J8AsP4HgFy+mu2TNwDW/wAwtjmz2iMAAChIAABA9QDw/B8Acvo84ydtADz/B4AYps5sjwAAoCABAACVA+DU83/rfwCI5dTs/nPW2wAAQOUNAAAgAAAAAQAApAsAHwAEgFwufRDQBgAAqm4AAAABAAAIAABAAAAAAgAAiOfKjwACQF63d/c2AACAAAAAAQAACAAAQAAAAAIAABAAAIAAAAAGd+0SQG6PLx+L/7dPDzcuIAgAIOugn/vvFAYgAIBEA3/p/7cgAAEAJB36U78uMQACAEg89MUACADA4D/7PQgBEABAgcEvBEAAAIUHvxAAAQAUHvxCAMbjNwGC4e/7BxsAwOCzDQAbAMDwd13ABgAw4GwDwAYAMPxdLxAAgGHmukEUHgGAATb8NfRIAGwAwPB3PQEBAIaV6woIADCkXF9AAIDh5DoDAgAMJdcbEABgGLnuIAAAAAEAOIW6/iAAAMPHfQABAIaOoeN+gAAAAAQAOG3ivoAAAEMG9wcEAAAgAMDpEvcJBAAYKrhfIAAAAAEATpO4byAAAAABAE6RuH8gAAAAAQBOj+4jIAAAQAAATo3uJwgAAEAAAAACAJKzLnZfQQAAAAIAABAAkI41sfsLAgAAEAAAgAAAAAQAxOf5sPsMAgAAEAAAgAAAAAQAACAAAAABABH4ZLj7DQIAABAAAIAAAAAEAAAgAAAAAQAACAAAQAAAAAIAABAAAIAAAAAEAAAgAAAAAQAACAAAQAAAAAIAAAQAACAAAAABAAAIAABAAAAAAgAAEAAAgAAAAAQAACAAAAABAAAIAABAAAAAAgAAEAAAgAAAAAQAAFR17RIQ2ePLh4vguu/q6eHGRcAGAAAQAACAAAAABAAAIAAAAAEAAAgAAEAAAAACAAAQAACAAAAABAAAIAAAQAAAAAIAABAAAIAAAAAEAAAgAAAAAQAACAAAQAAAAAIAABAAAIAAAADWunYJiOzp4cZFAFiyAXh/fb766r+4vbt3dQAgsFOz/P31+cojAACouAFwCQBAAAAAAgAAEAAAgAAAAAIHgB8FBIBczv0IoA0AAFTeAAAAAgAAEAAAQNoA8EFAAMjh0gcAbQAAoPoGAAAQAH/xGAAAYpg6s/8KgFOfAwAAYvs84z0CAICCBAAACIDTfA4AAMY2Z1b/EwA+BwAAuXw12z0CAICCZgWAxwAAMKa5M/rLAPAYAAByODXTZz8CsAUAgNin/7MBYAsAADlP/4s2AABAfIsCwGMAABjD0pl8NgA8BgCAmC7N8MWPAGwBACDm6X9SANgCAECu0/+qDYAtAADEPP1PDgBbAADIc/pfvQGwBQCAeKf/WQFgCwAAOU7/TTYAtgAAEOv0PzsAbAEAIP7pv9kGwBYAAOKc/hcFwLnCEAEA0H/4L9nQ+8uAAKCgRQFgCwAAcU//qzYAIgAAYg7/VQEAAMS1KgBsAQAg3um/yQZABABArOHfJADWfAMAwD6zs0kA+A2BANBHq5l77PEF2QIAwPrTf8sDd9NHACIAAMYf/s0DYM03BgCGfz/NA+BSoYgAAJg3G7f4rN0mGwAfCgSAsWfqcY8v2BYAAC7PxC0P1Jt+BkAEAMB4w3/zAFjzjQNA1eHfw+YB4EOBADBv9vX4LF2XDYAIAIBxhn+3ABABADDO8D8cDofuP6737fuP35f+mV8/37xKACgz+HsP/64bgDnfoG0AAIZ/sgAQAQAY/vsO/90CQAQAYPjv+5tzd/+VvVM+E3A4+FwAAHkG/97Df4gAmBMCIgAAp/42jqNcNI8EADD8C24A5mwCbAMAiDT4Rxv+Q20A5l4g2wAADP9EGwDbAAAM/oIbANsAAAz/4huAuZsA2wAA9h78EYZ/mAAQAgAY/IUDYG4ECAEAegz+aMM/ZAAIAQAM/sIBsCQChAAArQZ/5OEfPgDWhIAYAGDpT5FFHvypAkAIAGDwFw6AtSEgBgAM/eyDP3UAtAgBQQBQd+BnHvwlAqBlCIgBgBpDP/vgLxUArUNAFADkGfbVBn/JANg6BsQBwPhDvvLQFwCdQwCA8VQd/AJADAAY+gIAQQBg4AsABAGAgS8AEAUAhr0AQBwAGPLB/QfwL65wpcJThQAAAABJRU5ErkJggg==";
 
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#0b0d10" />
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" type="image/png" href="/icon-192.png" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>ElevenLabs Scribe v2 Dictation</title>
   <style>
     :root {
@@ -220,12 +297,17 @@ const INDEX_HTML = `<!doctype html>
     #meterBar { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: var(--ok); }
     #openMark  { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); left: 0%; }
     #closeMark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn);   left: 0%; }
-    #gateState {
+    .pill {
       display: inline-block; margin-left: 8px; font-size: 12px; padding: 1px 8px;
       border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
     }
-    #gateState.open { color: #0b0d10; background: var(--ok); border-color: var(--ok); }
-    .sliderval { color: var(--text); font-size: 12px; }
+    .pill.open { color: #0b0d10; background: var(--ok); border-color: var(--ok); }
+    .pill.ok   { color: var(--ok); border-color: var(--ok); }
+    .pill.live { color: #0b0d10; background: var(--accent); border-color: var(--accent); }
+    .pill.rec  { color: #fff; background: #b91c1c; border-color: #b91c1c; }
+    .pill.fail { color: #fff; background: var(--danger); border-color: var(--danger); }
+    .pill.warn { color: #0b0d10; background: var(--warn); border-color: var(--warn); }
+    .sliderval { color: var(--accent); font-size: 12px; }
     .legend { font-size: 11px; color: var(--muted); margin-top: 4px; }
     .legend .dr { color: var(--danger); }
     .legend .dy { color: var(--warn); }
@@ -253,24 +335,23 @@ const INDEX_HTML = `<!doctype html>
       background: #0f172a; border: 1px solid var(--line); border-radius: 6px;
       padding: 2px 6px; font-size: 12px; color: var(--text);
     }
+    .divider { height: 1px; background: var(--line); margin: 18px 0 14px; }
   </style>
 </head>
 
 <body>
 <main>
-  <h1>ElevenLabs Scribe v2 Dictation</h1>
+  <h1>ElevenLabs Scribe v2 Dictation (Realtime)</h1>
 
   <div class="grid">
     <section class="card">
-      <form onsubmit="return false" style="display:contents;">
-        <div id="accessCodeRow" style="display:none">
-          <label for="accessCode">Access code</label>
-          <input id="accessCode" type="password" placeholder="access code" autocomplete="off" />
-        </div>
+      <div id="passphraseRow" style="display:none">
+        <label for="passphrase">Passphrase</label>
+        <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
+      </div>
 
-        <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
-        <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
-      </form>
+      <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
+      <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
 
       <label class="checkbox">
         <input type="checkbox" id="saveApiKey" />
@@ -286,90 +367,32 @@ const INDEX_HTML = `<!doctype html>
         <button id="clearBtn">Clear history</button>
       </div>
 
-      <label>Mic level <span id="gateState">closed</span></label>
+      <label for="hotkeyBtn">Push‑to‑talk hotkey</label>
+      <div class="row">
+        <button id="hotkeyBtn" title="Click, then press the key combo you want">Ctrl + Space</button>
+        <button id="hotkeyResetBtn" title="Reset to Ctrl + Space">Reset</button>
+      </div>
+      <div class="hint" style="margin-top: 6px;">
+        Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
+      </div>
+
+      <div class="divider"></div>
+
+      <label>Mic level
+        <span id="micPill" class="pill">mic off</span>
+        <span id="linkPill" class="pill">link idle</span>
+        <span id="gateState" class="pill" title="Local noise gate state (affects the saved audio preview only)">closed</span>
+      </label>
       <div class="meterwrap">
         <div id="meterBar"></div>
         <div id="closeMark"></div>
         <div id="openMark"></div>
       </div>
-      <div class="legend">
-        <span class="dr">red = OPEN threshold</span> (speech must exceed) &nbsp;|&nbsp;
-        <span class="dy">yellow = CLOSE threshold</span> (gate holds open until below this)
-      </div>
-
-      <label for="gateOpen">Open threshold <span class="sliderval" id="gateOpenVal"></span></label>
-      <input id="gateOpen" type="range" min="0" max="0.12" step="0.001" value="0.030" />
-
-      <label for="gateClose">Close threshold <span class="sliderval" id="gateCloseVal"></span></label>
-      <input id="gateClose" type="range" min="0" max="0.12" step="0.001" value="0.008" />
-
-      <label for="highpass">High‑pass filter <span class="sliderval" id="highpassVal"></span></label>
-      <input id="highpass" type="range" min="0" max="200" step="5" value="85" />
-
-      <label class="checkbox">
-        <input type="checkbox" id="noiseSuppress" />
-        Browser noise suppression
-      </label>
-
-      <!-- ───────── Built‑in tutorial ───────── -->
-      <details class="help">
-        <summary>How do these filter settings work? (tap to learn)</summary>
-        <div class="body">
-          <p>Think of the gate as a <strong>bouncer for your mic</strong>. The whole
-          goal is to create a <em>gap</em> between how loud YOUR voice is and how loud
-          the room is, then only let your voice through.</p>
-
-          <h3>The mic level meter</h3>
-          <p>The green bar shows live loudness. Two marks sit on it:
-          <span class="tag">red = Open</span> and <span class="tag y">yellow = Close</span>.
-          The pill next to "Mic level" shows the gate's live state (OPEN / closed)
-          while you record.</p>
-
-          <h3>Open threshold (red)</h3>
-          <p>How loud a sound must be to <strong>start</strong> recording. Set it just
-          ABOVE where background noise/voices peak, so the room can't open the gate
-          but your speech easily does.</p>
-
-          <h3>Close threshold (yellow)</h3>
-          <p>Once open, the gate stays open until your level drops BELOW this (plus a
-          short hold). Set it LOW — your word‑endings and quiet syllables are much
-          softer than word‑beginnings, and a low Close keeps them from being chopped.
-          The space between yellow and red is the "safe zone" that rejects borderline
-          background speech.</p>
-
-          <h3>High‑pass filter</h3>
-          <p>Cuts low rumble (HVAC, desk thumps, footsteps) BEFORE the gate sees it,
-          so that junk can't falsely trip the gate open. 85 Hz is the sweet spot.
-          Raise toward 120 Hz for a rumbly room; set to 0 to disable. Don't go above
-          ~150 Hz or your voice starts sounding thin.</p>
-
-          <h3>2‑minute tuning routine</h3>
-          <p>1. Record, stay silent — see how far the room pushes the meter.<br>
-          2. Set <span class="tag">red</span> just above that point.<br>
-          3. Speak normally — confirm you shoot well past red and the pill flips OPEN.<br>
-          4. Set <span class="tag y">yellow</span> low, in the gap.<br>
-          5. Talk a long, pausey sentence — the pill should stay OPEN the whole way.</p>
-
-          <h3>Symptom cheat‑sheet</h3>
-          <table>
-            <tr><td>Word beginnings cut off</td><td>Open too high → lower red</td></tr>
-            <tr><td>Words drop mid‑sentence</td><td>Close too high → lower yellow</td></tr>
-            <tr><td>Background still transcribed</td><td>Open too low → raise red</td></tr>
-            <tr><td>Gate flickers open/closed</td><td>Gap too narrow → raise red, lower yellow</td></tr>
-            <tr><td>Nothing records at all</td><td>Both above your voice → drag both toward 0</td></tr>
-          </table>
-
-          <p><strong>Golden rule:</strong> the wider the gap between your voice and the
-          room on the meter, the better this works — and the #1 way to widen it is the
-          mic itself (close, low gain, point the back of a cardioid at the noise).
-          The sliders clean up what's left.</p>
-        </div>
-      </details>
 
       <div class="status" id="status">
-        CapsLock via AHK: hold to record, release to stop. Browser beeps when text is
-        ready on the clipboard — keep this tab focused until the beep, then switch
-        windows and Ctrl+V.
+        Ctrl+Space: tap to start/stop, hold to talk (CapsLock via AHK also works).
+        Browser beeps when text is ready on the clipboard — keep this tab focused
+        until the beep, then switch windows and Ctrl+V.
       </div>
 
       <label for="keyterms">Context / vocabulary keyterms</label>
@@ -379,25 +402,13 @@ ascites
 right lower quadrant"></textarea>
 
       <div class="hint" id="keytermHint">
-        Scribe v2 biases toward these terms. One per line, each &lt;50 chars, ≤5 words.
-        <strong>Keyterms add ~20 % to cost.</strong> 0 terms.
+        Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words.
+        <strong>Keyterms add ~20 % to cost.</strong> 0 / 50 terms.
       </div>
-
-      <label for="timestamps">Timestamps</label>
-      <select id="timestamps">
-        <option value="none" selected>none</option>
-        <option value="word">word</option>
-        <option value="character">character</option>
-      </select>
 
       <label class="checkbox">
         <input type="checkbox" id="noVerbatim" checked />
         Remove filler words / false starts
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="tagEvents" />
-        Tag audio events
       </label>
 
       <label class="checkbox">
@@ -406,8 +417,24 @@ right lower quadrant"></textarea>
       </label>
 
       <label class="checkbox">
+        <input type="checkbox" id="appendMode" checked />
+        Append consecutive recordings (don't clear)
+      </label>
+
+      <div class="row" id="appendWindowRow" style="margin: 4px 0 0 24px; align-items: center;">
+        <span class="hint" style="flex: 0 0 auto;">…only if started within</span>
+        <input id="appendWindow" type="number" min="0" max="600" step="5" value="45" style="flex: 0 0 80px;" />
+        <span class="hint" style="flex: 0 0 auto;">seconds (0 = always append)</span>
+      </div>
+
+      <label class="checkbox">
         <input type="checkbox" id="stripNewlines" checked />
         Strip newlines (collapse to spaces)
+      </label>
+
+      <label class="checkbox">
+        <input type="checkbox" id="stripEllipses" checked />
+        Remove ellipses (pauses become "…" otherwise)
       </label>
 
       <label class="checkbox">
@@ -417,32 +444,85 @@ right lower quadrant"></textarea>
 
       <label class="checkbox">
         <input type="checkbox" id="startBeep" checked />
-        Beep when recording starts
+        Start/done beeps (failure alarms always play)
       </label>
+
+      <details class="help" id="advanced">
+        <summary>Advanced audio &amp; noise settings</summary>
+        <div class="body">
+          <div class="legend">
+            <span class="dr">red mark on meter = gate OPEN threshold</span> &nbsp;|&nbsp;
+            <span class="dy">yellow = CLOSE threshold</span>
+          </div>
+
+          <label for="gateOpen">Gate open threshold <span class="sliderval" id="gateOpenVal"></span></label>
+          <input id="gateOpen" type="range" min="0" max="0.12" step="0.001" value="0.030" />
+
+          <label for="gateClose">Gate close threshold <span class="sliderval" id="gateCloseVal"></span></label>
+          <input id="gateClose" type="range" min="0" max="0.12" step="0.001" value="0.008" />
+
+          <label for="highpass">High‑pass filter <span class="sliderval" id="highpassVal"></span></label>
+          <input id="highpass" type="range" min="0" max="200" step="5" value="85" />
+
+          <div class="divider"></div>
+
+          <label style="font-weight: bold; color: var(--accent);">Scribe Realtime Filters</label>
+
+          <label for="vadSilence">Scribe pause limit <span class="sliderval" id="vadSilenceVal"></span></label>
+          <input id="vadSilence" type="range" min="0.3" max="3.0" step="0.1" value="2.0" />
+
+          <label for="vadThreshold">Scribe noise filter <span class="sliderval" id="vadThresholdVal"></span></label>
+          <input id="vadThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.55" />
+
+          <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
+          <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+
+          <label class="checkbox">
+            <input type="checkbox" id="noiseSuppress" />
+            Browser noise suppression
+          </label>
+
+          <label for="timestamps">Timestamps</label>
+          <select id="timestamps">
+            <option value="none" selected>none</option>
+            <option value="word">word</option>
+          </select>
+
+          <h3>How do these settings work?</h3>
+          <p><strong>Local gate</strong>: shapes only the locally saved audio preview — the realtime feed to Scribe is not gated. Use the Scribe filters to reject background speech.</p>
+          <p><strong>Pause limit</strong>: higher (e.g. 2.0s) waits longer before finalizing a segment, giving the AI more context to fix grammar/spelling.</p>
+          <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
+          <p><strong>Click filter</strong>: higher values stop brief clicks/rustling being read as speech.</p>
+        </div>
+      </details>
 
       <label>Notes</label>
       <div class="hint">
         English‑only, Scribe v2. Mic is kept warm between dictations for instant start.
-        The browser sends your API key and audio to your Worker, which calls ElevenLabs
-        server‑side to avoid CORS.
+        Your browser opens a secure WebSocket pipe back to the Worker, transcribing speech incrementally.
       </div>
     </section>
 
     <section class="card">
-      <div class="row">
-        <button id="copyBtn">Copy latest</button>
-        <button id="downloadBtn">Download .txt</button>
-      </div>
-
-      <label>Last recorded audio</label>
-      <audio id="audioPreview" controls style="width:100%; margin-bottom:10px;"></audio>
-
-      <div class="row">
-        <button id="downloadAudioBtn">Download audio</button>
-      </div>
-
-      <label>Latest transcript</label>
+      <label style="margin-top: 0;">Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
       <div id="latest" class="big"></div>
+
+      <div class="row" style="margin-top: 10px;">
+        <button id="copyBtn">Copy latest</button>
+        <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+      </div>
+
+      <details class="help">
+        <summary>Last recorded audio &amp; downloads</summary>
+        <div class="body">
+          <label>Last recorded audio (captured locally)</label>
+          <audio id="audioPreview" controls style="width:100%; margin-bottom:10px;"></audio>
+          <div class="row">
+            <button id="downloadAudioBtn">Download audio</button>
+            <button id="downloadBtn">Download transcripts .txt</button>
+          </div>
+        </div>
+      </details>
 
       <div class="row" style="margin-top:14px;">
         <button id="toggleHistoryBtn">Show saved transcripts</button>
@@ -458,14 +538,15 @@ right lower quadrant"></textarea>
 
   const apiKeyEl         = document.getElementById("apiKey");
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
-  const accessCodeEl     = document.getElementById("accessCode");
-  const accessCodeRow    = document.getElementById("accessCodeRow");
+  const passphraseEl     = document.getElementById("passphrase");
+  const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
   const forgetKeyBtn     = document.getElementById("forgetKeyBtn");
 
   const recordBtn        = document.getElementById("recordBtn");
   const clearBtn         = document.getElementById("clearBtn");
   const copyBtn          = document.getElementById("copyBtn");
+  const freshBtn         = document.getElementById("freshBtn");
   const downloadBtn      = document.getElementById("downloadBtn");
   const downloadAudioBtn = document.getElementById("downloadAudioBtn");
   const toggleHistoryBtn = document.getElementById("toggleHistoryBtn");
@@ -479,11 +560,12 @@ right lower quadrant"></textarea>
   const keytermHintEl    = document.getElementById("keytermHint");
   const timestampsEl     = document.getElementById("timestamps");
   const noVerbatimEl     = document.getElementById("noVerbatim");
-  const tagEventsEl      = document.getElementById("tagEvents");
   const autoCopyEl       = document.getElementById("autoCopy");
+  const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
   const startBeepEl      = document.getElementById("startBeep");
   const stripNewlinesEl  = document.getElementById("stripNewlines");
+  const stripEllipsesEl  = document.getElementById("stripEllipses");
   const trailingSpaceEl  = document.getElementById("trailingSpace");
 
   const gateOpenEl       = document.getElementById("gateOpen");
@@ -493,27 +575,82 @@ right lower quadrant"></textarea>
   const highpassEl       = document.getElementById("highpass");
   const highpassValEl    = document.getElementById("highpassVal");
 
+  // Realtime tuning VAD elements
+  const vadSilenceEl     = document.getElementById("vadSilence");
+  const vadThresholdEl   = document.getElementById("vadThreshold");
+  const minSpeechEl      = document.getElementById("minSpeech");
+  const vadSilenceValEl  = document.getElementById("vadSilenceVal");
+  const vadThresholdValEl = document.getElementById("vadThresholdVal");
+  const minSpeechValEl   = document.getElementById("minSpeechVal");
+
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
   const closeMark        = document.getElementById("closeMark");
   const gateStateEl      = document.getElementById("gateState");
 
+  const appendWindowEl   = document.getElementById("appendWindow");
+  const appendChipEl     = document.getElementById("appendChip");
+  const micPillEl        = document.getElementById("micPill");
+  const linkPillEl       = document.getElementById("linkPill");
+  const advancedEl       = document.getElementById("advanced");
+  const hotkeyBtn        = document.getElementById("hotkeyBtn");
+  const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
+
   let mediaRecorder = null;
   let chunks = [];
   let recording = false;
-  let sending = false;
+  let stopping = false;
   let stopRequested = false;
   let latestText = "";
   let lastAudioBlob = null;
   let lastAudioUrl = null;
 
-  // ── Persistent (warm) audio graph ──
+  // Realtime Variables
+  let ws = null;
+  let finalizedSegments = [];
+  let currentPartial = "";
+
+  // Per-session flow state
+  let sessionSeq = 0;          // bumps each recording; stale socket callbacks bail out
+  let sessionFinalized = true;
+  let userStopped = false;     // distinguishes clean PTT-release from unexpected disconnect
+  let stopPhase = null;        // null | "tail" | "awaitFinal"
+  let pendingStart = false;    // F13 pressed while previous session was finalizing
+  let pendingChunks = [];      // base64 audio captured while the WebSocket is still connecting
+  let prerollFrames = [];      // ring of raw idle frames; prepended at start so the first word survives
+  let sessionPreviousText = ""; // tail of the note being appended to; rides the first chunk as context
+  let firstChunkSent = false;  // previous_text may only accompany the FIRST chunk of a socket
+  let lastWsError = "";
+  let wsOpenAt = 0;
+  let recStartedAt = 0;
+  let partialCount = 0;
+  let speechDetected = false;
+  let maxRmsSeen = 0;
+  let micAlarmFired = false;
+  let sttAlarmFired = false;
+  let mutedSince = 0;
+  let lastFinalizeAt = 0;
+  let connectTimer = null;
+  let tailTimer = null;
+  let finalDeadlineTimer = null;
+  let quietTimer = null;
+
+  // In-app push-to-talk hotkey (F13/F14 via AHK always work in addition)
+  const DEFAULT_HOTKEY = { ctrl: true, alt: false, shift: false, meta: false, code: "Space" };
+  let hotkey = Object.assign({}, DEFAULT_HOTKEY);
+  let capturingHotkey = false;
+  let hotkeyEngaged = false; // current press-cycle started/queued a dictation
+  let hotkeyDownAt = 0;
+
+  // Persistent audio nodes
   let stream = null;
   let audioCtx = null;
   let hpFilter = null;
   let analyserNode = null;
   let gateNode = null;
   let destNode = null;
+  let recorderNode = null; // Node for real-time downsampling
+  let sinkNode = null;     // Muted sink to keep ScriptProcessor running safely
   let gateTimer = null;
   let gateBuf = null;
   let gateIsOpen = false;
@@ -523,20 +660,32 @@ right lower quadrant"></textarea>
   let historyVisible = false;
 
   const METER_MAX    = 0.12;
-  const HOLD_SECONDS = 0.4;
-
+  const HOLD_SECONDS = 0.9;
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
+
+  const CONNECT_TIMEOUT_MS = 5000;  // WebSocket must open within this or the dictation fails loudly
+  const TAIL_MS            = 600;   // keep streaming audio this long after PTT release (anti-clipping)
+  const FINAL_WAIT_MS      = 2500;  // max wait for the final committed transcript after commit
+  const COMMIT_QUIET_MS    = 350;   // close this soon after the last committed transcript arrives
+  const PENDING_CHUNK_CAP  = 400;   // ~35s of audio buffered while the socket connects
+  const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
+  const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
+  const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
+  const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
 
   const STORE_KEY              = "scribe_v2_transcripts_v9";
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
   const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
-  const ACCESS_CODE_STORAGE_KEY = "scribe_v2_access_code_v9";
+  const PASSPHRASE_STORAGE_KEY = "scribe_v2_passphrase_v9";
 
-  /* ───── Audio cue helpers ───── */
-
+  /* ───── Audio cues ─────
+     Beeps prefer the persistent (already running) AudioContext: a fresh
+     AudioContext created while the tab is in the background often starts
+     suspended and never sounds — exactly when you most need the cue. */
   function beep(freq, ms, when) {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const reuse = audioCtx && audioCtx.state === "running";
+      const ctx = reuse ? audioCtx : new (window.AudioContext || window.webkitAudioContext)();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.frequency.value = freq;
@@ -546,24 +695,80 @@ right lower quadrant"></textarea>
       const t0 = ctx.currentTime + (when || 0);
       osc.start(t0);
       osc.stop(t0 + ms / 1000);
-      setTimeout(() => ctx.close(), ((when || 0) + ms / 1000) * 1000 + 60);
+      if (!reuse) setTimeout(() => ctx.close(), ((when || 0) + ms / 1000) * 1000 + 60);
     } catch (e) {}
   }
 
+  // Start/done cues respect the checkbox; failure sounds always play.
   function startBeep() { if (startBeepEl.checked) beep(760, 130); }
   function doneBeep()  { if (startBeepEl.checked) { beep(1046, 90, 0); beep(1568, 130, 0.10); } }
-  function failBeep()  { if (startBeepEl.checked) beep(300, 280); }
+  function failBeep()  { beep(300, 280); }
+  function micAlarmBeep() { beep(330, 170, 0); beep(280, 170, 0.22); beep(240, 260, 0.44); }
+  function sttWarnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); }
 
-  /* ───── Text cleanup ───── */
+  /* ───── Audio Downsampling & Float conversion helpers ───── */
+  function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+    if (inputSampleRate === outputSampleRate) return buffer;
+    const sampleRateRatio = inputSampleRate / outputSampleRate;
+    const newLength = Math.round(buffer.length / sampleRateRatio);
+    const result = new Float32Array(newLength);
+    let offsetResult = 0;
+    let offsetInput = 0;
+    while (offsetResult < result.length) {
+      const nextOffsetInput = Math.round((offsetResult + 1) * sampleRateRatio);
+      let accum = 0, count = 0;
+      for (let i = offsetInput; i < nextOffsetInput && i < buffer.length; i++) {
+        accum += buffer[i];
+        count++;
+      }
+      result[offsetResult] = count > 0 ? accum / count : 0;
+      offsetResult++;
+      offsetInput = nextOffsetInput;
+    }
+    return result;
+  }
 
+  // Converts float values to 16-bit signed PCM
+  function floatTo16BitPCM(input) {
+    const output = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    return output.buffer;
+  }
+
+  function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return window.btoa(binary);
+  }
+
+  /* ───── Text processing ───── */
   function cleanTranscript(raw) {
     let t = raw;
+    if (stripEllipsesEl.checked) {
+      // Scribe renders dictation pauses as ellipses; strip both forms.
+      t = t.replace(/\\u2026/g, " ").replace(/\\.{3,}/g, " ");
+    }
     if (stripNewlinesEl.checked) {
       t = t.replace(/[\\r\\n]+/g, " ");
     }
     t = t.replace(/ +/g, " ").trim();
+    t = t.replace(/ ([,.;:!?])/g, "$1");
     if (trailingSpaceEl.checked && t.length > 0) t += " ";
     return t;
+  }
+
+  function updateLiveDisplay() {
+    const combined = finalizedSegments.join(" ") + (currentPartial ? " " + currentPartial : "");
+    const cleaned = cleanTranscript(combined);
+    latestText = cleaned;
+    latestEl.textContent = cleaned;
   }
 
   function setStatus(msg, cls) {
@@ -571,24 +776,90 @@ right lower quadrant"></textarea>
     statusEl.textContent = msg;
   }
 
+  function setMicPill(state) {
+    // state: "off" | "ready" | "rec" | "fail"
+    if (state === "rec")        { micPillEl.textContent = "REC";       micPillEl.className = "pill rec"; }
+    else if (state === "ready") { micPillEl.textContent = "mic ready"; micPillEl.className = "pill ok"; }
+    else if (state === "fail")  { micPillEl.textContent = "MIC FAIL";  micPillEl.className = "pill fail"; }
+    else                        { micPillEl.textContent = "mic off";   micPillEl.className = "pill"; }
+  }
+
+  function setLinkPill(state) {
+    // state: "idle" | "connecting" | "live" | "fail"
+    if (state === "live")            { linkPillEl.textContent = "LIVE";        linkPillEl.className = "pill live"; }
+    else if (state === "connecting") { linkPillEl.textContent = "connecting…"; linkPillEl.className = "pill warn"; }
+    else if (state === "fail")       { linkPillEl.textContent = "LINK FAIL";   linkPillEl.className = "pill fail"; }
+    else                             { linkPillEl.textContent = "link idle";   linkPillEl.className = "pill"; }
+  }
+
+  function updateAppendChip() {
+    const hasText = latestText && latestText.trim();
+    if (!appendModeEl.checked || !hasText || recording) {
+      appendChipEl.style.display = "none";
+      return;
+    }
+    appendChipEl.style.display = "";
+    const w = Number(appendWindowEl.value) || 0;
+    if (w > 0 && lastFinalizeAt) {
+      const remain = Math.ceil((lastFinalizeAt + w * 1000 - Date.now()) / 1000);
+      if (remain <= 0) {
+        appendChipEl.textContent = "next dictation starts fresh";
+        appendChipEl.className = "pill";
+      } else {
+        appendChipEl.textContent = "next dictation appends (" + remain + "s)";
+        appendChipEl.className = "pill ok";
+      }
+    } else {
+      appendChipEl.textContent = "next dictation appends";
+      appendChipEl.className = "pill ok";
+    }
+  }
+
+  /* ───── Configurable push-to-talk hotkey ───── */
+  function hotkeyLabel(hk) {
+    if (!hk || !hk.code) return "none";
+    const parts = [];
+    if (hk.ctrl)  parts.push("Ctrl");
+    if (hk.alt)   parts.push("Alt");
+    if (hk.shift) parts.push("Shift");
+    if (hk.meta)  parts.push("Win");
+    let k = hk.code;
+    if (k.indexOf("Key") === 0) k = k.slice(3);
+    else if (k.indexOf("Digit") === 0) k = k.slice(5);
+    parts.push(k);
+    return parts.join(" + ");
+  }
+
+  function hotkeyMatches(e) {
+    if (!hotkey || !hotkey.code) return false;
+    return e.code === hotkey.code &&
+           e.ctrlKey  === !!hotkey.ctrl &&
+           e.altKey   === !!hotkey.alt &&
+           e.shiftKey === !!hotkey.shift &&
+           e.metaKey  === !!hotkey.meta;
+  }
+
+  function updateHotkeyUI() {
+    hotkeyBtn.textContent = capturingHotkey ? "press a key combo… (Esc cancels)" : hotkeyLabel(hotkey);
+  }
+
   function parseKeyterms(raw) {
     return raw
       .split(/[\\r\\n]+/)
       .map((s) => s.trim().replace(/\\s+/g, " ").replace(/[<>{}\\[\\]\\\\]/g, ""))
       .filter(Boolean)
-      .filter((s) => s.length < 50 && s.split(" ").length <= 5)
-      .slice(0, 1000);
+      .filter((s) => s.length <= 20 && s.split(" ").length <= 5) // Fixed: <= 20 chars per Scribe API
+      .slice(0, 50); // Real-time only accepts up to 50 keyterms
   }
 
   function updateKeytermHint() {
     const n = parseKeyterms(keytermsEl.value).length;
     keytermHintEl.innerHTML =
-      "Scribe v2 biases toward these terms. One per line, each &lt;50 chars, ≤5 words. " +
-      "<strong>Keyterms add ~20 % to cost.</strong> " + n + " term" + (n === 1 ? "" : "s") + ".";
+      "Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words. " +
+      "<strong>Keyterms add ~20 % to cost.</strong> " + n + " / 50 terms.";
   }
 
-  /* ───── Gate UI helpers ───── */
-
+  /* ───── Gate UI ───── */
   function enforceGateOrder(changed) {
     let open = Number(gateOpenEl.value);
     let close = Number(gateCloseEl.value);
@@ -603,17 +874,22 @@ right lower quadrant"></textarea>
     gateCloseValEl.textContent = "(" + Number(gateCloseEl.value).toFixed(3) + ")";
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
+    
+    // Dynamic Scribe labels
+    vadSilenceValEl.textContent = "(" + Number(vadSilenceEl.value).toFixed(1) + "s)";
+    vadThresholdValEl.textContent = "(" + Number(vadThresholdEl.value).toFixed(2) + " - higher is less sensitive)";
+    minSpeechValEl.textContent = "(" + Number(minSpeechEl.value) + " ms)";
+
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
   }
 
   function setGateStateUI(isOpen) {
     gateStateEl.textContent = isOpen ? "OPEN" : "closed";
-    gateStateEl.className  = isOpen ? "open" : "";
+    gateStateEl.className  = isOpen ? "pill open" : "pill";
   }
 
-  /* ───── Persistence (debounced) ───── */
-
+  /* ───── Storage / Persistence ───── */
   let saveTimer = null;
   function saveSettings() {
     if (saveTimer) clearTimeout(saveTimer);
@@ -625,26 +901,33 @@ right lower quadrant"></textarea>
       keyterms:       keytermsEl.value,
       timestamps:     timestampsEl.value,
       noVerbatim:     noVerbatimEl.checked,
-      tagEvents:      tagEventsEl.checked,
       autoCopy:       autoCopyEl.checked,
+      appendMode:     appendModeEl.checked,
       saveApiKey:     saveApiKeyEl.checked,
       noiseSuppress:  noiseSuppressEl.checked,
       startBeep:      startBeepEl.checked,
       stripNewlines:  stripNewlinesEl.checked,
+      stripEllipses:  stripEllipsesEl.checked,
       trailingSpace:  trailingSpaceEl.checked,
       gateOpen:       gateOpenEl.value,
-      gateClose:      gateCloseEl.value,
+      gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
+      vadSilence:     vadSilenceEl.value,
+      vadThreshold:   vadThresholdEl.value,
+      minSpeech:      minSpeechEl.value,
+      appendWindow:   appendWindowEl.value,
+      advancedOpen:   Boolean(advancedEl && advancedEl.open),
+      hotkey:         hotkey,
       historyVisible: historyVisible,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
     if (saveApiKeyEl.checked) {
       localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyEl.value.trim());
-      if (accessCodeEl) localStorage.setItem(ACCESS_CODE_STORAGE_KEY, accessCodeEl.value.trim());
+      if (passphraseEl) localStorage.setItem(PASSPHRASE_STORAGE_KEY, passphraseEl.value.trim());
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
-      localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
+      localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     }
   }
 
@@ -656,23 +939,38 @@ right lower quadrant"></textarea>
       if (s.keyterms) keytermsEl.value = s.keyterms;
       if (s.timestamps) timestampsEl.value = s.timestamps;
       if (typeof s.noVerbatim    === "boolean") noVerbatimEl.checked    = s.noVerbatim;
-      if (typeof s.tagEvents     === "boolean") tagEventsEl.checked     = s.tagEvents;
       if (typeof s.autoCopy      === "boolean") autoCopyEl.checked      = s.autoCopy;
+      if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
       if (typeof s.saveApiKey    === "boolean") saveApiKeyEl.checked    = s.saveApiKey;
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
       if (typeof s.stripNewlines === "boolean") stripNewlinesEl.checked = s.stripNewlines;
+      if (typeof s.stripEllipses === "boolean") stripEllipsesEl.checked = s.stripEllipses;
       if (typeof s.trailingSpace === "boolean") trailingSpaceEl.checked = s.trailingSpace;
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
+      if (s.vadSilence !== undefined) vadSilenceEl.value = s.vadSilence;
+      if (s.vadThreshold !== undefined) vadThresholdEl.value = s.vadThreshold;
+      if (s.minSpeech !== undefined) minSpeechEl.value = s.minSpeech;
+      if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
+      if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
+      if (s.hotkey && typeof s.hotkey.code === "string" && s.hotkey.code) {
+        hotkey = {
+          ctrl:  !!s.hotkey.ctrl,
+          alt:   !!s.hotkey.alt,
+          shift: !!s.hotkey.shift,
+          meta:  !!s.hotkey.meta,
+          code:  s.hotkey.code,
+        };
+      }
       if (typeof s.historyVisible === "boolean") historyVisible = s.historyVisible;
 
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
-        const ac = localStorage.getItem(ACCESS_CODE_STORAGE_KEY);
-        if (ac && accessCodeEl) accessCodeEl.value = ac;
+        const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY);
+        if (p && passphraseEl) passphraseEl.value = p;
       }
     } catch (e) {}
   }
@@ -692,7 +990,6 @@ right lower quadrant"></textarea>
     const entry = { text: text, createdAt: new Date().toISOString() };
     if (meta) {
       if (meta.language_code !== undefined) entry.language_code = meta.language_code;
-      if (meta.language_probability !== undefined) entry.language_probability = meta.language_probability;
     }
     items.unshift(entry);
     setHistory(items);
@@ -745,14 +1042,13 @@ right lower quadrant"></textarea>
   }
 
   /* ───── Clipboard ───── */
-
   async function clipboardWrite(text) {
     try {
       if (navigator.clipboard && window.isSecureContext) {
         await navigator.clipboard.writeText(text);
         return true;
       }
-    } catch (e) { /* fall through */ }
+    } catch (e) { }
     try {
       const ta = document.createElement("textarea");
       ta.value = text;
@@ -780,15 +1076,30 @@ right lower quadrant"></textarea>
     await clipboardWrite(DICTATION_SENTINEL);
   }
 
-  /* ───── Warm audio graph: mic → high‑pass → analyser + hysteresis gate → recorder ───── */
+  /* ───── Real-time Audio Graph (mic → highpass → gate → script processor) ───── */
+  function audioGraphHealthy() {
+    // A stale graph (e.g. restored from bfcache, device unplugged, tab slept)
+    // can leave all variables set while the track is silently dead. Validate
+    // the actual track so reopening the app reliably re-engages the mic.
+    if (!stream || !audioCtx || audioCtx.state === "closed" || !destNode || !recorderNode) return false;
+    const track = stream.getAudioTracks()[0];
+    if (!track || track.readyState !== "live") return false;
+    return true;
+  }
 
   async function ensureAudio() {
-    if (stream && audioCtx && audioCtx.state !== "closed" && destNode) {
+    if (audioGraphHealthy()) {
       if (audioCtx.state === "suspended") {
         try { await audioCtx.resume(); } catch (e) {}
       }
-      return true;
+      if (audioCtx.state === "running") {
+        setMicPill(recording ? "rec" : "ready");
+        return true;
+      }
+      // Context exists but will not run — fall through and rebuild from scratch.
     }
+
+    releaseAudio();
 
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -799,6 +1110,21 @@ right lower quadrant"></textarea>
         sampleRate: 48000,
       },
     });
+
+    const micTrack = stream.getAudioTracks()[0];
+    if (micTrack) {
+      micTrack.addEventListener("ended", () => {
+        // OS/device revoked the mic (sleep, unplug, Citrix audio drop).
+        if (recording && !sessionFinalized) {
+          micAlarmFired = true;
+          setMicPill("fail");
+          micAlarmBeep();
+          setStatus("⚠ Microphone was disconnected mid-dictation — check the device before trusting this text.", "err");
+        } else {
+          setMicPill("off");
+        }
+      });
+    }
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") {
@@ -819,9 +1145,20 @@ right lower quadrant"></textarea>
     gateNode.gain.value = 0;
 
     destNode = audioCtx.createMediaStreamDestination();
+    recorderNode = audioCtx.createScriptProcessor(4096, 1, 1);
+
+    sinkNode = audioCtx.createGain();
+    sinkNode.gain.value = 0;
 
     source.connect(hpFilter);
     hpFilter.connect(analyserNode);
+
+    // STT FEED: pre-gate (raw, high-passed) audio -> Scribe.
+    hpFilter.connect(recorderNode);
+    recorderNode.connect(sinkNode);
+    sinkNode.connect(audioCtx.destination);
+
+    // LOCAL RECORDING ONLY: keep the noise gate on the playback file.
     hpFilter.connect(gateNode);
     gateNode.connect(destNode);
 
@@ -830,6 +1167,40 @@ right lower quadrant"></textarea>
     gateLastOpen = 0;
     lastMeterPct = -1;
     setGateStateUI(false);
+
+    // Audio sampling loop. Keeps streaming through the post-release "tail"
+    // phase so the last word is not clipped, and buffers chunks while the
+    // WebSocket is still connecting so the first word is not lost either.
+    recorderNode.onaudioprocess = (e) => {
+      const live = recording && (!stopping || stopPhase === "tail") && ws;
+      if (!live) {
+        // Idle: keep a short pre-roll ring so the first word — often spoken
+        // the instant the key lands, before the session is armed — survives.
+        // Held in memory only; sent only if a dictation starts within
+        // PREROLL_MS, discarded otherwise. Frames here were never sent, so
+        // prepending them can't double-transcribe anything.
+        prerollFrames.push({
+          t: Date.now(),
+          rate: audioCtx ? audioCtx.sampleRate : 48000,
+          samples: new Float32Array(e.inputBuffer.getChannelData(0)),
+        });
+        while (prerollFrames.length > PREROLL_FRAME_CAP) prerollFrames.shift();
+        return;
+      }
+
+      const floatSamples = e.inputBuffer.getChannelData(0);
+
+      const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
+      const pcmBuffer = floatTo16BitPCM(downsampled);
+      const base64Audio = arrayBufferToBase64(pcmBuffer);
+
+      if (ws.readyState === WebSocket.OPEN) {
+        flushPendingChunks();
+        sendAudioChunk(base64Audio, false);
+      } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
+        pendingChunks.push(base64Audio);
+      }
+    };
 
     if (gateTimer) clearInterval(gateTimer);
     gateTimer = setInterval(() => {
@@ -866,6 +1237,40 @@ right lower quadrant"></textarea>
           setGateStateUI(false);
         }
       }
+
+      // Recording health watchdog: catch the "dictated into a dead mic"
+      // disaster while it is happening, not after.
+      if (recording && !stopping) {
+        const nowMs = Date.now();
+        if (rms > maxRmsSeen) maxRmsSeen = rms;
+        if (rms > openT) speechDetected = true;
+
+        const track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+        const trackDead = !track || track.readyState !== "live";
+        if (track && track.muted) {
+          if (!mutedSince) mutedSince = nowMs;
+        } else {
+          mutedSince = 0;
+        }
+
+        if (!micAlarmFired) {
+          const flatline = nowMs - recStartedAt > 2500 && maxRmsSeen < FLATLINE_RMS;
+          const mutedLong = mutedSince && nowMs - mutedSince > 1500;
+          if (trackDead || mutedLong || flatline) {
+            micAlarmFired = true;
+            setMicPill("fail");
+            micAlarmBeep();
+            setStatus("⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.", "err");
+          }
+        }
+
+        if (!sttAlarmFired && speechDetected && wsOpenAt &&
+            nowMs - wsOpenAt > 8000 && partialCount === 0) {
+          sttAlarmFired = true;
+          sttWarnBeep();
+          setStatus("⚠ Audio is flowing but no text is coming back — the transcription service may be down.", "warn");
+        }
+      }
     }, 30);
 
     return true;
@@ -876,10 +1281,11 @@ right lower quadrant"></textarea>
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
     stream = null; audioCtx = null; hpFilter = null; analyserNode = null;
-    gateNode = null; destNode = null; gateBuf = null; gateIsOpen = false;
+    gateNode = null; destNode = null; recorderNode = null; sinkNode = null; gateBuf = null; gateIsOpen = false;
     lastMeterPct = -1;
     meterBar.style.width = "0%";
     setGateStateUI(false);
+    setMicPill("off");
   }
 
   async function tryWarmOnLoad() {
@@ -891,18 +1297,65 @@ right lower quadrant"></textarea>
     } catch (e) {}
   }
 
-  /* ───── Record / stop / transcribe ───── */
+  /* ───── Stream Audio & Run WebSocket Session ───── */
+  function clearSessionTimers() {
+    if (connectTimer)       { clearTimeout(connectTimer);       connectTimer = null; }
+    if (tailTimer)          { clearTimeout(tailTimer);          tailTimer = null; }
+    if (finalDeadlineTimer) { clearTimeout(finalDeadlineTimer); finalDeadlineTimer = null; }
+    if (quietTimer)         { clearTimeout(quietTimer);         quietTimer = null; }
+  }
+
+  // Single chokepoint for every audio frame: guarantees the spec-required
+  // commit/sample_rate fields and that previous_text rides only the first chunk.
+  function sendAudioChunk(base64, commit) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    const msg = {
+      message_type: "input_audio_chunk",
+      audio_base_64: base64,
+      commit: !!commit,
+      sample_rate: 16000
+    };
+    if (!firstChunkSent && sessionPreviousText) {
+      msg.previous_text = sessionPreviousText;
+    }
+    try { ws.send(JSON.stringify(msg)); } catch (e) { return false; }
+    firstChunkSent = true;
+    return true;
+  }
+
+  function flushPendingChunks() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    while (pendingChunks.length) {
+      if (!sendAudioChunk(pendingChunks[0], false)) break;
+      pendingChunks.shift();
+    }
+  }
+
+  function buildPrerollChunks() {
+    // Encode the idle frames captured just before this session started.
+    // Anything older than PREROLL_MS is stale chatter and dropped.
+    const minT = Date.now() - PREROLL_MS;
+    const out = [];
+    for (const f of prerollFrames) {
+      if (f.t <= minT) continue;
+      const downsampled = downsampleBuffer(f.samples, f.rate, 16000);
+      out.push(arrayBufferToBase64(floatTo16BitPCM(downsampled)));
+    }
+    prerollFrames = [];
+    return out;
+  }
 
   async function startRecording() {
-    if (recording || sending) return;
+    if (recording || stopping) return;
     stopRequested = false;
+    pendingStart = false;
 
     const apiKey = apiKeyEl.value.trim();
-    if (!apiKey && !(SHARED_MODE && accessCodeEl.value.trim())) {
+    if (!apiKey && !(SHARED_MODE && passphraseEl.value.trim())) {
       await writeSentinel();
       if (SHARED_MODE) {
-        setStatus("Enter the access code first.", "err");
-        accessCodeEl.focus();
+        setStatus("Enter the shared passphrase first.", "err");
+        passphraseEl.focus();
       } else {
         setStatus("Enter your ElevenLabs API key first.", "err");
         apiKeyEl.focus();
@@ -918,56 +1371,210 @@ right lower quadrant"></textarea>
       if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
       if (!audioCtx || audioCtx.state !== "running") {
         await writeSentinel();
-        setStatus("Audio not running (state: " + (audioCtx ? audioCtx.state : "none") +
-                  "). Click the page once, then try again.", "err");
+        setStatus("Audio not running. Click page once, then try again.", "err");
         failBeep();
         return;
       }
     } catch (e) {
       await writeSentinel();
+      setMicPill("fail");
       setStatus("Microphone unavailable: " + (e && e.message ? e.message : e), "err");
       failBeep();
       return;
     }
 
-    chunks = [];
+    // New session bookkeeping; stale callbacks from a previous socket bail out
+    const mySession = ++sessionSeq;
+    sessionFinalized = false;
+    userStopped = false;
+    stopPhase = null;
+    pendingChunks = buildPrerollChunks(); // first-word rescue: lead with the pre-roll
+    firstChunkSent = false;
+    lastWsError = "";
+    wsOpenAt = 0;
+    recStartedAt = Date.now();
+    partialCount = 0;
+    speechDetected = false;
+    maxRmsSeen = 0;
+    micAlarmFired = false;
+    sttAlarmFired = false;
+    mutedSince = 0;
+    clearSessionTimers();
 
+    // Continue the current text only when append mode is on AND the previous
+    // dictation finished recently enough (the append window).
+    if (!appendModeEl.checked) {
+      finalizedSegments = [];
+    } else {
+      const w = Number(appendWindowEl.value) || 0;
+      if (w > 0 && lastFinalizeAt && Date.now() - lastFinalizeAt > w * 1000) {
+        finalizedSegments = [];
+      }
+    }
+    currentPartial = "";
+    updateLiveDisplay();
+
+    // When continuing a note, hand the model the tail of the existing text as
+    // context (rides only the first chunk). Fresh notes send nothing — stale
+    // context would mislead the model.
+    sessionPreviousText = latestText && latestText.trim() ? latestText.trim().slice(-300) : "";
+
+    // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
+    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const params = new URLSearchParams();
+    if (apiKey) params.append("api_key", apiKey);
+    if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
+    params.append("no_verbatim", String(noVerbatimEl.checked));
+    params.append("timestamps", timestampsEl.value);
+
+    // Pass custom server-side VAD parameters [3]
+    params.append("vad_silence_threshold_secs", vadSilenceEl.value);
+    params.append("vad_threshold", vadThresholdEl.value);
+    params.append("min_speech_duration_ms", minSpeechEl.value);
+
+    const keyterms = parseKeyterms(keytermsEl.value);
+    params.append("keyterms_json", JSON.stringify(keyterms));
+
+    const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
+
+    try {
+      ws = new WebSocket(wsUrl);
+    } catch (err) {
+      await writeSentinel();
+      sessionFinalized = true;
+      setLinkPill("fail");
+      setStatus("Could not open transcription pipeline.", "err");
+      failBeep();
+      return;
+    }
+
+    setLinkPill("connecting");
+
+    // Fail LOUDLY if the pipe cannot open, before a long dictation is lost.
+    connectTimer = setTimeout(() => {
+      connectTimer = null;
+      if (mySession !== sessionSeq || sessionFinalized) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        lastWsError = lastWsError || "could not reach the transcription service";
+        setLinkPill("fail");
+        try { if (ws) ws.close(); } catch (e) {}
+        finalizeSession(true);
+      }
+    }, CONNECT_TIMEOUT_MS);
+
+    ws.onopen = () => {
+      if (mySession !== sessionSeq) return;
+      wsOpenAt = Date.now();
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      setLinkPill("live");
+      flushPendingChunks();
+      setStatus("Listening — transcribing live…", "ok");
+      if (stopPhase === "awaitFinal") {
+        // PTT was released while still connecting: buffered speech was just
+        // flushed; give the server a moment to chew on it, then commit.
+        setTimeout(() => { if (mySession === sessionSeq) beginCommitPhase(true); }, 400);
+      }
+    };
+
+    ws.onmessage = async (event) => {
+      if (mySession !== sessionSeq) return;
+      try {
+        const data = JSON.parse(event.data);
+        const m_type = data.message_type;
+
+        if (m_type === "session_started") {
+          // Server echoes the applied config — surface proof that keyterms took.
+          const cfg = data.config || {};
+          const kt = Array.isArray(cfg.keyterms) ? cfg.keyterms.length : 0;
+          if (!stopping) {
+            setStatus("Listening — transcribing live…" + (kt > 0 ? " (" + kt + " keyterms active)" : ""), "ok");
+          }
+        }
+        else if (m_type === "partial_transcript") {
+          partialCount++;
+          currentPartial = data.text;
+          updateLiveDisplay();
+        }
+        else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
+          partialCount++;
+          if (data.text && data.text.trim()) {
+            finalizedSegments.push(data.text);
+            currentPartial = "";
+            updateLiveDisplay();
+          }
+          if (stopPhase === "awaitFinal") {
+            // The final words arrived — close as soon as the server goes quiet
+            // instead of waiting out the whole deadline.
+            if (quietTimer) clearTimeout(quietTimer);
+            quietTimer = setTimeout(() => {
+              quietTimer = null;
+              if (mySession !== sessionSeq) return;
+              try { if (ws) ws.close(); } catch (e) {}
+              finalizeSession(false);
+            }, COMMIT_QUIET_MS);
+          }
+        }
+        else if (typeof data.error === "string" && data.error) {
+          // Covers the whole error-frame family: error, auth_error,
+          // quota_exceeded, rate_limited, commit_throttled, input_error,
+          // session_time_limit_exceeded, chunk_size_exceeded, … — any frame
+          // carrying an error string takes the loud path.
+          const tag = (m_type && m_type !== "error") ? (m_type + ": ") : "";
+          lastWsError = tag + data.error;
+          console.error("Scribe error frame:", lastWsError);
+          setStatus("Transcription service error — " + lastWsError, "err");
+          failBeep();
+        }
+      } catch (err) {
+        console.error("Error processing message:", err);
+      }
+    };
+
+    ws.onerror = (err) => {
+      if (mySession !== sessionSeq) return;
+      console.error("WebSocket Error:", err);
+      lastWsError = lastWsError || "pipeline connection error";
+      setStatus("Pipeline connection error.", "err");
+    };
+
+    ws.onclose = () => {
+      if (mySession !== sessionSeq) return;
+      console.log("WebSocket connection closed.");
+      setLinkPill(sessionFinalized || userStopped ? "idle" : "fail");
+      // A close we did not ask for is a failure and must sound like one.
+      finalizeSession(!userStopped);
+    };
+
+    // Parallel local audio recording for playback bar
+    chunks = [];
     const preferred = [
       "audio/webm;codecs=opus",
       "audio/webm",
       "audio/ogg;codecs=opus",
     ].find((type) => MediaRecorder.isTypeSupported(type));
 
-    // 64 kbps Opus is plenty for speech and transcribes well.
-    // (Was 16000 — that is a *bitrate*, not a sample rate, and far too low.)
-    const opts = { audioBitsPerSecond: 64000 };
-    if (preferred) opts.mimeType = preferred;
-
     try {
-      mediaRecorder = new MediaRecorder(destNode.stream, opts);
+      mediaRecorder = new MediaRecorder(
+        destNode.stream,
+        preferred ? { mimeType: preferred } : undefined
+      );
     } catch (e) {
-      await writeSentinel();
-      setStatus("MediaRecorder failed in this browser.", "err");
-      failBeep();
-      return;
+      console.warn("Local browser playbar preview recorder failed to initiate.");
     }
 
-    mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
+    if (mediaRecorder) {
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+      mediaRecorder.start();
+    }
 
-    mediaRecorder.onstop = async () => {
-      recording = false;
-      recordBtn.textContent = "Start recording";
-      recordBtn.classList.remove("danger");
-      await transcribeBlob();
-    };
-
-    mediaRecorder.start();
     recording = true;
+    stopping = false;
     recordBtn.textContent = "Stop recording";
     recordBtn.classList.add("danger");
-    setStatus("Recording...", "ok");
+    setMicPill("rec");
+    updateAppendChip();
     startBeep();
 
     if (stopRequested) {
@@ -977,127 +1584,137 @@ right lower quadrant"></textarea>
   }
 
   function stopRecording() {
-    if (!recording || !mediaRecorder) {
+    if (!recording || stopping) {
       stopRequested = true;
       return;
     }
-    setStatus("Stopping and sending audio...", "warn");
-    mediaRecorder.stop();
+    userStopped = true;
+    stopping = true;
+    stopPhase = "tail";
+    setStatus("Finalizing live speech transcript…", "warn");
+
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      mediaRecorder.stop();
+    }
+
+    // Keep streaming audio briefly after PTT release so trailing speech still
+    // in the capture pipeline reaches Scribe (this is what used to clip the
+    // last word or two), then commit and wait for the final transcript.
+    tailTimer = setTimeout(() => {
+      tailTimer = null;
+      beginCommitPhase(false);
+    }, TAIL_MS);
   }
 
-  async function transcribeBlob() {
-    if (!chunks.length) {
-      await writeSentinel();
-      setStatus("No audio captured.", "err");
-      failBeep();
-      return;
+  function beginCommitPhase(fromOpen) {
+    if (sessionFinalized) return;
+    stopPhase = "awaitFinal";
+
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      flushPendingChunks();
+      // Final empty chunk with commit: true forces the last segment out
+      sendAudioChunk("", true);
+      if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
+      finalDeadlineTimer = setTimeout(() => {
+        finalDeadlineTimer = null;
+        try { if (ws) ws.close(); } catch (e) {}
+        finalizeSession(false);
+      }, FINAL_WAIT_MS);
+    } else if (ws && ws.readyState === WebSocket.CONNECTING && !fromOpen) {
+      // Still connecting: ws.onopen sees stopPhase === "awaitFinal" and calls
+      // us back; the connect timeout covers the never-opens case.
+    } else {
+      finalizeSession(!userStopped);
+    }
+  }
+
+  async function finalizeSession(unexpected) {
+    if (sessionFinalized) return;
+    sessionFinalized = true;
+    clearSessionTimers();
+
+    recording = false;
+    stopping = false;
+    stopPhase = null;
+    stopRequested = false;
+    recordBtn.textContent = "Start recording";
+    recordBtn.classList.remove("danger");
+    if (micAlarmFired) setMicPill("fail");
+    else setMicPill(audioGraphHealthy() ? "ready" : "off");
+    if (!unexpected) setLinkPill("idle");
+
+    if (mediaRecorder && mediaRecorder.state !== "inactive") {
+      try { mediaRecorder.stop(); } catch (e) {}
     }
 
-    const apiKey = apiKeyEl.value.trim();
-    if (!apiKey && !(SHARED_MODE && accessCodeEl.value.trim())) {
-      await writeSentinel();
-      setStatus(SHARED_MODE ? "Missing access code." : "Missing API key.", "err");
-      failBeep();
-      return;
+    if (chunks.length) {
+      const blob = new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" });
+      lastAudioBlob = blob;
+      if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
+      lastAudioUrl = URL.createObjectURL(blob);
+      audioPreviewEl.src = lastAudioUrl;
     }
 
-    sending = true;
-    recordBtn.disabled = true;
-    setStatus("Transcribing...", "warn");
+    const cleaned = cleanTranscript(latestText);
+    lastFinalizeAt = Date.now();
 
-    // Send the recorded container as-is. ElevenLabs decodes it server-side
-    // (file_format "other" accepts all common audio/video formats). No raw-PCM
-    // conversion — that path mislabeled 48 kHz audio as 16 kHz and broke output.
-    const mimeType = (chunks[0] && chunks[0].type) || "audio/webm";
-    const blob = new Blob(chunks, { type: mimeType });
-    const fileFormat = "other";
-    const fileName = mimeType.includes("ogg") ? "recording.ogg" : "recording.webm";
-
-    if (blob.size < 1024) {
+    if (!cleaned.trim()) {
       await writeSentinel();
-      setStatus("Recording too short or empty.", "err");
-      failBeep();
-      sending = false;
-      recordBtn.disabled = false;
-      return;
-    }
-
-    lastAudioBlob = blob;
-    if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
-    lastAudioUrl = URL.createObjectURL(blob);
-    audioPreviewEl.src = lastAudioUrl;
-
-    const form = new FormData();
-    if (apiKey) form.append("api_key", apiKey);
-    if (SHARED_MODE) form.append("passphrase", accessCodeEl.value.trim());
-    form.append("file", blob, fileName);
-    form.append("file_format", fileFormat);
-    form.append("timestamps_granularity", timestampsEl.value);
-    form.append("no_verbatim", String(noVerbatimEl.checked));
-    form.append("tag_audio_events", String(tagEventsEl.checked));
-
-    const keyterms = parseKeyterms(keytermsEl.value);
-    form.append("keyterms_json", JSON.stringify(keyterms));
-
-    try {
-      const res = await fetch("/api/transcribe", { method: "POST", body: form });
-      const raw = await res.text();
-      let data;
-      try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
-
-      if (!res.ok) {
-        throw new Error(
-          (data && data.detail && data.detail.message) ||
-          (data && data.message) ||
-          (data && data.error) ||
-          raw || "Unknown transcription error"
-        );
-      }
-
-      const rawText = data.text || data.transcript || "";
-      const cleaned = cleanTranscript(rawText);
-
-      if (!cleaned.trim()) {
-        await writeSentinel();
-        setStatus("No speech detected.", "warn");
-        failBeep();
-        return;
-      }
-
-      latestText = cleaned;
-      latestEl.textContent = cleaned;
-
-      addHistory(rawText, {
-        language_code: data.language_code,
-        language_probability: data.language_probability,
-      });
-
-      if (autoCopyEl.checked) {
-        const copied = await copyText(cleaned);
-        setStatus(
-          copied ? "Transcript saved & copied. Done!"
-                 : "Transcript saved — copy FAILED (keep tab focused; use 'Copy latest').",
-          copied ? "ok" : "warn"
-        );
+      if (unexpected) {
+        setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
+      } else if (micAlarmFired) {
+        setStatus("No speech detected — the microphone never produced a signal. Check the mic.", "err");
       } else {
-        setStatus("Transcript saved.", "ok");
+        setStatus("No speech detected.", "warn");
       }
-
-      doneBeep();
-    } catch (err) {
-      await writeSentinel();
-      setStatus("Transcription failed: " + (err && err.message ? err.message : String(err)), "err");
       failBeep();
-    } finally {
-      sending = false;
-      recordBtn.disabled = false;
-      recordBtn.textContent = "Start recording";
-      recordBtn.classList.remove("danger");
+      updateAppendChip();
+      maybePendingStart();
+      return;
+    }
+
+    // Save final clean output to browser storage
+    addHistory(cleaned, { language_code: "en" });
+
+    if (autoCopyEl.checked) {
+      const copied = await copyText(cleaned);
+      if (!copied) {
+        setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
+        failBeep();
+      } else if (unexpected) {
+        setStatus("⚠ Connection lost mid-dictation — PARTIAL transcript copied. Verify it before pasting!", "err");
+        failBeep();
+      } else if (micAlarmFired) {
+        setStatus("⚠ Mic signal dropped during this dictation — verify the text before pasting!", "err");
+        failBeep();
+      } else {
+        setStatus("Live transcript saved & copied. Done!", "ok");
+        doneBeep();
+      }
+    } else {
+      if (unexpected) {
+        setStatus("⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
+        failBeep();
+      } else {
+        setStatus("Live transcript saved.", "ok");
+        doneBeep();
+      }
+    }
+
+    updateAppendChip();
+    maybePendingStart();
+  }
+
+  function maybePendingStart() {
+    // PTT pressed again while the previous dictation was finalizing —
+    // honor it so rapid consecutive dictations are never swallowed.
+    if (pendingStart) {
+      pendingStart = false;
+      setTimeout(() => { if (!recording && !stopping) startRecording(); }, 60);
     }
   }
 
-  /* ───── Event wiring ───── */
-
+  /* ───── Controls & Event Listeners ───── */
   recordBtn.onclick = () => {
     if (recording) stopRecording();
     else startRecording();
@@ -1105,23 +1722,48 @@ right lower quadrant"></textarea>
 
   forgetKeyBtn.onclick = () => {
     apiKeyEl.value = "";
-    if (accessCodeEl) accessCodeEl.value = "";
+    if (passphraseEl) passphraseEl.value = "";
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
-    localStorage.removeItem(ACCESS_CODE_STORAGE_KEY);
+    localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     saveSettingsNow();
-    setStatus(SHARED_MODE ? "Saved access code / key removed from this browser." : "API key removed from this browser.", "ok");
+    setStatus(SHARED_MODE ? "Shared passphrase / key removed." : "API key removed.", "ok");
   };
 
   clearBtn.onclick = () => {
     localStorage.removeItem(STORE_KEY);
     latestText = "";
     latestEl.textContent = "";
+    finalizedSegments = []; // Fixed: Make sure screen buffer is cleared alongside history
+    currentPartial = "";
     renderHistory();
+    updateAppendChip();
     setStatus("History cleared.");
   };
 
+  freshBtn.onclick = () => {
+    finalizedSegments = [];
+    currentPartial = "";
+    latestText = "";
+    latestEl.textContent = "";
+    updateAppendChip();
+    setStatus("Dictation box cleared — the next dictation starts a new note (history kept).", "ok");
+  };
+
   copyBtn.onclick = () => { if (latestText) copyText(latestText); };
+
+  hotkeyBtn.onclick = () => {
+    capturingHotkey = !capturingHotkey;
+    updateHotkeyUI();
+  };
+
+  hotkeyResetBtn.onclick = () => {
+    hotkey = Object.assign({}, DEFAULT_HOTKEY);
+    capturingHotkey = false;
+    updateHotkeyUI();
+    saveSettingsNow();
+    setStatus("Hotkey reset to " + hotkeyLabel(hotkey) + ".", "ok");
+  };
 
   toggleHistoryBtn.onclick = () => {
     historyVisible = !historyVisible;
@@ -1149,9 +1791,8 @@ right lower quadrant"></textarea>
     }
     const a = document.createElement("a");
     const url = URL.createObjectURL(lastAudioBlob);
-    const ext = (lastAudioBlob.type || "").includes("ogg") ? "ogg" : "webm";
     a.href = url;
-    a.download = "last-recording." + ext;
+    a.download = "last-recording.webm";
     a.click();
     URL.revokeObjectURL(url);
   };
@@ -1167,6 +1808,12 @@ right lower quadrant"></textarea>
     updateGateLabels();
     saveSettings();
   });
+
+  // Dynamic Scribe event listeners
+  vadSilenceEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
+  vadThresholdEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
+  minSpeechEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
+
   keytermsEl.addEventListener("input", updateKeytermHint);
 
   noiseSuppressEl.addEventListener("change", () => {
@@ -1174,20 +1821,48 @@ right lower quadrant"></textarea>
     tryWarmOnLoad();
   });
 
+  appendModeEl.addEventListener("change", updateAppendChip);
+  appendWindowEl.addEventListener("input", () => { saveSettings(); updateAppendChip(); });
+  if (advancedEl) advancedEl.addEventListener("toggle", saveSettings);
+
+  // Keep the "appending vs fresh" countdown honest
+  setInterval(updateAppendChip, 1000);
+
   for (const el of [
     apiKeyEl, saveApiKeyEl, keytermsEl, timestampsEl,
-    noVerbatimEl, tagEventsEl, autoCopyEl, startBeepEl,
-    stripNewlinesEl, trailingSpaceEl,
+    noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
+    stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);
   }
 
   document.addEventListener("keydown", (e) => {
+    // Hotkey capture mode: the next non-modifier keypress becomes the hotkey
+    if (capturingHotkey) {
+      e.preventDefault();
+      if (e.code === "Escape") {
+        capturingHotkey = false;
+        updateHotkeyUI();
+        return;
+      }
+      if (/^(Control|Shift|Alt|Meta)(Left|Right)$/.test(e.code)) return; // wait for the main key
+      hotkey = { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey, code: e.code };
+      capturingHotkey = false;
+      updateHotkeyUI();
+      hotkeyBtn.blur();
+      saveSettingsNow();
+      setStatus("Push-to-talk hotkey set to " + hotkeyLabel(hotkey) + ".", "ok");
+      return;
+    }
+
     if (e.repeat) return;
+
+    // F13/F14 are the AutoHotkey contract (CapsLock relay) — always active.
     if (e.code === "F13") {
       e.preventDefault();
-      if (!recording && !sending) startRecording();
+      if (!recording && !stopping) startRecording();
+      else if (stopping) pendingStart = true; // PTT again while finalizing: queue it
       return;
     }
     if (e.code === "F14") {
@@ -1195,25 +1870,82 @@ right lower quadrant"></textarea>
       if (recording || stopRequested) stopRecording();
       return;
     }
+
+    // In-app hotkey (default Ctrl+Space): tap toggles, hold is push-to-talk.
+    if (hotkeyMatches(e)) {
+      const t = e.target;
+      const inField = t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+      // An unmodified key (e.g. plain Space) must stay typable in form fields
+      if (inField && !(hotkey.ctrl || hotkey.alt || hotkey.meta)) return;
+      e.preventDefault();
+      if (!recording && !stopping) {
+        hotkeyEngaged = true;
+        hotkeyDownAt = Date.now();
+        startRecording();
+      } else if (stopping) {
+        hotkeyEngaged = true;
+        hotkeyDownAt = Date.now();
+        pendingStart = true; // tap while finalizing queues the next dictation
+      } else {
+        hotkeyEngaged = false; // second tap: toggle off
+        hotkeyDownAt = 0;
+        stopRecording();
+      }
+      return;
+    }
+  });
+
+  document.addEventListener("keyup", (e) => {
+    if (capturingHotkey || !hotkey || !hotkey.code || e.code !== hotkey.code) return;
+    if (!hotkeyEngaged) return;
+    hotkeyEngaged = false;
+    const held = hotkeyDownAt && Date.now() - hotkeyDownAt > HOTKEY_TAP_MS;
+    hotkeyDownAt = 0;
+    if (!held) return; // quick tap: keep recording, next tap stops
+    if (stopping) { pendingStart = false; return; } // held through a finalize: don't auto-restart
+    stopRecording();
   });
 
   window.addEventListener("beforeunload", () => {
     try { releaseAudio(); } catch (e) {}
   });
 
+  // Re-engage the mic when the app comes back: bfcache restores and slept
+  // tabs can leave a dead MediaStream behind that looks alive.
+  window.addEventListener("pageshow", (e) => {
+    if (e.persisted) releaseAudio();
+    if (!recording && !stopping) tryWarmOnLoad();
+  });
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && !recording && !stopping) {
+      tryWarmOnLoad();
+    }
+  });
+
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", () => {
+      if (!recording && !stopping && !audioGraphHealthy()) {
+        releaseAudio();
+        tryWarmOnLoad();
+      }
+    });
+  }
+
   if (SHARED_MODE) {
-    accessCodeRow.style.display = "";
-    if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared access in use)";
-    apiKeyEl.placeholder = "optional — leave blank to use the access code";
+    passphraseRow.style.display = "";
+    if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared passphrase access in use)";
+    apiKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
   }
 
   loadSettings();
   updateGateLabels();
   updateKeytermHint();
+  updateHotkeyUI();
   renderHistory();
+  updateAppendChip();
   tryWarmOnLoad();
 })();
 </script>
 </body>
 </html>`;
-

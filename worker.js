@@ -325,12 +325,13 @@ const KEYTERM_PRESETS = [
     id: "standard",
     label: "Standard medical",
     always: true,
-    // Starter stub — replace with the vocabulary every dictation should
-    // bias toward regardless of clinic (institution terms, common phrases).
     terms: [
       "Cerner", "FirstNet", "PowerChart",
       "afebrile", "normocephalic", "auscultation",
       "alert and oriented", "no acute distress",
+      "paronychia", "melena", "hematochezia", "HEART score", "MVC",
+      "COPD", "nonspecific", "ascites", "syncopal", "CVA", "CABG",
+      "ureterolithiasis", "biliary colic",
     ],
   },
   {
@@ -338,18 +339,24 @@ const KEYTERM_PRESETS = [
     label: "Wound care clinic",
     always: false,
     terms: [
-      "Santyl", "collagenase", "Dakin's solution", "Medihoney",
-      "Silvadene", "mupirocin", "Xeroform", "Mepilex", "Aquacel",
-      "calcium alginate", "hydrocolloid", "hydrogel", "Unna boot",
-      "wound vac", "negative pressure wound therapy",
-      "eschar", "slough", "granulation tissue", "epithelialization",
-      "undermining", "tunneling", "periwound", "maceration",
-      "induration", "fibrinous", "serosanguineous", "fluctuance",
-      "sharp debridement", "venous stasis ulcer", "arterial ulcer",
-      "diabetic foot ulcer", "pressure injury", "osteomyelitis",
-      "cellulitis", "ankle-brachial index", "dorsalis pedis",
-      "posterior tibial", "Charcot", "hyperkeratosis",
-      "total contact cast",
+      // Providers
+      "Obert", "Siler", "Von Schweinitz", "Shapshak",
+      "DeLaney", "Haverstock", "Passman",
+      // Cleansers
+      "Vashe",
+      // Hydrofera Blue line
+      "Hydrofera Blue", "Hydrofera Blue Ready", "Hydrofera Blue Classic",
+      // Aquacel line
+      "Aquacel Ag", "Aquacel AG ribbon",
+      // Algidex line
+      "Algidex Ag", "Algidex AG hydrogel gauze",
+      // Mepilex line
+      "Mepilex", "Mepilex Border", "Mepilex Border Flex",
+      "Mepilex Ag", "Mepilex Sacral",
+      // Other dressings
+      "Endoform", "Triad", "Triad paste", "Cuticerin", "Xeroform",
+      "Unna boot", "Profore", "Prisma", "Drawtex",
+      "Xtrasorb", "Medipore", "Coban",
     ],
   },
   {

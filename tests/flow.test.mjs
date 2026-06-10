@@ -720,5 +720,117 @@ const ktD = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json
 check('unchecking removes preset terms from the next call', !ktD.includes(p1Term));
 check('always-on terms survive with box empty and nothing checked', alwaysTerms.every((t) => ktD.includes(t)), ktD.length + ' terms');
 
+// ===== Scenario 19: phone mic session =====
+console.log('--- scenario 19: phone mic session ---');
+{
+  // Fresh boot so session state is clean
+  const socks19 = [];
+  const fetchCalls19 = [];
+  let w19;
+  const dom19 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w19 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => { fetchCalls19.push({ url: String(url), opts }); return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ text: 'Phone hello.' }) }); };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks19.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc19 = dom19.window.document;
+
+  // ---- Part A: desktop starts a phone session ----
+  const startBtn = doc19.getElementById('phoneStartBtn');
+  check('phoneStartBtn exists', !!startBtn);
+  if (startBtn) startBtn.click();
+  await sleep(20);
+  // A WebSocket should have been opened to /api/session/...
+  const sessionSock = socks19.find((s) => s.url.includes('/api/session/'));
+  check('desktop opens session listener WebSocket', !!sessionSock);
+
+  if (sessionSock) {
+    // Simulate phone sending a partial then committed transcript then phone_delivery
+    sessionSock.open();
+    sessionSock.msg({ message_type: 'partial_transcript', transcript: 'Hello' });
+    await sleep(10);
+    const latestEl19 = doc19.getElementById('latest');
+    check('desktop shows partial from phone', (latestEl19.textContent || '').includes('Hello'));
+
+    sessionSock.msg({ message_type: 'committed_transcript', transcript: 'Hello world.' });
+    await sleep(10);
+    check('desktop shows committed from phone', (latestEl19.textContent || '').includes('Hello world'));
+
+    sessionSock.msg({ message_type: 'phone_delivery', text: 'Hello world.' });
+    await sleep(30);
+    check('desktop clipboard gets phone delivery', (w19._clip || '').includes('Hello world'));
+  }
+
+  // ---- Part B: phone side — joinedSessionCode appended to WS URL ----
+  const socks19b = [];
+  const fetchCalls19b = [];
+  const dom19b = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => { fetchCalls19b.push({ url: String(url), opts }); return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ text: 'Phone realtime.' }) }); };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks19b.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc19b = dom19b.window.document;
+
+  // Enter a session code and join
+  const joinInput = doc19b.getElementById('phoneJoinInput');
+  const joinBtn = doc19b.getElementById('phoneJoinBtn');
+  check('phoneJoinInput exists', !!joinInput);
+  if (joinInput && joinBtn) {
+    joinInput.value = 'ABC123';
+    joinBtn.click();
+    await sleep(10);
+
+    // Switch to realtime and start recording
+    doc19b.getElementById('engRealtime').click();
+    doc19b.getElementById('apiKey').value = 'test-key';
+    doc19b.getElementById('recordBtn').click();
+    await sleep(50);
+
+    const transcribeSock = socks19b.find((s) => s.url.includes('/api/transcribe'));
+    check('phone WS URL includes session code', !!(transcribeSock && transcribeSock.url.includes('session=ABC123')));
+
+    if (transcribeSock) {
+      transcribeSock.open();
+      transcribeSock.msg({ message_type: 'session_started', config: {} });
+      // Use `text` field (ElevenLabs format); fires while recording so it seeds finalizedSegments
+      transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
+      // Stop recording; tail window runs for TAIL_MS (600ms)
+      doc19b.getElementById('recordBtn').click();
+      await sleep(700); // > TAIL_MS — beginCommitPhase now sends commit:true
+      // Server responds with a final committed transcript after the commit; this triggers
+      // the COMMIT_QUIET_MS (350ms) close path instead of the 2500ms deadline
+      transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
+      await sleep(500); // > COMMIT_QUIET_MS — WS closes -> finalizeSession -> deliverFinalText
+      // After delivery, should have POSTed to /api/session/ABC123/deliver
+      const deliverCall = fetchCalls19b.find((c) => c.url.includes('/api/session/') && c.url.includes('/deliver'));
+      check('phone POSTs final text to session deliver endpoint', !!deliverCall);
+    }
+  }
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

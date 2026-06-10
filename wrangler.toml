@@ -8,3 +8,11 @@ compatibility_date = "2025-01-01"
 # Shared mode (optional): set both secrets and users only need the passphrase.
 #   npx wrangler secret put ELEVENLABS_API_KEY
 #   npx wrangler secret put APP_PASSPHRASE
+
+[[durable_objects.bindings]]
+name = "SESSION_ROOM"
+class_name = "SessionRoom"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["SessionRoom"]

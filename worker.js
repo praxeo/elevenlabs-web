@@ -1,5 +1,37 @@
 import { KEYTERM_PRESETS } from './keyterms.js';
 
+// Durable Object: one room per session code. The Worker posts transcript events
+// here (fire-and-forget); desktop listeners receive them over a WebSocket.
+export class SessionRoom {
+  constructor(state, env) {
+    this.listeners = new Map(); // id -> WebSocket
+  }
+
+  async fetch(request) {
+    const url = new URL(request.url);
+
+    if (request.headers.get("Upgrade") === "websocket") {
+      const [client, server] = Object.values(new WebSocketPair());
+      server.accept();
+      const id = crypto.randomUUID();
+      this.listeners.set(id, server);
+      server.addEventListener("close", () => this.listeners.delete(id));
+      server.addEventListener("error", () => this.listeners.delete(id));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
+    if (request.method === "POST" && url.pathname.endsWith("/broadcast")) {
+      const message = await request.text();
+      for (const [id, ws] of this.listeners) {
+        try { ws.send(message); } catch { this.listeners.delete(id); }
+      }
+      return new Response("ok");
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -61,6 +93,32 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    // Phone mic session relay via Durable Object
+    if (url.pathname.startsWith("/api/session/")) {
+      const parts = url.pathname.split("/"); // ["","api","session",code,?action]
+      const code = (parts[3] || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+      if (!code || code.length < 4 || code.length > 8) {
+        return new Response("Invalid session code", { status: 400 });
+      }
+      if (!env || !env.SESSION_ROOM) {
+        return new Response("Session rooms not available", { status: 503 });
+      }
+      const stub = env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(code));
+      // Desktop listener: WebSocket upgrade
+      if (request.headers.get("Upgrade") === "websocket") {
+        return stub.fetch(request);
+      }
+      // Phone delivery: relay final authoritative text to desktop listeners
+      if (request.method === "POST" && parts[4] === "deliver") {
+        const body = await request.text();
+        return stub.fetch("https://session-room/broadcast", {
+          method: "POST",
+          body: body,
+        });
+      }
+      return new Response("Not found", { status: 404 });
+    }
+
     return new Response("Not found", { status: 404 });
   },
 };
@@ -88,6 +146,13 @@ async function handleTranscribeRealtime(request, env) {
     const clientKey  = String(url.searchParams.get("api_key") || "").trim();
     const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
     const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+
+    // Phone mic relay: if a session code is present, relay transcript events to
+    // the DO room so a desktop listener sees them in real time (fire-and-forget).
+    const sessionCode = (url.searchParams.get("session") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    const doStub = (sessionCode && sessionCode.length >= 4 && env && env.SESSION_ROOM)
+      ? env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(sessionCode))
+      : null;
 
     let apiKey = clientKey;
     if (!apiKey && serverKey && serverPass) {
@@ -169,6 +234,10 @@ async function handleTranscribeRealtime(request, env) {
 
     backendWs.addEventListener("message", (event) => {
       workerWs.send(event.data);
+      if (doStub) {
+        doStub.fetch("https://session-room/broadcast", { method: "POST", body: event.data })
+              .catch(() => {});
+      }
     });
 
     workerWs.addEventListener("close", () => {
@@ -177,6 +246,12 @@ async function handleTranscribeRealtime(request, env) {
 
     backendWs.addEventListener("close", () => {
       workerWs.close();
+      if (doStub) {
+        doStub.fetch("https://session-room/broadcast", {
+          method: "POST",
+          body: JSON.stringify({ message_type: "phone_session_end" }),
+        }).catch(() => {});
+      }
     });
 
     return new Response(null, {
@@ -611,6 +686,20 @@ const INDEX_HTML = `<!doctype html>
           <div class="hint" style="margin: 6px 0 12px;">
             Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
           </div>
+
+          <div class="hint" style="margin: 10px 0 4px; color: var(--text);">Phone mic</div>
+          <div class="row" style="margin-bottom: 4px; flex-wrap: wrap; gap: 6px; align-items: center;">
+            <button id="phoneStartBtn">Start phone session</button>
+            <span id="phoneCodeBadge" style="display:none; font-family: monospace; font-size: 20px; letter-spacing: 3px; color: var(--accent);"></span>
+            <button id="phoneStopBtn" style="display:none;">End session</button>
+          </div>
+          <div class="hint" id="phoneCodeHint" style="display:none; margin-bottom: 6px;"></div>
+          <div class="row" style="align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
+            <span class="hint" style="flex: 0 0 auto;">Join desktop:</span>
+            <input id="phoneJoinInput" type="text" maxlength="6" placeholder="ABC123" style="flex: 0 0 72px; font-family: monospace; text-transform: uppercase; text-align: center;" />
+            <button id="phoneJoinBtn">Join</button>
+            <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Connected</span>
+          </div>
         </div>
       </details>
 
@@ -795,6 +884,15 @@ right lower quadrant"></textarea>
   const batchOptsSectionEl = document.getElementById("batchOptsSection");
   const gateHintEl       = document.getElementById("gateHint");
 
+  // Phone mic session elements
+  const phoneStartBtnEl  = document.getElementById("phoneStartBtn");
+  const phoneStopBtnEl   = document.getElementById("phoneStopBtn");
+  const phoneCodeBadgeEl = document.getElementById("phoneCodeBadge");
+  const phoneCodeHintEl  = document.getElementById("phoneCodeHint");
+  const phoneJoinInputEl = document.getElementById("phoneJoinInput");
+  const phoneJoinBtnEl   = document.getElementById("phoneJoinBtn");
+  const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
+
   let mediaRecorder = null;
   let chunks = [];
   let recording = false;
@@ -833,6 +931,13 @@ right lower quadrant"></textarea>
   let tailTimer = null;
   let finalDeadlineTimer = null;
   let quietTimer = null;
+
+  // Phone mic session state
+  let phoneSessionCode  = "";   // desktop: generated code for the active session
+  let phoneSessionWs    = null; // desktop: WebSocket listening for phone transcripts
+  let joinedSessionCode = "";   // phone: code entered to join a desktop session
+  let remoteCommitted   = "";   // desktop: accumulated committed text from phone
+  let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
 
   // In-app push-to-talk hotkey (F13/F14 via AHK always work in addition)
   const DEFAULT_HOTKEY = { ctrl: true, alt: false, shift: false, meta: false, code: "Space" };
@@ -1956,6 +2061,8 @@ right lower quadrant"></textarea>
     const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
+    if (joinedSessionCode) params.append("session", joinedSessionCode);
+
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
 
     try {
@@ -2437,6 +2544,16 @@ right lower quadrant"></textarea>
 
     updateAppendChip();
     maybePendingStart();
+
+    // If this device is acting as a phone mic for a desktop session, relay the
+    // authoritative final text so the desktop can deliver it to the clipboard.
+    if (joinedSessionCode && cleaned.trim()) {
+      fetch("/api/session/" + joinedSessionCode + "/deliver", {
+        method: "POST",
+        body: JSON.stringify({ message_type: "phone_delivery", text: cleaned }),
+        headers: { "Content-Type": "application/json" },
+      }).catch(function() {});
+    }
   }
 
   function maybePendingStart() {
@@ -2445,6 +2562,137 @@ right lower quadrant"></textarea>
     if (pendingStart) {
       pendingStart = false;
       setTimeout(() => { if (!recording && !stopping && !finishing) startRecording(); }, 60);
+    }
+  }
+
+  /* ───── Phone mic session ───── */
+
+  function generateSessionCode() {
+    var chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I/l ambiguity
+    var arr = new Uint8Array(6);
+    crypto.getRandomValues(arr);
+    var code = "";
+    for (var i = 0; i < 6; i++) code += chars[arr[i] % chars.length];
+    return code;
+  }
+
+  function startPhoneSession() {
+    if (phoneSessionWs) return;
+    phoneSessionCode   = generateSessionCode();
+    remoteCommitted    = "";
+    remoteHasDelivery  = false;
+
+    phoneCodeBadgeEl.textContent = phoneSessionCode;
+    phoneCodeBadgeEl.style.display = "";
+    phoneStopBtnEl.style.display = "";
+    phoneStartBtnEl.style.display = "none";
+    if (phoneCodeHintEl) {
+      phoneCodeHintEl.textContent = "Open this page on your phone and enter the code above.";
+      phoneCodeHintEl.style.display = "";
+    }
+
+    var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    phoneSessionWs = new WebSocket(proto + "//" + window.location.host + "/api/session/" + phoneSessionCode);
+
+    phoneSessionWs.onmessage = function(evt) {
+      try { handlePhoneSessionMessage(JSON.parse(evt.data)); } catch(e) {}
+    };
+    phoneSessionWs.onclose = function() {
+      phoneSessionWs = null;
+    };
+    phoneSessionWs.onerror = function() {
+      phoneSessionWs = null;
+      setStatus("Phone session WebSocket error.", "err");
+    };
+
+    setStatus("Phone session ready. Code: " + phoneSessionCode, "ok");
+  }
+
+  function stopPhoneSession() {
+    if (phoneSessionWs) { phoneSessionWs.close(); phoneSessionWs = null; }
+    phoneSessionCode  = "";
+    remoteCommitted   = "";
+    remoteHasDelivery = false;
+    phoneCodeBadgeEl.style.display = "none";
+    phoneStopBtnEl.style.display = "none";
+    phoneStartBtnEl.style.display = "";
+    if (phoneCodeHintEl) phoneCodeHintEl.style.display = "none";
+    setStatus("Phone session ended.", "");
+  }
+
+  function handlePhoneSessionMessage(msg) {
+    if (!msg || !msg.message_type) return;
+
+    if (msg.message_type === "session_started") {
+      setStatus("Phone connected. Listening... (Code: " + phoneSessionCode + ")", "ok");
+      return;
+    }
+
+    if (msg.message_type === "partial_transcript") {
+      var partial = (msg.transcript || "").trim();
+      var combined = remoteCommitted + (remoteCommitted && partial ? " " : "") + partial;
+      latestText = cleanTranscript(combined);
+      latestEl.textContent = latestText;
+      return;
+    }
+
+    if (msg.message_type === "committed_transcript" ||
+        msg.message_type === "committed_transcript_with_timestamps") {
+      var seg = (msg.transcript || "").trim();
+      if (seg) remoteCommitted += (remoteCommitted ? " " : "") + seg;
+      latestText = cleanTranscript(remoteCommitted);
+      latestEl.textContent = latestText;
+      return;
+    }
+
+    if (msg.message_type === "phone_delivery") {
+      remoteHasDelivery = true;
+      var final = (msg.text || "").trim();
+      if (!final) return;
+      latestText = final;
+      latestEl.textContent = final;
+      addHistory(final, { language_code: "en", engine: "remote" });
+      if (autoCopyEl.checked) {
+        copyText(final).then(function(ok) {
+          if (ok) { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
+          else    { setStatus("Phone transcript saved but clipboard copy failed.", "err"); failBeep(); }
+        });
+      } else {
+        setStatus("Phone transcript received.", "ok");
+        doneBeep();
+      }
+      remoteCommitted   = "";
+      remoteHasDelivery = false;
+      return;
+    }
+
+    if (msg.message_type === "phone_session_end") {
+      if (!remoteHasDelivery && remoteCommitted.trim()) {
+        // Fallback: deliver accumulated committed text (realtime mode; no batch refine)
+        var fallback = cleanTranscript(remoteCommitted);
+        latestText = fallback;
+        latestEl.textContent = fallback;
+        addHistory(fallback, { language_code: "en", engine: "remote" });
+        if (autoCopyEl.checked) {
+          copyText(fallback).then(function(ok) {
+            if (ok) { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
+            else    { setStatus("Clipboard copy failed.", "err"); failBeep(); }
+          });
+        } else {
+          setStatus("Phone transcript received.", "ok");
+          doneBeep();
+        }
+      }
+      remoteCommitted   = "";
+      remoteHasDelivery = false;
+      setStatus("Phone session ended. Start a new session to continue.", "");
+      stopPhoneSession();
+      return;
+    }
+
+    if (msg.error) {
+      setStatus("Phone session error: " + msg.error, "err");
+      warnBeep();
     }
   }
 
@@ -2488,6 +2736,16 @@ right lower quadrant"></textarea>
   };
 
   copyBtn.onclick = () => { if (latestText) copyText(latestText); };
+
+  if (phoneStartBtnEl) phoneStartBtnEl.onclick = () => startPhoneSession();
+  if (phoneStopBtnEl)  phoneStopBtnEl.onclick  = () => stopPhoneSession();
+  if (phoneJoinBtnEl) phoneJoinBtnEl.onclick = () => {
+    var code = (phoneJoinInputEl ? phoneJoinInputEl.value : "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
+    joinedSessionCode = code;
+    if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
+    setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
+  };
 
   // Click the transcript box to append the next dictation onto it — one-shot,
   // works regardless of the append-mode checkbox; click again to cancel.

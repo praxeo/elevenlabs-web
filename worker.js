@@ -3,7 +3,16 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/transcribe") {
-      return handleTranscribe(request, env);
+      // One path, two protocols: a WebSocket upgrade reaches the realtime
+      // proxy, a plain POST reaches the batch proxy. Backward compatible
+      // with both pre-merge clients.
+      if (request.headers.get("Upgrade") === "websocket") {
+        return handleTranscribeRealtime(request, env);
+      }
+      if (request.method === "POST") {
+        return handleTranscribeBatch(request, env);
+      }
+      return new Response("Expected WebSocket upgrade or POST", { status: 400 });
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -50,7 +59,7 @@ export default {
   },
 };
 
-async function handleTranscribe(request, env) {
+async function handleTranscribeRealtime(request, env) {
   // Scribe Realtime uses WebSockets. Verify handshake upgrade
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Expected WebSocket upgrade", { status: 400 });
@@ -103,19 +112,8 @@ async function handleTranscribe(request, env) {
       keyterms = [];
     }
 
-    const seen = new Set();
-    const cleanedKeyterms = (Array.isArray(keyterms) ? keyterms : [])
-      .filter((t) => typeof t === "string")
-      .map((t) => t.trim().replace(/[<>{}\[\]\\]/g, "").replace(/\s+/g, " "))
-      .filter(Boolean)
-      .filter((t) => t.length <= 20 && t.split(" ").length <= 5)
-      .filter((t) => {
-        const k = t.toLowerCase();
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      })
-      .slice(0, 50);
+    // Realtime API caps: 50 terms, each <= 20 chars and <= 5 words.
+    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 20, maxWords: 5, maxTerms: 50 });
 
     // Construct backend connection parameters for ElevenLabs Scribe Realtime v2
     const elevenParams = new URLSearchParams();
@@ -184,6 +182,92 @@ async function handleTranscribe(request, env) {
   }
 }
 
+// Batch proxy: receives the recorded audio blob as multipart form data and
+// forwards it to ElevenLabs batch Scribe v2. Serves pure batch mode and the
+// hybrid mode's accuracy re-transcription pass.
+async function handleTranscribeBatch(request, env) {
+  try {
+    const incoming = await request.formData();
+
+    const clientKey  = String(incoming.get("api_key") || "").trim();
+    const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
+    const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+
+    let apiKey = clientKey;
+    if (!apiKey && serverKey && serverPass) {
+      const given = String(incoming.get("passphrase") || "").trim();
+      if (!safeEqual(given, serverPass)) {
+        return json({ error: "Invalid or missing access code." }, 401);
+      }
+      apiKey = serverKey;
+    }
+
+    const file = incoming.get("file");
+
+    if (!apiKey) {
+      return json({ error: "No ElevenLabs API key available (none provided, and no shared key/access code configured)." }, 400);
+    }
+    if (!file || typeof file === "string") return json({ error: "No audio file uploaded." }, 400);
+    if (file.size < 1024) return json({ error: "Recording too short or empty." }, 400);
+    if (file.size > 25 * 1024 * 1024) return json({ error: "Recording too large." }, 413);
+
+    const form = new FormData();
+
+    form.append("model_id", "scribe_v2");
+    form.append("file", file, file.name || "recording.webm");
+    form.append("file_format", String(incoming.get("file_format") || "other"));
+
+    form.append("language_code", "en");
+    form.append("diarize", "false");
+    form.append("num_speakers", "1");
+    form.append("temperature", "0");
+
+    form.append(
+      "timestamps_granularity",
+      String(incoming.get("timestamps_granularity") || "none")
+    );
+
+    const noVerbatim = incoming.get("no_verbatim") !== "false";
+    form.append("no_verbatim", String(noVerbatim));
+
+    form.append("tag_audio_events", String(incoming.get("tag_audio_events") === "true"));
+
+    let keyterms = [];
+    try {
+      keyterms = JSON.parse(String(incoming.get("keyterms_json") || "[]"));
+    } catch {
+      keyterms = [];
+    }
+
+    // Batch API caps: 1000 terms, each < 50 chars and <= 5 words.
+    for (const term of sanitizeKeyterms(keyterms, { maxChars: 49, maxWords: 5, maxTerms: 1000 })) {
+      form.append("keyterms", term);
+    }
+
+    const eleven = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+      method: "POST",
+      headers: { "xi-api-key": apiKey },
+      body: form,
+    });
+
+    const responseText = await eleven.text();
+
+    return new Response(responseText, {
+      status: eleven.status,
+      headers: {
+        "content-type":
+          eleven.headers.get("content-type") || "application/json; charset=utf-8",
+        "cache-control": "no-store",
+      },
+    });
+  } catch (err) {
+    return json(
+      { error: "Worker transcription proxy failed.", message: err?.message || String(err) },
+      500
+    );
+  }
+}
+
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let out = 0;
@@ -191,12 +275,42 @@ function safeEqual(a, b) {
   return out === 0;
 }
 
+function json(obj, status = 200) {
+  return new Response(JSON.stringify(obj, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+// Shared keyterm scrubber. The realtime and batch APIs accept different
+// volumes/lengths, so the limits are parameters; the cleaning pipeline
+// (strip risky chars, collapse whitespace, dedupe case-insensitively)
+// is identical for both.
+function sanitizeKeyterms(list, { maxChars, maxWords, maxTerms }) {
+  const seen = new Set();
+  return (Array.isArray(list) ? list : [])
+    .filter((t) => typeof t === "string")
+    .map((t) => t.trim().replace(/[<>{}\[\]\\]/g, "").replace(/\s+/g, " "))
+    .filter(Boolean)
+    .filter((t) => t.length <= maxChars && t.split(" ").length <= maxWords)
+    .filter((t) => {
+      const k = t.toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .slice(0, maxTerms);
+}
+
 // Web app manifest so the page is installable as a standalone app
 // (Chrome/Edge: address-bar install icon, or menu -> "Install app").
 const MANIFEST = {
-  name: "Scribe Realtime Dictation",
+  name: "Scribe Dictation",
   short_name: "Dictation",
-  description: "Push-to-talk realtime medical dictation via ElevenLabs Scribe v2",
+  description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 (realtime, batch, or hybrid)",
   start_url: "/",
   display: "standalone",
   background_color: "#0b0d10",

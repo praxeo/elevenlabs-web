@@ -20,7 +20,7 @@ export const KEYTERM_PRESETS = [
       "alert and oriented", "no acute distress",
       "paronychia", "melena", "hematochezia", "HEART score", "MVC",
       "COPD", "nonspecific", "ascites", "syncopal", "CVA", "CABG",
-      "ureterolithiasis", "biliary colic",
+      "ureterolithiasis", "biliary colic", "ureteral colic",
     ],
   },
   {

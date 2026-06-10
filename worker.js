@@ -590,32 +590,44 @@ right lower quadrant"></textarea>
           <label for="highpass">High‑pass filter <span class="sliderval" id="highpassVal"></span></label>
           <input id="highpass" type="range" min="0" max="200" step="5" value="85" />
 
-          <div class="divider"></div>
+          <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
 
-          <label style="font-weight: bold; color: var(--accent);">Scribe Realtime Filters</label>
+          <div id="vadSection">
+            <div class="divider"></div>
 
-          <label for="vadSilence">Scribe pause limit <span class="sliderval" id="vadSilenceVal"></span></label>
-          <input id="vadSilence" type="range" min="0.3" max="3.0" step="0.1" value="2.0" />
+            <label style="font-weight: bold; color: var(--accent);">Scribe Realtime Filters</label>
 
-          <label for="vadThreshold">Scribe noise filter <span class="sliderval" id="vadThresholdVal"></span></label>
-          <input id="vadThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.55" />
+            <label for="vadSilence">Scribe pause limit <span class="sliderval" id="vadSilenceVal"></span></label>
+            <input id="vadSilence" type="range" min="0.3" max="3.0" step="0.1" value="2.0" />
 
-          <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
-          <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+            <label for="vadThreshold">Scribe noise filter <span class="sliderval" id="vadThresholdVal"></span></label>
+            <input id="vadThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.55" />
+
+            <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
+            <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+          </div>
 
           <label class="checkbox">
             <input type="checkbox" id="noiseSuppress" />
             Browser noise suppression
           </label>
 
-          <label for="timestamps">Timestamps</label>
-          <select id="timestamps">
-            <option value="none" selected>none</option>
-            <option value="word">word</option>
-          </select>
+          <div id="batchOptsSection">
+            <label class="checkbox">
+              <input type="checkbox" id="tagEvents" />
+              Tag audio events ((laughter), (cough), …) — batch transcription only
+            </label>
+
+            <label for="timestamps">Timestamps</label>
+            <select id="timestamps">
+              <option value="none" selected>none</option>
+              <option value="word">word</option>
+              <option value="character">character</option>
+            </select>
+          </div>
 
           <h3>How do these settings work?</h3>
-          <p><strong>Local gate</strong>: shapes only the locally saved audio preview — the realtime feed to Scribe is not gated. Use the Scribe filters to reject background speech.</p>
+          <p><strong>Local gate</strong>: in batch mode it decides what gets recorded and transcribed; in realtime/hybrid the feed to Scribe is ungated — the gate shapes only the saved preview. Use the Scribe filters to reject background speech.</p>
           <p><strong>Pause limit</strong>: higher (e.g. 2.0s) waits longer before finalizing a segment, giving the AI more context to fix grammar/spelling.</p>
           <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
           <p><strong>Click filter</strong>: higher values stop brief clicks/rustling being read as speech.</p>
@@ -685,6 +697,7 @@ right lower quadrant"></textarea>
   const keytermsEl       = document.getElementById("keyterms");
   const keytermHintEl    = document.getElementById("keytermHint");
   const timestampsEl     = document.getElementById("timestamps");
+  const tagEventsEl      = document.getElementById("tagEvents");
   const noVerbatimEl     = document.getElementById("noVerbatim");
   const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
@@ -723,6 +736,9 @@ right lower quadrant"></textarea>
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
   const engineSegEl      = document.getElementById("engineSeg");
   const engineHintEl     = document.getElementById("engineHint");
+  const vadSectionEl     = document.getElementById("vadSection");
+  const batchOptsSectionEl = document.getElementById("batchOptsSection");
+  const gateHintEl       = document.getElementById("gateHint");
 
   let mediaRecorder = null;
   let chunks = [];
@@ -809,6 +825,15 @@ right lower quadrant"></textarea>
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
   const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
+
+  const BATCH_UPLOAD_TIMEOUT_MS = 30000; // pure batch: upload+transcription deadline
+  const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
+
+  // Per-API keyterm caps (the Worker re-enforces these server-side too)
+  const REALTIME_KEYTERM_MAX_CHARS = 20;
+  const REALTIME_KEYTERM_MAX_TERMS = 50;
+  const BATCH_KEYTERM_MAX_CHARS    = 49;
+  const BATCH_KEYTERM_MAX_TERMS    = 1000;
 
   const STORE_KEY              = "scribe_v2_transcripts_v9";
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
@@ -927,9 +952,11 @@ right lower quadrant"></textarea>
   }
 
   function setLinkPill(state) {
-    // state: "idle" | "connecting" | "live" | "fail"
+    // state: "idle" | "connecting" | "live" | "fail" | "uploading" | "refining"
     if (state === "live")            { linkPillEl.textContent = "LIVE";        linkPillEl.className = "pill live"; }
     else if (state === "connecting") { linkPillEl.textContent = "connecting…"; linkPillEl.className = "pill warn"; }
+    else if (state === "uploading")  { linkPillEl.textContent = "uploading…";  linkPillEl.className = "pill warn"; }
+    else if (state === "refining")   { linkPillEl.textContent = "refining…";   linkPillEl.className = "pill warn"; }
     else if (state === "fail")       { linkPillEl.textContent = "LINK FAIL";   linkPillEl.className = "pill fail"; }
     else                             { linkPillEl.textContent = "link idle";   linkPillEl.className = "pill"; }
   }
@@ -972,6 +999,22 @@ right lower quadrant"></textarea>
       }
     }
     if (engineHintEl) engineHintEl.textContent = ENGINE_HINTS[engine] || "";
+
+    // Per-engine controls: VAD sliders steer the realtime feed; tag-events and
+    // timestamp granularity ride the batch API call.
+    if (vadSectionEl) vadSectionEl.style.display = engine !== "batch" ? "" : "none";
+    if (batchOptsSectionEl) batchOptsSectionEl.style.display = engine !== "realtime" ? "" : "none";
+
+    if (gateHintEl) {
+      gateHintEl.textContent = engine === "batch"
+        ? "Batch: the gate IS the recording — only audio loud enough to open it gets transcribed."
+        : "The live feed to Scribe is ungated; the gate shapes only the saved audio preview.";
+    }
+    if (gateStateEl) {
+      gateStateEl.title = engine === "batch"
+        ? "Local noise gate state (decides what gets recorded and transcribed in batch mode)"
+        : "Local noise gate state (affects the saved audio preview only)";
+    }
   }
 
   function setEngine(val) {
@@ -1009,20 +1052,25 @@ right lower quadrant"></textarea>
     hotkeyBtn.textContent = capturingHotkey ? "press a key combo… (Esc cancels)" : hotkeyLabel(hotkey);
   }
 
-  function parseKeyterms(raw) {
+  // One keyterm box, two APIs with different caps: each call site filters the
+  // shared list down to what its API accepts (realtime: 50 terms <= 20 chars;
+  // batch: 1000 terms < 50 chars).
+  function parseKeyterms(raw, maxChars, maxTerms) {
     return raw
       .split(/[\\r\\n]+/)
       .map((s) => s.trim().replace(/\\s+/g, " ").replace(/[<>{}\\[\\]\\\\]/g, ""))
       .filter(Boolean)
-      .filter((s) => s.length <= 20 && s.split(" ").length <= 5) // Fixed: <= 20 chars per Scribe API
-      .slice(0, 50); // Real-time only accepts up to 50 keyterms
+      .filter((s) => s.length <= maxChars && s.split(" ").length <= 5)
+      .slice(0, maxTerms);
   }
 
   function updateKeytermHint() {
-    const n = parseKeyterms(keytermsEl.value).length;
+    const rt = parseKeyterms(keytermsEl.value, REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS).length;
+    const bt = parseKeyterms(keytermsEl.value, BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS).length;
     keytermHintEl.innerHTML =
-      "Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words. " +
-      "<strong>Keyterms add ~20 % to cost.</strong> " + n + " / 50 terms.";
+      "Scribe biases toward these terms. One per line. " +
+      "<strong>Keyterms add ~20 % to cost.</strong> " +
+      "Realtime uses " + rt + " / 50 (each &lt;= 20 chars); batch uses " + bt + " / 1000 (each &lt; 50 chars).";
   }
 
   /* ───── Gate UI ───── */
@@ -1067,6 +1115,7 @@ right lower quadrant"></textarea>
       engine:         engine,
       keyterms:       keytermsEl.value,
       timestamps:     timestampsEl.value,
+      tagEvents:      tagEventsEl.checked,
       noVerbatim:     noVerbatimEl.checked,
       autoCopy:       autoCopyEl.checked,
       appendMode:     appendModeEl.checked,
@@ -1107,6 +1156,7 @@ right lower quadrant"></textarea>
       if (s.engine === "realtime" || s.engine === "batch" || s.engine === "hybrid") engine = s.engine;
       if (s.keyterms) keytermsEl.value = s.keyterms;
       if (s.timestamps) timestampsEl.value = s.timestamps;
+      if (typeof s.tagEvents     === "boolean") tagEventsEl.checked     = s.tagEvents;
       if (typeof s.noVerbatim    === "boolean") noVerbatimEl.checked    = s.noVerbatim;
       if (typeof s.autoCopy      === "boolean") autoCopyEl.checked      = s.autoCopy;
       if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
@@ -1247,6 +1297,56 @@ right lower quadrant"></textarea>
 
   async function writeSentinel() {
     await clipboardWrite(DICTATION_SENTINEL);
+  }
+
+  /* ───── Batch transcription call (pure batch mode + hybrid refine) ───── */
+  async function batchTranscribe(blob, fileName, timeoutMs) {
+    const form = new FormData();
+    const apiKey = apiKeyEl.value.trim();
+    if (apiKey) form.append("api_key", apiKey);
+    if (SHARED_MODE) form.append("passphrase", passphraseEl.value.trim());
+    form.append("file", blob, fileName);
+    form.append("file_format", "other");
+    form.append("timestamps_granularity", timestampsEl.value);
+    form.append("no_verbatim", String(noVerbatimEl.checked));
+    form.append("tag_audio_events", String(tagEventsEl.checked));
+    form.append("keyterms_json", JSON.stringify(
+      parseKeyterms(keytermsEl.value, BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
+    ));
+
+    const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    const killer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs) : null;
+
+    try {
+      const res = await fetch("/api/transcribe", {
+        method: "POST",
+        body: form,
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      const raw = await res.text();
+      let data;
+      try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
+
+      if (!res.ok) {
+        const msg = (data && data.detail && data.detail.message) ||
+                    (data && data.message) ||
+                    (data && data.error) ||
+                    raw || "transcription request failed";
+        return { ok: false, text: "", error: String(msg) };
+      }
+      return { ok: true, text: String(data.text || data.transcript || ""), error: "" };
+    } catch (err) {
+      const aborted = err && err.name === "AbortError";
+      return {
+        ok: false,
+        text: "",
+        error: aborted
+          ? "timed out after " + Math.round(timeoutMs / 1000) + "s"
+          : (err && err.message ? err.message : String(err)),
+      };
+    } finally {
+      if (killer) clearTimeout(killer);
+    }
   }
 
   /* ───── Real-time Audio Graph (mic → highpass → gate → script processor) ───── */
@@ -1597,6 +1697,15 @@ right lower quadrant"></textarea>
     // context would mislead the model.
     sessionPreviousText = latestText && latestText.trim() ? latestText.trim().slice(-300) : "";
 
+    if (sessionEngine === "batch") {
+      // Pure batch: no WebSocket, no pre-roll (the gate-in-path recording
+      // cannot splice in pre-gate frames). The post-gate MediaRecorder IS the
+      // capture path; upload happens on stop.
+      pendingChunks = [];
+      startBatchRecording();
+      return;
+    }
+
     // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
@@ -1610,7 +1719,7 @@ right lower quadrant"></textarea>
     params.append("vad_threshold", vadThresholdEl.value);
     params.append("min_speech_duration_ms", minSpeechEl.value);
 
-    const keyterms = parseKeyterms(keytermsEl.value);
+    const keyterms = parseKeyterms(keytermsEl.value, REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
@@ -1732,10 +1841,9 @@ right lower quadrant"></textarea>
     ].find((type) => MediaRecorder.isTypeSupported(type));
 
     try {
-      mediaRecorder = new MediaRecorder(
-        destNode.stream,
-        preferred ? { mimeType: preferred } : undefined
-      );
+      const recOpts = { audioBitsPerSecond: 64000 };
+      if (preferred) recOpts.mimeType = preferred;
+      mediaRecorder = new MediaRecorder(destNode.stream, recOpts);
     } catch (e) {
       console.warn("Local browser playbar preview recorder failed to initiate.");
     }
@@ -1761,6 +1869,57 @@ right lower quadrant"></textarea>
     }
   }
 
+  // Batch-mode recording: the same post-gate MediaRecorder the other engines
+  // use for the preview, made load-bearing. Finalize is driven from onstop so
+  // the final dataavailable flush is always in chunks[] before upload.
+  function startBatchRecording() {
+    setLinkPill("idle");
+    chunks = [];
+
+    const preferred = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+    ].find((type) => MediaRecorder.isTypeSupported(type));
+
+    const opts = { audioBitsPerSecond: 64000 };
+    if (preferred) opts.mimeType = preferred;
+
+    try {
+      mediaRecorder = new MediaRecorder(destNode.stream, opts);
+    } catch (e) {
+      // In batch mode the recorder IS the capture path — failing it is fatal.
+      sessionFinalized = true;
+      writeSentinel();
+      setStatus("MediaRecorder failed in this browser — batch mode cannot record. Try realtime mode.", "err");
+      failBeep();
+      return;
+    }
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
+    };
+    mediaRecorder.onstop = () => {
+      if (sessionFinalized) return;
+      finalizeSession(false);
+    };
+    mediaRecorder.start();
+
+    recording = true;
+    stopping = false;
+    recordBtn.textContent = "Stop recording";
+    recordBtn.classList.add("danger");
+    setMicPill("rec");
+    updateAppendChip();
+    setStatus("Recording — release to upload for transcription…", "ok");
+    startBeep();
+
+    if (stopRequested) {
+      stopRequested = false;
+      stopRecording();
+    }
+  }
+
   function stopRecording() {
     if (!recording || stopping) {
       stopRequested = true;
@@ -1768,6 +1927,20 @@ right lower quadrant"></textarea>
     }
     userStopped = true;
     stopping = true;
+
+    if (sessionEngine === "batch") {
+      // No tail/commit phases: stopping the recorder flushes the last chunk,
+      // and its onstop handler drives the finalize/upload.
+      stopPhase = null;
+      setStatus("Stopping — preparing upload…", "warn");
+      if (mediaRecorder && mediaRecorder.state !== "inactive") {
+        try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
+      } else {
+        finalizeSession(false);
+      }
+      return;
+    }
+
     stopPhase = "tail";
     setStatus("Finalizing live speech transcript…", "warn");
 
@@ -1836,7 +2009,58 @@ right lower quadrant"></textarea>
     lastFinalizeAt = Date.now();
     finishing = true; // cleared in deliverFinalText — the single delivery exit
 
+    if (sessionEngine === "batch") {
+      await finishBatchSession(unexpected);
+      return;
+    }
+
     await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected });
+  }
+
+  // Pure batch delivery: upload the post-gate recording, splice the result
+  // onto the note base, and hand off to the shared delivery exit.
+  async function finishBatchSession(unexpected) {
+    // Rebuild from this session's chunks — lastAudioBlob can be stale from a
+    // previous session when nothing was captured in this one.
+    const blob = chunks.length
+      ? new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" })
+      : null;
+
+    if (!blob || blob.size < 1024) {
+      // Gate never opened / instant tap: nothing worth uploading.
+      await deliverFinalText("", { unexpected: unexpected });
+      return;
+    }
+
+    const fileName = (blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
+    setLinkPill("uploading");
+    setStatus("Uploading audio for transcription…", "warn");
+
+    const r = await batchTranscribe(blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+
+    if (!r.ok) {
+      lastWsError = r.error || "upload failed"; // surfaces in the failure status line
+      setLinkPill("fail");
+      await deliverFinalText("", { unexpected: true });
+      return;
+    }
+
+    setLinkPill("idle");
+
+    if (r.text && r.text.trim()) {
+      finalizedSegments = sessionBaseText ? [sessionBaseText, r.text] : [r.text];
+    } else {
+      finalizedSegments = sessionBaseText ? [sessionBaseText] : [];
+    }
+    currentPartial = "";
+    updateLiveDisplay();
+
+    if (!r.text || !r.text.trim()) {
+      await deliverFinalText("", { unexpected: unexpected });
+      return;
+    }
+
+    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected, label: "Transcript" });
   }
 
   // The single delivery exit for every engine: exactly one clipboard outcome
@@ -2038,7 +2262,7 @@ right lower quadrant"></textarea>
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, saveApiKeyEl, keytermsEl, timestampsEl,
+    apiKeyEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
     noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
     stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {

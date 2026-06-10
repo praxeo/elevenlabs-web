@@ -5,13 +5,18 @@
 //   node tests/flow.test.mjs
 //
 // Renders the page through the real Worker fetch handler, boots it in jsdom
-// with mocked WebSocket / audio graph / clipboard, and drives six scenarios:
+// with mocked WebSocket / fetch / audio graph / clipboard, and drives:
 //   1. happy path: buffer-while-connecting, tail streaming, commit, await-final
 //   2. unexpected mid-dictation disconnect (must fail loudly, keep partial text)
 //   3. dead-mic flatline alarm + empty-session sentinel
 //   4. append-window expiry drops stale text
 //   5. connect timeout fails loudly with sentinel
 //   6. PTT pressed during finalization queues a new session
+//   7. configurable hotkey: tap toggles, hold is push-to-talk
+//   8. engine selector: per-mode controls + persistence
+//   9. batch engine happy path (no socket; upload -> clipboard)
+//  10. batch upload failure -> sentinel, loud status
+//  11. PTT queued during a slow batch upload
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -80,6 +85,13 @@ const micTrack = { readyState: 'live', muted: false, listeners: {}, addEventList
 const mockStream = { getAudioTracks: () => [micTrack], getTracks: () => [micTrack] };
 
 let clipboard = '';
+
+// Queue-driven fetch mock for the batch upload path. Each entry:
+// { delayMs?, status, body }. An empty queue answers 500 so an unexpected
+// upload fails the scenario loudly instead of hanging.
+const fetchQueue = [];
+const fetchCalls = [];
+
 const dom = new JSDOM(html, {
   runScripts: 'dangerously',
   url: 'https://dictation.test/',
@@ -87,10 +99,41 @@ const dom = new JSDOM(html, {
     window.AudioContext = MockAudioCtx;
     window.WebSocket = MockWS;
     window.MediaRecorder = class {
-      constructor() { this.state = 'inactive'; }
+      constructor(stream, opts) { this.state = 'inactive'; this.stream = stream; this.opts = opts; }
       static isTypeSupported() { return false; }
       start() { this.state = 'recording'; }
-      stop() { this.state = 'inactive'; }
+      stop() {
+        if (this.state === 'inactive') return;
+        this.state = 'inactive';
+        // Deliver a plausible recording so size gates and the preview path run.
+        if (this.ondataavailable) {
+          this.ondataavailable({ data: new window.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) });
+        }
+        if (this.onstop) this.onstop();
+      }
+    };
+    window.URL.createObjectURL = () => 'blob:mock';
+    window.URL.revokeObjectURL = () => {};
+    window.fetch = (url, opts) => {
+      fetchCalls.push({ url: String(url), opts: opts || {}, form: opts && opts.body });
+      const next = fetchQueue.shift() || { status: 500, body: { error: 'unexpected fetch (queue empty)' } };
+      return new Promise((resolve, reject) => {
+        const t = setTimeout(() => {
+          resolve({
+            ok: next.status >= 200 && next.status < 300,
+            status: next.status,
+            text: () => Promise.resolve(JSON.stringify(next.body)),
+          });
+        }, next.delayMs || 5);
+        if (opts && opts.signal) {
+          opts.signal.addEventListener('abort', () => {
+            clearTimeout(t);
+            const err = new Error('aborted');
+            err.name = 'AbortError';
+            reject(err);
+          });
+        }
+      });
     };
     Object.defineProperty(window.navigator, 'mediaDevices', {
       value: { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} },
@@ -122,6 +165,9 @@ const pump = (n = 3) => { // fire onaudioprocess n times (~85ms of audio each)
 
 await sleep(200);
 doc.getElementById('apiKey').value = 'test-key';
+// Scenarios 1–7 exercise the realtime engine explicitly (the default engine
+// may differ); the engine scenarios below switch modes themselves.
+doc.getElementById('engRealtime').click();
 
 // ===== Scenario 1: happy path with slow connect (pre-roll + buffer + flush), tail, commit, final =====
 console.log('--- scenario 1: happy path ---');
@@ -302,6 +348,82 @@ hk2.msg({ message_type: 'committed_transcript', text: '' });
 await sleep(500);
 check('hotkey hold note saved + copied', clipboard.includes('Hotkey held note.'), JSON.stringify(clipboard));
 check('plain Space does nothing', (() => { kd({ code: 'Space' }); return doc.getElementById('recordBtn').textContent.includes('Start'); })());
+
+// ===== Scenario 8: engine selector — per-mode controls + persistence =====
+console.log('--- scenario 8: engine selector ---');
+doc.getElementById('engBatch').click();
+check('batch button active', doc.getElementById('engBatch').className.includes('active'));
+check('vad section hidden in batch mode', doc.getElementById('vadSection').style.display === 'none');
+check('batch opts visible in batch mode', doc.getElementById('batchOptsSection').style.display !== 'none');
+check('gate hint says gate is the recording', doc.getElementById('gateHint').textContent.includes('IS the recording'), doc.getElementById('gateHint').textContent);
+await sleep(400); // debounced settings save
+check('engine persisted to settings', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).engine === 'batch');
+doc.getElementById('engRealtime').click();
+check('vad section back in realtime mode', doc.getElementById('vadSection').style.display !== 'none');
+check('batch opts hidden in realtime mode', doc.getElementById('batchOptsSection').style.display === 'none');
+doc.getElementById('engBatch').click();
+
+// ===== Scenario 9: batch engine happy path =====
+console.log('--- scenario 9: batch happy path ---');
+doc.getElementById('freshBtn').click();
+const sCountBatch = sockets.length;
+const fCountBatch = fetchCalls.length;
+fetchQueue.push({ status: 200, body: { text: 'Batch note dictated.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+check('batch recording started', doc.getElementById('recordBtn').textContent.includes('Stop'));
+check('batch status mentions upload-on-release', status().includes('release to upload'), status());
+doc.getElementById('recordBtn').click(); // stop -> recorder flush -> upload
+await sleep(300);
+check('no WebSocket opened in batch mode', sockets.length === sCountBatch, sockets.length - sCountBatch);
+check('exactly one upload', fetchCalls.length === fCountBatch + 1, fetchCalls.length - fCountBatch);
+const upload = fetchCalls[fetchCalls.length - 1];
+check('upload went to /api/transcribe via POST', upload.url.includes('/api/transcribe') && upload.opts.method === 'POST');
+check('upload form carries api key + keyterms + tag_audio_events + file',
+  upload.form && upload.form.get('api_key') === 'test-key' &&
+  typeof upload.form.get('keyterms_json') === 'string' &&
+  upload.form.get('tag_audio_events') === 'false' &&
+  upload.form.get('file') !== null);
+check('batch text displayed', latest().includes('Batch note dictated.'), latest());
+check('batch text on clipboard', clipboard.includes('Batch note dictated.'), JSON.stringify(clipboard));
+check('batch success status', status().includes('Done!'), status());
+const hist9 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9'));
+check('history entry tagged engine batch', hist9[0] && hist9[0].engine === 'batch', hist9[0] && hist9[0].engine);
+check('record button reset after batch', doc.getElementById('recordBtn').textContent.includes('Start'));
+check('link pill idle after batch', doc.getElementById('linkPill').textContent === 'link idle');
+
+// ===== Scenario 10: batch upload failure -> sentinel =====
+console.log('--- scenario 10: batch upload failure ---');
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 500, body: { error: 'service exploded' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('upload failure -> sentinel on clipboard', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+check('upload failure -> loud err status', statusCls().includes('err') && status().includes('FAILED'), status());
+check('upload failure surfaces the server error', status().includes('service exploded'), status());
+check('link pill FAIL after failed upload', doc.getElementById('linkPill').textContent === 'LINK FAIL');
+check('record button reset after failure', doc.getElementById('recordBtn').textContent.includes('Start'));
+
+// ===== Scenario 11: PTT queued during a slow batch upload =====
+console.log('--- scenario 11: batch queued PTT ---');
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ delayMs: 800, status: 200, body: { text: 'Slow upload note.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click(); // stop -> slow upload starts
+await sleep(120);
+doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' })); // PTT during upload
+check('still uploading when PTT queued', doc.getElementById('linkPill').textContent === 'uploading…', doc.getElementById('linkPill').textContent);
+await sleep(1100); // upload resolves, queued session starts (~60ms later)
+check('slow upload delivered', clipboard.includes('Slow upload note.'), JSON.stringify(clipboard));
+check('queued PTT started the next batch session', doc.getElementById('recordBtn').textContent.includes('Stop'));
+fetchQueue.push({ status: 200, body: { text: 'Second.' } });
+doc.getElementById('recordBtn').click(); // wrap up the queued session
+await sleep(300);
+check('queued session delivered too', clipboard.includes('Second.'), JSON.stringify(clipboard));
+doc.getElementById('engRealtime').click(); // leave the page in realtime mode
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

@@ -91,6 +91,7 @@ idle
 - **WebSocket upgrade** → `handleTranscribeRealtime`: proxies to `wss api.elevenlabs.io/v1/speech-to-text/realtime` with `xi-api-key`. Query params: `model_id=scribe_v2_realtime`, `audio_format=pcm_16000`, `language_code=en`, `commit_strategy=vad`, `no_verbatim`, `include_timestamps`, optional `vad_silence_threshold_secs` / `vad_threshold` / `min_speech_duration_ms`, repeated `keyterms` (≤ 50, ≤ 20 chars, ≤ 5 words).
 - **POST** (multipart form) → `handleTranscribeBatch`: proxies to `https://api.elevenlabs.io/v1/speech-to-text` batch `scribe_v2`. Fields: `api_key` or `passphrase`, `file` (webm/ogg from batch mode, wav from the hybrid refine), `file_format=other`, `timestamps_granularity` (none/word/character), `no_verbatim`, `tag_audio_events`, `keyterms_json` (≤ 1000 terms, < 50 chars). Size gates 1 KB–25 MB.
 - Both handlers share `safeEqual`, `json`, and `sanitizeKeyterms` (per-API limits as parameters). Keyterm scrubbing happens client-side (`parseKeyterms` with per-API caps) **and** server-side — keep both.
+- **Keyterm presets** live in the `KEYTERM_PRESETS` const (top of `worker.js`, before `MANIFEST`): `always: true` lists apply to every dictation invisibly (every dictation then pays the ~20 % keyterm surcharge); the rest render as checkboxes in the Keyterms section, persisted as `presetIds` in the `_v9` settings (additive field). The Worker injects the sanitized lists via the `__KEYTERM_PRESETS__` token — **function replacer only**; a string replacement would interpret `$`-patterns in term text. The client merges in `effectiveKeyterms` with trim priority **custom > checked presets > always-on** when the realtime 50-term cap overflows; batch (1000) gets everything, so in hybrid the clipboard text benefits from the full list even when the live feed trimmed. Editing/adding a list = edit the const + deploy. `renderPresetRow()` must run before `loadSettings()` at boot.
 - Client → server WS frames: every chunk goes through the `sendAudioChunk` chokepoint, which guarantees the spec-required fields: `{"message_type":"input_audio_chunk","audio_base_64":"…","commit":false,"sample_rate":16000}`; the final flush sets `commit:true`. `previous_text` (append-continuation context) may ride **only the first** chunk of a socket — the server errors if it appears later.
 - Server → client frames: `session_started` (echoes applied config incl. `keyterms` — surfaced in the status line), `partial_transcript`, `committed_transcript`, `committed_transcript_with_timestamps`, plus a family of error frames. Client rule: **any frame carrying a string `error` takes the loud error path** — never match error types by name only. The Worker synthesizes an `error` frame then closes `1008` on handshake failures.
 - Audio pipeline: 48 kHz float (ScriptProcessor, 4096 samples ≈ 85 ms/frame) → averaged downsample to 16 kHz → s16le → base64 (stream) and, in hybrid, the same buffers → `buildWavBlob` (44-byte RIFF header via DataView) → POST.
@@ -110,12 +111,12 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (18 scenario groups: realtime happy path incl.
+# Full session-flow simulation (19 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
-# append/no-live-text, click-to-append, boot shim: migration/defaults/restore/
-# auth collapse):
+# append/no-live-text, click-to-append, keyterm presets, boot shim:
+# migration/defaults/restore/auth collapse):
 npm install --no-save jsdom
 node tests/flow.test.mjs
 ```

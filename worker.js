@@ -1,3 +1,5 @@
+import { KEYTERM_PRESETS } from './keyterms.js';
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -309,65 +311,6 @@ function sanitizeKeyterms(list, { maxChars, maxWords, maxTerms }) {
     .slice(0, maxTerms);
 }
 
-// Deployer-curated keyterm lists, merged client-side with the user's custom
-// terms on every dictation. Lists marked `always: true` never appear in the
-// UI and ride every dictation — which also means every dictation pays the
-// ~20 % keyterm cost surcharge. The rest render as checkboxes in the
-// Keyterms section (checked ids persist per browser as `presetIds` in the
-// v9 settings). To add or edit a list: change this array and
-// `npx wrangler deploy` — the HTML is served no-store, so every user gets
-// the update on next load. Terms longer than 20 chars or 5 words are
-// skipped by the realtime feed but still bias the batch/hybrid-refine call
-// (< 50 chars there); when the realtime 50-term cap overflows, the user's
-// custom terms win, then checked presets, then `always` lists.
-const KEYTERM_PRESETS = [
-  {
-    id: "standard",
-    label: "Standard medical",
-    always: true,
-    // Starter stub — replace with the vocabulary every dictation should
-    // bias toward regardless of clinic (institution terms, common phrases).
-    terms: [
-      "Cerner", "FirstNet", "PowerChart",
-      "afebrile", "normocephalic", "auscultation",
-      "alert and oriented", "no acute distress",
-    ],
-  },
-  {
-    id: "wound",
-    label: "Wound care clinic",
-    always: false,
-    terms: [
-      "Santyl", "collagenase", "Dakin's solution", "Medihoney",
-      "Silvadene", "mupirocin", "Xeroform", "Mepilex", "Aquacel",
-      "calcium alginate", "hydrocolloid", "hydrogel", "Unna boot",
-      "wound vac", "negative pressure wound therapy",
-      "eschar", "slough", "granulation tissue", "epithelialization",
-      "undermining", "tunneling", "periwound", "maceration",
-      "induration", "fibrinous", "serosanguineous", "fluctuance",
-      "sharp debridement", "venous stasis ulcer", "arterial ulcer",
-      "diabetic foot ulcer", "pressure injury", "osteomyelitis",
-      "cellulitis", "ankle-brachial index", "dorsalis pedis",
-      "posterior tibial", "Charcot", "hyperkeratosis",
-      "total contact cast",
-    ],
-  },
-  {
-    id: "er",
-    label: "ER shift",
-    always: false,
-    terms: [
-      "troponin", "D-dimer", "lactate", "procalcitonin",
-      "FAST exam", "CT angiogram", "pneumothorax", "pulmonary embolism",
-      "aortic dissection", "subdural hematoma", "midline shift",
-      "Glasgow Coma Scale", "obtunded", "diaphoresis", "syncope",
-      "epigastric", "guarding", "rebound tenderness", "appendicitis",
-      "cholecystitis", "diverticulitis", "pyelonephritis",
-      "nephrolithiasis", "DKA", "diabetic ketoacidosis",
-      "laceration", "avulsion",
-    ],
-  },
-];
 
 // Scrubbed once at module init through the same pipeline the proxies use, so
 // the JSON injected into the inline <script> can never carry <> { } [ ] \

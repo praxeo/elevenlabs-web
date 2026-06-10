@@ -17,6 +17,13 @@
 //   9. batch engine happy path (no socket; upload -> clipboard)
 //  10. batch upload failure -> sentinel, loud status
 //  11. PTT queued during a slow batch upload
+//  12. hybrid happy path: live feedback, refined text on the clipboard
+//  13. hybrid refine failure: live text delivered with a warn
+//  14. hybrid recovery: WS dies mid-dictation, batch refine still delivers
+//  15. hybrid append parity: previous_text on the first frame, refined splice
+//  16. hybrid with zero live text: refine still delivers
+// (scenario 0, asserted right after boot: legacy access-code migration shim
+//  and the hybrid default engine)
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -148,6 +155,10 @@ const dom = new JSDOM(html, {
       configurable: true,
     });
     Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
+    // Scenario 0 seed: a pre-merge batch-app user with a remembered access
+    // code under the legacy key. The page must surface it as the passphrase.
+    window.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true }));
+    window.localStorage.setItem('scribe_v2_access_code_v9', 'legacy-code');
     window.addEventListener('error', (e) => { console.log('PAGE ERROR:', e.message); failures++; });
   },
 });
@@ -164,6 +175,12 @@ const pump = (n = 3) => { // fire onaudioprocess n times (~85ms of audio each)
 };
 
 await sleep(200);
+
+// ===== Scenario 0: boot state — migration shim + default engine =====
+console.log('--- scenario 0: boot migration + default engine ---');
+check('legacy access code surfaced as passphrase', doc.getElementById('passphrase').value === 'legacy-code', JSON.stringify(doc.getElementById('passphrase').value));
+check('default engine is hybrid', doc.getElementById('engHybrid').className.includes('active'));
+
 doc.getElementById('apiKey').value = 'test-key';
 // Scenarios 1–7 exercise the realtime engine explicitly (the default engine
 // may differ); the engine scenarios below switch modes themselves.
@@ -423,7 +440,128 @@ fetchQueue.push({ status: 200, body: { text: 'Second.' } });
 doc.getElementById('recordBtn').click(); // wrap up the queued session
 await sleep(300);
 check('queued session delivered too', clipboard.includes('Second.'), JSON.stringify(clipboard));
-doc.getElementById('engRealtime').click(); // leave the page in realtime mode
+
+// ===== Scenario 12: hybrid happy path — live feedback, refined clipboard =====
+console.log('--- scenario 12: hybrid happy path ---');
+doc.getElementById('engHybrid').click();
+doc.getElementById('freshBtn').click();
+const fCount12 = fetchCalls.length;
+fetchQueue.push({ delayMs: 400, status: 200, body: { text: 'Refined note text.' } });
+pump(2); // speaking as the key lands -> pre-roll
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s12 = sockets[sockets.length - 1];
+s12.open();
+await sleep(30);
+pump(6); // live speech (with pre-roll: 8 frames ≈ 0.7s, above the refine minimum)
+s12.msg({ message_type: 'partial_transcript', text: 'live partial words' });
+check('hybrid shows live partials', latest().includes('live partial words'), latest());
+s12.msg({ message_type: 'committed_transcript', text: 'Live committed words.' });
+doc.getElementById('recordBtn').click(); // stop -> tail -> commit -> await final
+await sleep(700);
+s12.msg({ message_type: 'committed_transcript', text: '' }); // final commit reply
+await sleep(450); // quiet period passes -> finalize -> refine begins
+check('refining status shown', status().includes('Refining via batch'), status());
+check('link pill refining', doc.getElementById('linkPill').textContent === 'refining…', doc.getElementById('linkPill').textContent);
+await sleep(600); // refine resolves
+check('exactly one refine upload', fetchCalls.length === fCount12 + 1, fetchCalls.length - fCount12);
+const refineCall = fetchCalls[fetchCalls.length - 1];
+const refineFile = refineCall.form && refineCall.form.get('file');
+check('refine uploaded a wav file', refineFile && refineFile.name === 'recording.wav', refineFile && refineFile.name);
+check('clipboard holds the REFINED text', clipboard.includes('Refined note text.'), JSON.stringify(clipboard));
+check('clipboard does not hold the live text', !clipboard.includes('Live committed words.'), JSON.stringify(clipboard));
+check('box swapped to refined text', latest().includes('Refined note text.') && !latest().includes('Live committed words.'), latest());
+check('refined success status', status().includes('Refined transcript') && status().includes('Done!'), status());
+const hist12 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9'));
+check('history entry engine hybrid, live text kept for comparison',
+  hist12[0] && hist12[0].engine === 'hybrid' && typeof hist12[0].liveText === 'string' && hist12[0].liveText.includes('Live committed words.'),
+  hist12[0] && (hist12[0].engine + ' / ' + JSON.stringify(hist12[0].liveText)));
+check('link pill idle after refine', doc.getElementById('linkPill').textContent === 'link idle');
+
+// ===== Scenario 13: hybrid refine failure -> live text + audible warn =====
+console.log('--- scenario 13: hybrid refine failure ---');
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 500, body: { error: 'refine exploded' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s13 = sockets[sockets.length - 1];
+s13.open();
+await sleep(30);
+pump(8);
+s13.msg({ message_type: 'committed_transcript', text: 'Live survives.' });
+doc.getElementById('recordBtn').click();
+await sleep(700);
+s13.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(700);
+check('live text delivered when refine fails', clipboard.includes('Live survives.'), JSON.stringify(clipboard));
+check('warn status names the refine failure', statusCls().includes('warn') && status().includes('refine failed') && status().includes('refine exploded'), status());
+check('not reported as a clean Done', !status().includes('Done!'), status());
+
+// ===== Scenario 14: hybrid recovery — WS dies, batch refine still delivers =====
+console.log('--- scenario 14: hybrid WS-death recovery ---');
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Recovered full text.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s14 = sockets[sockets.length - 1];
+s14.open();
+await sleep(30);
+pump(8);
+s14.msg({ message_type: 'partial_transcript', text: 'doomed partial' });
+s14.serverClose(); // link dies mid-dictation — no user stop
+await sleep(700);
+check('refine ran despite the dead link', clipboard.includes('Recovered full text.'), JSON.stringify(clipboard));
+check('recovery framed as a failure to verify', statusCls().includes('err') && status().includes('recovered via batch'), status());
+
+// ===== Scenario 15: hybrid append parity =====
+console.log('--- scenario 15: hybrid append parity ---');
+doc.getElementById('freshBtn').click();
+doc.getElementById('appendWindow').value = '0'; // 0 = always append
+fetchQueue.push({ status: 200, body: { text: 'Part one.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s15a = sockets[sockets.length - 1];
+s15a.open();
+await sleep(30);
+pump(8);
+doc.getElementById('recordBtn').click();
+await sleep(700);
+s15a.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(700);
+check('first hybrid note delivered', clipboard.includes('Part one.'), JSON.stringify(clipboard));
+fetchQueue.push({ status: 200, body: { text: 'Part two.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s15b = sockets[sockets.length - 1];
+s15b.open();
+await sleep(30);
+pump(8);
+const f15 = s15b.sent.map((d) => JSON.parse(d));
+check('append session: first frame carries refined previous_text', f15.length >= 1 && typeof f15[0].previous_text === 'string' && f15[0].previous_text.endsWith('Part one.'), JSON.stringify(f15[0] && f15[0].previous_text));
+doc.getElementById('recordBtn').click();
+await sleep(700);
+s15b.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(700);
+check('refined splice keeps the note base', clipboard.includes('Part one.') && clipboard.includes('Part two.'), JSON.stringify(clipboard));
+
+// ===== Scenario 16: hybrid with zero live text — refine still delivers =====
+console.log('--- scenario 16: hybrid no live text ---');
+doc.getElementById('freshBtn').click();
+doc.getElementById('appendWindow').value = '1';
+await sleep(1300); // let the append window lapse so this note starts fresh
+fetchQueue.push({ status: 200, body: { text: 'Only batch heard this.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s16 = sockets[sockets.length - 1];
+s16.open();
+await sleep(30);
+pump(8); // audio flows but the server never sends a transcript
+doc.getElementById('recordBtn').click();
+await sleep(700);  // tail + commit
+await sleep(2700); // FINAL_WAIT deadline passes with no reply
+await sleep(300);  // refine resolves
+check('refine delivered text the live engine missed', clipboard.includes('Only batch heard this.'), JSON.stringify(clipboard));
+check('treated as a clean refined success', status().includes('Refined transcript') && status().includes('Done!'), status());
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

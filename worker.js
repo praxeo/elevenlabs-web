@@ -806,11 +806,19 @@ right lower quadrant"></textarea>
   // Engine: which transcription path a dictation uses. The selector value is
   // snapshotted into sessionEngine at start, so switching mid-session only
   // affects the NEXT dictation.
-  const DEFAULT_ENGINE = "realtime";
+  const DEFAULT_ENGINE = "hybrid";
   let engine = DEFAULT_ENGINE;
   let sessionEngine = DEFAULT_ENGINE;
   let sessionBaseText = "";  // note text this session appends onto (batch/hybrid splice into it)
   let finishing = false;     // a finalize is still uploading/refining; serializes sessions
+
+  // Hybrid: every 16 kHz s16le frame produced for the realtime feed is also
+  // captured here (pre-roll, while-connecting, live, tail — captured at the
+  // point of production, so frames survive even if the socket never opens).
+  // On finalize the buffer becomes a WAV for the batch re-transcription.
+  let sessionPcm = [];
+  let sessionPcmBytes = 0;
+  let sessionPcmTruncated = false;
 
   const METER_MAX    = 0.12;
   const HOLD_SECONDS = 0.9;
@@ -828,6 +836,9 @@ right lower quadrant"></textarea>
 
   const BATCH_UPLOAD_TIMEOUT_MS = 30000; // pure batch: upload+transcription deadline
   const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
+
+  const SESSION_PCM_CAP_BYTES = 24 * 1024 * 1024; // ~12.5 min @ 32 KB/s; the batch API caps files at 25 MB
+  const MIN_REFINE_BYTES      = 16000;            // ~0.5 s of audio; below this the refine is skipped
 
   // Per-API keyterm caps (the Worker re-enforces these server-side too)
   const REALTIME_KEYTERM_MAX_CHARS = 20;
@@ -913,6 +924,47 @@ right lower quadrant"></textarea>
       binary += String.fromCharCode(bytes[i]);
     }
     return window.btoa(binary);
+  }
+
+  // Hybrid capture chokepoint: called exactly once per produced frame, at the
+  // point of production (audio pump + pre-roll build) — never in the socket
+  // send paths, so buffered-then-dropped frames are still captured and
+  // nothing is ever captured twice.
+  function capturePcm(buf) {
+    if (sessionEngine !== "hybrid") return;
+    if (sessionPcmBytes + buf.byteLength > SESSION_PCM_CAP_BYTES) {
+      sessionPcmTruncated = true;
+      return;
+    }
+    sessionPcm.push(buf);
+    sessionPcmBytes += buf.byteLength;
+  }
+
+  // Wrap raw s16le PCM in a 44-byte RIFF/WAVE header: the batch engine gets
+  // bit-identical audio to what the realtime engine heard, including the
+  // pre-roll that no MediaRecorder could have captured.
+  function buildWavBlob(buffers, sampleRate) {
+    let dataLen = 0;
+    for (const b of buffers) dataLen += b.byteLength;
+    const header = new ArrayBuffer(44);
+    const v = new DataView(header);
+    const writeStr = (off, s) => {
+      for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
+    };
+    writeStr(0, "RIFF");
+    v.setUint32(4, 36 + dataLen, true);
+    writeStr(8, "WAVE");
+    writeStr(12, "fmt ");
+    v.setUint32(16, 16, true);             // fmt chunk size
+    v.setUint16(20, 1, true);              // PCM
+    v.setUint16(22, 1, true);              // mono
+    v.setUint32(24, sampleRate, true);
+    v.setUint32(28, sampleRate * 2, true); // byte rate (16-bit mono)
+    v.setUint16(32, 2, true);              // block align
+    v.setUint16(34, 16, true);             // bits per sample
+    writeStr(36, "data");
+    v.setUint32(40, dataLen, true);
+    return new Blob([header].concat(buffers), { type: "audio/wav" });
   }
 
   /* ───── Text processing ───── */
@@ -1465,6 +1517,7 @@ right lower quadrant"></textarea>
 
       const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
       const pcmBuffer = floatTo16BitPCM(downsampled);
+      capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
       const base64Audio = arrayBufferToBase64(pcmBuffer);
 
       if (ws.readyState === WebSocket.OPEN) {
@@ -1612,7 +1665,9 @@ right lower quadrant"></textarea>
     for (const f of prerollFrames) {
       if (f.t <= minT) continue;
       const downsampled = downsampleBuffer(f.samples, f.rate, 16000);
-      out.push(arrayBufferToBase64(floatTo16BitPCM(downsampled)));
+      const pcmBuffer = floatTo16BitPCM(downsampled);
+      capturePcm(pcmBuffer); // hybrid: pre-roll belongs in the refine audio too
+      out.push(arrayBufferToBase64(pcmBuffer));
     }
     prerollFrames = [];
     return out;
@@ -1662,6 +1717,9 @@ right lower quadrant"></textarea>
     sessionFinalized = false;
     userStopped = false;
     stopPhase = null;
+    sessionPcm = [];
+    sessionPcmBytes = 0;
+    sessionPcmTruncated = false;
     pendingChunks = buildPrerollChunks(); // first-word rescue: lead with the pre-roll
     firstChunkSent = false;
     lastWsError = "";
@@ -2013,8 +2071,85 @@ right lower quadrant"></textarea>
       await finishBatchSession(unexpected);
       return;
     }
+    if (sessionEngine === "hybrid") {
+      await refineAndDeliverHybrid(unexpected);
+      return;
+    }
 
     await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected });
+  }
+
+  // Hybrid delivery: the realtime text on screen was live feedback; the same
+  // audio — pre-roll, live, tail, exactly as produced for the stream — is
+  // re-transcribed by the stronger batch model and THAT lands on the
+  // clipboard. If the refine fails, the live text is delivered with an
+  // always-audible warn. If the live link died but audio was captured, the
+  // refine doubles as a recovery path.
+  async function refineAndDeliverHybrid(unexpected) {
+    const liveCleaned = cleanTranscript(latestText);
+    const pcm = sessionPcm;
+    const pcmBytes = sessionPcmBytes;
+    const truncated = sessionPcmTruncated;
+    sessionPcm = []; // a 20 MB buffer must never outlive its session
+    sessionPcmBytes = 0;
+    sessionPcmTruncated = false;
+
+    if (pcmBytes < MIN_REFINE_BYTES) {
+      // Instant tap / dead mic: nothing worth refining — deliver as realtime would.
+      await deliverFinalText(liveCleaned, { unexpected: unexpected });
+      return;
+    }
+
+    setLinkPill("refining");
+    setStatus("Refining via batch transcription…", "warn");
+
+    const wav = buildWavBlob(pcm, 16000);
+    const r = await batchTranscribe(wav, "recording.wav", REFINE_TIMEOUT_MS);
+
+    if (truncated && r.ok && r.text && r.text.trim() && liveCleaned.trim()) {
+      // The capture buffer capped out, so the refined text is missing the
+      // tail. The live text is complete — deliver that instead, loudly.
+      setLinkPill("fail");
+      await deliverFinalText(liveCleaned, {
+        unexpected: unexpected,
+        refineFailed: "recording exceeded the refine cap; complete LIVE text delivered instead",
+      });
+      return;
+    }
+
+    if (r.ok && r.text && r.text.trim()) {
+      finalizedSegments = sessionBaseText ? [sessionBaseText, r.text] : [r.text];
+      currentPartial = "";
+      updateLiveDisplay(); // the box swaps live text -> refined text
+      setLinkPill(unexpected ? "fail" : "idle");
+      const refinedCleaned = cleanTranscript(latestText);
+      await deliverFinalText(refinedCleaned, {
+        unexpected: unexpected,
+        label: "Refined transcript",
+        unexpectedMsg: "⚠ Live link lost mid-dictation — audio recovered via batch re-transcription. VERIFY the ending (it may cut off early)!",
+        liveText: liveCleaned !== refinedCleaned ? liveCleaned : undefined,
+      });
+      return;
+    }
+
+    if (liveCleaned.trim()) {
+      // Refine failed but the live text exists: deliver it, degraded-loudly.
+      setLinkPill("fail");
+      await deliverFinalText(liveCleaned, {
+        unexpected: unexpected,
+        refineFailed: r.error || "no text returned",
+      });
+      return;
+    }
+
+    // Neither engine produced text.
+    setLinkPill("fail");
+    if (r.ok) {
+      await deliverFinalText("", { unexpected: unexpected }); // genuine no-speech
+    } else {
+      lastWsError = "batch refine: " + (r.error || "failed");
+      await deliverFinalText("", { unexpected: true });
+    }
   }
 
   // Pure batch delivery: upload the post-gate recording, splice the result

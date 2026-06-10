@@ -1,0 +1,10 @@
+name = "eleven"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+# Deploy: npx wrangler deploy
+# Deploys over the existing `eleven` worker; its secrets persist across deploys.
+#
+# Shared mode (optional): set both secrets and users only need the passphrase.
+#   npx wrangler secret put ELEVENLABS_API_KEY
+#   npx wrangler secret put APP_PASSPHRASE

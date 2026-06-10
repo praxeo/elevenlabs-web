@@ -5,3 +5,8 @@
 # Wrangler / Node
 .wrangler/
 node_modules/
+
+# jsdom is installed transiently for tests (npm install --no-save jsdom);
+# the app itself has zero dependencies and no build step.
+package.json
+package-lock.json

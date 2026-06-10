@@ -383,6 +383,10 @@ const INDEX_HTML = `<!doctype html>
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .row > * { flex: 1; }
     .row button { flex: 0 0 auto; }
+    #engineSeg button { flex: 1 1 0; }
+    #engineSeg button.active {
+      border-color: var(--accent); background: #0e2a3a; color: var(--accent);
+    }
     .status {
       font-size: 13px; color: var(--muted); margin-top: 10px;
       min-height: 18px; white-space: pre-wrap;
@@ -455,7 +459,7 @@ const INDEX_HTML = `<!doctype html>
 
 <body>
 <main>
-  <h1>ElevenLabs Scribe v2 Dictation (Realtime)</h1>
+  <h1>ElevenLabs Scribe v2 Dictation</h1>
 
   <div class="grid">
     <section class="card">
@@ -475,6 +479,14 @@ const INDEX_HTML = `<!doctype html>
       <div class="row" style="margin-top: 10px;">
         <button id="forgetKeyBtn">Forget key</button>
       </div>
+
+      <label>Engine</label>
+      <div class="row" id="engineSeg">
+        <button id="engRealtime" data-engine="realtime" title="Live streaming text is the deliverable">Realtime</button>
+        <button id="engBatch" data-engine="batch" title="Upload after release; strongest model, no live text">Batch</button>
+        <button id="engHybrid" data-engine="hybrid" title="Live text as feedback + batch accuracy on the clipboard">Hybrid</button>
+      </div>
+      <div class="hint" id="engineHint" style="margin-top: 6px;"></div>
 
       <div class="row" style="margin-top: 14px;">
         <button id="recordBtn" class="primary">Start recording</button>
@@ -709,6 +721,8 @@ right lower quadrant"></textarea>
   const advancedEl       = document.getElementById("advanced");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
+  const engineSegEl      = document.getElementById("engineSeg");
+  const engineHintEl     = document.getElementById("engineHint");
 
   let mediaRecorder = null;
   let chunks = [];
@@ -773,6 +787,15 @@ right lower quadrant"></textarea>
 
   let historyVisible = false;
 
+  // Engine: which transcription path a dictation uses. The selector value is
+  // snapshotted into sessionEngine at start, so switching mid-session only
+  // affects the NEXT dictation.
+  const DEFAULT_ENGINE = "realtime";
+  let engine = DEFAULT_ENGINE;
+  let sessionEngine = DEFAULT_ENGINE;
+  let sessionBaseText = "";  // note text this session appends onto (batch/hybrid splice into it)
+  let finishing = false;     // a finalize is still uploading/refining; serializes sessions
+
   const METER_MAX    = 0.12;
   const HOLD_SECONDS = 0.9;
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
@@ -791,6 +814,9 @@ right lower quadrant"></textarea>
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
   const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
   const PASSPHRASE_STORAGE_KEY = "scribe_v2_passphrase_v9";
+  // The pre-merge batch app stored the shared access code under this key;
+  // read it as a fallback so those users keep their saved code.
+  const LEGACY_ACCESS_CODE_KEY = "scribe_v2_access_code_v9";
 
   /* ───── Audio cues ─────
      Beeps prefer the persistent (already running) AudioContext: a fresh
@@ -818,7 +844,9 @@ right lower quadrant"></textarea>
   function doneBeep()  { if (startBeepEl.checked) { beep(1046, 90, 0); beep(1568, 130, 0.10); } }
   function failBeep()  { beep(300, 280); }
   function micAlarmBeep() { beep(330, 170, 0); beep(280, 170, 0.22); beep(240, 260, 0.44); }
-  function sttWarnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); }
+  // Two-tone warn: degraded-but-usable outcomes (e.g. hybrid refine failed,
+  // live text delivered instead). Always audible, like failBeep.
+  function warnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); }
 
   /* ───── Audio Downsampling & Float conversion helpers ───── */
   function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
@@ -929,6 +957,30 @@ right lower quadrant"></textarea>
     }
   }
 
+  /* ───── Engine selector ───── */
+  const ENGINE_HINTS = {
+    realtime: "Live: text streams onto the screen as you speak and is what lands on the clipboard.",
+    batch: "Batch: audio uploads after release — the noise gate decides what gets transcribed. No live text.",
+    hybrid: "Hybrid: live text is feedback while you speak; the same audio is re-transcribed by the stronger batch model and THAT lands on the clipboard.",
+  };
+
+  function applyEngineUI() {
+    if (engineSegEl) {
+      const btns = engineSegEl.querySelectorAll("button");
+      for (const b of btns) {
+        b.className = b.getAttribute("data-engine") === engine ? "active" : "";
+      }
+    }
+    if (engineHintEl) engineHintEl.textContent = ENGINE_HINTS[engine] || "";
+  }
+
+  function setEngine(val) {
+    if (val !== "realtime" && val !== "batch" && val !== "hybrid") return;
+    engine = val;
+    applyEngineUI();
+    saveSettings();
+  }
+
   /* ───── Configurable push-to-talk hotkey ───── */
   function hotkeyLabel(hk) {
     if (!hk || !hk.code) return "none";
@@ -1012,6 +1064,7 @@ right lower quadrant"></textarea>
 
   function saveSettingsNow() {
     const s = {
+      engine:         engine,
       keyterms:       keytermsEl.value,
       timestamps:     timestampsEl.value,
       noVerbatim:     noVerbatimEl.checked,
@@ -1042,6 +1095,7 @@ right lower quadrant"></textarea>
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
       localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
+      localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     }
   }
 
@@ -1050,6 +1104,7 @@ right lower quadrant"></textarea>
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
+      if (s.engine === "realtime" || s.engine === "batch" || s.engine === "hybrid") engine = s.engine;
       if (s.keyterms) keytermsEl.value = s.keyterms;
       if (s.timestamps) timestampsEl.value = s.timestamps;
       if (typeof s.noVerbatim    === "boolean") noVerbatimEl.checked    = s.noVerbatim;
@@ -1083,7 +1138,8 @@ right lower quadrant"></textarea>
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
-        const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY);
+        const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY) ||
+                  localStorage.getItem(LEGACY_ACCESS_CODE_KEY);
         if (p && passphraseEl) passphraseEl.value = p;
       }
     } catch (e) {}
@@ -1104,6 +1160,8 @@ right lower quadrant"></textarea>
     const entry = { text: text, createdAt: new Date().toISOString() };
     if (meta) {
       if (meta.language_code !== undefined) entry.language_code = meta.language_code;
+      if (meta.engine) entry.engine = meta.engine;
+      if (meta.liveText) entry.liveText = meta.liveText; // hybrid: the realtime rendering, kept for comparison
     }
     items.unshift(entry);
     setHistory(items);
@@ -1135,7 +1193,8 @@ right lower quadrant"></textarea>
 
       const meta = document.createElement("div");
       meta.className = "history-meta";
-      meta.textContent = new Date(item.createdAt).toLocaleString();
+      meta.textContent = new Date(item.createdAt).toLocaleString() +
+        (item.engine ? " · " + item.engine : "");
 
       const text = document.createElement("div");
       text.className = "history-text";
@@ -1381,7 +1440,7 @@ right lower quadrant"></textarea>
         if (!sttAlarmFired && speechDetected && wsOpenAt &&
             nowMs - wsOpenAt > 8000 && partialCount === 0) {
           sttAlarmFired = true;
-          sttWarnBeep();
+          warnBeep();
           setStatus("⚠ Audio is flowing but no text is coming back — the transcription service may be down.", "warn");
         }
       }
@@ -1460,7 +1519,7 @@ right lower quadrant"></textarea>
   }
 
   async function startRecording() {
-    if (recording || stopping) return;
+    if (recording || stopping || finishing) return;
     stopRequested = false;
     pendingStart = false;
 
@@ -1499,6 +1558,7 @@ right lower quadrant"></textarea>
 
     // New session bookkeeping; stale callbacks from a previous socket bail out
     const mySession = ++sessionSeq;
+    sessionEngine = engine; // snapshot: selector changes only affect the NEXT session
     sessionFinalized = false;
     userStopped = false;
     stopPhase = null;
@@ -1527,6 +1587,10 @@ right lower quadrant"></textarea>
     }
     currentPartial = "";
     updateLiveDisplay();
+
+    // The note text this session extends. Batch/hybrid delivery splices the
+    // freshly transcribed text onto this base instead of live segments.
+    sessionBaseText = finalizedSegments.join(" ");
 
     // When continuing a note, hand the model the tail of the existing text as
     // context (rides only the first chunk). Fresh notes send nothing — stale
@@ -1769,12 +1833,27 @@ right lower quadrant"></textarea>
       audioPreviewEl.src = lastAudioUrl;
     }
 
-    const cleaned = cleanTranscript(latestText);
     lastFinalizeAt = Date.now();
+    finishing = true; // cleared in deliverFinalText — the single delivery exit
+
+    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected });
+  }
+
+  // The single delivery exit for every engine: exactly one clipboard outcome
+  // and one beep per session ends up here. opts:
+  //   unexpected    — the session ended on a failure we did not request
+  //   label         — what to call the text in the success status ("Live transcript", …)
+  //   unexpectedMsg — engine-specific override for the unexpected status line
+  //   refineFailed  — hybrid only: batch refine failed; deliver live text with a warn
+  //   liveText      — hybrid only: realtime rendering saved alongside for comparison
+  async function deliverFinalText(cleaned, opts) {
+    opts = opts || {};
+    finishing = false;
+    const label = opts.label || "Live transcript";
 
     if (!cleaned.trim()) {
       await writeSentinel();
-      if (unexpected) {
+      if (opts.unexpected) {
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic.", "err");
@@ -1788,29 +1867,35 @@ right lower quadrant"></textarea>
     }
 
     // Save final clean output to browser storage
-    addHistory(cleaned, { language_code: "en" });
+    addHistory(cleaned, { language_code: "en", engine: sessionEngine, liveText: opts.liveText });
 
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
       if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
         failBeep();
-      } else if (unexpected) {
-        setStatus("⚠ Connection lost mid-dictation — PARTIAL transcript copied. Verify it before pasting!", "err");
+      } else if (opts.unexpected) {
+        setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — PARTIAL transcript copied. Verify it before pasting!", "err");
         failBeep();
       } else if (micAlarmFired) {
         setStatus("⚠ Mic signal dropped during this dictation — verify the text before pasting!", "err");
         failBeep();
+      } else if (opts.refineFailed) {
+        setStatus("⚠ Batch refine failed — LIVE transcript copied (less accurate). " + opts.refineFailed, "warn");
+        warnBeep();
       } else {
-        setStatus("Live transcript saved & copied. Done!", "ok");
+        setStatus(label + " saved & copied. Done!", "ok");
         doneBeep();
       }
     } else {
-      if (unexpected) {
-        setStatus("⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
+      if (opts.unexpected) {
+        setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
+      } else if (opts.refineFailed) {
+        setStatus("⚠ Batch refine failed — live transcript saved, not copied. " + opts.refineFailed, "warn");
+        warnBeep();
       } else {
-        setStatus("Live transcript saved.", "ok");
+        setStatus(label + " saved.", "ok");
         doneBeep();
       }
     }
@@ -1824,7 +1909,7 @@ right lower quadrant"></textarea>
     // honor it so rapid consecutive dictations are never swallowed.
     if (pendingStart) {
       pendingStart = false;
-      setTimeout(() => { if (!recording && !stopping) startRecording(); }, 60);
+      setTimeout(() => { if (!recording && !stopping && !finishing) startRecording(); }, 60);
     }
   }
 
@@ -1840,6 +1925,7 @@ right lower quadrant"></textarea>
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
     localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
+    localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     saveSettingsNow();
     setStatus(SHARED_MODE ? "Shared passphrase / key removed." : "API key removed.", "ok");
   };
@@ -1935,6 +2021,15 @@ right lower quadrant"></textarea>
     tryWarmOnLoad();
   });
 
+  if (engineSegEl) {
+    engineSegEl.addEventListener("click", (e) => {
+      const t = e.target;
+      if (t && t.getAttribute && t.getAttribute("data-engine")) {
+        setEngine(t.getAttribute("data-engine"));
+      }
+    });
+  }
+
   appendModeEl.addEventListener("change", updateAppendChip);
   appendWindowEl.addEventListener("input", () => { saveSettings(); updateAppendChip(); });
   if (advancedEl) advancedEl.addEventListener("toggle", saveSettings);
@@ -1975,8 +2070,8 @@ right lower quadrant"></textarea>
     // F13/F14 are the AutoHotkey contract (CapsLock relay) — always active.
     if (e.code === "F13") {
       e.preventDefault();
-      if (!recording && !stopping) startRecording();
-      else if (stopping) pendingStart = true; // PTT again while finalizing: queue it
+      if (!recording && !stopping && !finishing) startRecording();
+      else if (stopping || finishing) pendingStart = true; // PTT again while finalizing: queue it
       return;
     }
     if (e.code === "F14") {
@@ -1992,11 +2087,11 @@ right lower quadrant"></textarea>
       // An unmodified key (e.g. plain Space) must stay typable in form fields
       if (inField && !(hotkey.ctrl || hotkey.alt || hotkey.meta)) return;
       e.preventDefault();
-      if (!recording && !stopping) {
+      if (!recording && !stopping && !finishing) {
         hotkeyEngaged = true;
         hotkeyDownAt = Date.now();
         startRecording();
-      } else if (stopping) {
+      } else if (stopping || finishing) {
         hotkeyEngaged = true;
         hotkeyDownAt = Date.now();
         pendingStart = true; // tap while finalizing queues the next dictation
@@ -2016,7 +2111,7 @@ right lower quadrant"></textarea>
     const held = hotkeyDownAt && Date.now() - hotkeyDownAt > HOTKEY_TAP_MS;
     hotkeyDownAt = 0;
     if (!held) return; // quick tap: keep recording, next tap stops
-    if (stopping) { pendingStart = false; return; } // held through a finalize: don't auto-restart
+    if (stopping || finishing) { pendingStart = false; return; } // held through a finalize: don't auto-restart
     stopRecording();
   });
 
@@ -2053,6 +2148,7 @@ right lower quadrant"></textarea>
   }
 
   loadSettings();
+  applyEngineUI();
   updateGateLabels();
   updateKeytermHint();
   updateHotkeyUI();

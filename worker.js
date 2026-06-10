@@ -356,10 +356,10 @@ const INDEX_HTML = `<!doctype html>
       font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
       background: var(--bg); color: var(--text); line-height: 1.35;
     }
-    main { max-width: 1000px; margin: 0 auto; padding: 22px; }
-    h1 { font-size: 22px; margin: 0 0 14px; }
-    .grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
-    @media (min-width: 850px) { .grid { grid-template-columns: 380px 1fr; } }
+    main { max-width: 1000px; margin: 0 auto; padding: 14px; }
+    h1 { font-size: 18px; margin: 0 0 10px; }
+    .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 850px) { .grid { grid-template-columns: 1fr 380px; align-items: start; } }
     .card {
       background: var(--panel); border: 1px solid var(--line);
       border-radius: 14px; padding: 14px;
@@ -384,6 +384,7 @@ const INDEX_HTML = `<!doctype html>
     .row > * { flex: 1; }
     .row button { flex: 0 0 auto; }
     #engineSeg button { flex: 1 1 0; }
+    #recordBtn { flex: 1 1 auto; font-weight: 600; }
     #engineSeg button.active {
       border-color: var(--accent); background: #0e2a3a; color: var(--accent);
     }
@@ -395,10 +396,12 @@ const INDEX_HTML = `<!doctype html>
     .status.warn { color: var(--warn); }
     .status.err { color: var(--danger); }
     .big {
-      font-size: 18px; white-space: pre-wrap; min-height: 180px;
+      font-size: 18px; white-space: pre-wrap; min-height: 140px;
       background: var(--panel2); border: 1px solid var(--line);
       border-radius: 12px; padding: 14px;
     }
+    .big:not(:empty) { cursor: pointer; }
+    .big.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .hint { color: var(--muted); font-size: 13px; }
     .history-item { border-top: 1px solid var(--line); padding: 12px 0; }
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
@@ -454,6 +457,20 @@ const INDEX_HTML = `<!doctype html>
       padding: 2px 6px; font-size: 12px; color: var(--text);
     }
     .divider { height: 1px; background: var(--line); margin: 18px 0 14px; }
+    /* Tiny/minimized app window: shed chrome so record + status + transcript
+       stay usable; everything else lives in the collapsible sections. */
+    @media (max-width: 600px), (max-height: 600px) {
+      main { padding: 8px; }
+      h1, #engineHint { display: none; }
+      .grid { gap: 8px; }
+      .card { padding: 10px; border-radius: 10px; }
+      .big { min-height: 72px; font-size: 16px; padding: 10px; }
+      textarea { min-height: 80px; }
+      label { margin: 8px 0 4px; }
+      .checkbox { margin-top: 8px; }
+      details.help { margin-top: 8px; }
+      .status { margin-top: 6px; }
+    }
   </style>
 </head>
 
@@ -463,24 +480,6 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <div id="passphraseRow" style="display:none">
-        <label for="passphrase">Passphrase</label>
-        <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
-      </div>
-
-      <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
-      <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
-
-      <label class="checkbox">
-        <input type="checkbox" id="saveApiKey" />
-        Remember on this browser
-      </label>
-
-      <div class="row" style="margin-top: 10px;">
-        <button id="forgetKeyBtn">Forget key</button>
-      </div>
-
-      <label>Engine</label>
       <div class="row" id="engineSeg">
         <button id="engRealtime" data-engine="realtime" title="Live streaming text is the deliverable">Realtime</button>
         <button id="engBatch" data-engine="batch" title="Upload after release; strongest model, no live text">Batch</button>
@@ -488,21 +487,9 @@ const INDEX_HTML = `<!doctype html>
       </div>
       <div class="hint" id="engineHint" style="margin-top: 6px;"></div>
 
-      <div class="row" style="margin-top: 14px;">
+      <div class="row" style="margin-top: 10px;">
         <button id="recordBtn" class="primary">Start recording</button>
-        <button id="clearBtn">Clear history</button>
       </div>
-
-      <label for="hotkeyBtn">Push‑to‑talk hotkey</label>
-      <div class="row">
-        <button id="hotkeyBtn" title="Click, then press the key combo you want">Ctrl + Space</button>
-        <button id="hotkeyResetBtn" title="Reset to Ctrl + Space">Reset</button>
-      </div>
-      <div class="hint" style="margin-top: 6px;">
-        Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
-      </div>
-
-      <div class="divider"></div>
 
       <label>Mic level
         <span id="micPill" class="pill">mic off</span>
@@ -521,57 +508,107 @@ const INDEX_HTML = `<!doctype html>
         until the beep, then switch windows and Ctrl+V.
       </div>
 
-      <label for="keyterms">Context / vocabulary keyterms</label>
-      <textarea id="keyterms" placeholder="One term per line. Examples:
+      <label>Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
+      <div id="latest" class="big" title="Click to append the next dictation to this text; click again to cancel"></div>
+
+      <div class="row" style="margin-top: 10px;">
+        <button id="copyBtn">Copy latest</button>
+        <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <details class="help" id="authSection" style="margin-top: 0;">
+        <summary id="authSummary">Access</summary>
+        <div class="body">
+          <div id="passphraseRow" style="display:none">
+            <label for="passphrase">Passphrase</label>
+            <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
+          </div>
+
+          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
+          <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+
+          <label class="checkbox">
+            <input type="checkbox" id="saveApiKey" />
+            Remember on this browser
+          </label>
+
+          <div class="row" style="margin-top: 10px;">
+            <button id="forgetKeyBtn">Forget key</button>
+          </div>
+        </div>
+      </details>
+
+      <details class="help" id="optionsSection">
+        <summary>Options</summary>
+        <div class="body">
+          <label class="checkbox" style="margin-top: 4px;">
+            <input type="checkbox" id="noVerbatim" checked />
+            Remove filler words / false starts
+          </label>
+
+          <label class="checkbox">
+            <input type="checkbox" id="autoCopy" checked />
+            Auto‑copy transcript to clipboard
+          </label>
+
+          <label class="checkbox">
+            <input type="checkbox" id="appendMode" />
+            Append consecutive recordings (don't clear)
+          </label>
+
+          <div class="row" id="appendWindowRow" style="margin: 4px 0 0 24px; align-items: center;">
+            <span class="hint" style="flex: 0 0 auto;">…only if started within</span>
+            <input id="appendWindow" type="number" min="0" max="600" step="5" value="45" style="flex: 0 0 80px;" />
+            <span class="hint" style="flex: 0 0 auto;">seconds (0 = always append)</span>
+          </div>
+
+          <label class="checkbox">
+            <input type="checkbox" id="stripNewlines" checked />
+            Strip newlines (collapse to spaces)
+          </label>
+
+          <label class="checkbox">
+            <input type="checkbox" id="stripEllipses" checked />
+            Remove ellipses (pauses become "…" otherwise)
+          </label>
+
+          <label class="checkbox">
+            <input type="checkbox" id="trailingSpace" checked />
+            Trailing space (for consecutive dictations)
+          </label>
+
+          <label class="checkbox">
+            <input type="checkbox" id="startBeep" checked />
+            Start/done beeps (failure alarms always play)
+          </label>
+
+          <label for="hotkeyBtn">Push‑to‑talk hotkey</label>
+          <div class="row">
+            <button id="hotkeyBtn" title="Click, then press the key combo you want">Ctrl + Space</button>
+            <button id="hotkeyResetBtn" title="Reset to Ctrl + Space">Reset</button>
+          </div>
+          <div class="hint" style="margin: 6px 0 12px;">
+            Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
+          </div>
+        </div>
+      </details>
+
+      <details class="help" id="keytermsSection">
+        <summary>Context / vocabulary keyterms</summary>
+        <div class="body">
+          <textarea id="keyterms" placeholder="One term per line. Examples:
 tachycardia
 ascites
 right lower quadrant"></textarea>
 
-      <div class="hint" id="keytermHint">
-        Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words.
-        <strong>Keyterms add ~20 % to cost.</strong> 0 / 50 terms.
-      </div>
-
-      <label class="checkbox">
-        <input type="checkbox" id="noVerbatim" checked />
-        Remove filler words / false starts
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="autoCopy" checked />
-        Auto‑copy transcript to clipboard
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="appendMode" checked />
-        Append consecutive recordings (don't clear)
-      </label>
-
-      <div class="row" id="appendWindowRow" style="margin: 4px 0 0 24px; align-items: center;">
-        <span class="hint" style="flex: 0 0 auto;">…only if started within</span>
-        <input id="appendWindow" type="number" min="0" max="600" step="5" value="45" style="flex: 0 0 80px;" />
-        <span class="hint" style="flex: 0 0 auto;">seconds (0 = always append)</span>
-      </div>
-
-      <label class="checkbox">
-        <input type="checkbox" id="stripNewlines" checked />
-        Strip newlines (collapse to spaces)
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="stripEllipses" checked />
-        Remove ellipses (pauses become "…" otherwise)
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="trailingSpace" checked />
-        Trailing space (for consecutive dictations)
-      </label>
-
-      <label class="checkbox">
-        <input type="checkbox" id="startBeep" checked />
-        Start/done beeps (failure alarms always play)
-      </label>
+          <div class="hint" id="keytermHint" style="margin-bottom: 12px;">
+            Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words.
+            <strong>Keyterms add ~20 % to cost.</strong> 0 / 50 terms.
+          </div>
+        </div>
+      </details>
 
       <details class="help" id="advanced">
         <summary>Advanced audio &amp; noise settings</summary>
@@ -634,22 +671,6 @@ right lower quadrant"></textarea>
         </div>
       </details>
 
-      <label>Notes</label>
-      <div class="hint">
-        English‑only, Scribe v2. Mic is kept warm between dictations for instant start.
-        Your browser opens a secure WebSocket pipe back to the Worker, transcribing speech incrementally.
-      </div>
-    </section>
-
-    <section class="card">
-      <label style="margin-top: 0;">Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
-      <div id="latest" class="big"></div>
-
-      <div class="row" style="margin-top: 10px;">
-        <button id="copyBtn">Copy latest</button>
-        <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
-      </div>
-
       <details class="help">
         <summary>Last recorded audio &amp; downloads</summary>
         <div class="body">
@@ -662,10 +683,16 @@ right lower quadrant"></textarea>
         </div>
       </details>
 
-      <div class="row" style="margin-top:14px;">
+      <div class="row" style="margin-top: 14px;">
         <button id="toggleHistoryBtn">Show saved transcripts</button>
+        <button id="clearBtn">Clear history</button>
       </div>
       <div id="history" style="display:none;"></div>
+
+      <div class="hint" style="margin-top: 14px;">
+        English‑only, Scribe v2. Mic stays warm between dictations for instant start.
+        Realtime/hybrid stream over a secure WebSocket through the Worker; batch uploads on release.
+      </div>
     </section>
   </div>
 </main>
@@ -732,6 +759,10 @@ right lower quadrant"></textarea>
   const micPillEl        = document.getElementById("micPill");
   const linkPillEl       = document.getElementById("linkPill");
   const advancedEl       = document.getElementById("advanced");
+  const authSectionEl    = document.getElementById("authSection");
+  const authSummaryEl    = document.getElementById("authSummary");
+  const optionsSectionEl = document.getElementById("optionsSection");
+  const keytermsSectionEl = document.getElementById("keytermsSection");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
   const engineSegEl      = document.getElementById("engineSeg");
@@ -802,11 +833,12 @@ right lower quadrant"></textarea>
   let lastMeterPct = -1;
 
   let historyVisible = false;
+  let appendArmed = false; // one-shot: clicking the transcript box arms "append the next dictation"
 
   // Engine: which transcription path a dictation uses. The selector value is
   // snapshotted into sessionEngine at start, so switching mid-session only
   // affects the NEXT dictation.
-  const DEFAULT_ENGINE = "hybrid";
+  const DEFAULT_ENGINE = "batch";
   let engine = DEFAULT_ENGINE;
   let sessionEngine = DEFAULT_ENGINE;
   let sessionBaseText = "";  // note text this session appends onto (batch/hybrid splice into it)
@@ -1014,8 +1046,21 @@ right lower quadrant"></textarea>
   }
 
   function updateAppendChip() {
-    const hasText = latestText && latestText.trim();
-    if (!appendModeEl.checked || !hasText || recording) {
+    const hasText = Boolean(latestText && latestText.trim());
+    if (!hasText) appendArmed = false; // nothing left to append to
+    latestEl.classList.toggle("armed", appendArmed && !recording);
+    if (!hasText || recording) {
+      appendChipEl.style.display = "none";
+      return;
+    }
+    if (appendArmed) {
+      // One-shot arm from clicking the box — beats the checkbox/window.
+      appendChipEl.style.display = "";
+      appendChipEl.textContent = "next dictation appends (box clicked)";
+      appendChipEl.className = "pill ok";
+      return;
+    }
+    if (!appendModeEl.checked) {
       appendChipEl.style.display = "none";
       return;
     }
@@ -1074,6 +1119,27 @@ right lower quadrant"></textarea>
     engine = val;
     applyEngineUI();
     saveSettings();
+  }
+
+  /* ───── Access section (API key / passphrase) ─────
+     Collapses once credentials exist so the working UI stays compact;
+     reopens whenever credentials are missing or forgotten. */
+  function hasAuth() {
+    if (apiKeyEl.value.trim()) return true;
+    return Boolean(SHARED_MODE && passphraseEl.value.trim());
+  }
+
+  function updateAuthUI() {
+    if (!authSummaryEl) return;
+    if (apiKeyEl.value.trim()) {
+      authSummaryEl.textContent = "Access — API key set ✓";
+    } else if (SHARED_MODE && passphraseEl.value.trim()) {
+      authSummaryEl.textContent = "Access — passphrase set ✓";
+    } else {
+      authSummaryEl.textContent = SHARED_MODE
+        ? "Access — enter the passphrase"
+        : "Access — enter your API key";
+    }
   }
 
   /* ───── Configurable push-to-talk hotkey ───── */
@@ -1185,6 +1251,8 @@ right lower quadrant"></textarea>
       minSpeech:      minSpeechEl.value,
       appendWindow:   appendWindowEl.value,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
+      optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
+      keytermsOpen:   Boolean(keytermsSectionEl && keytermsSectionEl.open),
       hotkey:         hotkey,
       historyVisible: historyVisible,
     };
@@ -1226,6 +1294,8 @@ right lower quadrant"></textarea>
       if (s.minSpeech !== undefined) minSpeechEl.value = s.minSpeech;
       if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
+      if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
+      if (typeof s.keytermsOpen === "boolean" && keytermsSectionEl) keytermsSectionEl.open = s.keytermsOpen;
       if (s.hotkey && typeof s.hotkey.code === "string" && s.hotkey.code) {
         hotkey = {
           ctrl:  !!s.hotkey.ctrl,
@@ -1267,6 +1337,20 @@ right lower quadrant"></textarea>
     }
     items.unshift(entry);
     setHistory(items);
+  }
+
+  // Boot restore: show the most recent saved transcript instead of an empty
+  // box, and adopt its finalize time so the append window keeps working
+  // across reloads. The restored note clears like any other when the next
+  // session starts fresh, and click-to-append can extend it.
+  function restoreLatestFromHistory() {
+    const items = getHistory();
+    if (!items.length || !items[0].text || !items[0].text.trim()) return;
+    finalizedSegments = [items[0].text.trim()];
+    currentPartial = "";
+    const t = Date.parse(items[0].createdAt || "");
+    if (!isNaN(t)) lastFinalizeAt = t;
+    updateLiveDisplay();
   }
 
   function applyHistoryVisibility() {
@@ -1681,6 +1765,7 @@ right lower quadrant"></textarea>
     const apiKey = apiKeyEl.value.trim();
     if (!apiKey && !(SHARED_MODE && passphraseEl.value.trim())) {
       await writeSentinel();
+      if (authSectionEl) authSectionEl.open = true; // surface the collapsed credentials box
       if (SHARED_MODE) {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
@@ -1733,9 +1818,12 @@ right lower quadrant"></textarea>
     mutedSince = 0;
     clearSessionTimers();
 
-    // Continue the current text only when append mode is on AND the previous
-    // dictation finished recently enough (the append window).
-    if (!appendModeEl.checked) {
+    // Continue the current text when armed by clicking the transcript box
+    // (one-shot, beats the window), or when append mode is on AND the
+    // previous dictation finished recently enough (the append window).
+    if (appendArmed) {
+      appendArmed = false; // consumed by this session
+    } else if (!appendModeEl.checked) {
       finalizedSegments = [];
     } else {
       const w = Number(appendWindowEl.value) || 0;
@@ -2286,6 +2374,8 @@ right lower quadrant"></textarea>
     localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     saveSettingsNow();
+    updateAuthUI();
+    if (authSectionEl) authSectionEl.open = true;
     setStatus(SHARED_MODE ? "Shared passphrase / key removed." : "API key removed.", "ok");
   };
 
@@ -2310,6 +2400,23 @@ right lower quadrant"></textarea>
   };
 
   copyBtn.onclick = () => { if (latestText) copyText(latestText); };
+
+  // Click the transcript box to append the next dictation onto it — one-shot,
+  // works regardless of the append-mode checkbox; click again to cancel.
+  // Ignored while a session is active and when text is being selected.
+  latestEl.addEventListener("click", () => {
+    if (recording || stopping || finishing) return;
+    if (!latestText || !latestText.trim()) return;
+    try {
+      const sel = window.getSelection && window.getSelection();
+      if (sel && String(sel)) return; // selecting text to copy, not arming
+    } catch (e) {}
+    appendArmed = !appendArmed;
+    updateAppendChip();
+    setStatus(appendArmed
+      ? "Next dictation will append to this text (click the box again to cancel)."
+      : "Next dictation starts fresh.", "");
+  });
 
   hotkeyBtn.onclick = () => {
     capturingHotkey = !capturingHotkey;
@@ -2392,12 +2499,24 @@ right lower quadrant"></textarea>
   appendModeEl.addEventListener("change", updateAppendChip);
   appendWindowEl.addEventListener("input", () => { saveSettings(); updateAppendChip(); });
   if (advancedEl) advancedEl.addEventListener("toggle", saveSettings);
+  if (optionsSectionEl) optionsSectionEl.addEventListener("toggle", saveSettings);
+  if (keytermsSectionEl) keytermsSectionEl.addEventListener("toggle", saveSettings);
+
+  // Credentials box: live summary while typing; collapse once credentials are
+  // entered (change fires on blur). Reopen any time via the summary.
+  for (const el of [apiKeyEl, passphraseEl]) {
+    el.addEventListener("input", updateAuthUI);
+    el.addEventListener("change", () => {
+      updateAuthUI();
+      if (hasAuth() && authSectionEl) authSectionEl.open = false;
+    });
+  }
 
   // Keep the "appending vs fresh" countdown honest
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
+    apiKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
     noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
     stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {
@@ -2511,6 +2630,9 @@ right lower quadrant"></textarea>
   updateGateLabels();
   updateKeytermHint();
   updateHotkeyUI();
+  restoreLatestFromHistory();
+  updateAuthUI();
+  if (authSectionEl) authSectionEl.open = !hasAuth(); // collapsed once credentials exist
   renderHistory();
   updateAppendChip();
   tryWarmOnLoad();

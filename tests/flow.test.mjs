@@ -22,8 +22,10 @@
 //  14. hybrid recovery: WS dies mid-dictation, batch refine still delivers
 //  15. hybrid append parity: previous_text on the first frame, refined splice
 //  16. hybrid with zero live text: refine still delivers
-// (scenario 0, asserted right after boot: legacy access-code migration shim
-//  and the hybrid default engine)
+//  17. click-to-append: clicking the transcript box arms a one-shot append
+// (scenario 0, asserted right after boot: legacy access-code migration shim,
+//  batch default engine, append-mode off by default, latest transcript
+//  restored from history, and the auth section's open/collapse behavior)
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -159,6 +161,11 @@ const dom = new JSDOM(html, {
     // code under the legacy key. The page must surface it as the passphrase.
     window.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true }));
     window.localStorage.setItem('scribe_v2_access_code_v9', 'legacy-code');
+    // Scenario 0 seed: a saved transcript — the boot must restore it into the
+    // latest-transcript box (most recent note visible after a reload).
+    window.localStorage.setItem('scribe_v2_transcripts_v9', JSON.stringify([
+      { text: 'Restored note. ', createdAt: new Date().toISOString(), engine: 'batch' },
+    ]));
     window.addEventListener('error', (e) => { console.log('PAGE ERROR:', e.message); failures++; });
   },
 });
@@ -176,15 +183,27 @@ const pump = (n = 3) => { // fire onaudioprocess n times (~85ms of audio each)
 
 await sleep(200);
 
-// ===== Scenario 0: boot state — migration shim + default engine =====
-console.log('--- scenario 0: boot migration + default engine ---');
+// ===== Scenario 0: boot state — migration shim + defaults + restore =====
+console.log('--- scenario 0: boot migration + defaults + restore ---');
 check('legacy access code surfaced as passphrase', doc.getElementById('passphrase').value === 'legacy-code', JSON.stringify(doc.getElementById('passphrase').value));
-check('default engine is hybrid', doc.getElementById('engHybrid').className.includes('active'));
+check('default engine is batch', doc.getElementById('engBatch').className.includes('active'));
+check('append mode unchecked by default', !doc.getElementById('appendMode').checked);
+check('latest transcript restored from history on boot', latest().includes('Restored note.'), latest());
+check('auth section open while credentials are missing', doc.getElementById('authSection').open === true);
+check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('enter'), doc.getElementById('authSummary').textContent);
 
 doc.getElementById('apiKey').value = 'test-key';
-// Scenarios 1–7 exercise the realtime engine explicitly (the default engine
-// may differ); the engine scenarios below switch modes themselves.
+doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true }));
+check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
+check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
+
+// Scenarios 1–7 exercise the realtime engine and append-mode-on behavior
+// explicitly (both defaults now differ); the engine scenarios below switch
+// modes themselves, and scenario 17 covers the append-off default.
 doc.getElementById('engRealtime').click();
+doc.getElementById('appendMode').click();
+check('append mode toggled on for the legacy scenarios', doc.getElementById('appendMode').checked);
+doc.getElementById('freshBtn').click(); // clear the restored note so scenario 1 starts fresh
 
 // ===== Scenario 1: happy path with slow connect (pre-roll + buffer + flush), tail, commit, final =====
 console.log('--- scenario 1: happy path ---');
@@ -562,6 +581,44 @@ await sleep(2700); // FINAL_WAIT deadline passes with no reply
 await sleep(300);  // refine resolves
 check('refine delivered text the live engine missed', clipboard.includes('Only batch heard this.'), JSON.stringify(clipboard));
 check('treated as a clean refined success', status().includes('Refined transcript') && status().includes('Done!'), status());
+
+// ===== Scenario 17: click-to-append — clicking the box arms a one-shot append =====
+console.log('--- scenario 17: click-to-append ---');
+doc.getElementById('engBatch').click();
+doc.getElementById('appendMode').click(); // back OFF — the shipped default
+check('append mode off again', !doc.getElementById('appendMode').checked);
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Alpha.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('base note delivered', clipboard.includes('Alpha.'), JSON.stringify(clipboard));
+check('chip hidden with append mode off', doc.getElementById('appendChip').style.display === 'none');
+
+doc.getElementById('latest').click(); // arm: next dictation appends
+check('box click arms the append chip',
+  doc.getElementById('appendChip').style.display !== 'none' &&
+  doc.getElementById('appendChip').textContent.includes('append'),
+  doc.getElementById('appendChip').textContent);
+check('box highlighted while armed', doc.getElementById('latest').className.includes('armed'));
+doc.getElementById('latest').click(); // second click cancels
+check('second click disarms', doc.getElementById('appendChip').style.display === 'none');
+doc.getElementById('latest').click(); // re-arm for the real run
+
+fetchQueue.push({ status: 200, body: { text: 'Beta.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('armed dictation appended onto the note', clipboard.includes('Alpha.') && clipboard.includes('Beta.'), JSON.stringify(clipboard));
+
+fetchQueue.push({ status: 200, body: { text: 'Gamma.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('arm is one-shot: the following dictation starts fresh', clipboard.includes('Gamma.') && !clipboard.includes('Beta.'), JSON.stringify(clipboard));
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

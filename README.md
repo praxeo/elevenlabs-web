@@ -5,8 +5,8 @@ A self-contained medical dictation web app built on a single Cloudflare Worker, 
 | Engine | What you get | What lands on the clipboard |
 |---|---|---|
 | **Realtime** | Text streams onto the screen as you speak | The live text |
-| **Batch** | No live text; audio uploads on release (the original batch app's behavior — the noise gate decides what gets transcribed) | The batch transcription |
-| **Hybrid** *(default)* | Live text as feedback **plus** a batch re-transcription of the same audio | The **refined batch text** — meaningfully more accurate |
+| **Batch** *(default)* | No live text; audio uploads on release (the original batch app's behavior — the noise gate decides what gets transcribed) | The batch transcription |
+| **Hybrid** | Live text as feedback **plus** a batch re-transcription of the same audio | The **refined batch text** — meaningfully more accurate |
 
 The hybrid design in one line: **realtime text is *feedback* ("it's hearing me"), batch text is the *deliverable*.** The exact audio the realtime engine heard — including the pre-roll from before you pressed the key — is wrapped in a WAV and re-transcribed by the stronger batch model, and that is what you paste.
 
@@ -20,9 +20,10 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 - **Anti-clipping pipeline** (realtime/hybrid): a ~400 ms pre-roll, buffering while the socket connects, a post-release audio tail, and a commit-then-wait shutdown — so the first and last words survive. In hybrid, all of it is also captured for the batch refine.
 - **Loud failure notification**: dead-mic alarm *while you're dictating*, connect-timeout alarm, failure and warn beeps that play even from a background tab, clipboard sentinel (`##DICTATION_FAILED##`), and mic/link status pills.
 - **Recovery, not just alarm**: in hybrid mode, if the live link dies mid-dictation, the locally captured audio is still re-transcribed through batch — the dictation is recovered, flagged for verification instead of lost.
-- **Smart append window**: consecutive dictations continue the same note in **every** engine; stale text drops off automatically.
+- **Click-to-append**: every dictation is its own note by default; click the transcript box to append the next dictation onto it (one-shot), or enable append mode to chain notes automatically within a time window — in **every** engine. The most recent transcript is restored into the box on load.
 - **Custom keyword biasing** from one keyterm list (realtime uses up to 50 terms, batch up to 1000).
-- **Installable web app** (PWA manifest) for a standalone window in constrained environments.
+- **Compact, tiny-window-first UI**: engine selector, record button, status, and the latest transcript stay on top; credentials (auto-collapse once entered), options, keyterms, and advanced tuning live in collapsible sections.
+- **Installable web app** (PWA manifest) for a standalone window in constrained environments — fully functional even shrunk to a sliver.
 
 ---
 
@@ -90,11 +91,13 @@ Set secrets with `npx wrangler secret put ELEVENLABS_API_KEY` (and `APP_PASSPHRA
 
 Open the deployed URL in Chrome/Edge → browser menu → **Install app** (or the install icon in the address bar). The app opens in its own standalone window, keeps mic permission, and is easier to keep running between dictations than a tab.
 
+The layout is built for tiny windows: shrink the app to a sliver and the record button, status line, and latest transcript stay visible while everything else collapses into expandable sections.
+
 ## Choosing an engine
 
-- **Hybrid (default)** — best text quality. You watch live text for confidence, and the clipboard gets the stronger batch model's rendering of the same audio. Costs both API calls per dictation and adds ~1–2 s after release before the done-beep. The history keeps both renderings, so you can audit how much the refine actually fixes.
+- **Batch (default)** — the original app's behavior: cheapest, no live feedback, and the local noise gate (not server VAD) decides what gets transcribed. The strongest model owns the clipboard; also the right pick on very constrained networks (no WebSocket), or when your gate tuning is doing useful work that server VAD can't replicate.
+- **Hybrid** — best text quality with live feedback. You watch live text for confidence, and the clipboard gets the stronger batch model's rendering of the same audio. Costs both API calls per dictation and adds ~1–2 s after release before the done-beep. The history keeps both renderings, so you can audit how much the refine actually fixes.
 - **Realtime** — fastest done-beep, single API call. Pick it when turnaround matters more than the last few percent of accuracy, or while evaluating whether hybrid's gain is worth its cost for your voice/mic/room.
-- **Batch** — the original app's behavior: cheapest, no live feedback, and the local noise gate (not server VAD) decides what gets transcribed. Pick it on very constrained networks (no WebSocket), or when your gate tuning is doing useful work that server VAD can't replicate.
 
 Switching engines mid-dictation affects the *next* dictation, never the one in flight.
 
@@ -104,7 +107,7 @@ Switching engines mid-dictation affects the *next* dictation, never the one in f
 2. Start dictating: **tap Ctrl + Space** (tap again to stop) or **hold it** like a radio mic — or hold CapsLock via AHK, or click the record button. Start beep = go. In realtime/hybrid you can speak immediately; audio is buffered while the pipeline connects.
 3. Speak. In realtime/hybrid, text appears live; the **REC** and **LIVE** pills confirm both mic and pipeline are healthy. In batch mode there is no live text — the gate pill flipping **OPEN** while you speak is your confirmation.
 4. Release. Realtime: tail → commit → copy. Hybrid: tail → commit → **"Refining via batch…"** → the refined text replaces the live text and is copied. Batch: **"uploading…"** → transcribed text appears and is copied. **Rising double beep = text is on the clipboard.** Switch windows and paste.
-5. Dictate again within the append window to continue the same note (the combined text is recopied each time), or wait for the window to lapse / press **Clear dictation box** to begin a new note.
+5. To continue the same note, **click the transcript box** before the next dictation (the chip confirms "next dictation appends"; the combined text is recopied each time) — or turn on **append mode** in Options to chain dictations automatically within the append window. **Clear dictation box** starts a new note.
 
 ### Audio cues
 
@@ -116,20 +119,20 @@ Switching engines mid-dictation affects the *next* dictation, never the one in f
 | Three descending low beeps | **Mic dead alarm** — recording but no audio signal (fires mid-dictation) |
 | Two mid beeps | **Warn** — degraded success: hybrid refine failed and the *live* text was copied instead (usable, verify); also: audio flowing but no text coming back |
 
-Start/done beeps can be disabled with the checkbox; **failure and warn alarms always play**, and they reuse the live audio context so they sound even when the tab is in the background.
+Start/done beeps can be disabled with the checkbox in **Options**; **failure and warn alarms always play**, and they reuse the live audio context so they sound even when the tab is in the background.
 
 ### Status pills
 
 - **mic ready / REC / MIC FAIL / mic off** — actual `MediaStreamTrack` health, not just permission state.
 - **link idle / connecting… / LIVE / uploading… / refining… / LINK FAIL** — transcription pipeline state across all engines.
 - **gate open/closed** — local noise gate. Preview-only in realtime/hybrid; **decides what gets transcribed in batch mode** (the hint under the sliders updates per engine).
-- **append chip** (above the transcript) — whether the next dictation appends or starts fresh, with a countdown.
+- **append chip** (above the transcript) — whether the next dictation appends or starts fresh; appears when you click the box (one-shot append, with a highlighted border) or when append mode is on (with a countdown).
 
 ## Hotkeys & AutoHotkey
 
 Two ways to drive push-to-talk, both always active:
 
-- **In-app hotkey** (no AHK needed): default **Ctrl + Space**. A quick **tap** starts a dictation and another tap stops it; **holding** the combo works like a radio mic — release to stop (presses longer than ~400 ms count as holds). Rebind it by clicking the hotkey button and pressing any combo; unmodified keys (e.g. plain `Space`) are allowed but won't trigger while you're typing in a text field. Saved per-browser.
+- **In-app hotkey** (no AHK needed): default **Ctrl + Space**. A quick **tap** starts a dictation and another tap stops it; **holding** the combo works like a radio mic — release to stop (presses longer than ~400 ms count as holds). Rebind it under **Options** by clicking the hotkey button and pressing any combo; unmodified keys (e.g. plain `Space`) are allowed but won't trigger while you're typing in a text field. Saved per-browser.
 - **F13 (start) / F14 (stop)** — the AutoHotkey contract, identical in every engine. The full Windows relay script ships in this repo as **`hotkey.ahk`** (AHK v2): register the browser window with **Win + F12**, then hold CapsLock to dictate; it waits for the transcript or the failure sentinel on the clipboard and pastes-ready text is announced by the browser's beep. Its `CLIP_TIMEOUT` is sized for hybrid's worst case (~11 s) — keep it ≥ 20 if you adjust the client deadlines.
 
 A minimal AHK v1 alternative:
@@ -154,10 +157,11 @@ Keep the dictation tab/window focused until the success beep if you rely on auto
 
 | Setting | Default | Applies to | When to change |
 |---|---|---|---|
-| **Engine** | hybrid | — | See [Choosing an engine](#choosing-an-engine). |
-| **Push-to-talk hotkey** | Ctrl + Space | all | Rebind to anything (click the field, press a combo). Tap toggles; holds longer than ~400 ms behave as press-and-hold. F13/F14 stay active regardless. |
+| **Engine** | batch | — | See [Choosing an engine](#choosing-an-engine). |
+| **Push-to-talk hotkey** | Ctrl + Space | all | Rebind to anything (click the field in Options, press a combo). Tap toggles; holds longer than ~400 ms behave as press-and-hold. F13/F14 stay active regardless. |
 | **Keyterms** | — | all | Curate per specialty: drug names, anatomy, eponyms, colleague names. One list feeds both APIs: realtime takes the first 50 (≤ 20 chars each), batch up to 1000 (< 50 chars each). Adds ~20 % to cost. The single biggest accuracy lever available; in realtime the status line shows the server-confirmed "(N keyterms active)". |
-| **Append window** | 45 s | all | Shorten if stale text keeps riding along into new notes; lengthen (or 0 = always) if you dictate long notes with long thinking pauses. |
+| **Append mode** | off | all | Off: each dictation is its own note, and clicking the transcript box arms a one-shot append. On: dictations chain automatically within the append window. |
+| **Append window** | 45 s | all | Only applies with append mode on. Shorten if stale text keeps riding along into new notes; lengthen (or 0 = always) if you dictate long notes with long thinking pauses. |
 | **Remove ellipses** | on | all | Scribe writes dictation pauses as "…"/"..." — this strips them. Turn off only if you genuinely dictate ellipses. |
 | **Scribe pause limit** (`vad_silence_threshold_secs`) | 2.0 s | realtime/hybrid | Raise if segments finalize mid-sentence and grammar suffers; lower for snappier commits on short utterances. |
 | **Scribe noise filter** (`vad_threshold`) | 0.55 | realtime/hybrid | Raise in shared/noisy rooms to reject background speech; lower if soft speech is being missed. |
@@ -209,7 +213,7 @@ The #1 way to widen the voice-vs-room gap is the mic itself (close, low gain, po
 - **Treat red status as "verify before pasting."** Text is still delivered after a mid-dictation failure when it exists (losing it would be worse), but it is flagged red + fail-beeped for a reason.
 - **Use hybrid's history to audit the refine.** Hybrid entries store both renderings (`liveText` alongside the refined text) — compare them to see what the batch model is actually buying you.
 - **Curate keyterms like a formulary.** Prune terms when you rotate services; they're 20 % of your bill.
-- **Use the append window for multi-breath notes**, and **Clear dictation box** when switching patients/fields — the chip above the transcript always tells you which will happen next.
+- **Click the box to continue a note** (or turn on append mode + window for hands-free chaining), and **Clear dictation box** when switching patients/fields — the chip above the transcript always tells you which will happen next.
 - **Download the audio when a transcription is wrong** — it answers "did it mishear, or did it not hear?" (Note: the preview is the post-gate recording; in hybrid the refine heard the ungated feed.)
 - **Install as a PWA** on shared workstations: standalone window, persistent mic grant, no tab roulette.
 - **History is the safety net.** Last 100 transcripts persist in `localStorage`; a botched clipboard is never a lost dictation.
@@ -238,9 +242,11 @@ The biggest risk in dictation is speaking a long passage into a dead pipeline an
 
 ## Append semantics
 
-- **Append mode on (default)**: a dictation started within the **append window** (default 45 s, configurable, 0 = always) continues the current note; the combined text is what gets copied. After the window lapses, the next dictation starts a fresh note automatically. Works identically in all three engines — batch and hybrid splice their transcription onto the note base.
+- **Click the transcript box** (any engine): the next dictation appends onto the text shown — a one-shot arm that works regardless of the checkbox and the window. The chip and the highlighted box border confirm it; a second click cancels. Clicking while selecting text does nothing (so manual copying still works), and clicks are ignored mid-session.
+- **Append mode on**: a dictation started within the **append window** (default 45 s, configurable, 0 = always) continues the current note; the combined text is what gets copied. After the window lapses, the next dictation starts a fresh note automatically. Works identically in all three engines — batch and hybrid splice their transcription onto the note base.
+- **Append mode off (the default)**: every dictation is its own note unless you click the box first.
 - **Clear dictation box** button: clears the current note immediately (history untouched).
-- **Append mode off**: every dictation is its own note.
+- **On load** the most recent saved transcript is restored into the box — a reload never hides the note you just dictated, and the append window keeps counting from the note's original finish time.
 
 The mental model: **the clipboard always equals the current note.** Appending recopies the whole note, so a paste at any point yields everything dictated so far; pasting replaces, so nothing is double-entered.
 
@@ -250,7 +256,7 @@ When a dictation continues a note, the tail of the existing text is also sent to
 
 This app deploys over the original batch app's URL, and your saved settings, API key/access code, gate tuning, and history carry over (the old `scribe_v2_access_code_v9` key is read automatically). Behavior deltas to know about:
 
-- **The default engine is hybrid.** Pick **Batch** in the engine selector to get exactly the old behavior — and it stays selected.
+- **The default engine is batch — the old behavior.** Pick **Realtime** or **Hybrid** in the engine selector to try the new modes; the choice is persisted per browser.
 - **Gate hold time is now 0.9 s** (was 0.4 s in code, though the old README documented 900 ms). Word endings survive longer pauses; lower `HOLD_SECONDS` in the code if you preferred the snappier close.
 - **Failure beeps now always play** — they were accidentally tied to the start/done-beep checkbox before. Silence on failure was never intended.
 - **The record button no longer locks during upload** — pressing PTT during an upload queues the next dictation instead.
@@ -263,6 +269,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 - [x] Realtime hardening: anti-clipping (buffer-while-connecting, post-release tail, commit-then-wait), dead-mic watchdog, connect timeout, failure-aware clipboard semantics, always-audible failure beeps, mic re-engagement, append window + chip, Advanced section, pre-roll, ellipsis filter, transcript-first layout, realtime-spec alignment (error-frame taxonomy, `previous_text`, server-confirmed keyterms), PWA, queued PTT, configurable hotkey, jsdom flow harness
 - [x] **Three-engine merge**: dual-protocol Worker (WS + POST on `/api/transcribe`), engine selector with per-mode UI, batch engine (post-gate recording, upload-on-release), **hybrid accuracy mode** — realtime feedback + batch re-transcription of the exact streamed audio (incl. pre-roll) as the clipboard deliverable, with WS-death recovery via the refine, degraded-success warn semantics, and per-engine history (`liveText` kept for comparison)
+- [x] **Compact-UI pass**: batch default engine, append-off default with **click-to-append** (one-shot arm by clicking the transcript box), latest transcript restored on load, collapsible Access/Options/Keyterms sections (Access auto-collapses once credentials are set), tiny-window layout for minimized/PWA use
 
 ### Next
 

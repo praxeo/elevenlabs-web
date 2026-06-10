@@ -30,22 +30,71 @@ export const KEYTERM_PRESETS = [
     terms: [
       // Providers
       "Obert", "Siler", "Von Schweinitz", "Shapshak",
-      "DeLaney", "Haverstock", "Passman",
-      // Cleansers
-      "Vashe",
-      // Hydrofera Blue line
+      "DeLaney", "Delaney", "Haverstock", "Passman",
+      "Kelly", "Greene",
+      // Cleansers & topical agents
+      "Vashe", "Hibiclens", "Dakins", "Dakins quarter strength",
+      "gentamicin ointment", "mupirocin", "triamcinolone",
+      "nystatin", "bacitracin", "Flagyl",
+      // Dressings — Hydrofera Blue
       "Hydrofera Blue", "Hydrofera Blue Ready", "Hydrofera Blue Classic",
-      // Aquacel line
-      "Aquacel Ag", "Aquacel AG ribbon",
-      // Algidex line
+      // Dressings — Aquacel
+      "Aquacel Ag", "Aquacel AG ribbon", "Aquacel AG ribbon packing",
+      // Dressings — Algidex
       "Algidex Ag", "Algidex AG hydrogel gauze",
-      // Mepilex line
+      // Dressings — Mepilex
       "Mepilex", "Mepilex Border", "Mepilex Border Flex",
       "Mepilex Ag", "Mepilex Sacral",
-      // Other dressings
-      "Endoform", "Triad", "Triad paste", "Cuticerin", "Xeroform",
+      // Dressings — biological / enzymatic
+      "Endoform", "Santyl", "NexoBrid", "EpiFix", "Resta",
+      // Dressings — other
+      "Triad", "Triad paste", "Cuticerin", "Xeroform",
       "Unna boot", "Profore", "Prisma", "Drawtex",
       "Xtrasorb", "Medipore", "Coban",
+      "ABD pad", "lambswool", "skin prep",
+      "white foam", "black foam", "wound vac foam",
+      // Offloading & compression
+      "TCC", "CROW boot", "Darco shoe", "diabetic shoe",
+      "compression sleeve", "multilayer compression",
+      "intermittent pneumatic compression",
+      "lymphedema pump", "offloading",
+      // Wound assessment
+      "probe-to-bone", "undermining", "tunneling", "periwound",
+      "granulation tissue", "hypergranulation", "epibole",
+      "slough", "eschar", "fibrin", "serosanguineous", "maceration",
+      "biofilm", "bioburden",
+      "lipodermatosclerosis", "hemosiderin", "stasis dermatitis",
+      "dorsalis pedis", "posterior tibial",
+      "ankle-brachial index", "ABI", "wagner grade",
+      // Debridement
+      "sharp debridement", "mechanical debridement",
+      "enzymatic debridement", "autolytic debridement",
+      "selective debridement",
+      // Diagnoses & conditions
+      "osteomyelitis", "calcaneal osteomyelitis", "chronic osteomyelitis",
+      "venous stasis ulcer", "diabetic foot ulcer", "DFU",
+      "neuropathic ulcer", "pressure injury",
+      "lymphedema", "venous insufficiency", "venous hypertension",
+      "chronic venous insufficiency", "venous duplex",
+      "fistula", "perianal fistula", "Crohn's disease",
+      "hidradenitis suppurativa", "bullous pemphigoid",
+      "pyoderma gangrenosum",
+      "leukocytoclastic vasculitis", "LCV",
+      "VEXAS syndrome", "Marjolin's ulcer",
+      "paraplegia", "incomplete paraplegia",
+      "spinal cord injury", "SCI",
+      "hip disarticulation", "below knee amputation", "BKA", "AKA",
+      "prosthetic joint infection",
+      "metastatic breast cancer", "triple negative breast cancer",
+      "DCIS", "soft tissue radionecrosis",
+      "acute promyelocytic leukemia", "APL",
+      "idiopathic pulmonary fibrosis", "IPF",
+      "neurogenic bladder", "suprapubic catheter",
+      "baclofen pump", "spasticity",
+      "pilon fracture", "equinus deformity", "plantarflexion deformity",
+      // Procedures & modalities
+      "STSG", "NPWT", "HBOT", "HBO", "ATA", "TBICU",
+      "THA", "TKA",
     ],
   },
   {

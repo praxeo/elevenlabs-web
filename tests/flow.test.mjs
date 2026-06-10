@@ -23,6 +23,8 @@
 //  15. hybrid append parity: previous_text on the first frame, refined splice
 //  16. hybrid with zero live text: refine still delivers
 //  17. click-to-append: clicking the transcript box arms a one-shot append
+//  18. keyterm presets: injected lists render as checkboxes, merge into both
+//      APIs (custom > checked presets > always-on), dedupe, persist
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -619,6 +621,104 @@ await sleep(120);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 check('arm is one-shot: the following dictation starts fresh', clipboard.includes('Gamma.') && !clipboard.includes('Beta.'), JSON.stringify(clipboard));
+
+// ===== Scenario 18: keyterm presets — injected lists, merge, dedupe, persistence =====
+console.log('--- scenario 18: keyterm presets ---');
+// Recover the injected preset definitions from the served page so these
+// assertions track whatever lists the deployer curates (no hardcoded terms).
+const presetSrc = html.match(/const KEYTERM_PRESETS\s*=\s*\((.*)\);/);
+check('preset definitions injected into the page', !!presetSrc);
+const PRESETS = JSON.parse(presetSrc[1]);
+const alwaysTerms = PRESETS.filter((p) => p.always).flatMap((p) => p.terms);
+const rtEligible = (t) => t.length <= 20 && t.split(' ').length <= 5;
+const rtAlways = alwaysTerms.filter(rtEligible);
+const optional = PRESETS.filter((p) => !p.always);
+check('ships an always-on list and at least one optional preset', rtAlways.length > 0 && optional.length > 0);
+const preset1 = optional[0];
+const p1Term = preset1.terms.find((t) => rtEligible(t) && !alwaysTerms.includes(t));
+check('optional preset has a realtime-eligible distinct term', typeof p1Term === 'string', p1Term);
+check('one checkbox per optional preset, none for always-on lists',
+  doc.querySelectorAll('#presetRow input[data-preset]').length === optional.length,
+  doc.querySelectorAll('#presetRow input[data-preset]').length);
+
+// Leg A (realtime, unchecked): always-on terms ride, preset terms do not,
+// custom terms lead the merged list.
+doc.getElementById('engRealtime').click();
+doc.getElementById('freshBtn').click();
+doc.getElementById('keyterms').value = 'zebraterm';
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s18a = sockets[sockets.length - 1];
+const ktA = JSON.parse(new URL(s18a.url).searchParams.get('keyterms_json'));
+check('custom term leads the merged list', ktA[0] === 'zebraterm', JSON.stringify(ktA[0]));
+check('always-on terms ride with presets unchecked', rtAlways.every((t) => ktA.includes(t)), ktA.length + ' terms');
+check('unchecked preset terms are not sent', !ktA.includes(p1Term));
+s18a.open();
+await sleep(30);
+s18a.msg({ message_type: 'committed_transcript', text: 'Preset leg A.' });
+doc.getElementById('recordBtn').click();
+await sleep(700);
+s18a.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(500);
+check('leg A delivered normally', clipboard.includes('Preset leg A.'), JSON.stringify(clipboard));
+
+// Check the first optional preset; the choice must persist in settings.
+const p1Box = doc.querySelector('input[data-preset="' + preset1.id + '"]');
+p1Box.click();
+await sleep(400); // debounced settings save
+const s18Settings = JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9'));
+check('checked preset id persisted in settings (additive v9 field)',
+  Array.isArray(s18Settings.presetIds) && s18Settings.presetIds.includes(preset1.id),
+  JSON.stringify(s18Settings.presetIds));
+
+// Leg B (realtime, checked): preset terms ride; a custom dupe of a preset
+// term is sent exactly once; the realtime cap holds.
+doc.getElementById('freshBtn').click();
+doc.getElementById('keyterms').value = 'zebraterm\n' + p1Term;
+doc.getElementById('recordBtn').click();
+await sleep(120);
+const s18b = sockets[sockets.length - 1];
+const ktB = JSON.parse(new URL(s18b.url).searchParams.get('keyterms_json'));
+check('checked preset terms ride the realtime call',
+  preset1.terms.filter(rtEligible).slice(0, 5).every((t) => ktB.includes(t)), ktB.length + ' terms');
+check('term duplicated between custom box and preset sent once',
+  ktB.filter((t) => t.toLowerCase() === p1Term.toLowerCase()).length === 1);
+check('realtime 50-term cap respected', ktB.length <= 50, ktB.length);
+s18b.open();
+await sleep(30);
+s18b.msg({ message_type: 'committed_transcript', text: 'Preset leg B.' });
+doc.getElementById('recordBtn').click();
+await sleep(700);
+s18b.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(500);
+check('leg B delivered normally', clipboard.includes('Preset leg B.'), JSON.stringify(clipboard));
+
+// Leg C (batch, checked): the upload form carries the full preset list —
+// including terms too long for realtime — plus the always-on list.
+doc.getElementById('engBatch').click();
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Preset leg C.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const ktC = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
+check('batch call carries the full checked preset list', preset1.terms.every((t) => ktC.includes(t)), ktC.length + ' terms');
+check('batch call carries the always-on list', alwaysTerms.every((t) => ktC.includes(t)));
+
+// Leg D (batch, unchecked again): preset terms vanish, always-on terms remain
+// even with the custom box empty.
+p1Box.click();
+doc.getElementById('keyterms').value = '';
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Preset leg D.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const ktD = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
+check('unchecking removes preset terms from the next call', !ktD.includes(p1Term));
+check('always-on terms survive with box empty and nothing checked', alwaysTerms.every((t) => ktD.includes(t)), ktD.length + ' terms');
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

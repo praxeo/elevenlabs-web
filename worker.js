@@ -19,7 +19,11 @@ export default {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
       return new Response(
-        INDEX_HTML.replace("__SHARED_MODE__", sharedMode ? "true" : "false"),
+        INDEX_HTML
+          .replace("__SHARED_MODE__", sharedMode ? "true" : "false")
+          // Function replacer: a plain string replacement would interpret
+          // $-sequences inside the JSON as replacement patterns.
+          .replace("__KEYTERM_PRESETS__", () => KEYTERM_PRESETS_CLIENT_JSON),
         {
           headers: {
             "content-type": "text/html; charset=utf-8",
@@ -304,6 +308,78 @@ function sanitizeKeyterms(list, { maxChars, maxWords, maxTerms }) {
     })
     .slice(0, maxTerms);
 }
+
+// Deployer-curated keyterm lists, merged client-side with the user's custom
+// terms on every dictation. Lists marked `always: true` never appear in the
+// UI and ride every dictation — which also means every dictation pays the
+// ~20 % keyterm cost surcharge. The rest render as checkboxes in the
+// Keyterms section (checked ids persist per browser as `presetIds` in the
+// v9 settings). To add or edit a list: change this array and
+// `npx wrangler deploy` — the HTML is served no-store, so every user gets
+// the update on next load. Terms longer than 20 chars or 5 words are
+// skipped by the realtime feed but still bias the batch/hybrid-refine call
+// (< 50 chars there); when the realtime 50-term cap overflows, the user's
+// custom terms win, then checked presets, then `always` lists.
+const KEYTERM_PRESETS = [
+  {
+    id: "standard",
+    label: "Standard medical",
+    always: true,
+    // Starter stub — replace with the vocabulary every dictation should
+    // bias toward regardless of clinic (institution terms, common phrases).
+    terms: [
+      "Cerner", "FirstNet", "PowerChart",
+      "afebrile", "normocephalic", "auscultation",
+      "alert and oriented", "no acute distress",
+    ],
+  },
+  {
+    id: "wound",
+    label: "Wound care clinic",
+    always: false,
+    terms: [
+      "Santyl", "collagenase", "Dakin's solution", "Medihoney",
+      "Silvadene", "mupirocin", "Xeroform", "Mepilex", "Aquacel",
+      "calcium alginate", "hydrocolloid", "hydrogel", "Unna boot",
+      "wound vac", "negative pressure wound therapy",
+      "eschar", "slough", "granulation tissue", "epithelialization",
+      "undermining", "tunneling", "periwound", "maceration",
+      "induration", "fibrinous", "serosanguineous", "fluctuance",
+      "sharp debridement", "venous stasis ulcer", "arterial ulcer",
+      "diabetic foot ulcer", "pressure injury", "osteomyelitis",
+      "cellulitis", "ankle-brachial index", "dorsalis pedis",
+      "posterior tibial", "Charcot", "hyperkeratosis",
+      "total contact cast",
+    ],
+  },
+  {
+    id: "er",
+    label: "ER shift",
+    always: false,
+    terms: [
+      "troponin", "D-dimer", "lactate", "procalcitonin",
+      "FAST exam", "CT angiogram", "pneumothorax", "pulmonary embolism",
+      "aortic dissection", "subdural hematoma", "midline shift",
+      "Glasgow Coma Scale", "obtunded", "diaphoresis", "syncope",
+      "epigastric", "guarding", "rebound tenderness", "appendicitis",
+      "cholecystitis", "diverticulitis", "pyelonephritis",
+      "nephrolithiasis", "DKA", "diabetic ketoacidosis",
+      "laceration", "avulsion",
+    ],
+  },
+];
+
+// Scrubbed once at module init through the same pipeline the proxies use, so
+// the JSON injected into the inline <script> can never carry <> { } [ ] \
+// characters that could break out of the page.
+const KEYTERM_PRESETS_CLIENT_JSON = JSON.stringify(
+  KEYTERM_PRESETS.map((p) => ({
+    id: String(p.id),
+    label: String(p.label),
+    always: Boolean(p.always),
+    terms: sanitizeKeyterms(p.terms, { maxChars: 49, maxWords: 5, maxTerms: 1000 }),
+  }))
+);
 
 // Web app manifest so the page is installable as a standalone app
 // (Chrome/Edge: address-bar install icon, or menu -> "Install app").
@@ -598,6 +674,8 @@ const INDEX_HTML = `<!doctype html>
       <details class="help" id="keytermsSection">
         <summary>Context / vocabulary keyterms</summary>
         <div class="body">
+          <div id="presetRow"></div>
+
           <textarea id="keyterms" placeholder="One term per line. Examples:
 tachycardia
 ascites
@@ -700,6 +778,8 @@ right lower quadrant"></textarea>
 <script>
 (() => {
   const SHARED_MODE      = (__SHARED_MODE__);
+  // Deployer-curated keyterm lists (pre-sanitized), injected at serve time.
+  const KEYTERM_PRESETS  = (__KEYTERM_PRESETS__);
 
   const apiKeyEl         = document.getElementById("apiKey");
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
@@ -763,6 +843,7 @@ right lower quadrant"></textarea>
   const authSummaryEl    = document.getElementById("authSummary");
   const optionsSectionEl = document.getElementById("optionsSection");
   const keytermsSectionEl = document.getElementById("keytermsSection");
+  const presetRowEl       = document.getElementById("presetRow");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
   const engineSegEl      = document.getElementById("engineSeg");
@@ -1170,9 +1251,9 @@ right lower quadrant"></textarea>
     hotkeyBtn.textContent = capturingHotkey ? "press a key combo… (Esc cancels)" : hotkeyLabel(hotkey);
   }
 
-  // One keyterm box, two APIs with different caps: each call site filters the
-  // shared list down to what its API accepts (realtime: 50 terms <= 20 chars;
-  // batch: 1000 terms < 50 chars).
+  // Parses the custom-terms textarea; each call site filters to what its API
+  // accepts (realtime: 50 terms <= 20 chars; batch: 1000 terms < 50 chars).
+  // Call sites send effectiveKeyterms(), which merges the presets in.
   function parseKeyterms(raw, maxChars, maxTerms) {
     return raw
       .split(/[\\r\\n]+/)
@@ -1182,13 +1263,70 @@ right lower quadrant"></textarea>
       .slice(0, maxTerms);
   }
 
+  // Preset checkboxes, rendered from the injected KEYTERM_PRESETS at boot —
+  // before loadSettings, which re-checks the persisted ones.
+  const presetInputs = {}; // preset id -> its checkbox input
+
+  function renderPresetRow() {
+    if (!presetRowEl || !Array.isArray(KEYTERM_PRESETS)) return;
+    for (const p of KEYTERM_PRESETS) {
+      if (p.always) continue; // always-on lists never render — they just apply
+      const lab = document.createElement("label");
+      lab.className = "checkbox";
+      lab.title = p.terms.join(", "); // hover shows what the list biases toward
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.setAttribute("data-preset", p.id);
+      cb.addEventListener("change", () => { updateKeytermHint(); saveSettings(); });
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(p.label + " (" + p.terms.length + " terms)"));
+      presetRowEl.appendChild(lab);
+      presetInputs[p.id] = cb;
+    }
+  }
+
+  // Effective keyterms for one API call: custom terms, then checked presets,
+  // then the always-on lists — deduped case-insensitively, capped per API.
+  // The order IS the trim priority when the realtime 50-term cap overflows;
+  // batch (1000) effectively never trims, so in batch/hybrid the clipboard
+  // text benefits from every list even when the live feed had to drop some.
+  function effectiveKeyterms(maxChars, maxTerms) {
+    const out = [];
+    const seen = {};
+    const push = (t) => {
+      if (typeof t !== "string" || !t) return;
+      if (t.length > maxChars || t.split(" ").length > 5) return;
+      const k = t.toLowerCase();
+      if (seen[k]) return;
+      seen[k] = true;
+      out.push(t);
+    };
+    for (const t of parseKeyterms(keytermsEl.value, maxChars, Infinity)) push(t);
+    for (const p of KEYTERM_PRESETS) {
+      if (!p.always && presetInputs[p.id] && presetInputs[p.id].checked) {
+        for (const t of p.terms) push(t);
+      }
+    }
+    for (const p of KEYTERM_PRESETS) {
+      if (p.always) { for (const t of p.terms) push(t); }
+    }
+    return out.slice(0, maxTerms);
+  }
+
   function updateKeytermHint() {
-    const rt = parseKeyterms(keytermsEl.value, REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS).length;
-    const bt = parseKeyterms(keytermsEl.value, BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS).length;
+    let alwaysCount = 0;
+    for (const p of KEYTERM_PRESETS) { if (p.always) alwaysCount += p.terms.length; }
+    const rtAll = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, Infinity).length;
+    const rt = Math.min(rtAll, REALTIME_KEYTERM_MAX_TERMS);
+    const bt = effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS).length;
     keytermHintEl.innerHTML =
-      "Scribe biases toward these terms. One per line. " +
+      "Scribe biases toward these terms (one per line) plus the checked lists" +
+      (alwaysCount ? " and " + alwaysCount + " always-on standard terms" : "") + ". " +
       "<strong>Keyterms add ~20 % to cost.</strong> " +
-      "Realtime uses " + rt + " / 50 (each &lt;= 20 chars); batch uses " + bt + " / 1000 (each &lt; 50 chars).";
+      "Realtime sends " + rt + " / 50 (each &lt;= 20 chars" +
+      (rtAll > REALTIME_KEYTERM_MAX_TERMS
+        ? "; over the cap your terms win, then presets, then standard" : "") +
+      "); batch sends " + bt + " / 1000 (each &lt; 50 chars).";
   }
 
   /* ───── Gate UI ───── */
@@ -1232,6 +1370,7 @@ right lower quadrant"></textarea>
     const s = {
       engine:         engine,
       keyterms:       keytermsEl.value,
+      presetIds:      Object.keys(presetInputs).filter((id) => presetInputs[id].checked),
       timestamps:     timestampsEl.value,
       tagEvents:      tagEventsEl.checked,
       noVerbatim:     noVerbatimEl.checked,
@@ -1275,6 +1414,12 @@ right lower quadrant"></textarea>
       const s = JSON.parse(raw);
       if (s.engine === "realtime" || s.engine === "batch" || s.engine === "hybrid") engine = s.engine;
       if (s.keyterms) keytermsEl.value = s.keyterms;
+      if (Array.isArray(s.presetIds)) {
+        // Unknown ids (a preset later renamed/removed) are ignored harmlessly.
+        for (const id of s.presetIds) {
+          if (presetInputs[id]) presetInputs[id].checked = true;
+        }
+      }
       if (s.timestamps) timestampsEl.value = s.timestamps;
       if (typeof s.tagEvents     === "boolean") tagEventsEl.checked     = s.tagEvents;
       if (typeof s.noVerbatim    === "boolean") noVerbatimEl.checked    = s.noVerbatim;
@@ -1447,7 +1592,7 @@ right lower quadrant"></textarea>
     form.append("no_verbatim", String(noVerbatimEl.checked));
     form.append("tag_audio_events", String(tagEventsEl.checked));
     form.append("keyterms_json", JSON.stringify(
-      parseKeyterms(keytermsEl.value, BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
+      effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
     ));
 
     const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
@@ -1865,7 +2010,7 @@ right lower quadrant"></textarea>
     params.append("vad_threshold", vadThresholdEl.value);
     params.append("min_speech_duration_ms", minSpeechEl.value);
 
-    const keyterms = parseKeyterms(keytermsEl.value, REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
+    const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
@@ -2625,6 +2770,7 @@ right lower quadrant"></textarea>
     apiKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
   }
 
+  renderPresetRow(); // must precede loadSettings, which re-checks persisted presets
   loadSettings();
   applyEngineUI();
   updateGateLabels();

@@ -7,8 +7,8 @@ Guidance for AI/dev sessions working in this repo. Read this before touching `wo
 A one-file Cloudflare Worker serving a medical dictation app with **three engines** behind one UI:
 
 - **Realtime** — ElevenLabs Scribe v2 Realtime over WebSocket; live text is the deliverable.
-- **Batch** — the post-gate recording uploads to batch Scribe v2 on release (the pre-merge batch app's behavior).
-- **Hybrid** (default) — realtime text is *feedback*; the same audio is re-transcribed through batch Scribe v2 and *that* lands on the clipboard.
+- **Batch** (default) — the post-gate recording uploads to batch Scribe v2 on release (the pre-merge batch app's behavior).
+- **Hybrid** — realtime text is *feedback*; the same audio is re-transcribed through batch Scribe v2 and *that* lands on the clipboard.
 
 Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHotkey, with clipboard handoff. See `README.md` for product behavior, tuning, and roadmap.
 
@@ -30,6 +30,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
   - Client JS uses string concatenation, not template literals — match that.
 - Settings persist under `localStorage` keys suffixed `_v9` (`scribe_v2_settings_v9`, `scribe_v2_transcripts_v9`, `elevenlabs_api_key_browser_v9`, `scribe_v2_passphrase_v9`). **Bumping the suffix wipes all user settings/history** — add fields to the existing schema instead; only bump on explicit request.
 - `scribe_v2_access_code_v9` is the pre-merge batch app's passphrase key. `loadSettings` **must keep reading it as a fallback** (users at the legacy batch URL still have their code there); writes go to `scribe_v2_passphrase_v9`, and forget/unremember must clear both.
+- **Compactness contract**: the app must stay fully usable in a tiny minimized PWA window. The primary card (engine selector, record button, meter/pills, status, latest transcript) stays always-visible and first in the DOM; credentials live in the Access `<details>` (auto-collapses once `hasAuth()`, reopened by `updateAuthUI` paths on missing/forgotten credentials), checkboxes + hotkey in Options, keyterms and Advanced in their own `<details>`. Put new settings inside those sections, not in always-visible rows.
 
 ## Hard invariants — do not break
 
@@ -50,7 +51,8 @@ One session per dictation, guarded by `sessionSeq` (stale socket callbacks bail 
 ```
 idle
  └─ startRecording(): ensureAudio(), per-session resets, sessionEngine = engine
-    snapshot, append-window decision, sessionBaseText snapshot
+    snapshot, append decision (appendArmed one-shot beats checkbox+window),
+    sessionBaseText snapshot
      ├─ ENGINE batch: no WebSocket, no pre-roll. Post-gate MediaRecorder is the
      │  capture path; stopRecording() → recorder.onstop → finalizeSession(false)
      │  → finishBatchSession(): upload webm → splice onto sessionBaseText
@@ -77,6 +79,8 @@ idle
 - Any close we didn't request ⇒ `finalizeSession(true)` ⇒ red status + fail beep (hybrid still refines — recovery — but stays framed as a failure).
 - A 30 ms watchdog (inside the gate meter loop) fires the mic alarm on dead/muted track or RMS flatline (< `FLATLINE_RMS` after 2.5 s), and a warn if speech flows but zero transcripts arrive in 8 s (realtime/hybrid). The mic alarm works in batch mode too (no WS dependency).
 - F13 during finalization or delivery sets `pendingStart`; `maybePendingStart()` starts the next session after `deliverFinalText`.
+- **Click-to-append**: clicking the populated transcript box while idle toggles `appendArmed` — a one-shot "append the next dictation" that beats the append-mode checkbox (off by default) and the window; consumed at session start, cleared whenever the box empties, ignored mid-session and while text is selected. The chip + box border surface the armed state.
+- **Boot restore**: `restoreLatestFromHistory()` puts the newest history entry into the box and adopts its `createdAt` as `lastFinalizeAt`, so the note stays visible across reloads and the append window keeps counting from the real finish time.
 - Trailing partials are part of `latestText` — never discard a partial at shutdown; that is the anti-clipping backstop if the commit reply never comes.
 - Mic re-engagement: `audioGraphHealthy()` checks the actual `MediaStreamTrack.readyState`, not just variable presence; rebuilt on start and on `pageshow` / `visibilitychange` / `devicechange`. bfcache restores leave dead streams that *look* alive.
 - `sessionPcm` (hybrid) is reset at session start and emptied in `refineAndDeliverHybrid` — a ~20 MB buffer must never outlive its session. On cap (`SESSION_PCM_CAP_BYTES`) the complete live text beats a truncated refine.
@@ -106,11 +110,12 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (17 scenario groups: realtime happy path incl.
+# Full session-flow simulation (18 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
-# append/no-live-text, boot migration shim):
+# append/no-live-text, click-to-append, boot shim: migration/defaults/restore/
+# auth collapse):
 npm install --no-save jsdom
 node tests/flow.test.mjs
 ```

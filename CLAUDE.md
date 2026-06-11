@@ -82,7 +82,7 @@ idle
 - **Click-to-append**: clicking the populated transcript box while idle toggles `appendArmed` — a one-shot "append the next dictation" that beats the append-mode checkbox (off by default) and the window; consumed at session start, cleared whenever the box empties, ignored mid-session and while text is selected. The chip + box border surface the armed state.
 - **Boot restore**: `restoreLatestFromHistory()` puts the newest history entry into the box and adopts its `createdAt` as `lastFinalizeAt`, so the note stays visible across reloads and the append window keeps counting from the real finish time.
 - Trailing partials are part of `latestText` — never discard a partial at shutdown; that is the anti-clipping backstop if the commit reply never comes.
-- Mic re-engagement: `audioGraphHealthy()` checks the actual `MediaStreamTrack.readyState`, not just variable presence; rebuilt on start and on `pageshow` / `visibilitychange` / `devicechange`. bfcache restores leave dead streams that *look* alive.
+- Mic re-engagement: `audioGraphHealthy()` checks the actual `MediaStreamTrack.readyState` **and `muted`** (iOS interruptions — lock screen, Siri, calls — leave the track "live" but permanently muted), not just variable presence; rebuilt on start and on `pageshow` / `visibilitychange` / `devicechange`. bfcache restores leave dead streams that *look* alive. iOS Safari has no Permissions API entry for the mic, so `tryWarmOnLoad` falls back to `micEverGranted` (set on the first successful `getUserMedia`) — without that fallback every re-warm path is a silent no-op on iOS. A screen wake lock is held from session start to `deliverFinalText` (re-acquired on `visibilitychange` mid-session) so iOS auto-lock cannot reclaim the mic mid-dictation or suspend the page mid-upload/refine.
 - `sessionPcm` (hybrid) is reset at session start and emptied in `refineAndDeliverHybrid` — a ~20 MB buffer must never outlive its session. On cap (`SESSION_PCM_CAP_BYTES`) the complete live text beats a truncated refine.
 
 ## Phone link (dictate on the phone, clipboard on the desktop)
@@ -126,7 +126,7 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (22 scenario groups: realtime happy path incl.
+# Full session-flow simulation (23 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
@@ -134,7 +134,8 @@ node --check /tmp/served.js
 # migration/defaults/restore/auth collapse, phone mic session, phone link
 # resilience: reconnect/replay-dedupe/focus-retry/grace-fallback/zero-listener
 # ack, SessionRoom DO contract incl. GET /latest, phone link persistence:
-# resume/rejoin across reloads):
+# resume/rejoin across reloads, iOS mic resilience: wake lock/muted-track
+# rebuild/Permissions-API-free re-warm):
 npm install --no-save jsdom
 node tests/flow.test.mjs
 ```

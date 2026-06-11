@@ -1,7 +1,7 @@
 // Session-flow simulation for the embedded client app.
 //
 // Run from the repo root:
-//   npm install --no-save jsdom
+//   npm install --no-save jsdom jsqr
 //   node tests/flow.test.mjs
 //
 // Renders the page through the real Worker fetch handler, boots it in jsdom
@@ -42,6 +42,9 @@
 //  23. iOS mic resilience: screen wake lock held per dictation, muted-track
 //      rebuild (iOS interruptions leave tracks "live" but muted), and the
 //      visibility re-warm working without the Permissions API (iOS Safari)
+//  24. QR join: desktop renders a locally-encoded QR of /?join=<code> that a
+//      real decoder (jsqr) reads back; opening that URL on the phone joins,
+//      persists, and cleans the address bar
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -50,6 +53,7 @@
 // flow, beeps, clipboard behavior, or watchdog change.
 
 import { JSDOM } from 'jsdom';
+import jsQR from 'jsqr';
 import { dirname, join } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -1247,6 +1251,93 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   doc23.dispatchEvent(new dom23.window.Event('visibilitychange'));
   await sleep(80);
   check('s23c: visibility re-warm re-engages the mic without the Permissions API', gum23 === 2, gum23);
+}
+
+// ===== Scenario 24: QR join =====
+console.log('--- scenario 24: QR join ---');
+{
+  // ---- Desktop: the rendered QR must decode (with a real decoder) to the join URL ----
+  const socks23 = [];
+  const dom23 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => Promise.resolve() };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks23.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(100);
+  const doc23 = dom23.window.document;
+
+  doc23.getElementById('phoneStartBtn').click();
+  await sleep(20);
+  const qrEl = doc23.getElementById('phoneQr');
+  const code23 = doc23.getElementById('phoneCodeBadge').textContent.trim();
+  check('s24: QR rendered when the session starts', qrEl.style.display !== 'none' && qrEl.innerHTML.includes('<svg'));
+  const joinUrl = qrEl.getAttribute('data-join-url');
+  check('s24: QR advertises the join URL for this session', joinUrl === 'https://dictation.test/?join=' + code23, joinUrl);
+
+  // Rasterize the SVG modules and decode with jsqr — proves the hand-rolled
+  // encoder produces a genuinely scannable code, not just plausible pixels.
+  const svg = qrEl.innerHTML;
+  const dim = Number((svg.match(/viewBox="0 0 (\d+)/) || [])[1] || 0);
+  check('s24: QR has a sane module count', dim >= 29 && dim <= 49, dim); // v1..v6 + quiet zones
+  const grid = Array.from({ length: dim }, () => new Array(dim).fill(0));
+  for (const mod of svg.matchAll(/M(\d+) (\d+)h1v1h-1z/g)) grid[Number(mod[2])][Number(mod[1])] = 1;
+  const scale = 4, W = dim * scale;
+  const px = new Uint8ClampedArray(W * W * 4);
+  for (let y = 0; y < W; y++) for (let x = 0; x < W; x++) {
+    const v = grid[Math.floor(y / scale)][Math.floor(x / scale)] ? 0 : 255;
+    const o = (y * W + x) * 4;
+    px[o] = px[o + 1] = px[o + 2] = v; px[o + 3] = 255;
+  }
+  const decoded = jsQR(px, W, W);
+  check('s24: QR decodes to the join URL', !!decoded && decoded.data === joinUrl, decoded && decoded.data);
+
+  doc23.getElementById('phoneStopBtn').click();
+  check('s24: QR hidden when the session ends', qrEl.style.display === 'none' && qrEl.innerHTML === '');
+
+  // ---- Phone: opening the scanned URL joins, persists, and cleans the address bar ----
+  const socks23p = [];
+  let w23p;
+  const dom23p = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?join=xyz234',
+    beforeParse(win) {
+      w23p = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => Promise.resolve() };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks23p.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ engine: 'realtime' }));
+    },
+  });
+  await sleep(100);
+  const doc23p = dom23p.window.document;
+  const settings23p = () => JSON.parse(w23p.localStorage.getItem('scribe_v2_settings_v9'));
+
+  check('s24p: scanned URL joins the session (code uppercased)', settings23p().joinedSessionCode === 'XYZ234', JSON.stringify(settings23p().joinedSessionCode));
+  check('s24p: join badge + leave shown after scan', doc23p.getElementById('phoneJoinBadge').style.display !== 'none' && doc23p.getElementById('phoneLeaveBtn').style.display !== 'none');
+  check('s24p: join param cleaned from the address bar', !w23p.location.search.includes('join'), w23p.location.href);
+  doc23p.getElementById('apiKey').value = 'test-key';
+  doc23p.getElementById('recordBtn').click();
+  await sleep(50);
+  const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
+  check('s24p: scanned join rides the next dictation', !!(scanSock && scanSock.url.includes('session=XYZ234')));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

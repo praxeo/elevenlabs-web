@@ -735,6 +735,7 @@ const INDEX_HTML = `<!doctype html>
             <button id="phoneStopBtn" style="display:none;">End session</button>
           </div>
           <div class="hint" id="phoneCodeHint" style="display:none; margin-bottom: 6px;"></div>
+          <div id="phoneQr" style="display:none; width:148px; line-height:0; border-radius:6px; overflow:hidden; margin: 0 0 8px;"></div>
           <div class="row" style="align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
             <span class="hint" style="flex: 0 0 auto;">Join desktop:</span>
             <input id="phoneJoinInput" type="text" maxlength="6" placeholder="ABC123" style="flex: 0 0 72px; font-family: monospace; text-transform: uppercase; text-align: center;" />
@@ -931,6 +932,7 @@ right lower quadrant"></textarea>
   const phoneStopBtnEl   = document.getElementById("phoneStopBtn");
   const phoneCodeBadgeEl = document.getElementById("phoneCodeBadge");
   const phoneCodeHintEl  = document.getElementById("phoneCodeHint");
+  const phoneQrEl        = document.getElementById("phoneQr");
   const phoneJoinInputEl = document.getElementById("phoneJoinInput");
   const phoneJoinBtnEl   = document.getElementById("phoneJoinBtn");
   const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
@@ -2675,6 +2677,223 @@ right lower quadrant"></textarea>
 
   /* ───── Phone mic session ───── */
 
+  /* Minimal QR encoder (byte mode, EC level M, versions 1-6 auto-selected) so
+     the join link can be rendered locally — no external QR service ever sees
+     the session code (it is the link's only credential). */
+  var QR_EC_BLOCKS = { // version: [ecCodewordsPerBlock, [dataCodewordsPerBlock, ...]]
+    1: [10, [16]],
+    2: [16, [28]],
+    3: [26, [44]],
+    4: [18, [32, 32]],
+    5: [24, [43, 43]],
+    6: [16, [27, 27, 27, 27]],
+  };
+  var QR_ALIGN = { 2: 18, 3: 22, 4: 26, 5: 30, 6: 34 }; // single alignment pattern center (v2-6)
+
+  function qrGf() { // GF(256) log/antilog tables, poly 0x11d
+    var exp = new Array(512), log = new Array(256), x = 1;
+    for (var i = 0; i < 255; i++) {
+      exp[i] = x; log[x] = i;
+      x <<= 1; if (x & 0x100) x ^= 0x11d;
+    }
+    for (var j = 255; j < 512; j++) exp[j] = exp[j - 255];
+    return { exp: exp, log: log };
+  }
+
+  function qrEcc(data, ecLen, gf) {
+    var gen = [1];
+    for (var i = 0; i < ecLen; i++) {
+      var next = [];
+      for (var j = 0; j <= gen.length; j++) next.push(0);
+      for (var j = 0; j < gen.length; j++) {
+        if (!gen[j]) continue;
+        next[j] ^= gen[j];
+        next[j + 1] ^= gf.exp[(gf.log[gen[j]] + i) % 255];
+      }
+      gen = next;
+    }
+    var res = data.slice();
+    for (var i = 0; i < ecLen; i++) res.push(0);
+    for (var i = 0; i < data.length; i++) {
+      var f = res[i];
+      if (!f) continue;
+      for (var j = 0; j < gen.length; j++) {
+        if (gen[j]) res[i + j] ^= gf.exp[(gf.log[gen[j]] + gf.log[f]) % 255];
+      }
+    }
+    return res.slice(data.length);
+  }
+
+  function qrCodewords(text, version) {
+    var spec = QR_EC_BLOCKS[version];
+    var dataCw = 0;
+    for (var i = 0; i < spec[1].length; i++) dataCw += spec[1][i];
+    var bits = [];
+    var put = function (val, len) { for (var i = len - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+    put(4, 4);                 // byte mode
+    put(text.length, 8);       // char count (8 bits for versions 1-9)
+    for (var i = 0; i < text.length; i++) put(text.charCodeAt(i) & 0xff, 8);
+    put(0, Math.min(4, dataCw * 8 - bits.length)); // terminator
+    while (bits.length % 8) bits.push(0);
+    var bytes = [];
+    for (var i = 0; i < bits.length; i += 8) {
+      var v = 0;
+      for (var j = 0; j < 8; j++) v = (v << 1) | bits[i + j];
+      bytes.push(v);
+    }
+    var pad = [0xec, 0x11], p = 0;
+    while (bytes.length < dataCw) bytes.push(pad[(p++) % 2]);
+    var gf = qrGf();
+    var blocks = [], eccs = [], off = 0;
+    for (var i = 0; i < spec[1].length; i++) {
+      var blk = bytes.slice(off, off + spec[1][i]);
+      off += spec[1][i];
+      blocks.push(blk);
+      eccs.push(qrEcc(blk, spec[0], gf));
+    }
+    var out = [], maxLen = 0;
+    for (var i = 0; i < blocks.length; i++) maxLen = Math.max(maxLen, blocks[i].length);
+    for (var c = 0; c < maxLen; c++) for (var i = 0; i < blocks.length; i++) {
+      if (c < blocks[i].length) out.push(blocks[i][c]);
+    }
+    for (var c = 0; c < spec[0]; c++) for (var i = 0; i < eccs.length; i++) out.push(eccs[i][c]);
+    return out;
+  }
+
+  function qrMatrix(text) {
+    var version = 0;
+    for (var v = 1; v <= 6; v++) {
+      var spec = QR_EC_BLOCKS[v], cap = 0;
+      for (var i = 0; i < spec[1].length; i++) cap += spec[1][i];
+      if (text.length <= cap - 2) { version = v; break; } // 12-bit header overhead
+    }
+    if (!version) return null; // longer than v6-M holds (106 bytes) — caller hides the QR
+    var size = 17 + 4 * version;
+    var m = [], fn = [];
+    for (var r = 0; r < size; r++) { m.push(new Array(size).fill(0)); fn.push(new Array(size).fill(false)); }
+    var setFn = function (r, c, val) { m[r][c] = val ? 1 : 0; fn[r][c] = true; };
+
+    var finder = function (r0, c0) {
+      for (var dr = -1; dr <= 7; dr++) for (var dc = -1; dc <= 7; dc++) {
+        var rr = r0 + dr, cc = c0 + dc;
+        if (rr < 0 || rr >= size || cc < 0 || cc >= size) continue;
+        var dark = dr >= 0 && dr <= 6 && dc >= 0 && dc <= 6 &&
+                   (dr === 0 || dr === 6 || dc === 0 || dc === 6 || (dr >= 2 && dr <= 4 && dc >= 2 && dc <= 4));
+        setFn(rr, cc, dark);
+      }
+    };
+    finder(0, 0); finder(0, size - 7); finder(size - 7, 0);
+
+    for (var i = 8; i < size - 8; i++) { // timing
+      if (!fn[6][i]) setFn(6, i, i % 2 === 0);
+      if (!fn[i][6]) setFn(i, 6, i % 2 === 0);
+    }
+
+    if (QR_ALIGN[version]) { // single alignment pattern for v2-6
+      var ap = QR_ALIGN[version];
+      for (var dr = -2; dr <= 2; dr++) for (var dc = -2; dc <= 2; dc++) {
+        setFn(ap + dr, ap + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1);
+      }
+    }
+
+    setFn(size - 8, 8, 1); // dark module
+    for (var i = 0; i <= 8; i++) { // reserve format areas (filled per-mask below)
+      if (i !== 6) {
+        if (!fn[8][i]) setFn(8, i, 0);
+        if (!fn[i][8]) setFn(i, 8, 0);
+      }
+    }
+    for (var i = 0; i < 8; i++) {
+      if (!fn[8][size - 1 - i]) setFn(8, size - 1 - i, 0);
+      if (!fn[size - 1 - i][8]) setFn(size - 1 - i, 8, 0);
+    }
+
+    var cw = qrCodewords(text, version);
+    var dataBits = [];
+    for (var i = 0; i < cw.length; i++) for (var j = 7; j >= 0; j--) dataBits.push((cw[i] >> j) & 1);
+    var k = 0, upward = true;
+    for (var col = size - 1; col > 0; col -= 2) { // zigzag placement
+      if (col === 6) col--;
+      for (var i = 0; i < size; i++) {
+        var r = upward ? size - 1 - i : i;
+        for (var dc = 0; dc < 2; dc++) {
+          var c = col - dc;
+          if (!fn[r][c]) m[r][c] = dataBits[k++] || 0; // missing = remainder bits (0)
+        }
+      }
+      upward = !upward;
+    }
+
+    var maskBit = function (mask, r, c) {
+      switch (mask) {
+        case 0: return (r + c) % 2 === 0;
+        case 1: return r % 2 === 0;
+        case 2: return c % 3 === 0;
+        case 3: return (r + c) % 3 === 0;
+        case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+        case 5: return (r * c) % 2 + (r * c) % 3 === 0;
+        case 6: return ((r * c) % 2 + (r * c) % 3) % 2 === 0;
+        default: return ((r + c) % 2 + (r * c) % 3) % 2 === 0;
+      }
+    };
+    var formatBits = function (mask) { // BCH(15,5) of EC level M (00) + mask, XOR 0x5412
+      var d = mask, rem = d << 10, g = 0x537;
+      for (var i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= g << (i - 10);
+      return ((d << 10) | (rem & 0x3ff)) ^ 0x5412;
+    };
+    var penalty = function (mm) { // adjacency runs + dark ratio: enough to pick a sane mask
+      var p = 0, dark = 0;
+      for (var r = 0; r < size; r++) {
+        var runR = 1, runC = 1;
+        for (var c = 0; c < size; c++) {
+          if (mm[r][c]) dark++;
+          if (c > 0) {
+            if (mm[r][c] === mm[r][c - 1]) { runR++; if (runR === 5) p += 3; else if (runR > 5) p++; } else runR = 1;
+            if (mm[c][r] === mm[c - 1][r]) { runC++; if (runC === 5) p += 3; else if (runC > 5) p++; } else runC = 1;
+          }
+        }
+      }
+      p += Math.floor(Math.abs(dark * 100 / (size * size) - 50) / 5) * 10;
+      return p;
+    };
+
+    var best = null, bestScore = Infinity;
+    for (var mask = 0; mask < 8; mask++) {
+      var mm = [];
+      for (var r = 0; r < size; r++) mm.push(m[r].slice());
+      for (var r = 0; r < size; r++) for (var c = 0; c < size; c++) {
+        if (!fn[r][c] && maskBit(mask, r, c)) mm[r][c] ^= 1;
+      }
+      var f = formatBits(mask);
+      for (var i = 0; i < 15; i++) {
+        var on = ((f >> i) & 1) === 1 ? 1 : 0;
+        if (i < 6) mm[i][8] = on;
+        else if (i < 8) mm[i + 1][8] = on;
+        else mm[size - 15 + i][8] = on;
+        if (i < 8) mm[8][size - 1 - i] = on;
+        else if (i < 9) mm[8][7] = on;
+        else mm[8][14 - i] = on;
+      }
+      var score = penalty(mm);
+      if (score < bestScore) { bestScore = score; best = mm; }
+    }
+    return best;
+  }
+
+  function renderQrSvg(text, el) {
+    var mtx = qrMatrix(text);
+    if (!mtx) { el.style.display = "none"; el.innerHTML = ""; return false; }
+    var n = mtx.length, q = 4; // spec quiet zone
+    var d = "";
+    for (var r = 0; r < n; r++) for (var c = 0; c < n; c++) {
+      if (mtx[r][c]) d += "M" + (c + q) + " " + (r + q) + "h1v1h-1z";
+    }
+    var dim = n + q * 2;
+    el.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + dim + ' ' + dim + '" width="148" height="148" shape-rendering="crispEdges"><rect width="' + dim + '" height="' + dim + '" fill="#fff"/><path d="' + d + '" fill="#000"/></svg>';
+    el.style.display = "";
+    return true;
+  }
+
   function generateSessionCode() {
     var chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I/l ambiguity
     var arr = new Uint8Array(6);
@@ -2716,8 +2935,13 @@ right lower quadrant"></textarea>
     phoneStopBtnEl.style.display = "";
     phoneStartBtnEl.style.display = "none";
     if (phoneCodeHintEl) {
-      phoneCodeHintEl.textContent = "Open this page on your phone and enter the code above.";
+      phoneCodeHintEl.textContent = "Scan the QR with the phone camera, or open this page on the phone and enter the code above.";
       phoneCodeHintEl.style.display = "";
+    }
+    if (phoneQrEl) {
+      var joinUrl = window.location.origin + "/?join=" + phoneSessionCode;
+      phoneQrEl.setAttribute("data-join-url", joinUrl);
+      renderQrSvg(joinUrl, phoneQrEl);
     }
     connectPhoneSessionWs();
     phoneLastPongAt = Date.now();
@@ -2731,6 +2955,18 @@ right lower quadrant"></textarea>
   // the replay cannot double-copy); the phone simply keeps relaying to the
   // code it had.
   function restorePhoneLink() {
+    // QR join: the desktop's QR encodes /?join=<code> — joining by scan is the
+    // same one-tap action as entering the code, and it persists the same way.
+    var joinParam = "";
+    try {
+      joinParam = (new URLSearchParams(window.location.search).get("join") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    } catch (e) {}
+    if (joinParam && joinParam.length >= 4 && joinParam.length <= 8) {
+      joinedSessionCode = joinParam;
+      saveSettingsNow();
+      try { history.replaceState(null, "", window.location.pathname); } catch (e) {}
+      setStatus("Joined session " + joinParam + " (scanned). Start recording to send audio to the desktop.", "ok");
+    }
     if (phoneSessionCode) {
       beginPhoneSession("Phone session resumed (code " + phoneSessionCode + ").");
       // No user gesture at boot, so beepCtx cannot be warmed yet — arm it on
@@ -2813,6 +3049,7 @@ right lower quadrant"></textarea>
     phoneStopBtnEl.style.display = "none";
     phoneStartBtnEl.style.display = "";
     if (phoneCodeHintEl) phoneCodeHintEl.style.display = "none";
+    if (phoneQrEl) { phoneQrEl.style.display = "none"; phoneQrEl.innerHTML = ""; }
     saveSettingsNow(); // forget the persisted session
     setStatus("Phone session ended.", "");
   }

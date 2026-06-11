@@ -2,9 +2,18 @@ import { KEYTERM_PRESETS } from './keyterms.js';
 
 // Durable Object: one room per session code. The Worker posts transcript events
 // here (fire-and-forget); desktop listeners receive them over a WebSocket.
+// Resilience contract with the client:
+//   - answers {"message_type":"ping"} with a pong (zombie-socket detection);
+//   - retains the most recent phone_delivery and replays it to (re)connecting
+//     listeners within the replay window (clients dedupe by delivery_id);
+//   - acks /broadcast with the listener count, so the phone can fail loudly
+//     when nobody was listening instead of assuming success.
+const DELIVERY_REPLAY_WINDOW_MS = 2 * 60 * 1000;
+
 export class SessionRoom {
   constructor(state, env) {
     this.listeners = new Map(); // id -> WebSocket
+    this.lastDelivery = null;   // { body, ts } — most recent phone_delivery
   }
 
   async fetch(request) {
@@ -17,15 +26,33 @@ export class SessionRoom {
       this.listeners.set(id, server);
       server.addEventListener("close", () => this.listeners.delete(id));
       server.addEventListener("error", () => this.listeners.delete(id));
+      server.addEventListener("message", (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          if (msg && msg.message_type === "ping") {
+            server.send(JSON.stringify({ message_type: "pong" }));
+          }
+        } catch {}
+      });
+      // A delivery that raced a listener drop must still reach the desktop.
+      if (this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS) {
+        try { server.send(this.lastDelivery.body); } catch {}
+      }
       return new Response(null, { status: 101, webSocket: client });
     }
 
     if (request.method === "POST" && url.pathname.endsWith("/broadcast")) {
       const message = await request.text();
+      let isDelivery = false;
+      try { isDelivery = JSON.parse(message).message_type === "phone_delivery"; } catch {}
+      if (isDelivery) this.lastDelivery = { body: message, ts: Date.now() };
+      let delivered = 0;
       for (const [id, ws] of this.listeners) {
-        try { ws.send(message); } catch { this.listeners.delete(id); }
+        try { ws.send(message); delivered++; } catch { this.listeners.delete(id); }
       }
-      return new Response("ok");
+      return new Response(JSON.stringify({ ok: true, listeners: delivered }), {
+        headers: { "content-type": "application/json" },
+      });
     }
 
     return new Response("Not found", { status: 404 });
@@ -698,7 +725,7 @@ const INDEX_HTML = `<!doctype html>
             <span class="hint" style="flex: 0 0 auto;">Join desktop:</span>
             <input id="phoneJoinInput" type="text" maxlength="6" placeholder="ABC123" style="flex: 0 0 72px; font-family: monospace; text-transform: uppercase; text-align: center;" />
             <button id="phoneJoinBtn">Join</button>
-            <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Connected</span>
+            <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Joined</span>
           </div>
         </div>
       </details>
@@ -935,6 +962,13 @@ right lower quadrant"></textarea>
   // Phone mic session state
   let phoneSessionCode  = "";   // desktop: generated code for the active session
   let phoneSessionWs    = null; // desktop: WebSocket listening for phone transcripts
+  let phonePingTimer    = null; // desktop: heartbeat interval while a session is active
+  let phoneLastPongAt   = 0;    // desktop: last time the room socket proved it is alive
+  let phoneReconnectTimer = null; // desktop: pending reconnect attempt
+  let phoneReconnectDelayMs = 0;  // desktop: current reconnect backoff
+  let phoneFallbackTimer = null;  // desktop: grace timer before live-text fallback delivery
+  let lastDeliveryId    = "";   // desktop: dedupe replayed phone_delivery frames
+  let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
@@ -1001,6 +1035,12 @@ right lower quadrant"></textarea>
   const SESSION_PCM_CAP_BYTES = 24 * 1024 * 1024; // ~12.5 min @ 32 KB/s; the batch API caps files at 25 MB
   const MIN_REFINE_BYTES      = 16000;            // ~0.5 s of audio; below this the refine is skipped
 
+  // Phone link (desktop listener <-> session room)
+  const PHONE_PING_INTERVAL_MS  = 25000; // heartbeat cadence on the listener socket
+  const PHONE_PONG_TIMEOUT_MS   = 90000; // no room traffic for this long = zombie socket; force a reconnect (sized for background-tab timer throttling, ~1 tick/min)
+  const PHONE_RECONNECT_MAX_MS  = 15000; // reconnect backoff cap
+  const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
+
   // Per-API keyterm caps (the Worker re-enforces these server-side too)
   const REALTIME_KEYTERM_MAX_CHARS = 20;
   const REALTIME_KEYTERM_MAX_TERMS = 50;
@@ -1019,10 +1059,22 @@ right lower quadrant"></textarea>
      Beeps prefer the persistent (already running) AudioContext: a fresh
      AudioContext created while the tab is in the background often starts
      suspended and never sounds — exactly when you most need the cue. */
+  // The desktop listener in a phone session never records, so audioCtx may not
+  // exist when its cues must sound — beepCtx is warmed from the session-start
+  // click (a user gesture) so those beeps stay audible in a background tab.
+  let beepCtx = null;
+  function warmBeepCtx() {
+    try {
+      if (!beepCtx) beepCtx = new (window.AudioContext || window.webkitAudioContext)();
+      if (beepCtx.state !== "running") beepCtx.resume();
+    } catch (e) {}
+  }
+
   function beep(freq, ms, when) {
     try {
-      const reuse = audioCtx && audioCtx.state === "running";
-      const ctx = reuse ? audioCtx : new (window.AudioContext || window.webkitAudioContext)();
+      const reuse = (audioCtx && audioCtx.state === "running") ? audioCtx
+                  : (beepCtx && beepCtx.state === "running") ? beepCtx : null;
+      const ctx = reuse || new (window.AudioContext || window.webkitAudioContext)();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.frequency.value = freq;
@@ -2547,12 +2599,10 @@ right lower quadrant"></textarea>
 
     // If this device is acting as a phone mic for a desktop session, relay the
     // authoritative final text so the desktop can deliver it to the clipboard.
+    // The room acks with its listener count — a relay nobody received must be
+    // loud here, never a false success.
     if (joinedSessionCode && cleaned.trim()) {
-      fetch("/api/session/" + joinedSessionCode + "/deliver", {
-        method: "POST",
-        body: JSON.stringify({ message_type: "phone_delivery", text: cleaned }),
-        headers: { "Content-Type": "application/json" },
-      }).catch(function() {});
+      relayDeliveryToDesktop(cleaned);
     }
   }
 
@@ -2576,14 +2626,28 @@ right lower quadrant"></textarea>
     return code;
   }
 
+  function setPhoneLinkUI(connected) {
+    if (!phoneCodeBadgeEl || !phoneSessionCode) return;
+    phoneCodeBadgeEl.textContent = connected ? phoneSessionCode : phoneSessionCode + " ⚠";
+    phoneCodeBadgeEl.style.color = connected ? "var(--accent)" : "var(--danger)";
+    phoneCodeBadgeEl.title = connected ? "" : "Link to the session room dropped — reconnecting";
+  }
+
   function startPhoneSession() {
-    if (phoneSessionWs) return;
+    if (phoneSessionCode) return; // already active (possibly mid-reconnect)
     phoneSessionCode   = generateSessionCode();
     remoteCommitted    = "";
     remoteHasDelivery  = false;
+    lastDeliveryId     = "";
+    pendingCopyText    = "";
+    phoneReconnectDelayMs = 0;
 
-    phoneCodeBadgeEl.textContent = phoneSessionCode;
+    // This click is a user gesture: warm the beep context now so this tab's
+    // success/failure cues stay audible later, when it is behind Citrix/Cerner.
+    warmBeepCtx();
+
     phoneCodeBadgeEl.style.display = "";
+    setPhoneLinkUI(true);
     phoneStopBtnEl.style.display = "";
     phoneStartBtnEl.style.display = "none";
     if (phoneCodeHintEl) {
@@ -2591,28 +2655,74 @@ right lower quadrant"></textarea>
       phoneCodeHintEl.style.display = "";
     }
 
-    var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-    phoneSessionWs = new WebSocket(proto + "//" + window.location.host + "/api/session/" + phoneSessionCode);
-
-    phoneSessionWs.onmessage = function(evt) {
-      try { handlePhoneSessionMessage(JSON.parse(evt.data)); } catch(e) {}
-    };
-    phoneSessionWs.onclose = function() {
-      phoneSessionWs = null;
-    };
-    phoneSessionWs.onerror = function() {
-      phoneSessionWs = null;
-      setStatus("Phone session WebSocket error.", "err");
-    };
-
+    connectPhoneSessionWs();
+    phoneLastPongAt = Date.now();
+    phonePingTimer = setInterval(phoneHeartbeat, PHONE_PING_INTERVAL_MS);
     setStatus("Phone session ready. Code: " + phoneSessionCode, "ok");
   }
 
+  function connectPhoneSessionWs() {
+    var code = phoneSessionCode;
+    if (!code) return;
+    var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    var ws = new WebSocket(proto + "//" + window.location.host + "/api/session/" + code);
+    phoneSessionWs = ws;
+
+    ws.onopen = function() {
+      if (phoneSessionWs !== ws || phoneSessionCode !== code) return;
+      phoneReconnectDelayMs = 0;
+      phoneLastPongAt = Date.now();
+      setPhoneLinkUI(true);
+    };
+    ws.onmessage = function(evt) {
+      if (phoneSessionWs !== ws) return;
+      phoneLastPongAt = Date.now(); // any room frame proves the link is alive
+      try { handlePhoneSessionMessage(JSON.parse(evt.data)); } catch(e) {}
+    };
+    ws.onclose = function() {
+      if (phoneSessionWs !== ws) return;
+      phoneSessionWs = null;
+      if (phoneSessionCode) schedulePhoneReconnect();
+    };
+    ws.onerror = function() { /* onclose always follows and reconnects */ };
+  }
+
+  function phoneHeartbeat() {
+    if (!phoneSessionCode) return;
+    var ws = phoneSessionWs;
+    if (!ws || ws.readyState !== 1) return;
+    try { ws.send(JSON.stringify({ message_type: "ping" })); } catch (e) {}
+    if (Date.now() - phoneLastPongAt > PHONE_PONG_TIMEOUT_MS) {
+      // NAT/idle timeouts can kill the socket without ever firing onclose —
+      // the link looks open but is deaf. Force the close; onclose reconnects.
+      try { ws.close(); } catch (e) {}
+    }
+  }
+
+  function schedulePhoneReconnect() {
+    setPhoneLinkUI(false);
+    setStatus("⚠ Phone link dropped — reconnecting… (code " + phoneSessionCode + " stays valid)", "err");
+    warnBeep();
+    phoneReconnectDelayMs = Math.min(phoneReconnectDelayMs ? phoneReconnectDelayMs * 2 : 1000, PHONE_RECONNECT_MAX_MS);
+    phoneReconnectTimer = setTimeout(function() {
+      phoneReconnectTimer = null;
+      if (phoneSessionCode && !phoneSessionWs) connectPhoneSessionWs();
+    }, phoneReconnectDelayMs);
+  }
+
   function stopPhoneSession() {
-    if (phoneSessionWs) { phoneSessionWs.close(); phoneSessionWs = null; }
-    phoneSessionCode  = "";
+    phoneSessionCode = ""; // cleared first so the onclose below does not reconnect
+    if (phonePingTimer)      { clearInterval(phonePingTimer); phonePingTimer = null; }
+    if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
+    if (phoneFallbackTimer)  { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
+    if (phoneSessionWs) {
+      var ws = phoneSessionWs;
+      phoneSessionWs = null;
+      try { ws.close(); } catch (e) {}
+    }
     remoteCommitted   = "";
     remoteHasDelivery = false;
+    pendingCopyText   = "";
     phoneCodeBadgeEl.style.display = "none";
     phoneStopBtnEl.style.display = "none";
     phoneStartBtnEl.style.display = "";
@@ -2620,8 +2730,48 @@ right lower quadrant"></textarea>
     setStatus("Phone session ended.", "");
   }
 
+  // Deliver text that arrived from the phone to this desktop's clipboard.
+  // degraded = live-text fallback (the authoritative delivery never came).
+  function deliverRemoteText(text, degraded) {
+    latestText = text;
+    latestEl.textContent = text;
+    addHistory(text, { language_code: "en", engine: "remote" });
+    if (!autoCopyEl.checked) {
+      if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript saved, not copied. Verify it!", "warn"); warnBeep(); }
+      else          { setStatus("Phone transcript received.", "ok"); doneBeep(); }
+      return;
+    }
+    copyText(text).then(function(ok) {
+      if (ok) {
+        pendingCopyText = "";
+        if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript copied instead (less accurate). Verify it!", "warn"); warnBeep(); }
+        else          { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
+      } else {
+        // Clipboard writes need document focus, and this tab is usually behind
+        // Citrix/Cerner when a delivery lands. Hold the text; retry on refocus.
+        pendingCopyText = text;
+        setStatus("⚠ Phone transcript received but clipboard copy FAILED — click this window and it will copy itself. Do NOT paste before that!", "err");
+        failBeep();
+      }
+    });
+  }
+
+  // Retry a held delivery the moment this tab can write the clipboard again.
+  window.addEventListener("focus", function() {
+    if (!pendingCopyText) return;
+    var text = pendingCopyText;
+    copyText(text).then(function(ok) {
+      if (!ok || pendingCopyText !== text) return;
+      pendingCopyText = "";
+      setStatus("Phone transcript copied. Done!", "ok");
+      doneBeep();
+    });
+  });
+
   function handlePhoneSessionMessage(msg) {
     if (!msg || !msg.message_type) return;
+
+    if (msg.message_type === "pong") return; // heartbeat reply; onmessage already timestamped it
 
     if (msg.message_type === "session_started") {
       setStatus("Phone connected. Listening... (Code: " + phoneSessionCode + ")", "ok");
@@ -2629,7 +2779,7 @@ right lower quadrant"></textarea>
     }
 
     if (msg.message_type === "partial_transcript") {
-      var partial = (msg.transcript || "").trim();
+      var partial = (msg.transcript || msg.text || "").trim();
       var combined = remoteCommitted + (remoteCommitted && partial ? " " : "") + partial;
       latestText = cleanTranscript(combined);
       latestEl.textContent = latestText;
@@ -2638,7 +2788,7 @@ right lower quadrant"></textarea>
 
     if (msg.message_type === "committed_transcript" ||
         msg.message_type === "committed_transcript_with_timestamps") {
-      var seg = (msg.transcript || "").trim();
+      var seg = (msg.transcript || msg.text || "").trim();
       if (seg) remoteCommitted += (remoteCommitted ? " " : "") + seg;
       latestText = cleanTranscript(remoteCommitted);
       latestEl.textContent = latestText;
@@ -2646,52 +2796,69 @@ right lower quadrant"></textarea>
     }
 
     if (msg.message_type === "phone_delivery") {
+      // The room replays the last delivery to (re)connecting listeners so a
+      // link drop cannot lose it — dedupe those replays by id.
+      if (msg.delivery_id && msg.delivery_id === lastDeliveryId) return;
+      if (msg.delivery_id) lastDeliveryId = msg.delivery_id;
+      if (phoneFallbackTimer) { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
       remoteHasDelivery = true;
       var final = (msg.text || "").trim();
-      if (!final) return;
-      latestText = final;
-      latestEl.textContent = final;
-      addHistory(final, { language_code: "en", engine: "remote" });
-      if (autoCopyEl.checked) {
-        copyText(final).then(function(ok) {
-          if (ok) { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
-          else    { setStatus("Phone transcript saved but clipboard copy failed.", "err"); failBeep(); }
-        });
-      } else {
-        setStatus("Phone transcript received.", "ok");
-        doneBeep();
-      }
+      if (final) deliverRemoteText(final, false);
       remoteCommitted   = "";
       remoteHasDelivery = false;
       return;
     }
 
     if (msg.message_type === "phone_session_end") {
-      if (!remoteHasDelivery && remoteCommitted.trim()) {
-        // Fallback: deliver accumulated committed text (realtime mode; no batch refine)
-        var fallback = cleanTranscript(remoteCommitted);
-        latestText = fallback;
-        latestEl.textContent = fallback;
-        addHistory(fallback, { language_code: "en", engine: "remote" });
-        if (autoCopyEl.checked) {
-          copyText(fallback).then(function(ok) {
-            if (ok) { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
-            else    { setStatus("Clipboard copy failed.", "err"); failBeep(); }
-          });
-        } else {
-          setStatus("Phone transcript received.", "ok");
-          doneBeep();
-        }
+      // The phone's dictation socket closed, but the authoritative
+      // phone_delivery may still be seconds away (hybrid refine). Keep the
+      // session alive for the next dictation and give the delivery a grace
+      // window before falling back to the accumulated live text.
+      if (remoteCommitted.trim() && !phoneFallbackTimer) {
+        setStatus("Phone dictation ended — waiting for the final transcript…", "warn");
+        phoneFallbackTimer = setTimeout(function() {
+          phoneFallbackTimer = null;
+          if (!remoteCommitted.trim()) return; // the delivery arrived meanwhile
+          var fallback = cleanTranscript(remoteCommitted);
+          remoteCommitted = "";
+          deliverRemoteText(fallback, true);
+        }, PHONE_FALLBACK_GRACE_MS);
       }
-      remoteCommitted   = "";
-      remoteHasDelivery = false;
-      setStatus("Phone session ended. Start a new session to continue.", "");
-      stopPhoneSession();
       return;
     }
 
     if (msg.error) {
       setStatus("Phone session error: " + msg.error, "err");
+      warnBeep();
+    }
+  }
+
+  // Phone side: push the final text to the session room and check the ack.
+  // The room buffers the last delivery for reconnecting listeners, so a
+  // zero-listener ack means "held for replay", not "gone" — but the desktop
+  // does not have the text yet and the user must hear that.
+  async function relayDeliveryToDesktop(text) {
+    var payload = JSON.stringify({
+      message_type: "phone_delivery",
+      text: text,
+      delivery_id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
+    });
+    var listeners = -1;
+    try {
+      var res = await fetch("/api/session/" + joinedSessionCode + "/deliver", {
+        method: "POST",
+        body: payload,
+        headers: { "Content-Type": "application/json" },
+      });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      try { listeners = JSON.parse(await res.text()).listeners; } catch (e) { listeners = -1; }
+    } catch (e) {
+      setStatus("⚠ Desktop relay FAILED — the transcript did NOT reach the desktop clipboard!", "err");
+      failBeep();
+      return;
+    }
+    if (listeners === 0) {
+      setStatus("⚠ Desktop link is DOWN — transcript held for replay when it reconnects. VERIFY it lands before pasting!", "err");
       warnBeep();
     }
   }

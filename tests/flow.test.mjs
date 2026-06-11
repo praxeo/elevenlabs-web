@@ -39,6 +39,9 @@
 //  22. phone link persistence: desktop session + phone join survive reloads
 //      (resume room at boot, replay deduped by the persisted delivery id,
 //      Leave/End forget the stored codes)
+//  23. iOS mic resilience: screen wake lock held per dictation, muted-track
+//      rebuild (iOS interruptions leave tracks "live" but muted), and the
+//      visibility re-warm working without the Permissions API (iOS Safari)
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -110,6 +113,9 @@ const micTrack = { readyState: 'live', muted: false, listeners: {}, addEventList
 const mockStream = { getAudioTracks: () => [micTrack], getTracks: () => [micTrack] };
 
 let clipboard = '';
+let gumCalls = 0;        // getUserMedia acquisitions (mic re-engagement paths)
+let wakeLockCalls = 0;   // wake lock acquisitions
+let activeWakeLock = null;
 
 // Queue-driven fetch mock for the batch upload path. Each entry:
 // { delayMs?, status, body }. An empty queue answers 500 so an unexpected
@@ -161,7 +167,11 @@ const dom = new JSDOM(html, {
       });
     };
     Object.defineProperty(window.navigator, 'mediaDevices', {
-      value: { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} },
+      value: { getUserMedia: () => { gumCalls++; return Promise.resolve(mockStream); }, addEventListener() {} },
+      configurable: true,
+    });
+    Object.defineProperty(window.navigator, 'wakeLock', {
+      value: { request: () => { wakeLockCalls++; activeWakeLock = { release() { activeWakeLock = null; return Promise.resolve(); } }; return Promise.resolve(activeWakeLock); } },
       configurable: true,
     });
     Object.defineProperty(window.navigator, 'permissions', {
@@ -1163,6 +1173,80 @@ console.log('--- scenario 22: phone link persistence ---');
   await sleep(20);
   check('s22p: leave forgets the persisted join', settings22p().joinedSessionCode === '', JSON.stringify(settings22p().joinedSessionCode));
   check('s22p: leave hides the badge', doc22p.getElementById('phoneJoinBadge').style.display === 'none');
+}
+
+// ===== Scenario 23: iOS mic resilience — wake lock, muted-track rebuild, re-warm fallback =====
+console.log('--- scenario 23: iOS mic resilience ---');
+
+// Leg A (main DOM): a dictation holds a screen wake lock until delivery
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Wake lock note.' } });
+const wlBefore = wakeLockCalls;
+doc.getElementById('recordBtn').click();
+await sleep(120);
+check('s23: wake lock acquired for the dictation', wakeLockCalls === wlBefore + 1 && activeWakeLock !== null, wakeLockCalls - wlBefore);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s23: dictation delivered', clipboard.includes('Wake lock note.'), JSON.stringify(clipboard));
+check('s23: wake lock released after delivery', activeWakeLock === null);
+
+// Leg B (main DOM): an iOS-interrupted track ("live" but muted) forces a mic rebuild
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Rebuilt mic note.' } });
+micTrack.muted = true;
+const gumBefore = gumCalls;
+doc.getElementById('recordBtn').click();
+micTrack.readyState = 'live'; micTrack.muted = false; // the fresh acquisition hands back a working track
+await sleep(120);
+check('s23: muted track triggers a mic re-acquisition', gumCalls === gumBefore + 1, gumCalls - gumBefore);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic note.'), JSON.stringify(clipboard));
+
+// Leg C (fresh DOM, no Permissions API — the iOS Safari situation): the
+// re-warm on visibilitychange must still re-engage a dead mic.
+{
+  const track23 = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+  const stream23 = { getAudioTracks: () => [track23], getTracks: () => [track23] };
+  let gum23 = 0;
+  let w23;
+  const dom23 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w23 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      // NOTE: no win.navigator.permissions — like iOS Safari for the mic
+      // jsdom reports visibilityState 'prerender'; the re-warm only runs when visible
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.mediaDevices = { getUserMedia: () => { gum23++; track23.readyState = 'live'; track23.muted = false; return Promise.resolve(stream23); }, addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Warm note."}') });
+      win.MediaRecorder = class {
+        constructor(s) { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      win.WebSocket = MockWS;
+    },
+  });
+  await sleep(100);
+  const doc23 = dom23.window.document;
+  check('s23c: no warm-up without a prior grant (no prompt ambush)', gum23 === 0, gum23);
+  doc23.getElementById('apiKey').value = 'test-key';
+  doc23.getElementById('recordBtn').click();
+  await sleep(120);
+  check('s23c: first dictation acquires the mic', gum23 === 1, gum23);
+  doc23.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s23c: batch note delivered', (w23._clip || '').includes('Warm note.'), JSON.stringify(w23._clip));
+  track23.readyState = 'ended'; // iOS killed the stream while the page was hidden
+  doc23.dispatchEvent(new dom23.window.Event('visibilitychange'));
+  await sleep(80);
+  check('s23c: visibility re-warm re-engages the mic without the Permissions API', gum23 === 2, gum23);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

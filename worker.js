@@ -1007,6 +1007,8 @@ right lower quadrant"></textarea>
   let sinkNode = null;     // Muted sink to keep ScriptProcessor running safely
   let gateTimer = null;
   let gateBuf = null;
+  let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
+  let wakeLock = null;        // screen wake lock held per dictation: iOS auto-lock reclaims the mic
   let gateIsOpen = false;
   let gateLastOpen = 0;
   let lastMeterPct = -1;
@@ -1755,6 +1757,21 @@ right lower quadrant"></textarea>
   }
 
   /* ───── Real-time Audio Graph (mic → highpass → gate → script processor) ───── */
+  // Screen wake lock: held from session start to delivery so iOS auto-lock
+  // cannot reclaim the mic mid-dictation or suspend the page mid-upload/refine.
+  // Unsupported/denied is fine — everything else still works.
+  async function acquireWakeLock() {
+    try {
+      if (navigator.wakeLock && navigator.wakeLock.request) {
+        wakeLock = await navigator.wakeLock.request("screen");
+      }
+    } catch (e) {}
+  }
+  function releaseWakeLock() {
+    try { if (wakeLock) wakeLock.release(); } catch (e) {}
+    wakeLock = null;
+  }
+
   function audioGraphHealthy() {
     // A stale graph (e.g. restored from bfcache, device unplugged, tab slept)
     // can leave all variables set while the track is silently dead. Validate
@@ -1762,6 +1779,9 @@ right lower quadrant"></textarea>
     if (!stream || !audioCtx || audioCtx.state === "closed" || !destNode || !recorderNode) return false;
     const track = stream.getAudioTracks()[0];
     if (!track || track.readyState !== "live") return false;
+    // iOS interruptions (screen lock, Siri, calls) leave the track "live" but
+    // permanently muted — that is a dead mic, rebuild from scratch.
+    if (track.muted) return false;
     return true;
   }
 
@@ -1788,6 +1808,7 @@ right lower quadrant"></textarea>
         sampleRate: 48000,
       },
     });
+    micEverGranted = true; // enables the iOS re-warm fallback in tryWarmOnLoad
 
     const micTrack = stream.getAudioTracks()[0];
     if (micTrack) {
@@ -1972,8 +1993,15 @@ right lower quadrant"></textarea>
       if (navigator.permissions && navigator.permissions.query) {
         const st = await navigator.permissions.query({ name: "microphone" });
         if (st.state === "granted") ensureAudio().catch(() => {});
+        return;
       }
     } catch (e) {}
+    // iOS Safari has no Permissions API entry for the microphone — the query
+    // above throws, which used to make every re-warm path a silent no-op on
+    // iOS. If this session already held the mic, re-acquiring is prompt-free,
+    // so re-warm anyway: iOS interruptions routinely kill the track while the
+    // page is hidden, and this is what re-engages it on return.
+    if (micEverGranted) ensureAudio().catch(() => {});
   }
 
   /* ───── Stream Audio & Run WebSocket Session ───── */
@@ -2064,6 +2092,11 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
+
+    // Hold a screen wake lock for the dictation: iOS auto-lock reclaims the
+    // microphone and suspends the page mid-upload/refine. Released by
+    // deliverFinalText — the single session exit.
+    acquireWakeLock();
 
     // New session bookkeeping; stale callbacks from a previous socket bail out
     const mySession = ++sessionSeq;
@@ -2567,6 +2600,7 @@ right lower quadrant"></textarea>
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
     finishing = false;
+    releaseWakeLock(); // the screen may sleep again once the outcome is delivered
     const label = opts.label || "Live transcript";
 
     if (!cleaned.trim()) {
@@ -3180,7 +3214,10 @@ right lower quadrant"></textarea>
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && !recording && !stopping) {
+    if (document.visibilityState !== "visible") return;
+    if (recording || stopping || finishing) {
+      acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides
+    } else {
       tryWarmOnLoad();
     }
   });

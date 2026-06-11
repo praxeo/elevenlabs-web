@@ -85,6 +85,19 @@ idle
 - Mic re-engagement: `audioGraphHealthy()` checks the actual `MediaStreamTrack.readyState`, not just variable presence; rebuilt on start and on `pageshow` / `visibilitychange` / `devicechange`. bfcache restores leave dead streams that *look* alive.
 - `sessionPcm` (hybrid) is reset at session start and emptied in `refineAndDeliverHybrid` — a ~20 MB buffer must never outlive its session. On cap (`SESSION_PCM_CAP_BYTES`) the complete live text beats a truncated refine.
 
+## Phone link (dictate on the phone, clipboard on the desktop)
+
+One Durable Object room per 6-char session code (`SessionRoom`, top of `worker.js`; route `/api/session/<code>`). The desktop holds a listener WebSocket to the room; the phone joins by code — its realtime WS carries `session=<code>` so the Worker mirrors transcript frames into the room (live feedback on the desktop), and the phone's `deliverFinalText` POSTs the authoritative final text to `/api/session/<code>/deliver`. The desktop's `phone_delivery` handler is what writes the desktop clipboard.
+
+Resilience contract — every layer of this link fails silently by default; do not weaken these:
+
+- **Heartbeat + reconnect**: the desktop pings the room every `PHONE_PING_INTERVAL_MS`; no room traffic for `PHONE_PONG_TIMEOUT_MS` (sized for background-tab timer throttling) = zombie socket — force-close and reconnect with backoff (cap `PHONE_RECONNECT_MAX_MS`) for as long as `phoneSessionCode` is set. A drop flips the code badge to `⚠`/danger with a red status. The badge being visible is **not** proof of a live link — only the heartbeat is.
+- **Buffered delivery + dedupe**: the room retains the last `phone_delivery` and replays it to (re)connecting listeners within `DELIVERY_REPLAY_WINDOW_MS`; the phone stamps each delivery with a `delivery_id` and the desktop dedupes by it, so replays can never double-copy.
+- **Delivery ack**: `/deliver` answers with the room's listener count. Zero listeners ⇒ red "desktop link is DOWN" status + warn beep on the phone (the local done beep has already played — correct: the local delivery succeeded, the relay leg failed). Never restore fire-and-forget here.
+- **Focus-retry copy**: a delivery whose clipboard write fails (tab unfocused behind Citrix/Cerner) is held in `pendingCopyText` with red status + fail beep, and retried on the window `focus` event. This is the sanctioned exception to "don't silently retry clipboard writes later" — it is not silent; the status stays red until the retry lands.
+- **`phone_session_end` is per-dictation, not per-session**: the Worker broadcasts it when the phone's realtime socket closes, which is *before* the hybrid refine finishes. The desktop must NOT tear down the session on it; it starts a `PHONE_FALLBACK_GRACE_MS` timer and, only if no `phone_delivery` arrives, delivers the accumulated live `remoteCommitted` text framed as degraded (warn). A real delivery cancels the timer.
+- **Audible desktop cues**: the desktop listener never records, so `audioCtx` may not exist; `beepCtx` is warmed from the session-start click (a user gesture) and `beep()` falls back to it. Without this, every fail beep on the listener is silent.
+
 ## ElevenLabs APIs (as used)
 
 **One path, two protocols** — `/api/transcribe`:
@@ -111,12 +124,14 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (19 scenario groups: realtime happy path incl.
+# Full session-flow simulation (21 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
 # append/no-live-text, click-to-append, keyterm presets, boot shim:
-# migration/defaults/restore/auth collapse):
+# migration/defaults/restore/auth collapse, phone mic session, phone link
+# resilience: reconnect/replay-dedupe/focus-retry/grace-fallback/zero-listener
+# ack, SessionRoom DO contract):
 npm install --no-save jsdom
 node tests/flow.test.mjs
 ```
@@ -141,6 +156,11 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | `REFINE_TIMEOUT_MS` | 8000 | Hybrid refine deadline (live text is the fallback) |
 | `SESSION_PCM_CAP_BYTES` | 24 MiB | Hybrid capture cap (~12.5 min); past it, live text wins |
 | `MIN_REFINE_BYTES` | 16000 | ~0.5 s; below this the hybrid refine is skipped |
+| `PHONE_PING_INTERVAL_MS` | 25000 | Desktop→room heartbeat cadence |
+| `PHONE_PONG_TIMEOUT_MS` | 90000 | No room traffic for this long = zombie socket, force reconnect |
+| `PHONE_RECONNECT_MAX_MS` | 15000 | Room-listener reconnect backoff cap |
+| `PHONE_FALLBACK_GRACE_MS` | 10000 | Wait for `phone_delivery` after `phone_session_end` before live-text fallback |
+| `DELIVERY_REPLAY_WINDOW_MS` | 120000 | (Worker, top of file) room replays the held delivery to reconnecting listeners |
 
 The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.6 s + final-wait 2.5 s + refine 8 s ≈ 11 s). If you raise the client deadlines, raise it too.
 
@@ -152,7 +172,7 @@ The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.6
 
 - `ScriptProcessorNode` is deprecated (AudioWorklet migration is on the roadmap) — don't add new load-bearing logic to it beyond the existing frame pump + `capturePcm`.
 - Closing the WS immediately after sending `commit:true` loses the final transcript — always go through the await-final path.
-- Clipboard writes require document focus; both `navigator.clipboard` and the `execCommand` fallback fail unfocused. The UX (beeps, sentinel) is built around that constraint — don't "fix" it by silently retrying later.
+- Clipboard writes require document focus; both `navigator.clipboard` and the `execCommand` fallback fail unfocused. The UX (beeps, sentinel) is built around that constraint — don't "fix" it by silently retrying later. (The phone-link focus-retry is the one sanctioned exception: it is loud while pending and retries only on refocus — see the Phone link section.)
 - The shared-mode passphrase travels as a query param on the WS path (hardening idea in the README roadmap); don't add logging of request URLs in the Worker. The POST path carries it in the form body.
 - "Clear dictation box" / "Clear history" during an in-flight upload/refine mutate `finalizedSegments`, which the delivery then overwrites from `sessionBaseText` — a cleared box can reappear with the delivered note. Cosmetic, known, alpha-acceptable.
 - The hybrid refine has no `previous_text` equivalent (batch API limitation) — cross-press capitalization/punctuation continuity in refined text can drift slightly from the live rendering.

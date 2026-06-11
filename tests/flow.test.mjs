@@ -25,6 +25,16 @@
 //  17. click-to-append: clicking the transcript box arms a one-shot append
 //  18. keyterm presets: injected lists render as checkboxes, merge into both
 //      APIs (custom > checked presets > always-on), dedupe, persist
+//  19. phone mic session: desktop listener mirrors transcripts + delivers
+//      phone_delivery to the clipboard; phone rides the session code on its
+//      WS and POSTs the final text to the room
+//  20. phone link resilience: session survives phone_session_end, dropped
+//      listener socket reconnects loudly, replayed deliveries dedupe by id,
+//      unfocused clipboard copy retries on refocus, session_end grace window
+//      falls back to live text (cancelled by the real delivery), and the
+//      phone treats a zero-listener deliver ack as a loud failure
+//  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
+//      held-delivery replay inside the window only, transcripts not buffered
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -785,7 +795,7 @@ console.log('--- scenario 19: phone mic session ---');
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
-      win.fetch = (url, opts) => { fetchCalls19b.push({ url: String(url), opts }); return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ text: 'Phone realtime.' }) }); };
+      win.fetch = (url, opts) => { fetchCalls19b.push({ url: String(url), opts }); return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}'), json: () => Promise.resolve({ text: 'Phone realtime.' }) }); };
       win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks19b.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
@@ -830,6 +840,222 @@ console.log('--- scenario 19: phone mic session ---');
       check('phone POSTs final text to session deliver endpoint', !!deliverCall);
     }
   }
+}
+
+// ===== Scenario 20: phone link resilience =====
+console.log('--- scenario 20: phone link resilience ---');
+{
+  // ---- Desktop side: reconnect, replay dedupe, focus-retry, grace fallback ----
+  const socks20 = [];
+  let w20;
+  let clipFail = false; // simulates an unfocused tab: both clipboard paths fail
+  const dom20 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w20 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { if (clipFail) return Promise.reject(new Error('Document is not focused')); win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks20.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc20 = dom20.window.document;
+  const status20 = () => doc20.getElementById('status').textContent;
+  const badge20 = () => doc20.getElementById('phoneCodeBadge');
+
+  doc20.getElementById('phoneStartBtn').click();
+  await sleep(20);
+  const sockA = socks20.find((s) => s.url.includes('/api/session/'));
+  check('s20: listener socket opened', !!sockA);
+  const code20 = sockA ? sockA.url.split('/api/session/')[1] : '';
+  sockA.open();
+  await sleep(10);
+
+  // pong frames are heartbeat plumbing, not deliveries
+  sockA.msg({ message_type: 'pong' });
+  await sleep(10);
+
+  // delivery with an id, then a replay of the same id must be ignored
+  sockA.msg({ message_type: 'phone_delivery', text: 'First note.', delivery_id: 'd1' });
+  await sleep(30);
+  check('s20: delivery copied to the clipboard', (w20._clip || '').includes('First note.'), JSON.stringify(w20._clip));
+  check('s20: delivery success status', status20().includes('Done!'), status20());
+  w20._clip = 'UNTOUCHED';
+  sockA.msg({ message_type: 'phone_delivery', text: 'First note.', delivery_id: 'd1' });
+  await sleep(30);
+  check('s20: replayed delivery_id deduped', w20._clip === 'UNTOUCHED', JSON.stringify(w20._clip));
+
+  // phone_session_end no longer tears the session down (multi-dictation sessions)
+  sockA.msg({ message_type: 'phone_session_end' });
+  await sleep(30);
+  check('s20: session_end keeps the listener socket open', !sockA.closed);
+  check('s20: badge still shows the code after session_end', badge20().style.display !== 'none' && badge20().textContent.includes(code20), badge20().textContent);
+
+  // dropped socket -> loud status, warn badge, auto-reconnect to the same room
+  sockA.serverClose();
+  await sleep(30);
+  check('s20: drop is loud', status20().includes('reconnecting'), status20());
+  check('s20: badge flags the dead link', badge20().textContent.includes('⚠'), badge20().textContent);
+  await sleep(1300); // first reconnect backoff is 1s
+  const sessSocks20 = socks20.filter((s) => s.url.includes('/api/session/'));
+  const sockB = sessSocks20[1];
+  check('s20: reconnected to the same room', !!sockB && sockB.url.includes(code20), sessSocks20.length + ' session sockets');
+  sockB.open();
+  await sleep(10);
+  check('s20: badge recovers once reconnected', !badge20().textContent.includes('⚠'), badge20().textContent);
+
+  // the room replays the held delivery on reconnect; a new id must deliver
+  sockB.msg({ message_type: 'phone_delivery', text: 'Held note.', delivery_id: 'd2' });
+  await sleep(30);
+  check('s20: held delivery lands after reconnect', (w20._clip || '').includes('Held note.'), JSON.stringify(w20._clip));
+
+  // focus-retry: copy fails while "unfocused", retries on the focus event
+  clipFail = true;
+  sockB.msg({ message_type: 'phone_delivery', text: 'Blocked note.', delivery_id: 'd3' });
+  await sleep(30);
+  check('s20: failed copy is loud and warns against pasting', status20().includes('FAILED'), status20());
+  check('s20: clipboard untouched by the failed copy', !(w20._clip || '').includes('Blocked note.'), JSON.stringify(w20._clip));
+  clipFail = false;
+  w20.dispatchEvent(new w20.Event('focus'));
+  await sleep(30);
+  check('s20: refocus retries the copy', (w20._clip || '').includes('Blocked note.'), JSON.stringify(w20._clip));
+  check('s20: refocus success status', status20().includes('Done!'), status20());
+
+  // session_end grace window: live committed text is delivered only after the
+  // authoritative delivery had its chance
+  sockB.msg({ message_type: 'committed_transcript', transcript: 'Live only words.' });
+  sockB.msg({ message_type: 'phone_session_end' });
+  await sleep(30);
+  check('s20: fallback waits for the real delivery first', !(w20._clip || '').includes('Live only words.'), JSON.stringify(w20._clip));
+  check('s20: waiting status during the grace window', status20().includes('waiting'), status20());
+  await sleep(10500); // > PHONE_FALLBACK_GRACE_MS
+  check('s20: grace fallback delivers the live text', (w20._clip || '').includes('Live only words.'), JSON.stringify(w20._clip));
+  check('s20: fallback framed as degraded', status20().includes('Verify'), status20());
+
+  // a real delivery cancels a pending fallback (no stale overwrite later)
+  sockB.msg({ message_type: 'committed_transcript', transcript: 'Stale live.' });
+  sockB.msg({ message_type: 'phone_session_end' });
+  await sleep(30);
+  sockB.msg({ message_type: 'phone_delivery', text: 'Authoritative note.', delivery_id: 'd4' });
+  await sleep(10500);
+  check('s20: delivery cancels the grace fallback', (w20._clip || '').includes('Authoritative note.') && !(w20._clip || '').includes('Stale live.'), JSON.stringify(w20._clip));
+
+  // End session: everything closes and stays closed (no reconnect loop)
+  doc20.getElementById('phoneStopBtn').click();
+  await sleep(1500);
+  const sessSocksEnd = socks20.filter((s) => s.url.includes('/api/session/'));
+  check('s20: stop closes the listener for good', sessSocksEnd.every((s) => s.closed) && sessSocksEnd.length === 2, sessSocksEnd.length + ' session sockets');
+
+  // ---- Phone side: a deliver ack with zero listeners must be loud ----
+  const socks20p = [];
+  const fetch20p = [];
+  const dom20p = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch20p.push({ url: String(url), opts });
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":0}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"unused"}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks20p.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc20p = dom20p.window.document;
+  const status20p = () => doc20p.getElementById('status').textContent;
+
+  doc20p.getElementById('phoneJoinInput').value = 'ABC123';
+  doc20p.getElementById('phoneJoinBtn').click();
+  doc20p.getElementById('engRealtime').click();
+  doc20p.getElementById('apiKey').value = 'test-key';
+  doc20p.getElementById('recordBtn').click();
+  await sleep(50);
+  const phoneSock = socks20p.find((s) => s.url.includes('/api/transcribe'));
+  check('s20p: phone WS carries the session code', !!(phoneSock && phoneSock.url.includes('session=ABC123')));
+  phoneSock.open();
+  phoneSock.msg({ message_type: 'committed_transcript', text: 'Phone note.' });
+  doc20p.getElementById('recordBtn').click(); // stop -> tail -> commit
+  await sleep(700);
+  phoneSock.msg({ message_type: 'committed_transcript', text: '' });
+  await sleep(600); // quiet period -> finalize -> deliver -> relay ack
+  const dCall = fetch20p.find((c) => c.url.includes('/deliver'));
+  check('s20p: deliver POST sent', !!dCall);
+  const dBody = dCall ? JSON.parse(dCall.opts.body) : {};
+  check('s20p: deliver carries text + delivery_id', dBody.text && dBody.text.includes('Phone note.') && typeof dBody.delivery_id === 'string' && dBody.delivery_id.length > 0, JSON.stringify(dBody.delivery_id));
+  check('s20p: zero-listener ack is loud on the phone', status20p().includes('Desktop link is DOWN'), status20p());
+}
+
+// ===== Scenario 21: SessionRoom Durable Object contract (direct, no jsdom) =====
+console.log('--- scenario 21: session room DO contract ---');
+{
+  class FakeSock {
+    constructor() { this.sent = []; this.handlers = {}; }
+    accept() {}
+    send(d) { this.sent.push(d); }
+    addEventListener(ev, fn) { this.handlers[ev] = fn; }
+  }
+  let lastPair = null;
+  globalThis.WebSocketPair = function () {
+    lastPair = { client: new FakeSock(), server: new FakeSock() };
+    return { 0: lastPair.client, 1: lastPair.server };
+  };
+  const RealResponse = globalThis.Response;
+  globalThis.Response = class {
+    constructor(body, init) { this.body = body; const i = init || {}; this.status = i.status || 200; this.webSocket = i.webSocket; }
+    async text() { return this.body; }
+  };
+
+  const room = new worker.SessionRoom({}, {});
+  const wsReq = () => ({ headers: { get: (h) => (h === 'Upgrade' ? 'websocket' : null) }, method: 'GET', url: 'https://room/api/session/ABC123' });
+  const postReq = (body) => ({ headers: { get: () => null }, method: 'POST', url: 'https://room/broadcast', text: async () => body });
+
+  await room.fetch(wsReq());
+  const listenerA = lastPair.server;
+  listenerA.handlers.message({ data: JSON.stringify({ message_type: 'ping' }) });
+  check('s21: room answers ping with pong', listenerA.sent.some((d) => JSON.parse(d).message_type === 'pong'));
+
+  const delivery = JSON.stringify({ message_type: 'phone_delivery', text: 'DO note.', delivery_id: 'do1' });
+  const ack1 = JSON.parse(await (await room.fetch(postReq(delivery))).text());
+  check('s21: broadcast acks the listener count', ack1.listeners === 1, JSON.stringify(ack1));
+  check('s21: listener received the delivery', listenerA.sent.includes(delivery));
+
+  listenerA.handlers.close();
+  const ack0 = JSON.parse(await (await room.fetch(postReq(delivery))).text());
+  check('s21: zero listeners reported after the socket closes', ack0.listeners === 0, JSON.stringify(ack0));
+
+  await room.fetch(wsReq());
+  const listenerB = lastPair.server;
+  check('s21: reconnecting listener gets the held delivery replayed', listenerB.sent.includes(delivery), listenerB.sent.length + ' frames');
+
+  room.lastDelivery.ts -= 3 * 60 * 1000; // age it past the replay window
+  await room.fetch(wsReq());
+  const listenerC = lastPair.server;
+  check('s21: stale deliveries are not replayed', !listenerC.sent.includes(delivery), listenerC.sent.length + ' frames');
+
+  const ackNonDelivery = JSON.parse(await (await room.fetch(postReq(JSON.stringify({ message_type: 'partial_transcript', text: 'x' })))).text());
+  check('s21: transcript frames are not buffered as deliveries', room.lastDelivery.body === delivery && typeof ackNonDelivery.listeners === 'number');
+
+  globalThis.Response = RealResponse;
+  delete globalThis.WebSocketPair;
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

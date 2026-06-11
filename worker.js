@@ -41,6 +41,14 @@ export class SessionRoom {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    if (request.method === "GET" && url.pathname.endsWith("/latest")) {
+      const fresh = this.lastDelivery && Date.now() - this.lastDelivery.ts < DELIVERY_REPLAY_WINDOW_MS;
+      const body = fresh
+        ? '{"ok":true,"age_ms":' + (Date.now() - this.lastDelivery.ts) + ',"delivery":' + this.lastDelivery.body + '}'
+        : '{"ok":true,"delivery":null}';
+      return new Response(body, { headers: { "content-type": "application/json" } });
+    }
+
     if (request.method === "POST" && url.pathname.endsWith("/broadcast")) {
       const message = await request.text();
       let isDelivery = false;
@@ -142,6 +150,12 @@ export default {
           method: "POST",
           body: body,
         });
+      }
+      // Native pollers (e.g. the AHK script): read the held delivery without
+      // joining the room — lets a native app write the clipboard with no
+      // browser-focus requirement.
+      if (request.method === "GET" && parts[4] === "latest") {
+        return stub.fetch("https://session-room/latest");
       }
       return new Response("Not found", { status: 404 });
     }
@@ -726,6 +740,7 @@ const INDEX_HTML = `<!doctype html>
             <input id="phoneJoinInput" type="text" maxlength="6" placeholder="ABC123" style="flex: 0 0 72px; font-family: monospace; text-transform: uppercase; text-align: center;" />
             <button id="phoneJoinBtn">Join</button>
             <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Joined</span>
+            <button id="phoneLeaveBtn" style="display:none;">Leave</button>
           </div>
         </div>
       </details>
@@ -919,6 +934,7 @@ right lower quadrant"></textarea>
   const phoneJoinInputEl = document.getElementById("phoneJoinInput");
   const phoneJoinBtnEl   = document.getElementById("phoneJoinBtn");
   const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
+  const phoneLeaveBtnEl  = document.getElementById("phoneLeaveBtn");
 
   let mediaRecorder = null;
   let chunks = [];
@@ -1494,6 +1510,11 @@ right lower quadrant"></textarea>
       keytermsOpen:   Boolean(keytermsSectionEl && keytermsSectionEl.open),
       hotkey:         hotkey,
       historyVisible: historyVisible,
+      // Phone link: survive reloads/PWA kills — the desktop resumes its room,
+      // the phone rejoins automatically, and replay dedupe survives the reload.
+      phoneSessionCode:  phoneSessionCode,
+      joinedSessionCode: joinedSessionCode,
+      lastDeliveryId:    lastDeliveryId,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
@@ -1551,6 +1572,9 @@ right lower quadrant"></textarea>
         };
       }
       if (typeof s.historyVisible === "boolean") historyVisible = s.historyVisible;
+      if (typeof s.phoneSessionCode  === "string") phoneSessionCode  = s.phoneSessionCode;
+      if (typeof s.joinedSessionCode === "string") joinedSessionCode = s.joinedSessionCode;
+      if (typeof s.lastDeliveryId    === "string") lastDeliveryId    = s.lastDeliveryId;
 
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
@@ -2646,6 +2670,13 @@ right lower quadrant"></textarea>
     // success/failure cues stay audible later, when it is behind Citrix/Cerner.
     warmBeepCtx();
 
+    beginPhoneSession("Phone session ready. Code: " + phoneSessionCode);
+    saveSettingsNow(); // session survives a reload — see restorePhoneLink
+  }
+
+  // Shared by startPhoneSession and the boot-time resume: shows the session UI,
+  // opens the listener socket, and arms the heartbeat.
+  function beginPhoneSession(statusMsg) {
     phoneCodeBadgeEl.style.display = "";
     setPhoneLinkUI(true);
     phoneStopBtnEl.style.display = "";
@@ -2654,11 +2685,31 @@ right lower quadrant"></textarea>
       phoneCodeHintEl.textContent = "Open this page on your phone and enter the code above.";
       phoneCodeHintEl.style.display = "";
     }
-
     connectPhoneSessionWs();
     phoneLastPongAt = Date.now();
-    phonePingTimer = setInterval(phoneHeartbeat, PHONE_PING_INTERVAL_MS);
-    setStatus("Phone session ready. Code: " + phoneSessionCode, "ok");
+    if (!phonePingTimer) phonePingTimer = setInterval(phoneHeartbeat, PHONE_PING_INTERVAL_MS);
+    setStatus(statusMsg, "ok");
+  }
+
+  // Boot restore: the codes persist in settings so an iOS PWA kill or a tab
+  // reload cannot break the pairing. The desktop reconnects to the same room
+  // (the room replays a delivery it missed; lastDeliveryId also persists, so
+  // the replay cannot double-copy); the phone simply keeps relaying to the
+  // code it had.
+  function restorePhoneLink() {
+    if (phoneSessionCode) {
+      beginPhoneSession("Phone session resumed (code " + phoneSessionCode + ").");
+      // No user gesture at boot, so beepCtx cannot be warmed yet — arm it on
+      // the first interaction instead, or the listener's cues stay silent.
+      var warm = function() { warmBeepCtx(); };
+      document.addEventListener("pointerdown", warm, { once: true });
+      document.addEventListener("keydown", warm, { once: true });
+    }
+    if (joinedSessionCode) {
+      if (phoneJoinInputEl) phoneJoinInputEl.value = joinedSessionCode;
+      if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
+      if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
+    }
   }
 
   function connectPhoneSessionWs() {
@@ -2723,10 +2774,12 @@ right lower quadrant"></textarea>
     remoteCommitted   = "";
     remoteHasDelivery = false;
     pendingCopyText   = "";
+    lastDeliveryId    = "";
     phoneCodeBadgeEl.style.display = "none";
     phoneStopBtnEl.style.display = "none";
     phoneStartBtnEl.style.display = "";
     if (phoneCodeHintEl) phoneCodeHintEl.style.display = "none";
+    saveSettingsNow(); // forget the persisted session
     setStatus("Phone session ended.", "");
   }
 
@@ -2799,7 +2852,7 @@ right lower quadrant"></textarea>
       // The room replays the last delivery to (re)connecting listeners so a
       // link drop cannot lose it — dedupe those replays by id.
       if (msg.delivery_id && msg.delivery_id === lastDeliveryId) return;
-      if (msg.delivery_id) lastDeliveryId = msg.delivery_id;
+      if (msg.delivery_id) { lastDeliveryId = msg.delivery_id; saveSettingsNow(); }
       if (phoneFallbackTimer) { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
       remoteHasDelivery = true;
       var final = (msg.text || "").trim();
@@ -2911,7 +2964,16 @@ right lower quadrant"></textarea>
     if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
     joinedSessionCode = code;
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
+    if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
+    saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
     setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
+  };
+  if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
+    joinedSessionCode = "";
+    if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
+    phoneLeaveBtnEl.style.display = "none";
+    saveSettingsNow();
+    setStatus("Left the desktop session — dictations stay on this device now.", "ok");
   };
 
   // Click the transcript box to append the next dictation onto it — one-shot,
@@ -3145,6 +3207,7 @@ right lower quadrant"></textarea>
   updateKeytermHint();
   updateHotkeyUI();
   restoreLatestFromHistory();
+  restorePhoneLink(); // resume/rejoin a persisted phone-link pairing
   updateAuthUI();
   if (authSectionEl) authSectionEl.open = !hasAuth(); // collapsed once credentials exist
   renderHistory();

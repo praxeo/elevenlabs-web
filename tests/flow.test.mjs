@@ -34,7 +34,11 @@
 //      falls back to live text (cancelled by the real delivery), and the
 //      phone treats a zero-listener deliver ack as a loud failure
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
-//      held-delivery replay inside the window only, transcripts not buffered
+//      held-delivery replay inside the window only, transcripts not buffered,
+//      GET /latest for native pollers (fresh delivery vs stale null)
+//  22. phone link persistence: desktop session + phone join survive reloads
+//      (resume room at boot, replay deduped by the persisted delivery id,
+//      Leave/End forget the stored codes)
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -1054,8 +1058,111 @@ console.log('--- scenario 21: session room DO contract ---');
   const ackNonDelivery = JSON.parse(await (await room.fetch(postReq(JSON.stringify({ message_type: 'partial_transcript', text: 'x' })))).text());
   check('s21: transcript frames are not buffered as deliveries', room.lastDelivery.body === delivery && typeof ackNonDelivery.listeners === 'number');
 
+  // GET /latest: native pollers (AHK) read the held delivery without joining
+  const latestReq = () => ({ headers: { get: () => null }, method: 'GET', url: 'https://room/api/session/ABC123/latest' });
+  const staleLatest = JSON.parse(await (await room.fetch(latestReq())).text());
+  check('s21: /latest returns null for a stale delivery', staleLatest.ok === true && staleLatest.delivery === null, JSON.stringify(staleLatest));
+  const delivery2 = JSON.stringify({ message_type: 'phone_delivery', text: 'DO note 2.', delivery_id: 'do2' });
+  await room.fetch(postReq(delivery2));
+  const freshLatest = JSON.parse(await (await room.fetch(latestReq())).text());
+  check('s21: /latest returns the held delivery with its id', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
+
   globalThis.Response = RealResponse;
   delete globalThis.WebSocketPair;
+}
+
+// ===== Scenario 22: phone link persistence — resume + rejoin across reloads =====
+console.log('--- scenario 22: phone link persistence ---');
+{
+  // ---- Desktop: a persisted session resumes at boot; persisted delivery id dedupes the replay ----
+  const socks22 = [];
+  let w22;
+  const dom22 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w22 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks22.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      // A desktop session was active before this "reload"
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ phoneSessionCode: 'ROOMZZ', lastDeliveryId: 'old1' }));
+    },
+  });
+  await sleep(100);
+  const doc22 = dom22.window.document;
+  const settings22 = () => JSON.parse(w22.localStorage.getItem('scribe_v2_settings_v9'));
+
+  const resumeSock = socks22.find((s) => s.url.includes('/api/session/ROOMZZ'));
+  check('s22: persisted session reconnects at boot', !!resumeSock);
+  check('s22: session UI restored (badge + stop button)', doc22.getElementById('phoneCodeBadge').style.display !== 'none' && doc22.getElementById('phoneStopBtn').style.display !== 'none');
+  resumeSock.open();
+  await sleep(10);
+
+  w22._clip = 'PRISTINE';
+  resumeSock.msg({ message_type: 'phone_delivery', text: 'Old note.', delivery_id: 'old1' }); // room replay of a pre-reload delivery
+  await sleep(30);
+  check('s22: persisted delivery id dedupes the replay across the reload', w22._clip === 'PRISTINE', JSON.stringify(w22._clip));
+  resumeSock.msg({ message_type: 'phone_delivery', text: 'Post-reload note.', delivery_id: 'new1' });
+  await sleep(30);
+  check('s22: new delivery lands after the resume', (w22._clip || '').includes('Post-reload note.'), JSON.stringify(w22._clip));
+  check('s22: new delivery id persisted immediately', settings22().lastDeliveryId === 'new1', JSON.stringify(settings22().lastDeliveryId));
+
+  doc22.getElementById('phoneStopBtn').click();
+  await sleep(20);
+  check('s22: ending the session forgets the persisted code', settings22().phoneSessionCode === '', JSON.stringify(settings22().phoneSessionCode));
+  doc22.getElementById('phoneStartBtn').click();
+  await sleep(20);
+  check('s22: starting a session persists its code', /^[A-Z2-9]{6}$/.test(settings22().phoneSessionCode), JSON.stringify(settings22().phoneSessionCode));
+  doc22.getElementById('phoneStopBtn').click();
+
+  // ---- Phone: a persisted join rides the next dictation after a "reload"; Leave forgets it ----
+  const socks22p = [];
+  let w22p;
+  const dom22p = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w22p = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks22p.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      // The phone joined a desktop session before this "reload" (iOS PWA kill)
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'ABC123', engine: 'realtime' }));
+    },
+  });
+  await sleep(100);
+  const doc22p = dom22p.window.document;
+  const settings22p = () => JSON.parse(w22p.localStorage.getItem('scribe_v2_settings_v9'));
+
+  check('s22p: join badge restored at boot', doc22p.getElementById('phoneJoinBadge').style.display !== 'none');
+  check('s22p: leave button shown for the restored join', doc22p.getElementById('phoneLeaveBtn').style.display !== 'none');
+  doc22p.getElementById('apiKey').value = 'test-key';
+  doc22p.getElementById('recordBtn').click();
+  await sleep(50);
+  const rejoinedSock = socks22p.find((s) => s.url.includes('/api/transcribe'));
+  check('s22p: restored join rides the next dictation', !!(rejoinedSock && rejoinedSock.url.includes('session=ABC123')), rejoinedSock && rejoinedSock.url.split('?')[1]);
+  doc22p.getElementById('recordBtn').click();
+  await sleep(6000); // let the never-opened socket time out and finalize
+
+  doc22p.getElementById('phoneLeaveBtn').click();
+  await sleep(20);
+  check('s22p: leave forgets the persisted join', settings22p().joinedSessionCode === '', JSON.stringify(settings22p().joinedSessionCode));
+  check('s22p: leave hides the badge', doc22p.getElementById('phoneJoinBadge').style.display === 'none');
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

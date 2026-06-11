@@ -18,7 +18,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 
 - `worker.js` — everything: Worker fetch handler (dual-protocol `/api/transcribe`), batch proxy, WebSocket proxy, PWA manifest/icons, and the entire client app embedded in the `INDEX_HTML` template literal.
 - `tests/flow.test.mjs` — jsdom harness simulating full dictation sessions across all three engines (see Validation).
-- `hotkey.ahk` — AutoHotkey v2 push-to-talk relay (CapsLock → F13/F14, clipboard handoff).
+- `hotkey.ahk` — AutoHotkey v2 push-to-talk relay (CapsLock → F13/F14, clipboard handoff) + optional phone-link clipboard poller (`GET /latest`, focus-free native clipboard writes).
 - `wrangler.toml` (deploys as worker `eleven`), `README.md`, this file.
 
 ## Constraints & style
@@ -96,7 +96,9 @@ Resilience contract — every layer of this link fails silently by default; do n
 - **Delivery ack**: `/deliver` answers with the room's listener count. Zero listeners ⇒ red "desktop link is DOWN" status + warn beep on the phone (the local done beep has already played — correct: the local delivery succeeded, the relay leg failed). Never restore fire-and-forget here.
 - **Focus-retry copy**: a delivery whose clipboard write fails (tab unfocused behind Citrix/Cerner) is held in `pendingCopyText` with red status + fail beep, and retried on the window `focus` event. This is the sanctioned exception to "don't silently retry clipboard writes later" — it is not silent; the status stays red until the retry lands.
 - **`phone_session_end` is per-dictation, not per-session**: the Worker broadcasts it when the phone's realtime socket closes, which is *before* the hybrid refine finishes. The desktop must NOT tear down the session on it; it starts a `PHONE_FALLBACK_GRACE_MS` timer and, only if no `phone_delivery` arrives, delivers the accumulated live `remoteCommitted` text framed as degraded (warn). A real delivery cancels the timer.
-- **Audible desktop cues**: the desktop listener never records, so `audioCtx` may not exist; `beepCtx` is warmed from the session-start click (a user gesture) and `beep()` falls back to it. Without this, every fail beep on the listener is silent.
+- **Audible desktop cues**: the desktop listener never records, so `audioCtx` may not exist; `beepCtx` is warmed from the session-start click (a user gesture) and `beep()` falls back to it. Without this, every fail beep on the listener is silent. (A boot-time session resume has no gesture — `restorePhoneLink` arms a one-shot warm-up on the first pointerdown/keydown.)
+- **Pairing survives reloads**: `phoneSessionCode`, `joinedSessionCode`, and `lastDeliveryId` persist as additive `_v9` settings fields; `restorePhoneLink()` (boot, after `loadSettings`) resumes the desktop room / restores the phone's join, so an iOS PWA kill or tab reload cannot break the link. Persisting `lastDeliveryId` is what keeps the room's replay from double-copying across a reload. "End session" / "Leave" must clear the stored codes.
+- **`GET /api/session/<code>/latest`** returns the room's held delivery (within the replay window) for native pollers — `hotkey.ahk`'s optional phone-link poller uses it to write the clipboard with **no browser-focus requirement** (set `PHONE_POLL_URL` + `PHONE_CODE` at the top of the script). The poller baselines the first id it sees (never pastes a pre-existing delivery), dedupes by `delivery_id`, and skips polls while the PTT clipboard handshake is in flight (`BUSY`). Same trust model as the listener WS: the code is the only credential.
 
 ## ElevenLabs APIs (as used)
 
@@ -124,14 +126,15 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (21 scenario groups: realtime happy path incl.
+# Full session-flow simulation (22 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
 # append/no-live-text, click-to-append, keyterm presets, boot shim:
 # migration/defaults/restore/auth collapse, phone mic session, phone link
 # resilience: reconnect/replay-dedupe/focus-retry/grace-fallback/zero-listener
-# ack, SessionRoom DO contract):
+# ack, SessionRoom DO contract incl. GET /latest, phone link persistence:
+# resume/rejoin across reloads):
 npm install --no-save jsdom
 node tests/flow.test.mjs
 ```

@@ -15,10 +15,81 @@ STRIP_NEWLINES := true
 TRAILING_SPACE := true
 ERR_SOUND      := true         ; the ONLY sound this script makes — on failure
 SENTINEL       := "##DICTATION_FAILED##"   ; must match the browser's marker
+
+; --- Phone-link clipboard poller (optional) ---
+; The browser can only write the clipboard while its window is focused. If you
+; dictate on a phone into this machine, set PHONE_POLL_URL to the worker and
+; PHONE_CODE to the session code shown on the desktop page: this script then
+; fetches the latest phone delivery and writes it to the clipboard natively —
+; no browser focus needed. Leave PHONE_CODE empty to disable.
+PHONE_POLL_URL := ""           ; e.g. "https://eleven.example.workers.dev" (no trailing slash)
+PHONE_CODE     := ""           ; 6-char session code from the desktop page
+PHONE_POLL_MS  := 2000
 ; ==================
 
 DICT_HWND := 0
 BUSY      := false
+
+; ===== Phone-link poller =====
+LAST_DELIVERY_ID := ""
+POLL_SEEDED      := false      ; first poll only baselines — never paste a pre-existing (possibly stale) delivery
+
+if (PHONE_POLL_URL != "" && PHONE_CODE != "")
+    SetTimer(PollPhoneDelivery, PHONE_POLL_MS)
+
+PollPhoneDelivery() {
+    global PHONE_POLL_URL, PHONE_CODE, LAST_DELIVERY_ID, POLL_SEEDED
+    global BUSY, STRIP_NEWLINES, TRAILING_SPACE
+    static polling := false
+    if (polling || BUSY)               ; never fight the PTT clipboard handshake
+        return
+    polling := true
+    try {
+        req := ComObject("WinHttp.WinHttpRequest.5.1")
+        req.Open("GET", PHONE_POLL_URL "/api/session/" PHONE_CODE "/latest", true)
+        req.Send()
+        req.WaitForResponse(5)
+        body := req.ResponseText
+        if (RegExMatch(body, '"delivery_id"\s*:\s*"((?:[^"\\]|\\.)*)"', &mId)
+            && RegExMatch(body, '"text"\s*:\s*"((?:[^"\\]|\\.)*)"', &mTxt)
+            && mId[1] != "") {
+            if !POLL_SEEDED {
+                ; A delivery may be held from before this script started —
+                ; baseline its id so we only ever copy NEW dictations.
+                LAST_DELIVERY_ID := mId[1]
+            } else if (mId[1] != LAST_DELIVERY_ID) {
+                LAST_DELIVERY_ID := mId[1]
+                txt := JsonUnescape(mTxt[1])
+                if STRIP_NEWLINES
+                    txt := RegExReplace(txt, "\R+", " ")
+                txt := Trim(RegExReplace(txt, " +", " "))
+                if (txt != "") {
+                    if TRAILING_SPACE
+                        txt .= " "
+                    A_Clipboard := txt
+                    Notify("Phone transcript on clipboard.")
+                }
+            }
+        }
+        POLL_SEEDED := true
+    } catch {
+        ; network blip — the next poll retries; stay silent (the browser side
+        ; of the link is the loud one)
+    }
+    polling := false
+}
+
+JsonUnescape(s) {
+    s := StrReplace(s, "\\", Chr(1))   ; protect escaped backslashes first
+    s := StrReplace(s, '\"', '"')
+    s := StrReplace(s, "\n", "`n")
+    s := StrReplace(s, "\r", "`r")
+    s := StrReplace(s, "\t", A_Tab)
+    s := StrReplace(s, "\/", "/")
+    while RegExMatch(s, "\\u([0-9A-Fa-f]{4})", &m)
+        s := StrReplace(s, m[0], Chr(Integer("0x" m[1])))
+    return StrReplace(s, Chr(1), "\")
+}
 
 ; --- Feedback: toasts are ALWAYS silent (option 16). The only audio is ErrBeep
 ;     on a genuine failure. Success is completely silent. ---

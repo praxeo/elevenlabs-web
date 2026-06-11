@@ -1519,6 +1519,9 @@ right lower quadrant"></textarea>
       phoneSessionCode:  phoneSessionCode,
       joinedSessionCode: joinedSessionCode,
       lastDeliveryId:    lastDeliveryId,
+      // iOS has no Permissions API for the mic; persisting the grant is what
+      // lets a relaunched PWA re-warm the mic at boot instead of staying cold.
+      micGranted:        micEverGranted,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
@@ -1579,6 +1582,7 @@ right lower quadrant"></textarea>
       if (typeof s.phoneSessionCode  === "string") phoneSessionCode  = s.phoneSessionCode;
       if (typeof s.joinedSessionCode === "string") joinedSessionCode = s.joinedSessionCode;
       if (typeof s.lastDeliveryId    === "string") lastDeliveryId    = s.lastDeliveryId;
+      if (s.micGranted === true) micEverGranted = true;
 
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
@@ -1810,10 +1814,27 @@ right lower quadrant"></textarea>
         sampleRate: 48000,
       },
     });
-    micEverGranted = true; // enables the iOS re-warm fallback in tryWarmOnLoad
+    if (!micEverGranted) {
+      micEverGranted = true; // enables the iOS re-warm fallback in tryWarmOnLoad
+      saveSettingsNow();     // persisted (micGranted): a relaunched iOS PWA re-warms at boot
+    }
 
     const micTrack = stream.getAudioTracks()[0];
     if (micTrack) {
+      micTrack.addEventListener("mute", () => {
+        // iOS interruptions (Siri, calls, app switches) mute the track without
+        // ending it. Mid-dictation the watchdog handles it loudly; while idle,
+        // self-heal so the next dictation does not start on a dead mic. The
+        // delay lets transient mutes (iOS often unmutes on its own) pass.
+        if (recording || stopping) return;
+        setTimeout(() => {
+          if (!recording && !stopping && !audioGraphHealthy() &&
+              document.visibilityState === "visible") {
+            releaseAudio();
+            tryWarmOnLoad();
+          }
+        }, 1200);
+      });
       micTrack.addEventListener("ended", () => {
         // OS/device revoked the mic (sleep, unplug, Citrix audio drop).
         if (recording && !sessionFinalized) {
@@ -1994,16 +2015,37 @@ right lower quadrant"></textarea>
     try {
       if (navigator.permissions && navigator.permissions.query) {
         const st = await navigator.permissions.query({ name: "microphone" });
-        if (st.state === "granted") ensureAudio().catch(() => {});
+        if (st.state === "granted") warmWithRetry(0);
         return;
       }
     } catch (e) {}
     // iOS Safari has no Permissions API entry for the microphone — the query
     // above throws, which used to make every re-warm path a silent no-op on
-    // iOS. If this session already held the mic, re-acquiring is prompt-free,
-    // so re-warm anyway: iOS interruptions routinely kill the track while the
-    // page is hidden, and this is what re-engages it on return.
-    if (micEverGranted) ensureAudio().catch(() => {});
+    // iOS. If this device held the mic before (micEverGranted persists as the
+    // micGranted settings field, so PWA relaunches count), re-acquiring is
+    // prompt-free — re-warm anyway: iOS interruptions routinely kill the
+    // track while the page is hidden, and this is what re-engages it.
+    if (micEverGranted) warmWithRetry(0);
+  }
+
+  // iOS hands the audio session back late after foregrounding: a getUserMedia
+  // issued immediately on return can fail and then succeed moments later. A
+  // single silent attempt leaves a cold mic until the next manual press, so
+  // retry on a short backoff before giving up (loudly).
+  let warmRetryTimer = null;
+  function warmWithRetry(attempt) {
+    if (recording || stopping) return;
+    if (warmRetryTimer) { clearTimeout(warmRetryTimer); warmRetryTimer = null; }
+    ensureAudio().catch(() => {
+      if (attempt >= 2) {
+        if (micEverGranted) setStatus("Microphone did not re-engage after returning — tap Start and it will reconnect.", "warn");
+        return;
+      }
+      warmRetryTimer = setTimeout(() => {
+        warmRetryTimer = null;
+        if (document.visibilityState === "visible") warmWithRetry(attempt + 1);
+      }, attempt === 0 ? 700 : 2000);
+    });
   }
 
   /* ───── Stream Audio & Run WebSocket Session ───── */
@@ -3457,6 +3499,12 @@ right lower quadrant"></textarea>
     } else {
       tryWarmOnLoad();
     }
+  });
+
+  // Standalone PWAs (iOS home-screen installs) sometimes fire only focus —
+  // not visibilitychange — when switching back from another app.
+  window.addEventListener("focus", () => {
+    if (!recording && !stopping && !audioGraphHealthy()) tryWarmOnLoad();
   });
 
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {

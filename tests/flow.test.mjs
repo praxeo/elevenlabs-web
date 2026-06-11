@@ -1213,6 +1213,7 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   const track23 = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
   const stream23 = { getAudioTracks: () => [track23], getTracks: () => [track23] };
   let gum23 = 0;
+  let gumFail23 = 0; // make the next N acquisitions fail (iOS hands the audio session back late)
   let w23;
   const dom23 = new JSDOM(html, {
     runScripts: 'dangerously', url: 'https://dictation.test/',
@@ -1226,7 +1227,7 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
       // NOTE: no win.navigator.permissions — like iOS Safari for the mic
       // jsdom reports visibilityState 'prerender'; the re-warm only runs when visible
       Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
-      win.navigator.mediaDevices = { getUserMedia: () => { gum23++; track23.readyState = 'live'; track23.muted = false; return Promise.resolve(stream23); }, addEventListener: () => {} };
+      win.navigator.mediaDevices = { getUserMedia: () => { gum23++; if (gumFail23 > 0) { gumFail23--; return Promise.reject(new Error('NotReadableError')); } track23.readyState = 'live'; track23.muted = false; return Promise.resolve(stream23); }, addEventListener: () => {} };
       win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Warm note."}') });
       win.MediaRecorder = class {
         constructor(s) { this.state = 'inactive'; }
@@ -1251,6 +1252,49 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   doc23.dispatchEvent(new dom23.window.Event('visibilitychange'));
   await sleep(80);
   check('s23c: visibility re-warm re-engages the mic without the Permissions API', gum23 === 2, gum23);
+
+  // iOS hands the audio session back late: the first re-acquire fails, the
+  // backoff retry must recover without any user action.
+  gumFail23 = 1;
+  track23.readyState = 'ended';
+  doc23.dispatchEvent(new dom23.window.Event('visibilitychange'));
+  await sleep(80);
+  check('s23c: flaky first re-acquire attempted', gum23 === 3, gum23);
+  await sleep(900); // > 700ms retry backoff
+  check('s23c: re-warm retries and recovers on its own', gum23 === 4, gum23);
+
+  // Standalone PWAs can fire only focus (no visibilitychange) on app switch
+  track23.readyState = 'ended';
+  dom23.window.dispatchEvent(new dom23.window.Event('focus'));
+  await sleep(80);
+  check('s23c: window focus re-engages a dead mic', gum23 === 5, gum23);
+}
+
+// Leg D (fresh DOM): the grant persists, so a killed-and-relaunched iOS PWA
+// re-warms the mic at boot instead of staying cold until the first press.
+{
+  const track23d = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+  const stream23d = { getAudioTracks: () => [track23d], getTracks: () => [track23d] };
+  let gum23d = 0;
+  const dom23d = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => Promise.resolve() };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      // no Permissions API (iOS Safari); the persisted grant is the only signal
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.mediaDevices = { getUserMedia: () => { gum23d++; return Promise.resolve(stream23d); }, addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.WebSocket = MockWS;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true }));
+    },
+  });
+  await sleep(150);
+  check('s23d: persisted grant re-warms the mic at boot after a PWA relaunch', gum23d === 1, gum23d);
 }
 
 // ===== Scenario 24: QR join =====

@@ -606,6 +606,70 @@ const INDEX_HTML = `<!doctype html>
       details.help { margin-top: 8px; }
       .status { margin-top: 6px; }
     }
+    /* Big-button dictation layout. Active only while body carries .bigbtn
+       (joined to a desktop session, or forced by the per-device override) —
+       NEVER keyed on screen size. Additive: a fixed overlay above the normal
+       page, so the desktop layout and its tiny-window compactness rules above
+       are untouched. */
+    #bigUi, #bigReturnBtn { display: none; }
+    body.bigbtn main > h1, body.bigbtn main > .grid { display: none; }
+    body.bigbtn #bigUi {
+      display: flex; flex-direction: column; position: fixed; inset: 0;
+      z-index: 40; padding: 14px; gap: 10px; align-items: center;
+      background: var(--bg); transition: background-color 0.25s;
+    }
+    body.bigbtn.bigbtn-settings #bigUi { display: none; }
+    body.bigbtn.bigbtn-settings main > .grid { display: grid; }
+    body.bigbtn.bigbtn-settings #bigReturnBtn {
+      display: block; position: fixed; right: 12px; bottom: 12px; z-index: 41;
+      background: #0c4a6e; border-color: #0369a1; font-weight: 600;
+    }
+    #bigTopRow { width: 100%; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
+    #bigJoinedBadge { font-family: monospace; letter-spacing: 2px; color: var(--accent); font-size: 14px; flex: 1 1 auto; }
+    #bigCenter {
+      flex: 1 1 auto; min-height: 0; width: 100%; display: flex;
+      flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    }
+    #bigState { font-size: 30px; font-weight: 800; letter-spacing: 2px; min-height: 36px; text-align: center; }
+    #bigBtn {
+      width: min(64vw, 52vh); height: min(64vw, 52vh); border-radius: 50%;
+      font-size: 20px; font-weight: 700; letter-spacing: 1px;
+      border: 6px solid var(--line); background: var(--panel); color: var(--text);
+      touch-action: none; user-select: none; -webkit-user-select: none;
+      -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    }
+    #bigHint { font-size: 12px; color: var(--muted); }
+    #bigStatus {
+      font-size: 14px; color: var(--text); text-align: center;
+      min-height: 18px; max-height: 18vh; overflow: auto; white-space: pre-wrap;
+    }
+    #bigPeek {
+      flex: 0 0 auto; width: 100%; background: var(--panel2);
+      border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
+    }
+    #bigPeek.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    #bigPeekBar { padding: 8px 12px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; -webkit-user-select: none; }
+    #bigPeekText { padding: 0 12px 8px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 20px; }
+    #bigPeek.expanded #bigPeekText { white-space: pre-wrap; overflow: auto; text-overflow: clip; max-height: 38vh; cursor: pointer; }
+    /* Whole-screen status: the overlay background IS the at-arm's-length
+       indicator, derived from the same transitions that drive the pills. */
+    body.bigbtn #bigUi[data-screen="connecting"] { background: #3d3008; }
+    body.bigbtn #bigUi[data-screen="rec"]        { background: #420d0d; }
+    body.bigbtn #bigUi[data-screen="busy"]       { background: #3d3008; }
+    body.bigbtn #bigUi[data-screen="ok"]         { background: #14532d; animation: bigFlash 0.7s ease-out; }
+    body.bigbtn #bigUi[data-screen="warn"]       { background: #78350f; }
+    body.bigbtn #bigUi[data-screen="fail"]       { background: #7f1d1d; }
+    body.bigbtn #bigUi[data-screen="alarm"]      { background: #7f1d1d; animation: bigAlarm 0.5s linear infinite alternate; }
+    #bigUi[data-screen="rec"] #bigBtn        { border-color: #ef4444; background: #b91c1c; color: #fff; animation: bigPulse 1.2s ease-in-out infinite; }
+    #bigUi[data-screen="connecting"] #bigBtn { border-color: var(--warn); }
+    #bigUi[data-screen="busy"] #bigBtn       { border-color: var(--warn); }
+    #bigUi[data-screen="ok"] #bigBtn         { border-color: var(--ok); }
+    #bigUi[data-screen="warn"] #bigBtn       { border-color: var(--warn); }
+    #bigUi[data-screen="fail"] #bigBtn       { border-color: var(--danger); }
+    #bigUi[data-screen="alarm"] #bigBtn      { border-color: var(--danger); }
+    @keyframes bigPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); } 50% { box-shadow: 0 0 0 24px rgba(239,68,68,0); } }
+    @keyframes bigFlash { from { background: #22c55e; } }
+    @keyframes bigAlarm { from { background: #7f1d1d; } to { background: #450a0a; } }
   </style>
 </head>
 
@@ -743,6 +807,16 @@ const INDEX_HTML = `<!doctype html>
             <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Joined</span>
             <button id="phoneLeaveBtn" style="display:none;">Leave</button>
           </div>
+
+          <label for="bigButtonMode">Big-button layout (per device)</label>
+          <select id="bigButtonMode">
+            <option value="joined" selected>When joined to a desktop session</option>
+            <option value="always">Always — solo phone dictation</option>
+            <option value="never">Never — e.g. a desktop that joins</option>
+          </select>
+          <div class="hint" style="margin: 6px 0 4px;">
+            Turns this device into a one-button dictation surface. Stored on this device only.
+          </div>
         </div>
       </details>
 
@@ -848,6 +922,27 @@ right lower quadrant"></textarea>
       </div>
     </section>
   </div>
+
+  <!-- Big-button dictation layout: hidden unless body.bigbtn (see CSS).
+       A fixed overlay — the normal page above stays untouched for desktops. -->
+  <div id="bigUi" data-screen="idle">
+    <div id="bigTopRow">
+      <span id="bigJoinedBadge"></span>
+      <button id="bigLeaveBtn">Leave</button>
+      <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
+    </div>
+    <div id="bigCenter">
+      <div id="bigState">READY</div>
+      <button id="bigBtn">HOLD TO TALK</button>
+      <div id="bigHint">hold = push‑to‑talk &middot; tap = start/stop</div>
+      <div id="bigStatus"></div>
+    </div>
+    <div id="bigPeek">
+      <div id="bigPeekBar">Latest transcript — tap to expand</div>
+      <div id="bigPeekText"></div>
+    </div>
+  </div>
+  <button id="bigReturnBtn">&#8592; Back to the button</button>
 </main>
 
 <script>
@@ -938,6 +1033,20 @@ right lower quadrant"></textarea>
   const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
   const phoneLeaveBtnEl  = document.getElementById("phoneLeaveBtn");
 
+  // Big-button dictation layout elements
+  const bigUiEl          = document.getElementById("bigUi");
+  const bigBtnEl         = document.getElementById("bigBtn");
+  const bigStateEl       = document.getElementById("bigState");
+  const bigStatusEl      = document.getElementById("bigStatus");
+  const bigJoinedBadgeEl = document.getElementById("bigJoinedBadge");
+  const bigLeaveBtnEl    = document.getElementById("bigLeaveBtn");
+  const bigSettingsBtnEl = document.getElementById("bigSettingsBtn");
+  const bigReturnBtnEl   = document.getElementById("bigReturnBtn");
+  const bigPeekEl        = document.getElementById("bigPeek");
+  const bigPeekBarEl     = document.getElementById("bigPeekBar");
+  const bigPeekTextEl    = document.getElementById("bigPeekText");
+  const bigButtonModeEl  = document.getElementById("bigButtonMode");
+
   let mediaRecorder = null;
   let chunks = [];
   let recording = false;
@@ -958,6 +1067,7 @@ right lower quadrant"></textarea>
   let userStopped = false;     // distinguishes clean PTT-release from unexpected disconnect
   let stopPhase = null;        // null | "tail" | "awaitFinal"
   let pendingStart = false;    // F13 pressed while previous session was finalizing
+  let pendingStartTimer = null; // armed deferred start from maybePendingStart; cancellable until it fires
   let pendingChunks = [];      // base64 audio captured while the WebSocket is still connecting
   let prerollFrames = [];      // ring of raw idle frames; prepended at start so the first word survives
   let sessionPreviousText = ""; // tail of the note being appended to; rides the first chunk as context
@@ -990,6 +1100,17 @@ right lower quadrant"></textarea>
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
+
+  // Big-button layout state. The screen indicator is DERIVED from the same
+  // transitions that drive the status line and pills (recorded below) — the
+  // layout adds no session machinery of its own.
+  let lastStatusCls     = "";    // class of the most recent setStatus
+  let lastMicPillState  = "off"; // most recent setMicPill state
+  let lastLinkPillState = "idle"; // most recent setLinkPill state
+  let bigBtnEngaged   = false;  // current button press started/queued a dictation
+  let bigBtnDownAt    = 0;
+  let bigBtnPointerId = null;   // owning pointer; other touches are ignored
+  let bigPeekExpanded = false;
 
   // In-app push-to-talk hotkey (F13/F14 via AHK always work in addition)
   const DEFAULT_HOTKEY = { ctrl: true, alt: false, shift: false, meta: false, code: "Space" };
@@ -1060,6 +1181,7 @@ right lower quadrant"></textarea>
   const PHONE_PONG_TIMEOUT_MS   = 90000; // no room traffic for this long = zombie socket; force a reconnect (sized for background-tab timer throttling, ~1 tick/min)
   const PHONE_RECONNECT_MAX_MS  = 15000; // reconnect backoff cap
   const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
+  const RELAY_TIMEOUT_MS        = 10000; // phone->room delivery ack deadline; a hung relay must fail loudly, and the queued next session waits on the ack
 
   // Per-API keyterm caps (the Worker re-enforces these server-side too)
   const REALTIME_KEYTERM_MAX_CHARS = 20;
@@ -1108,14 +1230,21 @@ right lower quadrant"></textarea>
     } catch (e) {}
   }
 
+  // Haptics mirror the beep vocabulary where the device supports it. They
+  // ride inside the beep functions so every call site gets both for free —
+  // a vibration never replaces a sound, it accompanies it.
+  function haptic(pattern) {
+    try { if (navigator.vibrate) navigator.vibrate(pattern); } catch (e) {}
+  }
+
   // Start/done cues respect the checkbox; failure sounds always play.
-  function startBeep() { if (startBeepEl.checked) beep(760, 130); }
-  function doneBeep()  { if (startBeepEl.checked) { beep(1046, 90, 0); beep(1568, 130, 0.10); } }
-  function failBeep()  { beep(300, 280); }
-  function micAlarmBeep() { beep(330, 170, 0); beep(280, 170, 0.22); beep(240, 260, 0.44); }
+  function startBeep() { if (startBeepEl.checked) { beep(760, 130); haptic(30); } }
+  function doneBeep()  { if (startBeepEl.checked) { beep(1046, 90, 0); beep(1568, 130, 0.10); haptic([40, 60, 40]); } }
+  function failBeep()  { beep(300, 280); haptic([220, 90, 220]); }
+  function micAlarmBeep() { beep(330, 170, 0); beep(280, 170, 0.22); beep(240, 260, 0.44); haptic([250, 100, 250, 100, 250]); }
   // Two-tone warn: degraded-but-usable outcomes (e.g. hybrid refine failed,
   // live text delivered instead). Always audible, like failBeep.
-  function warnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); }
+  function warnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); haptic([90, 90, 90]); }
 
   /* ───── Audio Downsampling & Float conversion helpers ───── */
   function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
@@ -1221,35 +1350,43 @@ right lower quadrant"></textarea>
     const cleaned = cleanTranscript(combined);
     latestText = cleaned;
     latestEl.textContent = cleaned;
+    updateBigPeek();
   }
 
   function setStatus(msg, cls) {
     statusEl.className = "status " + (cls || "");
     statusEl.textContent = msg;
+    lastStatusCls = cls || "";
+    updateBigScreen();
   }
 
   function setMicPill(state) {
     // state: "off" | "ready" | "rec" | "fail"
+    lastMicPillState = state;
     if (state === "rec")        { micPillEl.textContent = "REC";       micPillEl.className = "pill rec"; }
     else if (state === "ready") { micPillEl.textContent = "mic ready"; micPillEl.className = "pill ok"; }
     else if (state === "fail")  { micPillEl.textContent = "MIC FAIL";  micPillEl.className = "pill fail"; }
     else                        { micPillEl.textContent = "mic off";   micPillEl.className = "pill"; }
+    updateBigScreen();
   }
 
   function setLinkPill(state) {
     // state: "idle" | "connecting" | "live" | "fail" | "uploading" | "refining"
+    lastLinkPillState = state;
     if (state === "live")            { linkPillEl.textContent = "LIVE";        linkPillEl.className = "pill live"; }
     else if (state === "connecting") { linkPillEl.textContent = "connecting…"; linkPillEl.className = "pill warn"; }
     else if (state === "uploading")  { linkPillEl.textContent = "uploading…";  linkPillEl.className = "pill warn"; }
     else if (state === "refining")   { linkPillEl.textContent = "refining…";   linkPillEl.className = "pill warn"; }
     else if (state === "fail")       { linkPillEl.textContent = "LINK FAIL";   linkPillEl.className = "pill fail"; }
     else                             { linkPillEl.textContent = "link idle";   linkPillEl.className = "pill"; }
+    updateBigScreen();
   }
 
   function updateAppendChip() {
     const hasText = Boolean(latestText && latestText.trim());
     if (!hasText) appendArmed = false; // nothing left to append to
     latestEl.classList.toggle("armed", appendArmed && !recording);
+    updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
     if (!hasText || recording) {
       appendChipEl.style.display = "none";
       return;
@@ -1522,6 +1659,10 @@ right lower quadrant"></textarea>
       // iOS has no Permissions API for the mic; persisting the grant is what
       // lets a relaunched PWA re-warm the mic at boot instead of staying cold.
       micGranted:        micEverGranted,
+      // Big-button layout override — a PER-DEVICE setting by design (the
+      // portable/per-device settings split planned in the roadmap): a phone
+      // forced to "always" must not drag a desktop sharing its profile along.
+      bigButtonMode:     bigButtonModeEl ? bigButtonModeEl.value : "joined",
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
@@ -1583,6 +1724,9 @@ right lower quadrant"></textarea>
       if (typeof s.joinedSessionCode === "string") joinedSessionCode = s.joinedSessionCode;
       if (typeof s.lastDeliveryId    === "string") lastDeliveryId    = s.lastDeliveryId;
       if (s.micGranted === true) micEverGranted = true;
+      if (bigButtonModeEl && (s.bigButtonMode === "joined" || s.bigButtonMode === "always" || s.bigButtonMode === "never")) {
+        bigButtonModeEl.value = s.bigButtonMode;
+      }
 
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
@@ -2102,11 +2246,16 @@ right lower quadrant"></textarea>
     if (recording || stopping || finishing) return;
     stopRequested = false;
     pendingStart = false;
+    // A direct start supersedes any armed queued start (the timer would no-op
+    // against recording=true anyway, but a dead handle must not linger where
+    // the release guards read it).
+    if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
     const apiKey = apiKeyEl.value.trim();
     if (!apiKey && !(SHARED_MODE && passphraseEl.value.trim())) {
       await writeSentinel();
       if (authSectionEl) authSectionEl.open = true; // surface the collapsed credentials box
+      setBigSettingsVisible(true); // the big-button layout hides it otherwise
       if (SHARED_MODE) {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
@@ -2478,6 +2627,12 @@ right lower quadrant"></textarea>
     sessionFinalized = true;
     clearSessionTimers();
 
+    // Set BEFORE the button/pill updates below: those trigger the big-screen
+    // recalc, and with finishing already true it renders WORKING… through the
+    // delivery awaits instead of a stale (possibly green) status — an error
+    // path must never flash the success screen.
+    finishing = true; // cleared in deliverFinalText — the single delivery exit
+
     recording = false;
     stopping = false;
     stopPhase = null;
@@ -2501,7 +2656,6 @@ right lower quadrant"></textarea>
     }
 
     lastFinalizeAt = Date.now();
-    finishing = true; // cleared in deliverFinalText — the single delivery exit
 
     if (sessionEngine === "batch") {
       await finishBatchSession(unexpected);
@@ -2643,7 +2797,6 @@ right lower quadrant"></textarea>
   //   liveText      — hybrid only: realtime rendering saved alongside for comparison
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
-    finishing = false;
     releaseWakeLock(); // the screen may sleep again once the outcome is delivered
     const label = opts.label || "Live transcript";
 
@@ -2654,16 +2807,24 @@ right lower quadrant"></textarea>
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic.", "err");
       } else {
-        setStatus("No speech detected.", "warn");
+        // The sentinel is on the clipboard and the fail beep plays — this IS
+        // a failure outcome and must read as one everywhere (incl. the
+        // big-button screen), even when the cause is just an accidental tap.
+        setStatus("No speech detected — nothing transcribed; sentinel copied.", "err");
       }
       failBeep();
+      finishing = false;
+      updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
       updateAppendChip();
       maybePendingStart();
       return;
     }
 
-    // Save final clean output to browser storage
-    addHistory(cleaned, { language_code: "en", engine: sessionEngine, liveText: opts.liveText });
+    // Save final clean output to browser storage. A storage failure (quota)
+    // must not block the actual deliverable — the clipboard write and beep.
+    try {
+      addHistory(cleaned, { language_code: "en", engine: sessionEngine, liveText: opts.liveText });
+    } catch (e) {}
 
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
@@ -2696,15 +2857,20 @@ right lower quadrant"></textarea>
       }
     }
 
+    finishing = false;
+    updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
     updateAppendChip();
-    maybePendingStart();
 
     // If this device is acting as a phone mic for a desktop session, relay the
     // authoritative final text so the desktop can deliver it to the clipboard.
     // The room acks with its listener count — a relay nobody received must be
-    // loud here, never a false success.
+    // loud here, never a false success. A queued next session waits for the
+    // ack: its REC screen must not paint over a relay failure before the
+    // failure was ever shown.
     if (joinedSessionCode && cleaned.trim()) {
-      relayDeliveryToDesktop(cleaned);
+      relayDeliveryToDesktop(cleaned).finally(maybePendingStart);
+    } else {
+      maybePendingStart();
     }
   }
 
@@ -2713,8 +2879,24 @@ right lower quadrant"></textarea>
     // honor it so rapid consecutive dictations are never swallowed.
     if (pendingStart) {
       pendingStart = false;
-      setTimeout(() => { if (!recording && !stopping && !finishing) startRecording(); }, 60);
+      if (pendingStartTimer) clearTimeout(pendingStartTimer);
+      // A failure outcome gets a beat of screen time before the queued
+      // session's REC paints over it — only the failure path pays the delay.
+      const delay = lastStatusCls === "err" ? 1500 : 60;
+      pendingStartTimer = setTimeout(() => {
+        pendingStartTimer = null;
+        if (!recording && !stopping && !finishing) startRecording();
+      }, delay);
     }
+  }
+
+  // A queued start must die when the press that queued it ends without a tap:
+  // a hold released during the finalize/queued window, a cancelled pointer,
+  // or F14 (CapsLock up). Otherwise the deferred startRecording opens a mic
+  // nobody is holding — a silent open mic in a clinical room.
+  function cancelQueuedStart() {
+    pendingStart = false;
+    if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
   }
 
   /* ───── Phone mic session ───── */
@@ -3210,11 +3392,16 @@ right lower quadrant"></textarea>
       delivery_id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
     });
     var listeners = -1;
+    // A black-holed POST must still produce an outcome: without a deadline a
+    // hung relay reports nothing at all (and would stall a queued session).
+    var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var killer = ctrl ? setTimeout(function () { try { ctrl.abort(); } catch (e) {} }, RELAY_TIMEOUT_MS) : null;
     try {
       var res = await fetch("/api/session/" + joinedSessionCode + "/deliver", {
         method: "POST",
         body: payload,
         headers: { "Content-Type": "application/json" },
+        signal: ctrl ? ctrl.signal : undefined,
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
       try { listeners = JSON.parse(await res.text()).listeners; } catch (e) { listeners = -1; }
@@ -3222,12 +3409,174 @@ right lower quadrant"></textarea>
       setStatus("⚠ Desktop relay FAILED — the transcript did NOT reach the desktop clipboard!", "err");
       failBeep();
       return;
+    } finally {
+      if (killer) clearTimeout(killer);
     }
     if (listeners === 0) {
       setStatus("⚠ Desktop link is DOWN — transcript held for replay when it reconnects. VERIFY it lands before pasting!", "err");
       warnBeep();
     }
   }
+
+  /* ───── Big-button dictation layout ─────
+     Active while this device is JOINED to a desktop session (or forced by the
+     per-device override) — activation is the joined state, never the screen
+     size. The button drives the exact same startRecording()/stopRecording()
+     session paths as the record button, with the hotkey's tap/hold semantics;
+     the whole-screen indicator is derived from the existing status/pill
+     transitions. Everything here is additive: the normal layout (and the
+     desktop tiny-window compactness contract) is untouched. */
+  function bigButtonActive() {
+    const mode = bigButtonModeEl ? bigButtonModeEl.value : "joined";
+    if (mode === "never") return false;
+    if (mode === "always") return true;
+    return Boolean(joinedSessionCode);
+  }
+
+  function applyBigButtonUI() {
+    const active = bigButtonActive();
+    document.body.classList.toggle("bigbtn", active);
+    if (!active) {
+      document.body.classList.remove("bigbtn-settings");
+      bigPeekExpanded = false;
+    }
+    if (bigJoinedBadgeEl) {
+      bigJoinedBadgeEl.textContent = joinedSessionCode
+        ? "Joined " + joinedSessionCode
+        : "Not joined — dictating to this device";
+    }
+    if (bigLeaveBtnEl) bigLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
+    updateBigScreen();
+  }
+
+  function setBigSettingsVisible(show) {
+    document.body.classList.toggle("bigbtn-settings", Boolean(show) && bigButtonActive());
+  }
+
+  // Whole-screen state, derived from the SAME transitions that drive the
+  // status line and the mic/link pills — no new state machinery. Because the
+  // deliverable goes to the DESKTOP in joined mode, relay outcomes are part of
+  // the picture automatically: a zero-listener ack or relay failure lands as
+  // an "err" status after the local delivery, turning the screen red even
+  // though the local done beep already played.
+  function updateBigScreen() {
+    if (!bigUiEl) return;
+    let state;
+    if (lastMicPillState === "fail") state = "alarm";
+    else if (recording && !stopping) state = lastLinkPillState === "connecting" ? "connecting" : "rec";
+    else if (stopping || finishing || lastLinkPillState === "uploading" || lastLinkPillState === "refining") state = "busy";
+    else if (lastStatusCls === "err") state = "fail";
+    else if (lastStatusCls === "warn") state = "warn";
+    else if (lastStatusCls === "ok") state = "ok";
+    else state = "idle";
+    bigUiEl.setAttribute("data-screen", state);
+    if (bigStateEl) {
+      // The warn headline must never claim DONE: warn covers both degraded
+      // deliveries AND idle advisories (mic re-warm failed, …) — "CHECK"
+      // points at the status line below without asserting a delivery.
+      bigStateEl.textContent =
+        state === "alarm" ? "⚠ MIC FAIL" :
+        state === "rec" ? "● REC" :
+        state === "connecting" ? "CONNECTING…" :
+        state === "busy" ? "WORKING…" :
+        state === "ok" ? "DONE" :
+        state === "warn" ? "⚠ CHECK" :
+        state === "fail" ? "FAILED" : "READY";
+    }
+    if (bigBtnEl) {
+      bigBtnEl.textContent =
+        (recording && !stopping) ? "STOP" :
+        (stopping || finishing) ? "…" : "HOLD TO TALK";
+    }
+    if (bigStatusEl) bigStatusEl.textContent = statusEl.textContent;
+    updateBigPeek();
+  }
+
+  // The latest transcript collapses to a one-line peek strip; tap to expand.
+  function updateBigPeek() {
+    if (!bigPeekEl) return;
+    bigPeekTextEl.textContent = latestText || "";
+    bigPeekEl.classList.toggle("expanded", bigPeekExpanded);
+    bigPeekEl.classList.toggle("armed", appendArmed && !recording);
+    bigPeekBarEl.textContent = bigPeekExpanded
+      ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
+      : "Latest transcript — tap to expand";
+  }
+
+  // Press/release handling. Pointer capture plus the cancel/lost/document
+  // backstops guarantee that EVERY way a press can end routes through
+  // bigBtnRelease — long-press-and-slide-away or multi-touch must never wedge
+  // the recording state (never-lose-a-dictation, applied to input handling).
+  function bigBtnPress(e) {
+    if (e.preventDefault) e.preventDefault();
+    if (bigBtnPointerId !== null) return; // a second finger never steals the press
+    bigBtnPointerId = e.pointerId !== undefined ? e.pointerId : -1;
+    try { bigBtnEl.setPointerCapture(e.pointerId); } catch (err) {}
+    if (!recording && !stopping && !finishing) {
+      bigBtnEngaged = true;
+      bigBtnDownAt = Date.now();
+      startRecording();
+    } else if (stopping || finishing) {
+      bigBtnEngaged = true;
+      bigBtnDownAt = Date.now();
+      pendingStart = true; // press while finalizing queues the next dictation
+    } else {
+      bigBtnEngaged = false; // second tap: toggle off
+      bigBtnDownAt = 0;
+      stopRecording();
+    }
+  }
+
+  function bigBtnRelease(e) {
+    if (bigBtnPointerId === null) return;
+    if (e && e.pointerId !== undefined && e.pointerId !== bigBtnPointerId) return; // not the owning finger
+    bigBtnPointerId = null;
+    if (!bigBtnEngaged) return;
+    bigBtnEngaged = false;
+    // pointercancel / lostpointercapture mean the real release will NEVER
+    // arrive (gesture takeover, capture loss). Unlike a quick tap, that is a
+    // stop regardless of hold duration — an open mic nobody can release is
+    // never the right interpretation. (If this press toggled an existing
+    // recording off, bigBtnPress already cleared bigBtnEngaged — no re-stop.)
+    const cancelled = Boolean(e && (e.type === "pointercancel" || e.type === "lostpointercapture"));
+    const held = bigBtnDownAt && Date.now() - bigBtnDownAt > HOTKEY_TAP_MS;
+    bigBtnDownAt = 0;
+    if (!held && !cancelled) return; // quick tap: keep recording, next tap stops
+    if (stopping || finishing || pendingStartTimer) { cancelQueuedStart(); return; } // press ended during a finalize/queued window: don't auto-start an unheld mic
+    stopRecording();
+  }
+
+  if (bigBtnEl) {
+    bigBtnEl.addEventListener("pointerdown", bigBtnPress);
+    bigBtnEl.addEventListener("pointerup", bigBtnRelease);
+    bigBtnEl.addEventListener("pointercancel", bigBtnRelease);
+    bigBtnEl.addEventListener("lostpointercapture", bigBtnRelease);
+    // Long-press context menus would swallow the release.
+    bigBtnEl.addEventListener("contextmenu", (e) => e.preventDefault());
+    // Backstop for environments where pointer capture is unavailable: the
+    // release is caught at the document even if the finger slid off the button.
+    document.addEventListener("pointerup", bigBtnRelease);
+    document.addEventListener("pointercancel", bigBtnRelease);
+  }
+
+  if (bigPeekBarEl) bigPeekBarEl.addEventListener("click", () => {
+    bigPeekExpanded = !bigPeekExpanded;
+    updateBigPeek();
+  });
+  if (bigPeekTextEl) bigPeekTextEl.addEventListener("click", () => {
+    if (!bigPeekExpanded) { bigPeekExpanded = true; updateBigPeek(); return; }
+    // Expanded: tapping the text is click-to-append. Forward to the shared
+    // transcript-box handler so the one-shot arm rules live in exactly one place.
+    latestEl.click();
+  });
+
+  if (bigLeaveBtnEl) bigLeaveBtnEl.onclick = () => { if (phoneLeaveBtnEl) phoneLeaveBtnEl.click(); };
+  if (bigSettingsBtnEl) bigSettingsBtnEl.onclick = () => setBigSettingsVisible(true);
+  if (bigReturnBtnEl) bigReturnBtnEl.onclick = () => setBigSettingsVisible(false);
+  if (bigButtonModeEl) bigButtonModeEl.addEventListener("change", () => {
+    saveSettings();
+    applyBigButtonUI();
+  });
 
   /* ───── Controls & Event Listeners ───── */
   recordBtn.onclick = () => {
@@ -3279,6 +3628,7 @@ right lower quadrant"></textarea>
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
     if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
     saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
+    applyBigButtonUI(); // joining flips this device into the big-button layout
     setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
   };
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
@@ -3286,6 +3636,7 @@ right lower quadrant"></textarea>
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
     phoneLeaveBtnEl.style.display = "none";
     saveSettingsNow();
+    applyBigButtonUI(); // leaving reverts to the normal layout (unless the override is "always")
     setStatus("Left the desktop session — dictations stay on this device now.", "ok");
   };
 
@@ -3443,6 +3794,10 @@ right lower quadrant"></textarea>
     if (e.code === "F14") {
       e.preventDefault();
       if (recording || stopRequested) stopRecording();
+      // CapsLock released while a queued start was armed (or still pending a
+      // finalize): a session starting AFTER the last F14 would violate the
+      // contract — and open a mic nobody is holding.
+      else cancelQueuedStart();
       return;
     }
 
@@ -3477,7 +3832,7 @@ right lower quadrant"></textarea>
     const held = hotkeyDownAt && Date.now() - hotkeyDownAt > HOTKEY_TAP_MS;
     hotkeyDownAt = 0;
     if (!held) return; // quick tap: keep recording, next tap stops
-    if (stopping || finishing) { pendingStart = false; return; } // held through a finalize: don't auto-restart
+    if (stopping || finishing || pendingStartTimer) { cancelQueuedStart(); return; } // held through a finalize/queued window: don't auto-start an unheld mic
     stopRecording();
   });
 
@@ -3530,6 +3885,7 @@ right lower quadrant"></textarea>
   updateHotkeyUI();
   restoreLatestFromHistory();
   restorePhoneLink(); // resume/rejoin a persisted phone-link pairing
+  applyBigButtonUI(); // after restorePhoneLink: a persisted/QR join boots straight into the big button
   updateAuthUI();
   if (authSectionEl) authSectionEl.open = !hasAuth(); // collapsed once credentials exist
   renderHistory();

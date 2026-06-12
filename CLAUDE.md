@@ -20,7 +20,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 
 1. **Reliability — never lose a dictation.** Loud failure is the floor, not the ceiling: the next step is durability (IndexedDB dictation journal, crash-safe recovery, phone-side delivery queue). Work that narrows a loss window outranks features; work that widens one — even temporarily, even behind a flag — is rejected.
 2. **Settings portability.** Settings are `localStorage`-scoped: per browser profile, per device, per origin — desktop, phone, and installed PWAs don't share (iOS home-screen PWAs don't even share with Safari). The planned split: **portable** settings (engine, keyterms, append prefs) sync across devices; **per-device** settings (gate thresholds, hotkey, mic tuning) deliberately stay local. Don't entrench new settings in ways that make that split harder — when adding one, note which side it belongs to.
-3. **Mobile-first dictation UI.** The phone is becoming the primary mic; phone-width viewports should get a dedicated layout — one big center push-to-talk button, whole-screen status — instead of the desktop layout squeezed down. The desktop compactness contract below stays unchanged; this is an additional phone-width layout, not a redesign.
+3. **Mobile-first dictation UI.** ✅ Landed as the **big-button layout** (see the Phone link section): activation is the *joined state* (`joinedSessionCode`) or the per-device `bigButtonMode` override — never the screen size. The desktop compactness contract below stays unchanged; the layout is an additive fixed overlay, not a redesign.
 
 ## Repo layout
 
@@ -38,11 +38,11 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
   - Client JS uses string concatenation, not template literals — match that.
 - Settings persist under `localStorage` keys suffixed `_v9` (`scribe_v2_settings_v9`, `scribe_v2_transcripts_v9`, `elevenlabs_api_key_browser_v9`, `scribe_v2_passphrase_v9`). **Bumping the suffix wipes all user settings/history** — add fields to the existing schema instead; only bump on explicit request.
 - `scribe_v2_access_code_v9` is the pre-merge batch app's passphrase key. `loadSettings` **must keep reading it as a fallback** (users at the legacy batch URL still have their code there); writes go to `scribe_v2_passphrase_v9`, and forget/unremember must clear both.
-- **Compactness contract**: the app must stay fully usable in a tiny minimized PWA window. The primary card (engine selector, record button, meter/pills, status, latest transcript) stays always-visible and first in the DOM; credentials live in the Access `<details>` (auto-collapses once `hasAuth()`, reopened by `updateAuthUI` paths on missing/forgotten credentials), checkboxes + hotkey in Options, keyterms and Advanced in their own `<details>`. Put new settings inside those sections, not in always-visible rows.
+- **Compactness contract**: the app must stay fully usable in a tiny minimized PWA window. The primary card (engine selector, record button, meter/pills, status, latest transcript) stays always-visible and first in the DOM; credentials live in the Access `<details>` (auto-collapses once `hasAuth()`, reopened by `updateAuthUI` paths on missing/forgotten credentials), checkboxes + hotkey in Options, keyterms and Advanced in their own `<details>`. Put new settings inside those sections, not in always-visible rows. **The joined-mode big-button layout is additive to this**: `#bigUi` is a fixed overlay (`display:none` without `body.bigbtn`), the primary card keeps its DOM position, and nothing about the tiny-window rules changes when the layout is off — keep it that way.
 
 ## Hard invariants — do not break
 
-- **F13 keydown starts, F14 keydown stops — always, unconditionally.** This is the AutoHotkey contract (CapsLock hold). The configurable in-app hotkey (default Ctrl+Space; tap = toggle, hold > `HOTKEY_TAP_MS` = push-to-talk) is **additive** — it must never replace or shadow F13/F14.
+- **F13 keydown starts, F14 keydown stops — always, unconditionally.** This is the AutoHotkey contract (CapsLock hold). F14 while idle also cancels a queued-but-not-yet-started session (`cancelQueuedStart`) — a session starting *after* the last F14 would violate the contract and open a mic nobody is holding. The configurable in-app hotkey (default Ctrl+Space; tap = toggle, hold > `HOTKEY_TAP_MS` = push-to-talk) is **additive** — it must never replace or shadow F13/F14.
 - **Clipboard sentinel** is exactly `##DICTATION_FAILED##` (AHK/user workflows recognize it).
 - **Beep semantics**: start/done beeps are gated by the checkbox; **failure (`failBeep`), mic-alarm (`micAlarmBeep`) and warn (`warnBeep`) sounds always play**. Beeps reuse the persistent `audioCtx` when running (a fresh `AudioContext` in a background tab starts suspended and is silent — exactly when the cue matters most). A degraded success (hybrid refine failed, live text delivered) gets `warnBeep`, never `doneBeep`.
 - **Exactly one delivery per session.** Every engine's finalize path ends in exactly one `deliverFinalText()` call — one clipboard outcome, one beep. `sessionFinalized` guards finalize; the `finishing` flag spans the async upload/refine phases and serializes sessions: F13/hotkey during it queues via `pendingStart`, never overlaps.
@@ -86,7 +86,7 @@ idle
 
 - Any close we didn't request ⇒ `finalizeSession(true)` ⇒ red status + fail beep (hybrid still refines — recovery — but stays framed as a failure).
 - A 30 ms watchdog (inside the gate meter loop) fires the mic alarm on dead/muted track or RMS flatline (< `FLATLINE_RMS` after 2.5 s), and a warn if speech flows but zero transcripts arrive in 8 s (realtime/hybrid). The mic alarm works in batch mode too (no WS dependency).
-- F13 during finalization or delivery sets `pendingStart`; `maybePendingStart()` starts the next session after `deliverFinalText`.
+- F13 during finalization or delivery sets `pendingStart`; `maybePendingStart()` starts the next session after `deliverFinalText` — via a cancellable `pendingStartTimer` (60 ms; **1.5 s after a failure outcome** so the red screen/status is seen before the next REC paints over it). On the phone-link path the queued start additionally waits for the relay ack (`relayDeliveryToDesktop(...).finally(maybePendingStart)`, deadline `RELAY_TIMEOUT_MS`). **A queued start dies when the press that queued it ends without a tap**: a hold released during the finalize/queued window, a cancelled pointer, or F14 calls `cancelQueuedStart()` — the deferred `startRecording` must never open a mic nobody is holding. `finishing` stays true through the delivery's status/beep branches (cleared just before the relay/queue tail), so the big-screen derivation shows WORKING… across the awaits instead of a stale state.
 - **Click-to-append**: clicking the populated transcript box while idle toggles `appendArmed` — a one-shot "append the next dictation" that beats the append-mode checkbox (off by default) and the window; consumed at session start, cleared whenever the box empties, ignored mid-session and while text is selected. The chip + box border surface the armed state.
 - **Boot restore**: `restoreLatestFromHistory()` puts the newest history entry into the box and adopts its `createdAt` as `lastFinalizeAt`, so the note stays visible across reloads and the append window keeps counting from the real finish time.
 - Trailing partials are part of `latestText` — never discard a partial at shutdown; that is the anti-clipping backstop if the commit reply never comes.
@@ -108,6 +108,7 @@ Resilience contract — every layer of this link fails silently by default; do n
 - **QR join**: the desktop renders a QR of `/?join=<code>` next to the code badge, generated by the embedded encoder (`qrMatrix` — byte mode, EC M, versions 1-6) — **never** an external QR image service, which would leak the code (the link's only credential). The phone's boot path (`restorePhoneLink`) consumes `?join=`, persists the join like a typed code, and scrubs the param from the address bar. Scenario 24 round-trips the rendered SVG through a real decoder (`jsqr`) — keep that test: a QR that renders but doesn't scan is a silent failure.
 - **Pairing survives reloads**: `phoneSessionCode`, `joinedSessionCode`, and `lastDeliveryId` persist as additive `_v9` settings fields; `restorePhoneLink()` (boot, after `loadSettings`) resumes the desktop room / restores the phone's join, so an iOS PWA kill or tab reload cannot break the link. Persisting `lastDeliveryId` is what keeps the room's replay from double-copying across a reload. "End session" / "Leave" must clear the stored codes.
 - **`GET /api/session/<code>/latest`** returns the room's held delivery (within the replay window) for native pollers — `hotkey.ahk`'s optional phone-link poller uses it to write the clipboard with **no browser-focus requirement** (set `PHONE_POLL_URL` + `PHONE_CODE` at the top of the script). The poller baselines the first id it sees (never pastes a pre-existing delivery), dedupes by `delivery_id`, and skips polls while the PTT clipboard handshake is in flight (`BUSY`). Same trust model as the listener WS: the code is the only credential.
+- **Big-button layout (joined devices)**: while `joinedSessionCode` is set (or `bigButtonMode` = "always" — a per-device additive `_v9` field; "never" wins over a join), `body.bigbtn` swaps the page for a fixed overlay: one center push-to-talk button + whole-screen status + transcript peek strip. The button has the hotkey's tap/hold semantics (`HOTKEY_TAP_MS`) and drives the normal `startRecording()`/`stopRecording()`/`pendingStart` paths — never parallel session logic. Input is pointer-events with capture; pointercancel/lostpointercapture/document-level release backstops mean a slide-away or multi-touch can never wedge the recording, and **a `pointercancel`/`lostpointercapture` stops the dictation regardless of hold duration** (the real release can never arrive — an open mic is never the right interpretation; a sub-tap-threshold cancel must NOT convert to toggle mode). The screen state (`updateBigScreen`) is **derived** from the existing `setStatus` class + mic/link pill transitions — the zero-listener "desktop link is DOWN" ack and relay failures land as `err` statuses *after* the local delivery, which is what reddens the screen (the queued next session waits on the relay ack and gives a failure ~1.5 s of screen time — see the session-state section); do not invent separate state for it. The warn headline is "⚠ CHECK", never a DONE claim (warn covers idle advisories too), and the no-speech sentinel outcome is classified `err` so it reads FAILED. Haptics (`haptic()`) live inside the beep functions and mirror them — they must never replace a sound. `applyBigButtonUI()` runs at boot after `restorePhoneLink()` (a persisted or `?join=` boot lands directly in the layout) and on join/leave/override changes.
 
 ## ElevenLabs APIs (as used)
 
@@ -135,7 +136,7 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (24 scenario groups: realtime happy path incl.
+# Full session-flow simulation (25 scenario groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
@@ -145,7 +146,12 @@ node --check /tmp/served.js
 # ack, SessionRoom DO contract incl. GET /latest, phone link persistence:
 # resume/rejoin across reloads, iOS mic resilience: wake lock/muted-track
 # rebuild/Permissions-API-free re-warm, QR join: locally-encoded QR decoded
-# back with jsqr + /?join= auto-join):
+# back with jsqr + /?join= auto-join, big-button layout: join/leave/persisted/
+# QR activation, hold-vs-tap pointer semantics incl. slide-away backstop,
+# sub-threshold pointercancel, multi-touch, queued-start cancellation
+# (release/cancel/F14), screen-state mirror incl. zero-listener + relay-fail
+# redden, finalize-gap busy, sentinel-outcome FAILED, haptic patterns, peek
+# strip, per-device override):
 npm install --no-save jsdom jsqr
 node tests/flow.test.mjs
 ```
@@ -174,6 +180,7 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | `PHONE_PONG_TIMEOUT_MS` | 90000 | No room traffic for this long = zombie socket, force reconnect |
 | `PHONE_RECONNECT_MAX_MS` | 15000 | Room-listener reconnect backoff cap |
 | `PHONE_FALLBACK_GRACE_MS` | 10000 | Wait for `phone_delivery` after `phone_session_end` before live-text fallback |
+| `RELAY_TIMEOUT_MS` | 10000 | Phone→room delivery ack deadline (a hung relay fails loudly; the queued next session waits on the ack) |
 | `DELIVERY_REPLAY_WINDOW_MS` | 120000 | (Worker, top of file) room replays the held delivery to reconnecting listeners |
 
 The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.6 s + final-wait 2.5 s + refine 8 s ≈ 11 s). If you raise the client deadlines, raise it too.

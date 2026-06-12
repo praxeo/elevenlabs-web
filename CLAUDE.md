@@ -14,6 +14,14 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 
 **Prime directive: failures must be loud.** A silent failure means wrong or missing text in a patient chart. Never trade failure visibility for a feature. An error path must never play the success beep or leave a stale clipboard unflagged.
 
+## Status & direction
+
+**Alpha, in real production use** (first external alpha passed June 2026). The README's [Roadmap](README.md#roadmap) is the canonical backlog — keep it updated in the same change as the code. When priorities collide, this is the binding order:
+
+1. **Reliability — never lose a dictation.** Loud failure is the floor, not the ceiling: the next step is durability (IndexedDB dictation journal, crash-safe recovery, phone-side delivery queue). Work that narrows a loss window outranks features; work that widens one — even temporarily, even behind a flag — is rejected.
+2. **Settings portability.** Settings are `localStorage`-scoped: per browser profile, per device, per origin — desktop, phone, and installed PWAs don't share (iOS home-screen PWAs don't even share with Safari). The planned split: **portable** settings (engine, keyterms, append prefs) sync across devices; **per-device** settings (gate thresholds, hotkey, mic tuning) deliberately stay local. Don't entrench new settings in ways that make that split harder — when adding one, note which side it belongs to.
+3. **Mobile-first dictation UI.** The phone is becoming the primary mic; phone-width viewports should get a dedicated layout — one big center push-to-talk button, whole-screen status — instead of the desktop layout squeezed down. The desktop compactness contract below stays unchanged; this is an additional phone-width layout, not a redesign.
+
 ## Repo layout
 
 - `worker.js` — everything: Worker fetch handler (dual-protocol `/api/transcribe`), batch proxy, WebSocket proxy, PWA manifest/icons, and the entire client app embedded in the `INDEX_HTML` template literal.

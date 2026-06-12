@@ -56,8 +56,11 @@
 //      finalize gap renders WORKING, never a stale success; the no-speech
 //      sentinel outcome reads FAILED), haptics mirror the beep patterns,
 //      the peek strip expands + click-to-append works, the normal settings
-//      stay reachable, and the per-device override persists ("never" wins
-//      over a join)
+//      stay reachable, the per-device override persists ("never" wins over
+//      a join), and a joined phone whose local clipboard is denied (iOS: no
+//      write outside a gesture) defers the outcome to the relay ack instead
+//      of a false copy-FAILED — while zero-listener/relay-failure/unjoined
+//      outcomes stay loud failures
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -1412,13 +1415,14 @@ console.log('--- scenario 25: big-button layout ---');
       socks: [], fetches: [], vibes: [], win: null,
       deliverListeners: 1, deliverFail: false, deliverDelayMs: 0,
       batchText: 'Big note.', batchDelayMs: 0,
+      clipFail: false, // simulate iOS denying clipboard writes outside a user gesture
     };
     state.dom = new JSDOM(html, {
       runScripts: 'dangerously', url: (opts && opts.url) || 'https://dictation.test/',
       beforeParse(win) {
         state.win = win;
         win.isSecureContext = true;
-        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.navigator.clipboard = { writeText: (t) => { if (state.clipFail) return Promise.reject(new Error('NotAllowedError')); win._clip = t; return Promise.resolve(); } };
         win.URL.createObjectURL = () => 'blob:mock';
         win.URL.revokeObjectURL = () => {};
         win.AudioContext = MockAudioCtx;
@@ -1729,6 +1733,68 @@ console.log('--- scenario 25: big-button layout ---');
   const D2 = mkBigDom({ settings: { bigButtonMode: 'never', joinedSessionCode: 'XYZ111' } });
   await sleep(100);
   check('s25d: persisted "never" beats a persisted join at boot', !D2.dom.window.document.body.classList.contains('bigbtn'), D2.dom.window.document.body.className);
+
+  // ---- Leg E: joined phone whose LOCAL clipboard is denied (iOS refuses
+  // writes outside a user gesture). The deliverable is the DESKTOP clipboard
+  // via the relay — a denied local copy on an otherwise-clean outcome must
+  // defer to the relay ack, not brand the dictation a false FAILED. ----
+  const E = mkBigDom({ settings: { joinedSessionCode: 'IOSPHN' } });
+  await sleep(100);
+  const dE = E.dom.window.document;
+  const bigBtnE = dE.getElementById('bigBtn');
+  const screenE = () => dE.getElementById('bigUi').getAttribute('data-screen');
+  const statusE = () => dE.getElementById('status').textContent;
+  E.clipFail = true;
+  dE.getElementById('apiKey').value = 'test-key';
+
+  // clean dictation, desktop listening: the relay ack announces the outcome
+  E.batchText = 'Relay note.';
+  const vibesE1 = E.vibes.length;
+  pev(E.win, bigBtnE, 'pointerdown', 1);
+  await sleep(550);
+  pev(E.win, bigBtnE, 'pointerup', 1);
+  await sleep(400);
+  check('s25e: local-copy denial with a live desktop is NOT a failure', !statusE().includes('FAILED'), statusE());
+  check('s25e: relay ack announces the desktop delivery', statusE().includes('Delivered to the desktop'), statusE());
+  check('s25e: screen lands green', screenE() === 'ok', screenE());
+  check('s25e: done haptic closes the dictation', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[40,60,40]', JSON.stringify(E.vibes.slice(vibesE1)));
+  check('s25e: no fail haptic anywhere in the clean flow', !E.vibes.slice(vibesE1).some((v) => JSON.stringify(v) === '[220,90,220]'), JSON.stringify(E.vibes.slice(vibesE1)));
+  check('s25e: phone clipboard genuinely untouched', E.win._clip === undefined, JSON.stringify(E.win._clip));
+
+  // desktop gone: the zero-listener ack stays a loud red failure (no done cue)
+  E.deliverListeners = 0;
+  E.batchText = 'Down note.';
+  const vibesE2 = E.vibes.length;
+  pev(E.win, bigBtnE, 'pointerdown', 2);
+  await sleep(550);
+  pev(E.win, bigBtnE, 'pointerup', 2);
+  await sleep(400);
+  check('s25e: zero-listener ack still fails loudly', statusE().includes('Desktop link is DOWN') && screenE() === 'fail', statusE() + ' / ' + screenE());
+  check('s25e: warn haptic, and never a done cue', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[90,90,90]' && !E.vibes.slice(vibesE2).some((v) => JSON.stringify(v) === '[40,60,40]'), JSON.stringify(E.vibes.slice(vibesE2)));
+  E.deliverListeners = 1;
+
+  // relay hard failure: red + fail cue
+  E.deliverFail = true;
+  E.batchText = 'Failed relay note.';
+  pev(E.win, bigBtnE, 'pointerdown', 3);
+  await sleep(550);
+  pev(E.win, bigBtnE, 'pointerup', 3);
+  await sleep(400);
+  check('s25e: relay failure stays a loud red failure', statusE().includes('Desktop relay FAILED') && screenE() === 'fail', statusE() + ' / ' + screenE());
+  check('s25e: fail haptic closes the relay failure', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes.slice(vibesE2)));
+  E.deliverFail = false;
+
+  // NOT joined: the local clipboard IS the deliverable again — a denied copy
+  // stays the loud failure it always was
+  dE.getElementById('phoneLeaveBtn').click();
+  await sleep(20);
+  E.batchText = 'Solo note.';
+  dE.getElementById('recordBtn').click();
+  await sleep(120);
+  dE.getElementById('recordBtn').click();
+  await sleep(400);
+  check('s25e: unjoined denied copy is still a loud failure', statusE().includes('clipboard copy FAILED') && dE.getElementById('status').className.includes('err'), statusE());
+  check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

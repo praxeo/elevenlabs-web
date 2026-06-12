@@ -12,6 +12,8 @@ The hybrid design in one line: **realtime text is *feedback* ("it's hearing me")
 
 Designed for clinicians dictating into **Cerner running inside Citrix**: push-to-talk via AutoHotkey (CapsLock → F13/F14), clipboard handoff, audio cues so you never have to look at the browser, and *loud* failure notification — the worst outcome this tool can produce is silently wrong or missing text in a chart, and everything in the design bends toward preventing that.
 
+**Status: alpha, in real production use** (first external alpha passed). The priority order for all work, when trade-offs collide: **(1) reliability — never lose a dictation, (2) settings portability between devices, (3) a mobile-first dictation UI.** See the [Roadmap](#roadmap).
+
 **Key features:**
 
 - **Engine selector** — Realtime / Batch / Hybrid, switchable per dictation, persisted per browser. Mode-specific controls show and hide with it.
@@ -22,6 +24,8 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 - **Recovery, not just alarm**: in hybrid mode, if the live link dies mid-dictation, the locally captured audio is still re-transcribed through batch — the dictation is recovered, flagged for verification instead of lost.
 - **Click-to-append**: every dictation is its own note by default; click the transcript box to append the next dictation onto it (one-shot), or enable append mode to chain notes automatically within a time window — in **every** engine. The most recent transcript is restored into the box on load.
 - **Keyword biasing in three tiers**: a deployer-curated standard list that rides every dictation, optional per-clinic preset lists as one-click checkboxes (*Wound care clinic*, *ER shift* — hover to see the terms), and your own custom terms — merged and deduped per dictation (realtime takes up to 50 terms, batch up to 1000; your terms win, then presets, then the standard list when the realtime cap overflows). Presets are edited in `worker.js` and reach every user on deploy.
+- **Phone link** — dictate on your phone, the text lands on the desktop's clipboard: QR-scan pairing (one scan = paired until you leave), live text mirrored to the desktop while you speak, acknowledged delivery with server-side buffering and replay, automatic heartbeat/reconnect with a visible warning when the link is down, and an optional AutoHotkey poller for focus-free clipboard writes on thin clients. See [Phone link](#phone-link--dictate-on-your-phone-paste-on-your-desktop).
+- **iOS hardening** — screen wake lock per dictation, automatic mic re-engagement after app switches and PWA kills (with retries for iOS's late audio-session handback), and pairing + permissions that persist across relaunches.
 - **Compact, tiny-window-first UI**: engine selector, record button, status, and the latest transcript stay on top; credentials (auto-collapse once entered), options, keyterms, and advanced tuning live in collapsible sections.
 - **Installable web app** (PWA manifest) for a standalone window in constrained environments — fully functional even shrunk to a sliver.
 
@@ -34,14 +38,16 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 3. [Choosing an engine](#choosing-an-engine)
 4. [Daily workflow](#daily-workflow)
 5. [Hotkeys & AutoHotkey](#hotkeys--autohotkey)
-6. [Tuning guide — things to adjust](#tuning-guide--things-to-adjust)
-7. [Best practices](#best-practices)
-8. [Failure handling](#failure-handling)
-9. [Append semantics](#append-semantics)
-10. [Notes for pre-merge batch app users](#notes-for-pre-merge-batch-app-users)
-11. [Roadmap](#roadmap)
-12. [Thoughts & open questions](#thoughts--open-questions)
-13. [Troubleshooting](#troubleshooting)
+6. [Phone link — dictate on your phone, paste on your desktop](#phone-link--dictate-on-your-phone-paste-on-your-desktop)
+7. [Tuning guide — things to adjust](#tuning-guide--things-to-adjust)
+8. [Where settings live (and don't)](#where-settings-live-and-dont)
+9. [Best practices](#best-practices)
+10. [Failure handling](#failure-handling)
+11. [Append semantics](#append-semantics)
+12. [Notes for pre-merge batch app users](#notes-for-pre-merge-batch-app-users)
+13. [Roadmap](#roadmap)
+14. [Thoughts & open questions](#thoughts--open-questions)
+15. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -59,6 +65,12 @@ Cloudflare Worker   /api/transcribe — one path, two protocols
   │       └→ ElevenLabs wss …/v1/speech-to-text/realtime  (scribe_v2_realtime, VAD commits)
   └─ POST multipart    → batch proxy (key injection, keyterm scrub)
           └→ ElevenLabs https …/v1/speech-to-text          (scribe_v2)
+
+Cloudflare Worker   /api/session/<code> — phone link (one Durable Object room per session)
+  ├─ WebSocket → desktop listener (live transcript mirror, deliveries, heartbeat pong)
+  ├─ POST /deliver → authoritative final text from the phone (ack = listener count;
+  │                  last delivery buffered 2 min and replayed to reconnecting listeners)
+  └─ GET /latest → held delivery for native pollers (hotkey.ahk's focus-free clipboard)
 ```
 
 Everything lives in **one file, `worker.js`** — the Worker fetch handler, both proxies, and the entire client app embedded as a template literal. No build step, no dependencies, no framework. That is a deliberate constraint: the whole system can be read top to bottom, deployed by pasting into the Cloudflare dashboard, and audited in one sitting.
@@ -68,6 +80,7 @@ Design notes:
 - **The gate's role depends on the engine.** In realtime/hybrid the noise gate only shapes the locally saved audio preview — the feed to Scribe is *not* gated; extraneous-speech rejection is done server-side via the Scribe VAD parameters. In **batch** mode the gate is load-bearing: the post-gate recording is exactly what gets transcribed, like the original batch app.
 - **The hybrid refine hears what realtime heard.** Every 16 kHz PCM frame produced for the stream (pre-roll, while-connecting, live, tail) is also kept in a session buffer, captured at the point of production — so the refine works even if the socket never opened. On release it becomes a WAV and goes through the batch proxy.
 - **One session per dictation.** Pressing PTT again while the previous dictation is finalizing, uploading, or refining queues a new session automatically.
+- **The phone link is acked end-to-end.** The phone's realtime audio rides its normal `/api/transcribe` socket with a `session=<code>` tag; the Worker mirrors transcript frames into the session's Durable Object room for the desktop to display. The *authoritative* text travels separately (`POST /deliver`) and is acknowledged with the room's listener count — so a delivery into an empty room is a loud failure on the phone, never an assumption. The room buffers the last delivery for reconnecting listeners; clients dedupe by delivery id.
 - In **shared mode** the Worker injects the master API key server-side; the browser only ever holds the passphrase.
 
 ## Deployment
@@ -127,6 +140,7 @@ Start/done beeps can be disabled with the checkbox in **Options**; **failure and
 - **link idle / connecting… / LIVE / uploading… / refining… / LINK FAIL** — transcription pipeline state across all engines.
 - **gate open/closed** — local noise gate. Preview-only in realtime/hybrid; **decides what gets transcribed in batch mode** (the hint under the sliders updates per engine).
 - **append chip** (above the transcript) — whether the next dictation appends or starts fresh; appears when you click the box (one-shot append, with a highlighted border) or when append mode is on (with a countdown).
+- **phone session code badge** (Options → Phone mic, desktop side) — clean code = link verified alive by heartbeat; **red ⚠ = dropped, reconnecting** (deliveries are buffered and replayed meanwhile). The same beep vocabulary applies to phone deliveries: success = copied, long low = copy failed/held for refocus, two-tone warn = degraded fallback or link drop.
 
 ## Hotkeys & AutoHotkey
 
@@ -149,7 +163,37 @@ A minimal AHK v1 alternative:
 return
 ```
 
-Keep the dictation tab/window focused until the success beep if you rely on auto-copy — browsers refuse clipboard writes from unfocused pages. (This is a browser security boundary, not a bug to fix; the beep-then-switch habit is the workaround.)
+Keep the dictation tab/window focused until the success beep if you rely on auto-copy — browsers refuse clipboard writes from unfocused pages. (This is a browser security boundary, not a bug to fix; the beep-then-switch habit is the workaround — and the [phone link](#phone-link--dictate-on-your-phone-paste-on-your-desktop) has its own escape hatches: a focus-retry that lands the copy the moment you click back, and an optional AHK poller with no focus requirement at all.)
+
+## Phone link — dictate on your phone, paste on your desktop
+
+For thin clients and locked-down desktops where the browser can't own a decent microphone: the phone does the dictating, the desktop gets the text on its clipboard.
+
+**Pairing (once):**
+
+1. On the desktop, open **Options → Phone mic** → **Start phone session**. A 6-character code and a QR code appear.
+2. On the phone, **scan the QR** with the camera (or open the app, type the code, **Join**). That's it — the pairing persists on *both* sides across page reloads, app switches, and iOS killing the PWA, until you press **End session** (desktop) or **Leave** (phone).
+
+**Dictating:** use the phone exactly as usual — any engine (hybrid recommended). Live text mirrors onto the desktop as you speak; when you release, the final text is delivered to the desktop, copied to its clipboard, and announced with the same success/failure beeps as a local dictation.
+
+**The reliability machinery underneath** (all of it exists because every layer of this link fails silently by default):
+
+- The desktop **heartbeats** the session room and **reconnects automatically** with backoff; a drop flips the code badge to a red ⚠ with a warn beep. A clean badge means the link is genuinely alive — it's verified every 25 s, not assumed.
+- Final texts are **buffered server-side for 2 minutes** and replayed if the desktop was mid-reconnect (or mid-reload) when they arrived. Deliveries carry unique ids, so a replay can never double-copy.
+- The phone is **told whether the desktop actually received** each delivery. A relay miss is a loud red status on the phone — never a false success beep.
+- If the desktop tab isn't focused when text arrives (you're in Cerner/Citrix), the copy is **held and retried automatically on refocus** — red status and fail beep until it lands, so a stale clipboard can't masquerade as a fresh one.
+- If the phone dies before its final delivery, the desktop falls back to the **live text it already mirrored** (after a 10 s grace window), clearly framed as degraded — verify before pasting.
+
+### Focus-free clipboard on the desktop (optional)
+
+If the desktop runs `hotkey.ahk` anyway, set `PHONE_POLL_URL` (your worker URL) and `PHONE_CODE` (the session code) at the top of the script. It polls the session's `GET /latest` endpoint every 2 s and writes new deliveries **straight to the Windows clipboard — no browser focus needed**. It baselines on startup (never pastes a delivery that predates it), dedupes by id, and pauses itself during the CapsLock push-to-talk handshake.
+
+### iPhone notes
+
+- **Turn on Voice Isolation.** While the mic is active, open Control Center → **Mic Mode** → **Voice Isolation**. iOS suppresses background voices at the OS level, before the audio ever reaches the page — by far the most effective fix for ambient speech ending up in notes, and it persists per app.
+- Mic permission, the pairing, and your settings **survive iOS killing the PWA**; the mic re-warms automatically at relaunch and on app-switch returns (with retries — iOS hands the audio session back late after foregrounding).
+- **Hard OS limit:** switching apps *mid-dictation* kills that dictation — iOS revokes the mic the instant a web page is backgrounded. It fails loudly (mic alarm), but finish the press before switching.
+- **Security model:** the 6-character session code is the link's only credential — treat it like a meeting code. Codes are random per session, and the QR is generated locally on the page (no external QR service ever sees it).
 
 ## Tuning guide — things to adjust
 
@@ -205,6 +249,17 @@ The #1 way to widen the voice-vs-room gap is the mic itself (close, low gain, po
 | `MIN_REFINE_BYTES` | 16000 | ~0.5 s of audio; shorter sessions skip the refine. |
 
 `echoCancellation` is currently `true` in `getUserMedia`. For a close-talking headset with no speaker playback, turning it off is a legitimate accuracy experiment — change it in `ensureAudio()`.
+
+## Where settings live (and don't)
+
+Everything — engine choice, keyterms, gate tuning, hotkey, credentials, history, phone-link pairing — persists in **`localStorage`**, which is scoped to *one browser profile on one device on one origin*. The practical consequences, today:
+
+- **Desktop and phone never share settings.** Keyterms you curate on the desktop do not exist on the phone, and vice versa. Set up each device you dictate from.
+- **An installed PWA may not share with the browser.** On desktop Chrome/Edge the installed app shares the browser profile's storage, so settings carry over. **On iOS they do not** — a home-screen PWA has storage completely separate from Safari. If you set up in Safari and then install to the home screen, the PWA starts blank (enter the passphrase/key once there; the QR-join and persistence features work identically in both).
+- **Different browsers / profiles / private windows** are all separate worlds.
+- What *does* travel: keyterm **preset lists** ship inside `worker.js` itself, so editing them and deploying reaches every user and device at next load. (This is the current workaround for shared vocabulary.)
+
+This is the #2 roadmap priority — see [Settings portability](#roadmap). Until then: settings are per-device by design of the web platform, not by choice of this app.
 
 ## Best practices
 
@@ -271,12 +326,33 @@ This app deploys over the original batch app's URL, and your saved settings, API
 - [x] **Three-engine merge**: dual-protocol Worker (WS + POST on `/api/transcribe`), engine selector with per-mode UI, batch engine (post-gate recording, upload-on-release), **hybrid accuracy mode** — realtime feedback + batch re-transcription of the exact streamed audio (incl. pre-roll) as the clipboard deliverable, with WS-death recovery via the refine, degraded-success warn semantics, and per-engine history (`liveText` kept for comparison)
 - [x] **Compact-UI pass**: batch default engine, append-off default with **click-to-append** (one-shot arm by clicking the transcript box), latest transcript restored on load, collapsible Access/Options/Keyterms sections (Access auto-collapses once credentials are set), tiny-window layout for minimized/PWA use
 - [x] **Keyterm presets**: deployer-curated lists in `worker.js` — an always-on standard list plus per-clinic checkbox presets (Wound care clinic, ER shift), injected into the page at serve time, merged client-side with custom terms (custom > presets > standard under the realtime cap), checked state persisted per browser
+- [x] **Phone link**: Durable Object session rooms, live transcript mirroring to the desktop, authoritative final delivery with listener-count acks, heartbeat + auto-reconnect (zombie-socket detection sized for background-tab throttling), 2-minute buffered replay deduped by delivery id, focus-retry clipboard copy, live-text grace fallback, QR-scan pairing (local encoder, decode-verified in tests), pairing persistence across reloads/PWA kills, `GET /latest` + AHK native poller for focus-free clipboard writes
+- [x] **iOS mic resilience**: screen wake lock per dictation, muted-track detection and rebuild (interruptions leave tracks "live" but dead), persisted mic grant (PWA relaunches re-warm at boot), retrying re-warm for iOS's late audio-session handback, focus-event re-warm for standalone PWAs, idle muted-track self-heal
 
-### Next
+### Next — in priority order
 
+**1. Durability: never lose a dictation.** The alpha verdict: the app works, but reliability is the product. Close every remaining window where speech can vanish:
+
+- [ ] **Dictation journal** — persist the captured audio (and session state) to IndexedDB *during* the dictation, marked delivered only after the clipboard/relay succeeds. A tab crash, PWA kill, or browser restart mid-upload/mid-refine then boots into "1 unsent dictation — recover?" with one-tap re-transcription through batch, instead of silence. This subsumes the audio side of every failure mode below it.
 - [ ] **Ride-through WS death in hybrid** — keep capturing after the live link dies and only finalize on release, so the recovered refine covers the *entire* dictation (today capture stops when the session finalizes on close).
+- [ ] **Phone-side delivery queue** — if the room ack says no listener received the text (desktop down longer than the replay window), keep the delivery queued on the phone and re-POST when the link heals, instead of relying on the 2-minute server buffer alone.
+- [ ] **Local failure log** — ring buffer of session outcomes (timings, bytes sent, transcripts received, failure reason, delivery acks) surfaced in the UI, for diagnosing "it failed earlier" reports from the field.
+
+**2. Settings portability.** Settings are per-browser-per-device today (see [Where settings live](#where-settings-live-and-dont)); desktop, phone, and installed PWAs don't share. Candidate design, to be settled before building: split settings into **portable** (engine, keyterms, custom lists, append prefs, beeps) and **per-device** (gate thresholds, hotkey, mic tuning — these *should* stay local); then sync the portable half. Options, cheapest first:
+
+- [ ] **Export/import via QR or code phrase** — the QR plumbing already exists; zero backend.
+- [ ] **KV-backed profiles in shared mode** — passphrase-keyed server-side settings blob; every device with the passphrase pulls the same profile (per-device settings stay local). Plays well with the existing shared-mode trust model.
+- [ ] **Piggyback the phone link** — a paired phone/desktop already share a room; syncing portable settings across an active pair is nearly free once the split exists.
+
+**3. Mobile-first dictation UI.** The phone is becoming the primary microphone (phone link), but it renders the desktop layout shrunk. Replace it on phone-sized viewports with a dedicated dictation surface:
+
+- [ ] **One big push-to-talk button in the middle** — thumb-sized, hold-to-talk and tap-to-toggle (same semantics as the hotkey), with the whole-screen background as the status/recording indicator (idle / armed / REC / delivering / failed) readable at arm's length.
+- [ ] Haptic feedback (`navigator.vibrate`) mirroring the beep vocabulary where supported; transcript and settings behind a swipe/collapse so the button owns the screen.
+- [ ] Keep the existing compact layout on desktop — the compactness contract (usable in a sliver of a window) is unchanged; this is a phone-width layout, not a redesign.
+
+**Also queued (smaller):**
+
 - [ ] **Mic self-test button** — 2-second record-and-meter check producing an explicit pass/fail, for non-developer users who won't read a meter.
-- [ ] **Local failure log** — small ring buffer of session outcomes (start/stop times, bytes sent, transcripts received, failure reason) surfaced in the UI, for diagnosing "it failed earlier" reports.
 - [ ] **Settings presets** — e.g. *Quiet office* / *Shared ward* bundles for the Scribe VAD trio, one click instead of three sliders.
 
 ### Later / ideas
@@ -300,7 +376,8 @@ This app deploys over the original batch app's URL, and your saved settings, API
 - **`commit: true` under `commit_strategy=vad`.** The shutdown path sends a final empty chunk with `commit: true` and then *waits*; even if a future API change ignored the manual commit, the wait-for-quiet + deadline still close the session gracefully. Re-verify against ElevenLabs docs as the realtime API evolves.
 - **Clipboard focus is a hard boundary.** Browsers will not let an unfocused page write the clipboard. Every design here (beeps, sentinel, AHK pacing) routes around that instead of fighting it; a local helper app would be the only true escape hatch.
 - **Cost notes.** Keyterms add ~20 %. Realtime is billed on audio time (the tail and connect buffering add a fraction of a second per dictation). Hybrid adds one batch call per dictation on top — the price of the accuracy win; pick Realtime or Batch when that trade isn't worth it.
-- **Settings live in `localStorage` v9 keys.** Bumping the version string wipes every user's tuned thresholds and saved keys — treat key names (including the legacy `scribe_v2_access_code_v9` fallback) as part of the public contract.
+- **Settings live in `localStorage` v9 keys.** Bumping the version string wipes every user's tuned thresholds and saved keys — treat key names (including the legacy `scribe_v2_access_code_v9` fallback) as part of the public contract. The per-device scoping this implies is the app's biggest UX rough edge today — see [Where settings live](#where-settings-live-and-dont) and roadmap priority #2.
+- **The phone is becoming the primary microphone.** The phone link started as a thin-client workaround and alpha use is pulling it toward being the default capture path — which is what motivates roadmap priority #3 (a phone-width layout that is a dictation *device*, not a shrunken settings page). The desktop increasingly acts as a receiver: display, clipboard, AHK relay.
 
 ## Troubleshooting
 
@@ -317,4 +394,8 @@ This app deploys over the original batch app's URL, and your saved settings, API
 | Nothing transcribes in batch mode | The gate never opened (recording too short/empty → sentinel). Watch the gate pill while speaking; retune the thresholds. |
 | Success beep but paste shows `##DICTATION_FAILED##` | The previous dictation failed and left the sentinel; the beep belongs to a newer one. Use the history panel. |
 | Nothing transcribes, *LINK FAIL* | Worker can't reach ElevenLabs or the key/passphrase is wrong — the status line shows the upstream error. |
-| No beeps in the background | Beeps reuse the live audio context precisely for this; if the mic was never warmed, there is no running context — warm the mic first (open the app once). |
+| No beeps in the background | Beeps reuse the live audio context precisely for this; if the mic was never warmed, there is no running context — warm the mic first (open the app once). On a phone-link desktop (which never records), the beep context is warmed by the Start-session click — after a reload, click the page once. |
+| Phone dictation never reaches the desktop | Check the desktop code badge: **⚠ = reconnecting** (self-heals; deliveries are buffered 2 min and replayed). If the phone showed "desktop link is DOWN", the desktop was offline past the buffer — the text is still in the phone's box and history. |
+| Desktop shows the text but the paste is stale | The tab wasn't focused when the copy ran. Click the browser window once — the held copy lands automatically and the status goes green. For a permanent fix on thin clients, use the AHK poller (`PHONE_POLL_URL`/`PHONE_CODE` in `hotkey.ahk`). |
+| Background voices in the notes (phone) | iOS Control Center → Mic Mode → **Voice Isolation** (the OS-level fix), then raise the **Scribe noise filter** for the live feed. Remember: in hybrid, the clipboard text comes from the batch refine, which hears the ungated mic — Voice Isolation is the lever that cleans it. |
+| iPhone mic cold after reopening the app | It re-warms automatically (boot, visibility, focus — with retries). If the warn status says it couldn't re-engage, tap Start once: acquisition inside a tap always works. Switching apps *mid-dictation* kills that dictation — OS limit, not recoverable. |

@@ -2826,9 +2826,23 @@ right lower quadrant"></textarea>
       addHistory(cleaned, { language_code: "en", engine: sessionEngine, liveText: opts.liveText });
     } catch (e) {}
 
+    let announceRelayOutcome = false; // joined + clean outcome + local copy denied: the relay ack owns the outcome cue
+
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
-      if (!copied) {
+      const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
+      const cleanOutcome = !opts.unexpected && !micAlarmFired && !opts.refineFailed;
+      if (!copied && relayCarries && cleanOutcome) {
+        // Joined mode: the deliverable is the DESKTOP clipboard via the
+        // relay. iOS denies local clipboard writes outside a user gesture —
+        // by delivery time (post upload/refine) there is none — which would
+        // brand every successful relay delivery a failure here. The local
+        // copy is best-effort; defer the outcome cue to the relay ack below
+        // (done on a listener ack, red warn/fail on zero-listeners/relay
+        // failure). Exactly one outcome beep either way.
+        announceRelayOutcome = true;
+        setStatus("Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)", "warn");
+      } else if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
         failBeep();
       } else if (opts.unexpected) {
@@ -2868,7 +2882,7 @@ right lower quadrant"></textarea>
     // ack: its REC screen must not paint over a relay failure before the
     // failure was ever shown.
     if (joinedSessionCode && cleaned.trim()) {
-      relayDeliveryToDesktop(cleaned).finally(maybePendingStart);
+      relayDeliveryToDesktop(cleaned, announceRelayOutcome).finally(maybePendingStart);
     } else {
       maybePendingStart();
     }
@@ -3385,7 +3399,9 @@ right lower quadrant"></textarea>
   // The room buffers the last delivery for reconnecting listeners, so a
   // zero-listener ack means "held for replay", not "gone" — but the desktop
   // does not have the text yet and the user must hear that.
-  async function relayDeliveryToDesktop(text) {
+  // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
+  // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
+  async function relayDeliveryToDesktop(text, announceOutcome) {
     var payload = JSON.stringify({
       message_type: "phone_delivery",
       text: text,
@@ -3415,6 +3431,11 @@ right lower quadrant"></textarea>
     if (listeners === 0) {
       setStatus("⚠ Desktop link is DOWN — transcript held for replay when it reconnects. VERIFY it lands before pasting!", "err");
       warnBeep();
+    } else if (announceOutcome) {
+      // The deferred outcome cue: the desktop received it — this is the
+      // dictation's success moment.
+      setStatus("Delivered to the desktop clipboard. Done!", "ok");
+      doneBeep();
     }
   }
 

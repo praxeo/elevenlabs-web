@@ -25,6 +25,7 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 - **Click-to-append**: every dictation is its own note by default; click the transcript box to append the next dictation onto it (one-shot), or enable append mode to chain notes automatically within a time window — in **every** engine. The most recent transcript is restored into the box on load.
 - **Keyword biasing in three tiers**: a deployer-curated standard list that rides every dictation, optional per-clinic preset lists as one-click checkboxes (*Wound care clinic*, *ER shift* — hover to see the terms), and your own custom terms — merged and deduped per dictation (realtime takes up to 50 terms, batch up to 1000; your terms win, then presets, then the standard list when the realtime cap overflows). Presets are edited in `worker.js` and reach every user on deploy.
 - **Phone link** — dictate on your phone, the text lands on the desktop's clipboard: QR-scan pairing (one scan = paired until you leave), live text mirrored to the desktop while you speak, acknowledged delivery with server-side buffering and replay, automatic heartbeat/reconnect with a visible warning when the link is down, and an optional AutoHotkey poller for focus-free clipboard writes on thin clients. See [Phone link](#phone-link--dictate-on-your-phone-paste-on-your-desktop).
+- **Big-button layout on joined devices** — a joined phone stops being a shrunken settings page and becomes a dictation *device*: one thumb-sized push-to-talk button (hold to talk, tap to toggle — the hotkey semantics), the whole screen as the status indicator readable at arm's length (including whether the desktop actually received the text), haptic feedback mirroring the beeps, and the transcript collapsed to a peek strip. Per-device override in Options (when joined / always / never).
 - **iOS hardening** — screen wake lock per dictation, automatic mic re-engagement after app switches and PWA kills (with retries for iOS's late audio-session handback), and pairing + permissions that persist across relaunches.
 - **Compact, tiny-window-first UI**: engine selector, record button, status, and the latest transcript stay on top; credentials (auto-collapse once entered), options, keyterms, and advanced tuning live in collapsible sections.
 - **Installable web app** (PWA manifest) for a standalone window in constrained environments — fully functional even shrunk to a sliver.
@@ -175,6 +176,18 @@ For thin clients and locked-down desktops where the browser can't own a decent m
 2. On the phone, **scan the QR** with the camera (or open the app, type the code, **Join**). That's it — the pairing persists on *both* sides across page reloads, app switches, and iOS killing the PWA, until you press **End session** (desktop) or **Leave** (phone).
 
 **Dictating:** use the phone exactly as usual — any engine (hybrid recommended). Live text mirrors onto the desktop as you speak; when you release, the final text is delivered to the desktop, copied to its clipboard, and announced with the same success/failure beeps as a local dictation.
+
+### The joined phone becomes a big button
+
+The moment a device **joins** a session (typed code or QR scan), it switches to a dedicated dictation layout — and because the pairing persists, a killed-and-relaunched PWA boots straight back into it:
+
+- **One big push-to-talk button** in the center (~⅔ of the screen wide): **hold to talk** (release stops), **quick tap to toggle** start/stop — the same semantics as the desktop hotkey, driving the exact same session machinery underneath.
+- **The whole screen is the status indicator**, readable at arm's length: dark = ready, amber = connecting/working (or a degraded outcome — the headline says ⚠ CHECK, read the status line), deep red + pulsing button = recording, green flash = delivered, **solid red = failed (stays red until your next action)**. A dictation that produced no speech reads FAILED, not done — the failure sentinel is on the clipboard. Because the deliverable goes to the *desktop* in this mode, the relay outcome is part of the indicator — if the desktop link was down when the text was delivered, the screen turns red even though the local success beep already played; a dictation queued behind a failed relay waits ~1.5 s so you see the red before the next recording paints over it.
+- **Haptics mirror the beeps** where the device supports it (start, done, warn, fail, mic-alarm). Vibrations accompany the sounds, never replace them.
+- **The transcript collapses to a peek strip** at the bottom — tap to expand, tap the expanded text to arm click-to-append, exactly like clicking the transcript box on the desktop.
+- The **joined badge and Leave** stay visible at the top; **Settings** opens the normal page (engine selector, credentials, keyterms, tuning — all the existing sections), and "Back to the button" returns.
+
+**Per-device override** (Options → *Big-button layout*): **when joined** (default), **always** (a phone used for solo dictation, no desktop involved), or **never** (e.g. a desktop that joins a session but should keep its normal layout). Stored per device; in the default *when joined* mode, leaving the session restores the normal layout (with *always*, the big button stays — change the override via Settings).
 
 **The reliability machinery underneath** (all of it exists because every layer of this link fails silently by default):
 
@@ -328,6 +341,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 - [x] **Keyterm presets**: deployer-curated lists in `worker.js` — an always-on standard list plus per-clinic checkbox presets (Wound care clinic, ER shift), injected into the page at serve time, merged client-side with custom terms (custom > presets > standard under the realtime cap), checked state persisted per browser
 - [x] **Phone link**: Durable Object session rooms, live transcript mirroring to the desktop, authoritative final delivery with listener-count acks, heartbeat + auto-reconnect (zombie-socket detection sized for background-tab throttling), 2-minute buffered replay deduped by delivery id, focus-retry clipboard copy, live-text grace fallback, QR-scan pairing (local encoder, decode-verified in tests), pairing persistence across reloads/PWA kills, `GET /latest` + AHK native poller for focus-free clipboard writes
 - [x] **iOS mic resilience**: screen wake lock per dictation, muted-track detection and rebuild (interruptions leave tracks "live" but dead), persisted mic grant (PWA relaunches re-warm at boot), retrying re-warm for iOS's late audio-session handback, focus-event re-warm for standalone PWAs, idle muted-track self-heal
+- [x] **Mobile-first big-button layout**: joined devices (and a per-device "always" override) get a dedicated dictation surface — one thumb-sized hold-or-tap push-to-talk button driving the normal session paths, whole-screen status derived from the existing status/pill transitions (relay outcomes included: a zero-listener ack reddens the screen after the local success), haptics mirroring the beep vocabulary, transcript peek strip with click-to-append, settings reachable behind the existing sections; activation is the *joined state*, never the screen size, so the desktop tiny-window contract is untouched
 
 ### Next — in priority order
 
@@ -344,11 +358,10 @@ This app deploys over the original batch app's URL, and your saved settings, API
 - [ ] **KV-backed profiles in shared mode** — passphrase-keyed server-side settings blob; every device with the passphrase pulls the same profile (per-device settings stay local). Plays well with the existing shared-mode trust model.
 - [ ] **Piggyback the phone link** — a paired phone/desktop already share a room; syncing portable settings across an active pair is nearly free once the split exists.
 
-**3. Mobile-first dictation UI.** The phone is becoming the primary microphone (phone link), but it renders the desktop layout shrunk. Replace it on phone-sized viewports with a dedicated dictation surface:
+**3. Mobile-first dictation UI.** ✅ Landed — see [The joined phone becomes a big button](#the-joined-phone-becomes-a-big-button). Remaining polish ideas:
 
-- [ ] **One big push-to-talk button in the middle** — thumb-sized, hold-to-talk and tap-to-toggle (same semantics as the hotkey), with the whole-screen background as the status/recording indicator (idle / armed / REC / delivering / failed) readable at arm's length.
-- [ ] Haptic feedback (`navigator.vibrate`) mirroring the beep vocabulary where supported; transcript and settings behind a swipe/collapse so the button owns the screen.
-- [ ] Keep the existing compact layout on desktop — the compactness contract (usable in a sliver of a window) is unchanged; this is a phone-width layout, not a redesign.
+- [ ] Live partial text on the big screen while dictating (today the peek strip mirrors it; a large-type live readout could replace the state word mid-dictation).
+- [ ] Swipe gestures (swipe up = expand transcript, swipe down = settings) as an alternative to the tap targets.
 
 **Also queued (smaller):**
 

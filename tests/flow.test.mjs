@@ -45,6 +45,19 @@
 //  24. QR join: desktop renders a locally-encoded QR of /?join=<code> that a
 //      real decoder (jsqr) reads back; opening that URL on the phone joins,
 //      persists, and cleans the address bar
+//  25. big-button dictation layout: joining flips it on and Leave reverts,
+//      a persisted join and the /?join= boot path land straight in it, the
+//      button drives the normal session paths with hotkey tap/hold semantics
+//      (slide-away via the document backstop, sub-threshold pointercancel
+//      stops, multi-touch ignored, a queued press cancelled/F14'd/released-
+//      after-delivery never auto-starts an unheld mic), the whole-screen
+//      state mirrors status/pill transitions (zero-listener relay ack and
+//      relay failures redden it — even with a queued tap pending; the
+//      finalize gap renders WORKING, never a stale success; the no-speech
+//      sentinel outcome reads FAILED), haptics mirror the beep patterns,
+//      the peek strip expands + click-to-append works, the normal settings
+//      stay reachable, and the per-device override persists ("never" wins
+//      over a join)
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
@@ -1382,6 +1395,340 @@ console.log('--- scenario 24: QR join ---');
   await sleep(50);
   const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
   check('s24p: scanned join rides the next dictation', !!(scanSock && scanSock.url.includes('session=XYZ234')));
+  // Drain: finalize the abandoned session now so its 5s connect timer cannot
+  // fire in the middle of a later scenario (finalizeSession clears it).
+  if (scanSock) scanSock.serverClose();
+  await sleep(50);
+}
+
+// ===== Scenario 25: big-button dictation layout =====
+console.log('--- scenario 25: big-button layout ---');
+{
+  // Fresh phone-like DOM factory: batch engine (the default — no WS to drive),
+  // controllable upload/deliver latency + deliver failure, and a vibration
+  // spy for the haptic mirror.
+  const mkBigDom = (opts) => {
+    const state = {
+      socks: [], fetches: [], vibes: [], win: null,
+      deliverListeners: 1, deliverFail: false, deliverDelayMs: 0,
+      batchText: 'Big note.', batchDelayMs: 0,
+    };
+    state.dom = new JSDOM(html, {
+      runScripts: 'dangerously', url: (opts && opts.url) || 'https://dictation.test/',
+      beforeParse(win) {
+        state.win = win;
+        win.isSecureContext = true;
+        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock';
+        win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.vibrate = (p) => { state.vibes.push(p); return true; };
+        const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+        const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+        win.navigator.mediaDevices = { getUserMedia: () => { track.readyState = 'live'; return Promise.resolve(stream); }, addEventListener: () => {} };
+        win.fetch = (url, fOpts) => {
+          state.fetches.push({ url: String(url), opts: fOpts || {} });
+          if (String(url).includes('/deliver')) {
+            return new Promise((resolve) => setTimeout(() => resolve({
+              ok: !state.deliverFail, status: state.deliverFail ? 500 : 200,
+              text: () => Promise.resolve('{"ok":true,"listeners":' + state.deliverListeners + '}'),
+            }), state.deliverDelayMs || 0));
+          }
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ok: true, status: 200,
+            text: () => Promise.resolve(JSON.stringify({ text: state.batchText })),
+          }), state.batchDelayMs || 0));
+        };
+        win.MediaRecorder = class {
+          constructor(s) { this.state = 'inactive'; }
+          static isTypeSupported() { return false; }
+          start() { this.state = 'recording'; }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+        };
+        const SockClass = class extends MockWS { constructor(url) { super(url); state.socks.push(this); } };
+        SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+        win.WebSocket = SockClass;
+        if (opts && opts.settings) win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(opts.settings));
+      },
+    });
+    return state;
+  };
+  // jsdom has no PointerEvent; a generic Event with a pointerId rides the
+  // same listeners. setPointerCapture is absent (the code try/catches it),
+  // so every leg runs in the same no-capture regime as capture-less
+  // browsers; the slide-away leg below releases on <body>, so the
+  // document-level backstop is what catches it there.
+  const pev = (win, el, type, id) => {
+    const ev = new win.Event(type, { bubbles: true, cancelable: true });
+    ev.pointerId = id;
+    el.dispatchEvent(ev);
+  };
+
+  // ---- Leg A: joining flips the layout on; Leave reverts ----
+  const A = mkBigDom();
+  await sleep(100);
+  const dA = A.dom.window.document;
+  check('s25a: normal layout before joining', !dA.body.classList.contains('bigbtn'), dA.body.className);
+  dA.getElementById('phoneJoinInput').value = 'BIG123';
+  dA.getElementById('phoneJoinBtn').click();
+  await sleep(20);
+  check('s25a: joining activates the big-button layout', dA.body.classList.contains('bigbtn'), dA.body.className);
+  check('s25a: joined badge shows the code', dA.getElementById('bigJoinedBadge').textContent.includes('BIG123'), dA.getElementById('bigJoinedBadge').textContent);
+  check('s25a: big Leave visible while joined', dA.getElementById('bigLeaveBtn').style.display !== 'none');
+  dA.getElementById('bigLeaveBtn').click();
+  await sleep(20);
+  check('s25a: Leave reverts to the normal layout', !dA.body.classList.contains('bigbtn'), dA.body.className);
+  check('s25a: Leave forgot the persisted join', JSON.parse(A.win.localStorage.getItem('scribe_v2_settings_v9')).joinedSessionCode === '');
+
+  // ---- Leg B: persisted join boots into the big button + button semantics ----
+  const B = mkBigDom({ settings: { joinedSessionCode: 'BIGBOOT', saveApiKey: false } });
+  await sleep(100);
+  const dB = B.dom.window.document;
+  const bigBtnB = dB.getElementById('bigBtn');
+  const screenB = () => dB.getElementById('bigUi').getAttribute('data-screen');
+  const statusB = () => dB.getElementById('status').textContent;
+  check('s25b: persisted join boots straight into the big button', dB.body.classList.contains('bigbtn'), dB.body.className);
+  check('s25b: boot badge shows the restored code', dB.getElementById('bigJoinedBadge').textContent.includes('BIGBOOT'));
+  check('s25b: screen idle at boot', screenB() === 'idle', screenB());
+  dB.getElementById('apiKey').value = 'test-key';
+
+  // hold = push-to-talk: pointerdown starts, pointerup past the threshold stops
+  const vibesAtStart = B.vibes.length;
+  pev(B.win, bigBtnB, 'pointerdown', 1);
+  await sleep(150);
+  check('s25b: pointerdown started the normal session path', dB.getElementById('recordBtn').textContent.includes('Stop'));
+  check('s25b: no parallel session machinery (no WS in batch mode)', B.socks.length === 0, B.socks.length);
+  check('s25b: whole screen shows REC', screenB() === 'rec', screenB());
+  check('s25b: start haptic mirrored the start beep', JSON.stringify(B.vibes[vibesAtStart]) === '30', JSON.stringify(B.vibes.slice(vibesAtStart)));
+  await sleep(450); // total hold > HOTKEY_TAP_MS
+  pev(B.win, bigBtnB, 'pointerup', 1);
+  await sleep(400);
+  check('s25b: hold release stopped + delivered', (B.win._clip || '').includes('Big note.'), JSON.stringify(B.win._clip));
+  check('s25b: success turns the screen green', screenB() === 'ok', screenB());
+  check('s25b: done haptic fired (the done pattern, not just any vibe)', JSON.stringify(B.vibes[B.vibes.length - 1]) === '[40,60,40]', JSON.stringify(B.vibes.slice(vibesAtStart)));
+
+  // tap = toggle: a quick press keeps recording, the next tap stops
+  B.batchText = 'Tap note.';
+  pev(B.win, bigBtnB, 'pointerdown', 2);
+  await sleep(80);
+  pev(B.win, bigBtnB, 'pointerup', 2); // released under the tap threshold
+  await sleep(200);
+  check('s25b: tap keeps the recording running', dB.getElementById('recordBtn').textContent.includes('Stop'));
+  pev(B.win, bigBtnB, 'pointerdown', 3); // second tap stops on press
+  pev(B.win, bigBtnB, 'pointerup', 3);
+  await sleep(400);
+  check('s25b: second tap stopped + delivered', (B.win._clip || '').includes('Tap note.'), JSON.stringify(B.win._clip));
+
+  // pointercancel (browser stole the pointer mid-hold) must behave as release
+  B.batchText = 'Cancel note.';
+  pev(B.win, bigBtnB, 'pointerdown', 4);
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointercancel', 4);
+  await sleep(400);
+  check('s25b: pointercancel never wedges the recording', (B.win._clip || '').includes('Cancel note.'), JSON.stringify(B.win._clip));
+
+  // multi-touch: a second finger neither steals nor releases the press
+  B.batchText = 'Multi note.';
+  pev(B.win, bigBtnB, 'pointerdown', 5);
+  await sleep(100);
+  pev(B.win, bigBtnB, 'pointerdown', 6); // second finger lands
+  pev(B.win, bigBtnB, 'pointerup', 6);   // and lifts
+  await sleep(100);
+  check('s25b: other fingers do not release the press', dB.getElementById('recordBtn').textContent.includes('Stop'));
+  await sleep(350); // owning finger now past the tap threshold
+  pev(B.win, bigBtnB, 'pointerup', 5);
+  await sleep(400);
+  check('s25b: owning finger release stops + delivers', (B.win._clip || '').includes('Multi note.'), JSON.stringify(B.win._clip));
+
+  // peek strip: collapsed mirror, tap to expand, click-to-append from expanded
+  const peekB = dB.getElementById('bigPeek');
+  check('s25b: peek strip mirrors the latest transcript', dB.getElementById('bigPeekText').textContent.includes('Multi note.'), dB.getElementById('bigPeekText').textContent);
+  check('s25b: peek starts collapsed', !peekB.classList.contains('expanded'));
+  dB.getElementById('bigPeekBar').click();
+  check('s25b: tapping the bar expands the peek', peekB.classList.contains('expanded'));
+  dB.getElementById('bigPeekText').click(); // click-to-append via the shared handler
+  check('s25b: expanded text click arms click-to-append', dB.getElementById('appendChip').style.display !== 'none' && peekB.classList.contains('armed'), dB.getElementById('appendChip').textContent);
+  B.batchText = 'Appended.';
+  pev(B.win, bigBtnB, 'pointerdown', 7);
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointerup', 7);
+  await sleep(400);
+  check('s25b: armed dictation appended onto the note', (B.win._clip || '').includes('Multi note.') && (B.win._clip || '').includes('Appended.'), JSON.stringify(B.win._clip));
+
+  // relay outcome is part of the screen: a zero-listener ack reddens it even
+  // though the local delivery already succeeded (and beeped done)
+  B.deliverListeners = 0;
+  B.batchText = 'Down note.';
+  const vibesBeforeDown = B.vibes.length;
+  pev(B.win, bigBtnB, 'pointerdown', 8);
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointerup', 8);
+  await sleep(400);
+  check('s25b: local delivery still landed', (B.win._clip || '').includes('Down note.'), JSON.stringify(B.win._clip));
+  check('s25b: zero-listener ack is loud', statusB().includes('Desktop link is DOWN'), statusB());
+  check('s25b: zero-listener ack reddens the screen', screenB() === 'fail', screenB());
+  check('s25b: warn haptic accompanied the relay warning (warn pattern, not done/fail)', JSON.stringify(B.vibes[B.vibes.length - 1]) === '[90,90,90]', JSON.stringify(B.vibes.slice(vibesBeforeDown)));
+  B.deliverListeners = 1;
+
+  // no-capture slide-away: the finger slides off the button before lifting.
+  // The release lands on <body>, so the button's own listeners never see it —
+  // only the document-level backstop routes it to bigBtnRelease.
+  B.batchText = 'Slide note.';
+  pev(B.win, bigBtnB, 'pointerdown', 9);
+  await sleep(550); // past HOTKEY_TAP_MS
+  pev(B.win, dB.body, 'pointerup', 9); // release off the button
+  await sleep(400);
+  check('s25b: slide-off release caught by the document backstop', (B.win._clip || '').includes('Slide note.'), JSON.stringify(B.win._clip));
+  check('s25b: slide-off release does not wedge the screen in REC', screenB() !== 'rec', screenB());
+  B.batchText = 'After slide.';
+  pev(B.win, bigBtnB, 'pointerdown', 10); // the cleared pointer id must not eat the next press
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointerup', 10);
+  await sleep(400);
+  check('s25b: next press after a slide-off works normally', (B.win._clip || '').includes('After slide.'), JSON.stringify(B.win._clip));
+
+  // pointercancel UNDER the tap threshold: the release will never arrive
+  // (gesture takeover) — it must stop the dictation, not convert it to a
+  // toggle that leaves the mic open.
+  B.batchText = 'Cancelled tap note.';
+  pev(B.win, bigBtnB, 'pointerdown', 11);
+  await sleep(150); // < HOTKEY_TAP_MS
+  pev(B.win, bigBtnB, 'pointercancel', 11);
+  await sleep(400);
+  check('s25b: sub-threshold pointercancel stops the recording', dB.getElementById('recordBtn').textContent.includes('Start'));
+  check('s25b: the cancelled dictation still delivered', (B.win._clip || '').includes('Cancelled tap note.'), JSON.stringify(B.win._clip));
+
+  // a press queued during a finalize, then cancelled, must not auto-start a
+  // session nobody is holding
+  B.batchDelayMs = 400;
+  B.batchText = 'CDF note.';
+  pev(B.win, bigBtnB, 'pointerdown', 12);
+  await sleep(450);
+  pev(B.win, bigBtnB, 'pointerup', 12); // hold release -> slow upload (finishing)
+  await sleep(100);
+  pev(B.win, bigBtnB, 'pointerdown', 13); // queued during the finalize
+  await sleep(100);
+  pev(B.win, bigBtnB, 'pointercancel', 13); // and cancelled before it started
+  B.batchDelayMs = 0;
+  await sleep(600); // delivery + would-be queued start window
+  check('s25b: cancelled queued press never auto-starts', dB.getElementById('recordBtn').textContent.includes('Start'));
+  check('s25b: the slow note still delivered', (B.win._clip || '').includes('CDF note.'), JSON.stringify(B.win._clip));
+
+  // F14 (CapsLock up) while a queued start is pending cancels it — a session
+  // must never start after the last F14
+  B.batchDelayMs = 400;
+  B.batchText = 'F14 note.';
+  pev(B.win, bigBtnB, 'pointerdown', 14);
+  await sleep(450);
+  pev(B.win, bigBtnB, 'pointerup', 14); // slow upload (finishing)
+  await sleep(100);
+  dB.dispatchEvent(new B.win.KeyboardEvent('keydown', { code: 'F13' })); // queue
+  dB.dispatchEvent(new B.win.KeyboardEvent('keydown', { code: 'F14' })); // CapsLock released
+  B.batchDelayMs = 0;
+  await sleep(600);
+  check('s25b: F14 cancels a queued start', dB.getElementById('recordBtn').textContent.includes('Start'));
+  check('s25b: F14-cancelled flow still delivered the note', (B.win._clip || '').includes('F14 note.'), JSON.stringify(B.win._clip));
+
+  // hold-through-delivery ghost: press queued during a finalize, the delivery
+  // lands while the finger is STILL down, the release arrives in the queued-
+  // start window — it must cancel the deferred start, not be erased by it
+  B.batchDelayMs = 400;
+  B.deliverFail = true; // relay failure -> err outcome -> long queued-start window
+  B.batchText = 'Ghost note.';
+  pev(B.win, bigBtnB, 'pointerdown', 15);
+  await sleep(450);
+  pev(B.win, bigBtnB, 'pointerup', 15); // slow upload starts
+  await sleep(100);
+  pev(B.win, bigBtnB, 'pointerdown', 16); // queued; finger stays down through the delivery
+  await sleep(800); // delivery + relay failure land while holding
+  pev(B.win, bigBtnB, 'pointerup', 16); // held release inside the queued-start window
+  await sleep(1800); // past the deferred-start delay
+  check('s25b: hold released after delivery cancels the queued start (no ghost mic)', dB.getElementById('recordBtn').textContent.includes('Start'));
+  check('s25b: ghost-window note still delivered locally', (B.win._clip || '').includes('Ghost note.'), JSON.stringify(B.win._clip));
+  check('s25b: relay failure stayed on screen', screenB() === 'fail', screenB());
+
+  // queued TAP + relay failure: the failure gets screen time BEFORE the
+  // queued session's REC paints over it, and the queued dictation still runs
+  B.batchText = 'Redden note.';
+  pev(B.win, bigBtnB, 'pointerdown', 17);
+  await sleep(450);
+  pev(B.win, bigBtnB, 'pointerup', 17); // slow upload (batchDelayMs still 400)
+  await sleep(100);
+  pev(B.win, bigBtnB, 'pointerdown', 18); // quick tap during the finalize: queue survives release
+  pev(B.win, bigBtnB, 'pointerup', 18);
+  await sleep(700); // delivery + relay failure done; queued start still pending (err delay)
+  check('s25b: relay failure shown before the queued REC repaints', screenB() === 'fail' && dB.getElementById('recordBtn').textContent.includes('Start'), screenB());
+  await sleep(1600); // err-delayed queued start fires
+  check('s25b: queued dictation still starts after the failure beat', dB.getElementById('recordBtn').textContent.includes('Stop'));
+  B.deliverFail = false;
+  B.batchDelayMs = 0;
+  B.batchText = 'After redden.';
+  pev(B.win, bigBtnB, 'pointerdown', 19); // tap stops the queued session
+  pev(B.win, bigBtnB, 'pointerup', 19);
+  await sleep(400);
+  check('s25b: queued session delivered cleanly', (B.win._clip || '').includes('After redden.'), JSON.stringify(B.win._clip));
+
+  // no-speech outcome: the sentinel lands on the clipboard — the big screen
+  // must read as a FAILURE, never as a success-family DONE
+  B.batchText = '';
+  pev(B.win, bigBtnB, 'pointerdown', 20);
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointerup', 20);
+  await sleep(400);
+  check('s25b: no-speech outcome copies the sentinel', B.win._clip === '##DICTATION_FAILED##', JSON.stringify(B.win._clip));
+  check('s25b: sentinel outcome reddens the screen', screenB() === 'fail', screenB());
+  check('s25b: headline never claims DONE on a sentinel outcome', dB.getElementById('bigState').textContent === 'FAILED', dB.getElementById('bigState').textContent);
+  B.batchText = 'Big note.';
+
+  // settings stay reachable behind the existing sections
+  dB.getElementById('bigSettingsBtn').click();
+  check('s25b: Settings reveals the normal layout', dB.body.classList.contains('bigbtn-settings'));
+  check('s25b: settings view CSS reveals the normal grid', html.includes('body.bigbtn.bigbtn-settings main > .grid { display: grid; }'));
+  dB.getElementById('bigReturnBtn').click();
+  check('s25b: Back returns to the button', !dB.body.classList.contains('bigbtn-settings'));
+
+  // per-device override: "never" wins over an active join, and persists
+  dB.getElementById('bigButtonMode').value = 'never';
+  dB.getElementById('bigButtonMode').dispatchEvent(new B.win.Event('change', { bubbles: true }));
+  check('s25b: override "never" wins over the join', !dB.body.classList.contains('bigbtn'), dB.body.className);
+  await sleep(400); // debounced settings save
+  check('s25b: override persisted as an additive v9 field', JSON.parse(B.win.localStorage.getItem('scribe_v2_settings_v9')).bigButtonMode === 'never');
+  dB.getElementById('bigButtonMode').value = 'joined';
+  dB.getElementById('bigButtonMode').dispatchEvent(new B.win.Event('change', { bubbles: true }));
+  check('s25b: back to "joined" restores the layout', dB.body.classList.contains('bigbtn'));
+
+  // realtime unexpected close: the finalize gap must render WORKING…, never a
+  // stale green DONE flash, before the red failure lands
+  dB.getElementById('engRealtime').click();
+  pev(B.win, bigBtnB, 'pointerdown', 21); // quick tap toggles on
+  pev(B.win, bigBtnB, 'pointerup', 21);
+  await sleep(150);
+  const rtSock = B.socks[B.socks.length - 1];
+  rtSock.open();
+  await sleep(30);
+  rtSock.msg({ message_type: 'committed_transcript', text: 'Doomed note.' });
+  rtSock.serverClose(); // dies mid-dictation, no user stop
+  check('s25b: finalize gap renders WORKING, not a stale success', screenB() === 'busy', screenB());
+  await sleep(300);
+  check('s25b: unexpected close lands on the red screen', screenB() === 'fail', screenB());
+  check('s25b: partial still delivered on the unexpected close', (B.win._clip || '').includes('Doomed note.'), JSON.stringify(B.win._clip));
+
+  // ---- Leg C: the QR /?join= boot path lands in the big button ----
+  const C = mkBigDom({ url: 'https://dictation.test/?join=btn789' });
+  await sleep(100);
+  const dC = C.dom.window.document;
+  check('s25c: /?join= boot lands in the big-button layout', dC.body.classList.contains('bigbtn'), dC.body.className);
+  check('s25c: scanned code joined + shown', dC.getElementById('bigJoinedBadge').textContent.includes('BTN789'), dC.getElementById('bigJoinedBadge').textContent);
+
+  // ---- Leg D: override boots — "always" without a join, "never" despite one ----
+  const D1 = mkBigDom({ settings: { bigButtonMode: 'always' } });
+  await sleep(100);
+  const dD1 = D1.dom.window.document;
+  check('s25d: "always" boots into the big button with no join (solo phone)', dD1.body.classList.contains('bigbtn'), dD1.body.className);
+  check('s25d: no Leave button without a join', dD1.getElementById('bigLeaveBtn').style.display === 'none');
+  const D2 = mkBigDom({ settings: { bigButtonMode: 'never', joinedSessionCode: 'XYZ111' } });
+  await sleep(100);
+  check('s25d: persisted "never" beats a persisted join at boot', !D2.dom.window.document.body.classList.contains('bigbtn'), D2.dom.window.document.body.className);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

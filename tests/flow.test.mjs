@@ -243,6 +243,17 @@ doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true
 check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
 check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
 
+// Scribe-filter reset: lever-fiddling must be undoable in one click.
+console.log('--- scribe filter reset ---');
+doc.getElementById('vadSilence').value = '0.3';
+doc.getElementById('vadThreshold').value = '0.9';
+doc.getElementById('minSpeech').value = '1000';
+doc.getElementById('vadResetBtn').click();
+check('reset restores pause limit default', doc.getElementById('vadSilence').value === '2.0', doc.getElementById('vadSilence').value);
+check('reset restores noise filter default', doc.getElementById('vadThreshold').value === '0.55', doc.getElementById('vadThreshold').value);
+check('reset restores click filter default', doc.getElementById('minSpeech').value === '150', doc.getElementById('minSpeech').value);
+check('reset refreshes the slider label', doc.getElementById('vadSilenceVal').textContent.includes('2.0'), doc.getElementById('vadSilenceVal').textContent);
+
 // Scenarios 1–7 exercise the realtime engine and append-mode-on behavior
 // explicitly (both defaults now differ); the engine scenarios below switch
 // modes themselves, and scenario 17 covers the append-off default.

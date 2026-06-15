@@ -224,6 +224,7 @@ If the desktop runs `hotkey.ahk` anyway, set `PHONE_POLL_URL` (your worker URL) 
 | **Scribe pause limit** (`vad_silence_threshold_secs`) | 2.0 s | realtime/hybrid | Raise if segments finalize mid-sentence and grammar suffers; lower for snappier commits on short utterances. |
 | **Scribe noise filter** (`vad_threshold`) | 0.55 | realtime/hybrid | Raise in shared/noisy rooms to reject background speech; lower if soft speech is being missed. |
 | **Scribe click filter** (`min_speech_duration_ms`) | 150 ms | realtime/hybrid | Raise if keyboard clicks / rustles produce stray words; lower if clipped single-word utterances get dropped. |
+| **Reset Scribe filters to defaults** | — | realtime/hybrid | One-click restore of the three Scribe filters above (2.0 s / 0.55 / 150 ms). These persist in `localStorage`, so a round of tuning that hurt accuracy stays in effect until reset — this is how you undo it without clearing site data. |
 | **Gate open/close, high-pass** | 0.030 / 0.008 / 85 Hz | all (load-bearing in batch) | In realtime/hybrid these shape only the saved preview. **In batch mode they decide what gets transcribed** — see the gate tutorial below. |
 | **Tag audio events** | off | batch/hybrid | Batch Scribe can annotate (laughter), (cough), etc. in the text. |
 | **Timestamps** | none | batch/hybrid (word also plumbed for realtime) | Word/character granularity rides the batch API call; currently unused by the UI. |

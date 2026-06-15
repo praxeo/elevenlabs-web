@@ -869,6 +869,8 @@ right lower quadrant"></textarea>
 
             <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
             <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+
+            <button id="vadResetBtn" title="Restore the Scribe Realtime filters to their defaults">Reset Scribe filters to defaults</button>
           </div>
 
           <label class="checkbox">
@@ -1016,6 +1018,7 @@ right lower quadrant"></textarea>
   const presetRowEl       = document.getElementById("presetRow");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
+  const vadResetBtn      = document.getElementById("vadResetBtn");
   const engineSegEl      = document.getElementById("engineSeg");
   const engineHintEl     = document.getElementById("engineHint");
   const vadSectionEl     = document.getElementById("vadSection");
@@ -3689,6 +3692,18 @@ right lower quadrant"></textarea>
     updateHotkeyUI();
     saveSettingsNow();
     setStatus("Hotkey reset to " + hotkeyLabel(hotkey) + ".", "ok");
+  };
+
+  // Restore the three Scribe Realtime filters to the documented defaults so a
+  // round of lever-fiddling can be undone in one click (they otherwise persist
+  // invisibly in localStorage and silently degrade realtime accuracy).
+  vadResetBtn.onclick = () => {
+    vadSilenceEl.value   = "2.0";
+    vadThresholdEl.value = "0.55";
+    minSpeechEl.value    = "150";
+    updateGateLabels();
+    saveSettingsNow();
+    setStatus("Scribe filters reset to defaults (pause 2.0s, noise 0.55, click 150ms).", "ok");
   };
 
   toggleHistoryBtn.onclick = () => {

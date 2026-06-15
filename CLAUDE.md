@@ -46,6 +46,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 - **Clipboard sentinel** is exactly `##DICTATION_FAILED##` (AHK/user workflows recognize it).
 - **Beep semantics**: start/done beeps are gated by the checkbox; **failure (`failBeep`), mic-alarm (`micAlarmBeep`) and warn (`warnBeep`) sounds always play**. Beeps reuse the persistent `audioCtx` when running (a fresh `AudioContext` in a background tab starts suspended and is silent — exactly when the cue matters most). A degraded success (hybrid refine failed, live text delivered) gets `warnBeep`, never `doneBeep`.
 - **Exactly one delivery per session.** Every engine's finalize path ends in exactly one `deliverFinalText()` call — one clipboard outcome, one beep. `sessionFinalized` guards finalize; the `finishing` flag spans the async upload/refine phases and serializes sessions: F13/hotkey during it queues via `pendingStart`, never overlaps.
+- **Re-transcribe is a separate, user-initiated delivery — not a session.** The `retranscribeBtn` re-uploads the *last* dictation's retained audio (`retranscribeBlob`: the ungated WAV in realtime/hybrid, the post-gate webm in batch — set at finalize, cleared at the next session start) through `batchTranscribe` and routes a **success** back through the same `deliverFinalText()` exit (still one clipboard write / one beep / one relay leg, splicing onto `sessionBaseText`). It sets `finishing` to serialize against new sessions. A **failed** re-transcribe must keep the on-screen text — it must never call `deliverFinalText("")` and clobber a real transcript with the sentinel (loud warn/fail status + beep instead). It is the manual, in-memory precursor to the durability journal's one-tap recovery.
 - **STT feed is pre-gate** in realtime/hybrid: Scribe receives raw high-passed audio; the noise gate shapes only the local `MediaRecorder` preview. **In batch mode the gate is load-bearing**: the post-gate recording *is* what gets transcribed, and `MediaRecorder` construction failure is fatal (sentinel + failBeep), not a preview degradation.
 - **`capturePcm` captures each frame exactly once, at production time** (audio pump + pre-roll build) — never in `sendAudioChunk`/`flushPendingChunks`. That is what makes the hybrid refine a recovery path when the socket never opens or dies: the buffer is a superset of what the stream delivered. Keep the pre-roll property too: the ring only ever holds never-sent frames, so prepending cannot double-transcribe.
 - **Shared mode**: the master API key must never reach the browser; the Worker injects it server-side after the constant-time passphrase check (`safeEqual`) — on both the WS and POST paths.
@@ -141,7 +142,9 @@ node --check /tmp/served.js
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/
-# append/no-live-text, click-to-append, keyterm presets, boot shim:
+# append/no-live-text, click-to-append, keyterm presets, re-transcribe
+# (success replaces+copies, failure keeps text, cleared on next session),
+# boot shim:
 # migration/defaults/restore/auth collapse, phone mic session, phone link
 # resilience: reconnect/replay-dedupe/focus-retry/grace-fallback/zero-listener
 # ack, SessionRoom DO contract incl. GET /latest, phone link persistence:

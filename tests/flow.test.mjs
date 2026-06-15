@@ -775,6 +775,42 @@ const ktD = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json
 check('unchecking removes preset terms from the next call', !ktD.includes(p1Term));
 check('always-on terms survive with box empty and nothing checked', alwaysTerms.every((t) => ktD.includes(t)), ktD.length + ' terms');
 
+// ===== Scenario 18b: re-transcribe — re-run the last dictation through the batch model =====
+// Leg D above left a batch dictation with retained audio; the button reuses it.
+console.log('--- scenario 18b: re-transcribe last dictation ---');
+const rtxBtn = doc.getElementById('retranscribeBtn');
+check('re-transcribe button offered after a dictation with audio', rtxBtn.style.display !== 'none', rtxBtn.style.display);
+fetchQueue.push({ status: 200, body: { text: 'Batch-accurate re-transcription.' } });
+rtxBtn.click();
+await sleep(60);
+check('re-transcribed text replaces the box', latest().includes('Batch-accurate re-transcription.'), latest());
+check('re-transcribed text copied', clipboard.includes('Batch-accurate re-transcription.'), JSON.stringify(clipboard));
+check('re-transcribe reports success', status().includes('Re-transcribed') && status().includes('Done'), status());
+check('button stays available to re-run', rtxBtn.style.display !== 'none');
+// A failed re-transcribe must keep the existing text — never clobber a real transcript with the sentinel.
+const rtxTextBeforeFail = latest();
+fetchQueue.push({ status: 500, body: { error: 'batch exploded' } });
+rtxBtn.click();
+await sleep(60);
+check('failed re-transcribe keeps the existing transcript', latest() === rtxTextBeforeFail, latest());
+check('failed re-transcribe is loud', statusCls().includes('err') && status().includes('Re-transcribe FAILED'), status());
+check('re-transcribe failure does not clobber with the sentinel', clipboard !== '##DICTATION_FAILED##', JSON.stringify(clipboard));
+// A new recording points the retry source at the most recent dictation.
+doc.getElementById('engRealtime').click();
+doc.getElementById('recordBtn').click();
+await sleep(80);
+check('re-transcribe button hidden while a new dictation records', rtxBtn.style.display === 'none', rtxBtn.style.display);
+const sRtx = sockets[sockets.length - 1];
+sRtx.open();
+await sleep(30);
+sRtx.msg({ message_type: 'committed_transcript', text: 'New session text.' });
+doc.getElementById('recordBtn').click();
+await sleep(700);
+sRtx.msg({ message_type: 'committed_transcript', text: '' });
+await sleep(500);
+check('re-transcribe button returns after the new dictation finalizes', rtxBtn.style.display !== 'none', rtxBtn.style.display);
+doc.getElementById('engBatch').click(); // restore the engine state later main-DOM scenarios expect
+
 // ===== Scenario 19: phone mic session =====
 console.log('--- scenario 19: phone mic session ---');
 {

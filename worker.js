@@ -713,6 +713,7 @@ const INDEX_HTML = `<!doctype html>
       <div class="row" style="margin-top: 10px;">
         <button id="copyBtn">Copy latest</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+        <button id="retranscribeBtn" style="display:none;" title="Re-run the last dictation's audio through the more accurate batch model (recovery after a failure, or an upgrade when the live text is inaccurate)">Re-transcribe (batch)</button>
       </div>
     </section>
 
@@ -964,6 +965,7 @@ right lower quadrant"></textarea>
   const clearBtn         = document.getElementById("clearBtn");
   const copyBtn          = document.getElementById("copyBtn");
   const freshBtn         = document.getElementById("freshBtn");
+  const retranscribeBtn  = document.getElementById("retranscribeBtn");
   const downloadBtn      = document.getElementById("downloadBtn");
   const downloadAudioBtn = document.getElementById("downloadAudioBtn");
   const toggleHistoryBtn = document.getElementById("toggleHistoryBtn");
@@ -1058,6 +1060,14 @@ right lower quadrant"></textarea>
   let latestText = "";
   let lastAudioBlob = null;
   let lastAudioUrl = null;
+
+  // Re-transcribe source: the last dictation's audio, retained so the user can
+  // re-run it through the accurate batch model — a recovery path after a
+  // failure and an upgrade path when the live realtime text is too inaccurate.
+  // Held until the next session starts; the WAV (hybrid) can be ~24 MB.
+  let retranscribeBlob = null;
+  let retranscribeName = "";
+  let retranscribing = false; // a manual re-transcribe upload is in flight
 
   // Realtime Variables
   let ws = null;
@@ -1420,6 +1430,16 @@ right lower quadrant"></textarea>
       appendChipEl.textContent = "next dictation appends";
       appendChipEl.className = "pill ok";
     }
+  }
+
+  // The re-transcribe button is offered whenever the last dictation left a
+  // usable audio source and nothing is mid-flight. The server gates uploads at
+  // 1 KB, so a sub-1 KB blob (instant tap) is treated as no source.
+  function updateRetranscribeBtn() {
+    if (!retranscribeBtn) return;
+    const usable = retranscribeBlob && retranscribeBlob.size >= 1024;
+    const busy = recording || stopping || finishing || retranscribing;
+    retranscribeBtn.style.display = (usable && !busy) ? "" : "none";
   }
 
   /* ───── Engine selector ───── */
@@ -2303,6 +2323,9 @@ right lower quadrant"></textarea>
     sessionPcm = [];
     sessionPcmBytes = 0;
     sessionPcmTruncated = false;
+    retranscribeBlob = null; // the retry source always points at the most recent dictation
+    retranscribeName = "";
+    updateRetranscribeBtn();
     pendingChunks = buildPrerollChunks(); // first-word rescue: lead with the pre-roll
     firstChunkSent = false;
     lastWsError = "";
@@ -2656,6 +2679,11 @@ right lower quadrant"></textarea>
       if (lastAudioUrl) URL.revokeObjectURL(lastAudioUrl);
       lastAudioUrl = URL.createObjectURL(blob);
       audioPreviewEl.src = lastAudioUrl;
+      // Retain the post-gate webm as a re-transcribe source. It is exactly what
+      // batch mode already transcribes; hybrid upgrades this to the ungated WAV
+      // in refineAndDeliverHybrid below.
+      retranscribeBlob = blob;
+      retranscribeName = (blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
     }
 
     lastFinalizeAt = Date.now();
@@ -2697,6 +2725,10 @@ right lower quadrant"></textarea>
     setStatus("Refining via batch transcription…", "warn");
 
     const wav = buildWavBlob(pcm, 16000);
+    // The ungated WAV is the exact realtime feed — a better re-transcribe
+    // source than the gated webm preview finalizeSession retained.
+    retranscribeBlob = wav;
+    retranscribeName = "recording.wav";
     const r = await batchTranscribe(wav, "recording.wav", REFINE_TIMEOUT_MS);
 
     if (truncated && r.ok && r.text && r.text.trim() && liveCleaned.trim()) {
@@ -2819,6 +2851,7 @@ right lower quadrant"></textarea>
       finishing = false;
       updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
       updateAppendChip();
+      updateRetranscribeBtn(); // a failed dictation is exactly when retry matters
       maybePendingStart();
       return;
     }
@@ -2877,6 +2910,7 @@ right lower quadrant"></textarea>
     finishing = false;
     updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
     updateAppendChip();
+    updateRetranscribeBtn();
 
     // If this device is acting as a phone mic for a desktop session, relay the
     // authoritative final text so the desktop can deliver it to the clipboard.
@@ -3642,6 +3676,49 @@ right lower quadrant"></textarea>
   };
 
   copyBtn.onclick = () => { if (latestText) copyText(latestText); };
+
+  // Re-transcribe: re-run the last dictation's retained audio through the
+  // accurate batch model. Recovery after a failure, and an upgrade when the
+  // live realtime text was too inaccurate. On success it splices onto the same
+  // note base and goes through the single delivery exit (one clipboard write,
+  // one beep, and the relay leg if this device is joined). On failure it keeps
+  // the existing text — never clobbers a real transcript with the sentinel.
+  retranscribeBtn.onclick = async () => {
+    if (!retranscribeBlob || retranscribeBlob.size < 1024) return;
+    if (recording || stopping || finishing || retranscribing) return;
+    retranscribing = true;
+    finishing = true; // serialize against new sessions + show WORKING on the big screen
+    updateRetranscribeBtn();
+    setLinkPill("uploading");
+    setStatus("Re-transcribing the last dictation via the batch model…", "warn");
+
+    const r = await batchTranscribe(retranscribeBlob, retranscribeName, BATCH_UPLOAD_TIMEOUT_MS);
+    retranscribing = false;
+
+    if (r.ok && r.text && r.text.trim()) {
+      finalizedSegments = sessionBaseText ? [sessionBaseText, r.text] : [r.text];
+      currentPartial = "";
+      updateLiveDisplay();
+      setLinkPill("idle");
+      await deliverFinalText(cleanTranscript(latestText), { label: "Re-transcribed transcript" });
+      updateRetranscribeBtn(); // still retryable; deliverFinalText cleared finishing
+      return;
+    }
+
+    // Failure (or genuine no-speech): keep whatever text is already on screen —
+    // re-transcribe must never overwrite a real transcript with the sentinel.
+    finishing = false;
+    setLinkPill("fail");
+    if (r.ok) {
+      setStatus("Re-transcribe returned no text — the existing transcript was kept.", "warn");
+      warnBeep();
+    } else {
+      setStatus("Re-transcribe FAILED — " + (r.error || "upload error") + ". The existing transcript was kept.", "err");
+      failBeep();
+    }
+    updateBigScreen();
+    updateRetranscribeBtn();
+  };
 
   if (phoneStartBtnEl) phoneStartBtnEl.onclick = () => startPhoneSession();
   if (phoneStopBtnEl)  phoneStopBtnEl.onclick  = () => stopPhoneSession();

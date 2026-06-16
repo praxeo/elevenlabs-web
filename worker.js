@@ -1723,6 +1723,22 @@ right lower quadrant"></textarea>
     gateStateEl.className  = isOpen ? "pill open" : "pill";
   }
 
+  // Push-to-talk means speech is imminent the instant you press — so open the
+  // gate immediately at record start instead of waiting for the RMS open
+  // threshold. In batch the post-gate recording IS the transcript, so a gate
+  // that starts closed clips the onset of the first word (and the gate-meter
+  // loop's close-on-silence logic still gates long pauses from here). Pre-gate
+  // engines (realtime/hybrid) are already onset-safe; this also keeps their
+  // saved preview from clipping. Fast ramp so the very first samples are open.
+  function primeGateOpen() {
+    if (!gateNode || !audioCtx) return;
+    const now = audioCtx.currentTime;
+    gateIsOpen = true;
+    gateLastOpen = now;
+    gateNode.gain.setTargetAtTime(1, now, 0.005);
+    setGateStateUI(true);
+  }
+
   /* ───── Storage / Persistence ───── */
   let saveTimer = null;
   function saveSettings() {
@@ -2682,6 +2698,7 @@ right lower quadrant"></textarea>
       mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunks.push(e.data);
       };
+      primeGateOpen(); // PTT: capture the first word's onset in the preview
       mediaRecorder.start();
     }
 
@@ -2733,6 +2750,7 @@ right lower quadrant"></textarea>
       if (sessionFinalized) return;
       finalizeSession(false);
     };
+    primeGateOpen(); // PTT: batch transcribes the post-gate recording — capture the first word's onset
     mediaRecorder.start();
 
     recording = true;

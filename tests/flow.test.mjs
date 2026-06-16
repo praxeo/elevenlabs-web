@@ -457,6 +457,10 @@ doc.getElementById('recordBtn').click();
 await sleep(120);
 check('batch recording started', doc.getElementById('recordBtn').textContent.includes('Stop'));
 check('batch status mentions upload-on-release', status().includes('release to upload'), status());
+// PTT gate priming: the gate opens the instant recording starts (before any
+// audio crosses the RMS threshold) so the first word's onset is not clipped —
+// in batch the post-gate recording IS what gets transcribed.
+check('batch gate primed OPEN at record start (no first-word clip)', doc.getElementById('gateState').textContent === 'OPEN', doc.getElementById('gateState').textContent);
 doc.getElementById('recordBtn').click(); // stop -> recorder flush -> upload
 await sleep(300);
 check('no WebSocket opened in batch mode', sockets.length === sCountBatch, sockets.length - sCountBatch);

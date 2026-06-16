@@ -298,6 +298,10 @@ check('append chip visible + appending', doc.getElementById('appendChip').textCo
 const frames1 = s1.sent.map((d) => JSON.parse(d));
 check('every frame carries sample_rate 16000 + boolean commit', frames1.every((f) => f.sample_rate === 16000 && typeof f.commit === 'boolean'), frames1.length + ' frames');
 check('fresh note sends no previous_text', frames1.every((f) => !('previous_text' in f)));
+// Advanced latency probe: connect (handshake), first word, and finalize (commit ->
+// final words) all populated for a completed realtime session.
+const latRead1 = doc.getElementById('latencyReadout').textContent;
+check('s1: latency readout populated (connect/first-word/finalize)', /^Last realtime:/.test(latRead1) && /connect \d+ms/.test(latRead1) && /first word \d+ms/.test(latRead1) && /finalize \d+ms/.test(latRead1) && /updates/.test(latRead1), latRead1);
 
 // ===== Scenario 2: append within window, then unexpected mid-dictation disconnect =====
 console.log('--- scenario 2: unexpected disconnect ---');

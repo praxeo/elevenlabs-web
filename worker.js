@@ -302,12 +302,17 @@ async function handleTranscribeRealtime(request, env) {
       return returnWsError("Missing Mistral API key configuration");
     }
 
-    // Connect to Mistral's Voxtral realtime STT. Session config (model + the
-    // PCM16/16 kHz audio format) is sent as a session.update frame once the
-    // socket is open — not via query params. The no_verbatim/timestamps/VAD/
-    // keyterms query params the client still sends are ElevenLabs-era and have
-    // no Voxtral realtime equivalent; they are simply not forwarded.
-    const backendResponse = await fetch(MISTRAL_REALTIME_URL, {
+    // Connect to Mistral's Voxtral realtime STT. The model (and the optional
+    // streaming-delay knob) ride the connection URL — Mistral gates the realtime
+    // resource on a valid model at handshake time, so connecting without it
+    // 403s even with a good key. Audio format + model are also (re)sent in the
+    // session.update frame once the socket opens.
+    const backendUrl = new URL(MISTRAL_REALTIME_URL);
+    backendUrl.searchParams.set("model", MISTRAL_REALTIME_MODEL);
+    const streamingDelayParam = url.searchParams.get("target_streaming_delay_ms");
+    if (streamingDelayParam) backendUrl.searchParams.set("target_streaming_delay_ms", streamingDelayParam);
+
+    const backendResponse = await fetch(backendUrl.toString(), {
       headers: {
         "Upgrade": "websocket",
         "Authorization": "Bearer " + apiKey,

@@ -107,6 +107,10 @@ export default {
         headers: {
           "content-type": "application/manifest+json",
           "cache-control": "public, max-age=3600",
+          // Some clinical/proxy middleboxes and extensions 302-redirect static
+          // assets (adding params like ?_sm_byp=…); a redirected fetch is held
+          // to CORS, so advertise it openly to keep the manifest loadable.
+          "access-control-allow-origin": "*",
         },
       });
     }
@@ -120,6 +124,7 @@ export default {
         headers: {
           "content-type": "image/png",
           "cache-control": "public, max-age=86400",
+          "access-control-allow-origin": "*",
         },
       });
     }

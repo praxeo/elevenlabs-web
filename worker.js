@@ -183,20 +183,23 @@ const MISTRAL_REALTIME_URL   = "https://api.mistral.ai/v1/audio/transcriptions/r
 // Client (ElevenLabs frame vocabulary) -> Mistral backend events. The client
 // sends every audio frame through one chokepoint:
 //   {message_type:"input_audio_chunk", audio_base_64, commit, sample_rate, …}
-// Returns the Voxtral frames to forward (append, then commit on the final flush).
-// previous_text / keyterms / VAD params have no Voxtral realtime equivalent and
-// are dropped here (documented limitation — the hybrid refine still applies the
-// full keyterm list to the clipboard deliverable on the ElevenLabs batch leg).
+// Voxtral's wire protocol (per the mistralai SDK): audio rides input_audio.append
+// (base64 in `audio`); the final flush sends input_audio.flush (transcribe what's
+// buffered) then input_audio.end (close the stream so the final transcription.done
+// fires). previous_text / keyterms / VAD params have no Voxtral realtime equivalent
+// and are dropped (documented limitation — the hybrid refine still applies the full
+// keyterm list to the clipboard deliverable on the ElevenLabs batch leg).
 export function voxtralClientToBackend(raw) {
   let m;
   try { m = JSON.parse(raw); } catch { return []; }
   if (!m || m.message_type !== "input_audio_chunk") return [];
   const out = [];
   if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
-    out.push(JSON.stringify({ type: "input_audio_buffer.append", audio: m.audio_base_64 }));
+    out.push(JSON.stringify({ type: "input_audio.append", audio: m.audio_base_64 }));
   }
   if (m.commit) {
-    out.push(JSON.stringify({ type: "input_audio_buffer.commit", final: true }));
+    out.push(JSON.stringify({ type: "input_audio.flush" }));
+    out.push(JSON.stringify({ type: "input_audio.end" }));
   }
   return out;
 }
@@ -340,19 +343,17 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    // First backend frame configures the session (model + audio format, plus
-    // the optional latency/accuracy knob from the UI's Voxtral Realtime Filters).
-    const sessionUpdate = {
-      type: "session.update",
-      model: MISTRAL_REALTIME_MODEL,
-      audio_format: { encoding: "pcm_s16le", sample_rate: 16000 },
-    };
+    // First backend frame configures the session. Per Voxtral's schema the
+    // config nests under `session` (audio_format + optional streaming delay);
+    // the model is NOT here — it rides the connection URL above. Must be sent
+    // before any audio (audio_format updates are rejected once audio starts).
+    const session = { audio_format: { encoding: "pcm_s16le", sample_rate: 16000 } };
     const streamingDelay = parseInt(url.searchParams.get("target_streaming_delay_ms") || "", 10);
     if (Number.isFinite(streamingDelay) && streamingDelay > 0) {
-      sessionUpdate.target_streaming_delay_ms = streamingDelay;
+      session.target_streaming_delay_ms = streamingDelay;
     }
     try {
-      backendWs.send(JSON.stringify(sessionUpdate));
+      backendWs.send(JSON.stringify({ type: "session.update", session: session }));
     } catch (e) {}
 
     const toClient = makeVoxtralToClient();

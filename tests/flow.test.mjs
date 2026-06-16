@@ -1814,49 +1814,50 @@ console.log('--- scenario 25: big-button layout ---');
 {
   const c2b = worker.voxtralClientToBackend;
 
-  // Audio chunk -> input_audio_buffer.append (base64 carried verbatim).
+  // Audio chunk -> input_audio.append (base64 carried verbatim).
   const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 })).map(JSON.parse);
-  check('s26: audio chunk maps to input_audio_buffer.append', append.length === 1 && append[0].type === 'input_audio_buffer.append' && append[0].audio === 'QUJD', JSON.stringify(append));
+  check('s26: audio chunk maps to input_audio.append', append.length === 1 && append[0].type === 'input_audio.append' && append[0].audio === 'QUJD', JSON.stringify(append));
 
-  // Final flush (empty audio + commit) -> a single commit, no empty append.
+  // Final flush (empty audio + commit) -> flush then end, no empty append.
   const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 })).map(JSON.parse);
-  check('s26: empty final flush maps to one commit(final) frame', commit.length === 1 && commit[0].type === 'input_audio_buffer.commit' && commit[0].final === true, JSON.stringify(commit));
+  check('s26: empty final flush maps to flush + end', commit.length === 2 && commit[0].type === 'input_audio.flush' && commit[1].type === 'input_audio.end', JSON.stringify(commit));
 
-  // Audio + commit on the same frame -> append then commit, in order.
+  // Audio + commit on the same frame -> append, then flush, then end, in order.
   const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true })).map(JSON.parse);
-  check('s26: audio+commit maps to append then commit', both.length === 2 && both[0].type === 'input_audio_buffer.append' && both[1].type === 'input_audio_buffer.commit', JSON.stringify(both));
+  check('s26: audio+commit maps to append then flush then end', both.length === 3 && both[0].type === 'input_audio.append' && both[1].type === 'input_audio.flush' && both[2].type === 'input_audio.end', JSON.stringify(both));
 
   // Non-audio / garbage frames are ignored, never forwarded.
   check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
   check('s26: malformed JSON is dropped, not thrown', c2b('{not json').length === 0);
 
-  // Backend -> client translation is stateful per socket.
+  // Backend -> client translation is stateful per socket. Uses Voxtral's real
+  // server event vocabulary: session.created, transcription.text.delta (text),
+  // transcription.done (text), error (error.message).
   const toC = worker.makeVoxtralToClient();
-  const created = toC(JSON.stringify({ type: 'transcription.session.created' })).map(JSON.parse);
+  const created = toC(JSON.stringify({ type: 'session.created' })).map(JSON.parse);
   check('s26: session.created -> session_started', created.length === 1 && created[0].message_type === 'session_started');
 
   // Deltas accumulate into a RUNNING partial (not just the latest piece) — the
-  // client renders currentPartial as the whole in-progress phrase.
-  const d1 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'Patient ' })).map(JSON.parse);
-  const d2 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'presents' })).map(JSON.parse);
+  // client renders currentPartial as the whole in-progress phrase. Mistral's
+  // delta event is transcription.text.delta with the piece in `text`.
+  const d1 = toC(JSON.stringify({ type: 'transcription.text.delta', text: 'Patient ' })).map(JSON.parse);
+  const d2 = toC(JSON.stringify({ type: 'transcription.text.delta', text: 'presents' })).map(JSON.parse);
   check('s26: first delta -> partial', d1[0].message_type === 'partial_transcript' && d1[0].text === 'Patient ');
   check('s26: deltas accumulate into a running partial', d2[0].text === 'Patient presents', d2[0].text);
 
-  // done carries the full text -> one committed segment; accumulator resets.
-  const done1 = toC(JSON.stringify({ type: 'transcription.done', text: 'Patient presents with ascites.' })).map(JSON.parse);
+  // transcription.done carries the full text -> one committed segment; reset.
+  const done1 = toC(JSON.stringify({ type: 'transcription.done', model: 'voxtral-mini-transcribe-realtime-2602', text: 'Patient presents with ascites.' })).map(JSON.parse);
   check('s26: done -> committed_transcript with the segment', done1[0].message_type === 'committed_transcript' && done1[0].text === 'Patient presents with ascites.', JSON.stringify(done1));
 
   // A SECOND done whose text is cumulative-from-start must not re-emit the
   // already-committed prefix (no double-paste into the chart).
-  const d3 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'And more.' }));
+  toC(JSON.stringify({ type: 'transcription.text.delta', text: 'And more.' }));
   const done2 = toC(JSON.stringify({ type: 'transcription.done', text: 'Patient presents with ascites. And more.' })).map(JSON.parse);
   check('s26: cumulative done emits only the NEW portion', done2[0].text === 'And more.', JSON.stringify(done2));
 
-  // Any error-bearing backend event -> loud client {error} frame.
-  const e1 = toC(JSON.stringify({ type: 'transcription.error', error: 'rate limited' })).map(JSON.parse);
-  check('s26: error event -> loud error frame', e1.length === 1 && typeof e1[0].error === 'string' && e1[0].message_type === 'error', JSON.stringify(e1));
-  const e2 = worker.makeVoxtralToClient()(JSON.stringify({ type: 'error', error: { message: 'bad audio', type: 'input_error' } })).map(JSON.parse);
-  check('s26: nested error object -> loud error frame with message', e2[0].error === 'bad audio', JSON.stringify(e2));
+  // Voxtral error event: {type:"error", error:{message}} -> loud {error} frame.
+  const e1 = worker.makeVoxtralToClient()(JSON.stringify({ type: 'error', error: { message: 'rate limited', type: 'rate_limit' } })).map(JSON.parse);
+  check('s26: error event -> loud error frame with message', e1.length === 1 && e1[0].message_type === 'error' && e1[0].error === 'rate limited', JSON.stringify(e1));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

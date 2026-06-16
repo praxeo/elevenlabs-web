@@ -1037,6 +1037,9 @@ right lower quadrant"></textarea>
 
             <label style="font-weight: bold; color: var(--accent);">Realtime (Soniox)</label>
             <div class="hint">Live transcription runs on Soniox (stt-rt-v5) with endpoint detection. Accuracy is tuned via the Keyterms section below — they're sent as Soniox context terms on every realtime dictation.</div>
+
+            <div class="hint" id="latencyReadout" style="margin-top:8px; font-variant-numeric: tabular-nums;"></div>
+            <div class="hint" style="opacity:.7; margin-top:2px;">Latency of the last realtime/hybrid dictation. <b>connect</b> (WS handshake) and <b>finalize</b> (release&nbsp;&rarr;&nbsp;final words) are full round-trips through the Cloudflare proxy to Soniox and back. <b>first word</b> also includes when you started speaking. If connect/finalize are small but it still feels laggy, the proxy hop is not the bottleneck.</div>
           </div>
 
           <label class="checkbox">
@@ -1123,6 +1126,7 @@ right lower quadrant"></textarea>
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
   const sonioxKeyEl     = document.getElementById("sonioxKey");
   const sonioxKeyLabelEl = document.getElementById("sonioxKeyLabel");
+  const latencyReadoutEl = document.getElementById("latencyReadout");
   const passphraseEl     = document.getElementById("passphrase");
   const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
@@ -1239,6 +1243,11 @@ right lower quadrant"></textarea>
   let lastWsError = "";
   let wsOpenAt = 0;
   let recStartedAt = 0;
+  // Per-session realtime latency probe (Advanced readout): timestamps for the
+  // connect handshake, first on-screen word, commit, and final words — so the
+  // Cloudflare-proxy round-trip can be seen, not guessed. Reset per realtime/
+  // hybrid session; null for batch (no live leg).
+  let lat = null;
   let partialCount = 0;
   let speechDetected = false;
   let maxRmsSeen = 0;
@@ -1524,6 +1533,22 @@ right lower quadrant"></textarea>
     latestText = cleaned;
     latestEl.textContent = cleaned;
     updateBigPeek();
+  }
+
+  // Render the realtime latency probe into the Advanced readout. connect & finalize
+  // are full round-trips through the Cloudflare proxy to Soniox; first-word also
+  // includes speech onset. A missing leg (e.g. an unexpected drop with no commit)
+  // shows "—" rather than a wrong number.
+  function renderLatencyReadout() {
+    if (!latencyReadoutEl) return;
+    if (!lat || !lat.connectStart) { latencyReadoutEl.textContent = ""; return; }
+    const ms = (a, b) => (a && b && b >= a) ? (b - a) + "ms" : "—";
+    const connect   = ms(lat.connectStart, lat.openAt);
+    const firstWord = ms(lat.openAt, lat.firstPartialAt);
+    const finalize  = ms(lat.commitSentAt, lat.finalizeAt);
+    latencyReadoutEl.textContent =
+      "Last realtime: connect " + connect + " · first word " + firstWord +
+      "* · finalize " + finalize + " · " + partialCount + " updates";
   }
 
   function setStatus(msg, cls) {
@@ -2616,6 +2641,10 @@ right lower quadrant"></textarea>
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
 
+    // Start the latency probe just before the handshake so "connect" captures the
+    // full browser -> Worker -> Soniox chain.
+    lat = { connectStart: Date.now(), openAt: 0, firstPartialAt: 0, commitSentAt: 0, finalizeAt: 0 };
+
     try {
       ws = new WebSocket(wsUrl);
     } catch (err) {
@@ -2644,6 +2673,7 @@ right lower quadrant"></textarea>
     ws.onopen = () => {
       if (mySession !== sessionSeq) return;
       wsOpenAt = Date.now();
+      if (lat) lat.openAt = wsOpenAt;
       if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
       setLinkPill("live");
       flushPendingChunks();
@@ -2673,11 +2703,16 @@ right lower quadrant"></textarea>
         }
         else if (m_type === "partial_transcript") {
           partialCount++;
+          if (lat && !lat.firstPartialAt && data.text && data.text.trim()) lat.firstPartialAt = Date.now();
           currentPartial = data.text;
           updateLiveDisplay();
         }
         else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
           partialCount++;
+          if (lat) {
+            if (!lat.firstPartialAt && data.text && data.text.trim()) lat.firstPartialAt = Date.now();
+            lat.finalizeAt = Date.now(); // Soniox emits committed once, on finished
+          }
           if (data.text && data.text.trim()) {
             finalizedSegments.push(data.text);
             currentPartial = "";
@@ -2859,6 +2894,7 @@ right lower quadrant"></textarea>
       flushPendingChunks();
       // Final empty chunk with commit: true forces the last segment out
       sendAudioChunk("", true);
+      if (lat && !lat.commitSentAt) lat.commitSentAt = Date.now();
       if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
       finalDeadlineTimer = setTimeout(() => {
         finalDeadlineTimer = null;
@@ -2877,6 +2913,10 @@ right lower quadrant"></textarea>
     if (sessionFinalized) return;
     sessionFinalized = true;
     clearSessionTimers();
+
+    // Refresh the Advanced latency readout for live-leg sessions only (lat is
+    // reset per realtime/hybrid session; batch has no live leg to measure).
+    if (sessionEngine !== "batch") renderLatencyReadout();
 
     // Set BEFORE the button/pill updates below: those trigger the big-screen
     // recalc, and with finishing already true it renders WORKING… through the

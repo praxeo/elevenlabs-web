@@ -1849,6 +1849,12 @@ console.log('--- scenario 25: big-button layout ---');
   const committed = done.find((f) => f.message_type === 'committed_transcript');
   check('s26: finished -> committed_transcript with confirmed text', committed && committed.text === 'How are you doing', JSON.stringify(done));
 
+  // Soniox endpoint markers (<end>, <fin>) are control tokens, not transcript —
+  // they must never reach the rendered text.
+  const ep = worker.makeSonioxToClient();
+  const epOut = ep(JSON.stringify({ tokens: [{ text: 'Done', is_final: true }, { text: '<end>', is_final: true }, { text: ' next', is_final: false }] })).map(JSON.parse);
+  check('s26: endpoint markers filtered out of the transcript', epOut.find((f) => f.message_type === 'partial_transcript').text === 'Done next', JSON.stringify(epOut));
+
   // error_code -> loud {error} frame.
   const e1 = worker.makeSonioxToClient()(JSON.stringify({ error_code: 401, error_message: 'invalid api key' })).map(JSON.parse);
   const errFrame = e1.find((f) => f.message_type === 'error');

@@ -243,6 +243,9 @@ export function makeSonioxToClient() {
     if (Array.isArray(m.tokens)) {
       for (const t of m.tokens) {
         if (!t || typeof t.text !== "string") continue;
+        // Soniox emits control markers (e.g. <end>, <fin>) as standalone tokens
+        // when endpoint detection fires — never real transcript, so drop them.
+        if (/^\s*<[^>]+>\s*$/.test(t.text)) continue;
         if (t.is_final) newFinal += t.text;
         else nonFinal += t.text;
       }

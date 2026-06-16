@@ -223,13 +223,11 @@ If the desktop runs `hotkey.ahk` anyway, set `PHONE_POLL_URL` (your worker URL) 
 | **Append mode** | off | all | Off: each dictation is its own note, and clicking the transcript box arms a one-shot append. On: dictations chain automatically within the append window. |
 | **Append window** | 45 s | all | Only applies with append mode on. Shorten if stale text keeps riding along into new notes; lengthen (or 0 = always) if you dictate long notes with long thinking pauses. |
 | **Remove ellipses** | on | all | Scribe writes dictation pauses as "…"/"..." — this strips them. Turn off only if you genuinely dictate ellipses. |
-| **Scribe pause limit** (`vad_silence_threshold_secs`) | 2.0 s | realtime/hybrid | Raise if segments finalize mid-sentence and grammar suffers; lower for snappier commits on short utterances. |
-| **Scribe noise filter** (`vad_threshold`) | 0.55 | realtime/hybrid | Raise in shared/noisy rooms to reject background speech; lower if soft speech is being missed. |
-| **Scribe click filter** (`min_speech_duration_ms`) | 150 ms | realtime/hybrid | Raise if keyboard clicks / rustles produce stray words; lower if clipped single-word utterances get dropped. |
+| **Streaming delay** (`target_streaming_delay_ms`) | 1000 ms | realtime/hybrid | Voxtral's latency-vs-accuracy knob — the only live tuning param it exposes. Lower (~240 ms) for snappier live text; raise (toward ~2400 ms) for more context per token and fewer mid-phrase corrections. (Replaced the old ElevenLabs Scribe VAD filters, which Voxtral realtime doesn't support.) |
 | **Gate open/close, high-pass** | 0.030 / 0.008 / 85 Hz | all (load-bearing in batch) | In realtime/hybrid these shape only the saved preview. **In batch mode they decide what gets transcribed** — see the gate tutorial below. |
 | **Tag audio events** | off | batch/hybrid | Batch Scribe can annotate (laughter), (cough), etc. in the text. |
 | **Timestamps** | none | batch/hybrid (word also plumbed for realtime) | Word/character granularity rides the batch API call; currently unused by the UI. |
-| **Browser noise suppression** | off | all | Browser DSP can distort specialized terms. Try on only if the room is hopeless and raising the Scribe noise filter wasn't enough. |
+| **Browser noise suppression** | off | all | Browser DSP can distort specialized terms. Try on only if the room is hopeless and gate/Voice-Isolation tuning wasn't enough. |
 
 ### Tuning the gate (matters most in batch mode)
 
@@ -405,14 +403,14 @@ This app deploys over the original batch app's URL, and your saved settings, API
 | Text stops mid-dictation, red status | Network/service drop. In hybrid the refine usually recovers the full text (verify the ending); in realtime the partial was copied — verify before pasting. |
 | Two-tone warn beep, amber status | Hybrid's batch refine failed — the *live* text was copied and is usable; the status names the upstream error. If it recurs, check quota/key and consider Realtime mode until resolved. |
 | "uploading…"/"refining…" hangs then fails | Batch API unreachable or slow; deadlines are 30 s (batch) / 8 s (refine). The audio preview still holds the recording. |
-| Last words missing | Should be fixed by the tail + commit-wait flow. If it recurs, raise `TAIL_MS` and/or the Scribe pause limit. |
-| First words missing (realtime/hybrid) | The pre-roll captures ~400 ms before the keypress while the mic is warm. If it persists: lower the Scribe **noise filter** (0.55 → 0.40) and **click filter** (150 → 100 ms). On the very first dictation after a cold open there is no pre-roll yet — speak on the start beep. |
+| Last words missing | Should be fixed by the tail + commit-wait flow. If it recurs, raise `TAIL_MS`. |
+| First words missing (realtime/hybrid) | The pre-roll captures ~400 ms before the keypress while the mic is warm. If it persists, lower the **streaming delay** for snappier commits. On the very first dictation after a cold open there is no pre-roll yet — speak on the start beep. |
 | First words missing (batch) | The gate opens late — lower the **open threshold** (red), and speak on the beep; there is no pre-roll in batch mode. |
 | Nothing transcribes in batch mode | The gate never opened (recording too short/empty → sentinel). Watch the gate pill while speaking; retune the thresholds. |
 | Success beep but paste shows `##DICTATION_FAILED##` | The previous dictation failed and left the sentinel; the beep belongs to a newer one. Use the history panel. |
-| Nothing transcribes, *LINK FAIL* | Worker can't reach ElevenLabs or the key/passphrase is wrong — the status line shows the upstream error. |
+| Nothing transcribes, *LINK FAIL* | Worker can't reach the STT backend (Mistral for realtime, ElevenLabs for batch) or the key/passphrase is wrong — the status line shows the upstream error. |
 | No beeps in the background | Beeps reuse the live audio context precisely for this; if the mic was never warmed, there is no running context — warm the mic first (open the app once). On a phone-link desktop (which never records), the beep context is warmed by the Start-session click — after a reload, click the page once. |
 | Phone dictation never reaches the desktop | Check the desktop code badge: **⚠ = reconnecting** (self-heals; deliveries are buffered 2 min and replayed). If the phone showed "desktop link is DOWN", the desktop was offline past the buffer — the text is still in the phone's box and history. |
 | Desktop shows the text but the paste is stale | The tab wasn't focused when the copy ran. Click the browser window once — the held copy lands automatically and the status goes green. For a permanent fix on thin clients, use the AHK poller (`PHONE_POLL_URL`/`PHONE_CODE` in `hotkey.ahk`). |
-| Background voices in the notes (phone) | iOS Control Center → Mic Mode → **Voice Isolation** (the OS-level fix), then raise the **Scribe noise filter** for the live feed. Remember: in hybrid, the clipboard text comes from the batch refine, which hears the ungated mic — Voice Isolation is the lever that cleans it. |
+| Background voices in the notes (phone) | iOS Control Center → Mic Mode → **Voice Isolation** (the OS-level fix). Remember: in hybrid, the clipboard text comes from the batch refine, which hears the ungated mic — Voice Isolation is the lever that cleans it. |
 | iPhone mic cold after reopening the app | It re-warms automatically (boot, visibility, focus — with retries). If the warn status says it couldn't re-engage, tap Start once: acquisition inside a tap always works. Switching apps *mid-dictation* kills that dictation — OS limit, not recoverable. |

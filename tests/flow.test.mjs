@@ -260,6 +260,7 @@ doc.getElementById('recordBtn').click();
 await sleep(150);
 const s1 = sockets[0];
 check('socket created, still connecting', s1 && s1.readyState === 0);
+check('realtime socket carries the Voxtral streaming-delay knob', new URL(s1.url).searchParams.get('target_streaming_delay_ms') === '1000', s1.url);
 pump(4); // speak while connecting
 check('no frames sent while connecting', s1.sent.length === 0);
 s1.open();

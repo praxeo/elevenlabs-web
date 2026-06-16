@@ -327,13 +327,19 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    // First backend frame configures the session (model + audio format).
+    // First backend frame configures the session (model + audio format, plus
+    // the optional latency/accuracy knob from the UI's Voxtral Realtime Filters).
+    const sessionUpdate = {
+      type: "session.update",
+      model: MISTRAL_REALTIME_MODEL,
+      audio_format: { encoding: "pcm_s16le", sample_rate: 16000 },
+    };
+    const streamingDelay = parseInt(url.searchParams.get("target_streaming_delay_ms") || "", 10);
+    if (Number.isFinite(streamingDelay) && streamingDelay > 0) {
+      sessionUpdate.target_streaming_delay_ms = streamingDelay;
+    }
     try {
-      backendWs.send(JSON.stringify({
-        type: "session.update",
-        model: MISTRAL_REALTIME_MODEL,
-        audio_format: { encoding: "pcm_s16le", sample_rate: 16000 },
-      }));
+      backendWs.send(JSON.stringify(sessionUpdate));
     } catch (e) {}
 
     const toClient = makeVoxtralToClient();
@@ -940,16 +946,11 @@ right lower quadrant"></textarea>
           <div id="vadSection">
             <div class="divider"></div>
 
-            <label style="font-weight: bold; color: var(--accent);">Scribe Realtime Filters</label>
+            <label style="font-weight: bold; color: var(--accent);">Voxtral Realtime Filters</label>
 
-            <label for="vadSilence">Scribe pause limit <span class="sliderval" id="vadSilenceVal"></span></label>
-            <input id="vadSilence" type="range" min="0.3" max="3.0" step="0.1" value="2.0" />
-
-            <label for="vadThreshold">Scribe noise filter <span class="sliderval" id="vadThresholdVal"></span></label>
-            <input id="vadThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.55" />
-
-            <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
-            <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+            <label for="streamingDelay">Streaming delay <span class="sliderval" id="streamingDelayVal"></span></label>
+            <input id="streamingDelay" type="range" min="200" max="3000" step="100" value="1000" />
+            <div class="hint">Voxtral's latency-vs-accuracy knob (target_streaming_delay_ms). Lower = faster live text; higher = more context per token, fewer corrections. ~240 ms is snappy, ~2400 ms is the most accurate.</div>
           </div>
 
           <label class="checkbox">
@@ -1075,12 +1076,8 @@ right lower quadrant"></textarea>
   const highpassValEl    = document.getElementById("highpassVal");
 
   // Realtime tuning VAD elements
-  const vadSilenceEl     = document.getElementById("vadSilence");
-  const vadThresholdEl   = document.getElementById("vadThreshold");
-  const minSpeechEl      = document.getElementById("minSpeech");
-  const vadSilenceValEl  = document.getElementById("vadSilenceVal");
-  const vadThresholdValEl = document.getElementById("vadThresholdVal");
-  const minSpeechValEl   = document.getElementById("minSpeechVal");
+  const streamingDelayEl    = document.getElementById("streamingDelay");
+  const streamingDelayValEl = document.getElementById("streamingDelayVal");
 
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
@@ -1687,10 +1684,8 @@ right lower quadrant"></textarea>
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
     
-    // Dynamic Scribe labels
-    vadSilenceValEl.textContent = "(" + Number(vadSilenceEl.value).toFixed(1) + "s)";
-    vadThresholdValEl.textContent = "(" + Number(vadThresholdEl.value).toFixed(2) + " - higher is less sensitive)";
-    minSpeechValEl.textContent = "(" + Number(minSpeechEl.value) + " ms)";
+    // Voxtral realtime tuning label
+    streamingDelayValEl.textContent = "(" + Number(streamingDelayEl.value) + " ms)";
 
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
@@ -1727,9 +1722,7 @@ right lower quadrant"></textarea>
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
-      vadSilence:     vadSilenceEl.value,
-      vadThreshold:   vadThresholdEl.value,
-      minSpeech:      minSpeechEl.value,
+      streamingDelay: streamingDelayEl.value,
       appendWindow:   appendWindowEl.value,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
@@ -1790,9 +1783,7 @@ right lower quadrant"></textarea>
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
-      if (s.vadSilence !== undefined) vadSilenceEl.value = s.vadSilence;
-      if (s.vadThreshold !== undefined) vadThresholdEl.value = s.vadThreshold;
-      if (s.minSpeech !== undefined) minSpeechEl.value = s.minSpeech;
+      if (s.streamingDelay !== undefined) streamingDelayEl.value = s.streamingDelay;
       if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
@@ -2462,10 +2453,9 @@ right lower quadrant"></textarea>
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
 
-    // Pass custom server-side VAD parameters [3]
-    params.append("vad_silence_threshold_secs", vadSilenceEl.value);
-    params.append("vad_threshold", vadThresholdEl.value);
-    params.append("min_speech_duration_ms", minSpeechEl.value);
+    // Voxtral realtime tuning: latency vs accuracy. The Worker folds this into
+    // the session.update sent to Mistral.
+    params.append("target_streaming_delay_ms", streamingDelayEl.value);
 
     const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
@@ -3845,9 +3835,7 @@ right lower quadrant"></textarea>
   });
 
   // Dynamic Scribe event listeners
-  vadSilenceEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
-  vadThresholdEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
-  minSpeechEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
+  streamingDelayEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
 
   keytermsEl.addEventListener("input", updateKeytermHint);
 

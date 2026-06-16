@@ -1718,12 +1718,22 @@ console.log('--- scenario 25: big-button layout ---');
   const rtSock = B.socks[B.socks.length - 1];
   rtSock.open();
   await sleep(30);
+  // Live realtime words must SHOW on the big screen while recording — the whole
+  // point of the realtime engine on mobile. (Regression: they only reached the
+  // collapsed, head-truncated peek strip, so the newest words scrolled off-screen
+  // and the strip looked frozen as the note grew.)
+  rtSock.msg({ message_type: 'partial_transcript', text: 'the patient is recovering well and' });
+  await sleep(20);
+  check('s25b: live realtime words show on the big screen while recording',
+    dB.getElementById('bigPeekText').textContent.includes('recovering well and'), dB.getElementById('bigPeekText').textContent);
+  check('s25b: peek enters live mode (wrapped, tail-pinned) during recording', peekB.classList.contains('live'));
   rtSock.msg({ message_type: 'committed_transcript', text: 'Doomed note.' });
   rtSock.serverClose(); // dies mid-dictation, no user stop
   check('s25b: finalize gap renders WORKING, not a stale success', screenB() === 'busy', screenB());
   await sleep(300);
   check('s25b: unexpected close lands on the red screen', screenB() === 'fail', screenB());
   check('s25b: partial still delivered on the unexpected close', (B.win._clip || '').includes('Doomed note.'), JSON.stringify(B.win._clip));
+  check('s25b: peek leaves live mode once recording ends', !peekB.classList.contains('live'));
 
   // ---- Leg C: the QR /?join= boot path lands in the big button ----
   const C = mkBigDom({ url: 'https://dictation.test/?join=btn789' });

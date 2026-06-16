@@ -186,7 +186,7 @@ The moment a device **joins** a session (typed code or QR scan), it switches to 
 - **One big push-to-talk button** in the center (~⅔ of the screen wide): **hold to talk** (release stops), **quick tap to toggle** start/stop — the same semantics as the desktop hotkey, driving the exact same session machinery underneath.
 - **The whole screen is the status indicator**, readable at arm's length: dark = ready, amber = connecting/working (or a degraded outcome — the headline says ⚠ CHECK, read the status line), deep red + pulsing button = recording, green flash = delivered, **solid red = failed (stays red until your next action)**. A dictation that produced no speech reads FAILED, not done — the failure sentinel is on the clipboard. Because the deliverable goes to the *desktop* in this mode, the relay outcome is part of the indicator — if the desktop link was down when the text was delivered, the screen turns red even though the local success beep already played; a dictation queued behind a failed relay waits ~1.5 s so you see the red before the next recording paints over it.
 - **Haptics mirror the beeps** where the device supports it (start, done, warn, fail, mic-alarm). Vibrations accompany the sounds, never replace them.
-- **The transcript collapses to a peek strip** at the bottom — tap to expand, tap the expanded text to arm click-to-append, exactly like clicking the transcript box on the desktop.
+- **The transcript collapses to a peek strip** at the bottom — tap to expand, tap the expanded text to arm click-to-append, exactly like clicking the transcript box on the desktop. **While you dictate, the strip turns live**: it wraps and keeps the newest recognized words on-screen so the realtime feedback tracks your speech (instead of a one-line strip that scrolls the latest words off the edge and looks frozen).
 - The **joined badge and Leave** stay visible at the top; **Settings** opens the normal page (engine selector, credentials, keyterms, tuning — all the existing sections), and "Back to the button" returns.
 
 **Per-device override** (Options → *Big-button layout*): **when joined** (default), **always** (a phone used for solo dictation, no desktop involved), or **never** (e.g. a desktop that joins a session but should keep its normal layout). Stored per device; in the default *when joined* mode, leaving the session restores the normal layout (with *always*, the big button stays — change the override via Settings).
@@ -362,7 +362,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 **3. Mobile-first dictation UI.** ✅ Landed — see [The joined phone becomes a big button](#the-joined-phone-becomes-a-big-button). Remaining polish ideas:
 
-- [ ] Live partial text on the big screen while dictating (today the peek strip mirrors it; a large-type live readout could replace the state word mid-dictation).
+- [ ] Large-type live readout on the big screen while dictating: the peek strip now goes *live* during recording (wraps + tail-pins the realtime words so they stay on-screen), but a bigger center readout that replaces the state word mid-dictation could read better at arm's length.
 - [ ] Swipe gestures (swipe up = expand transcript, swipe down = settings) as an alternative to the tap targets.
 
 **Also queued (smaller):**

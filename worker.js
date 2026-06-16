@@ -164,8 +164,99 @@ export default {
   },
 };
 
+// ─── Mistral Voxtral realtime STT ───
+// The realtime engine (and hybrid's live-feedback leg) proxies here instead of
+// ElevenLabs. Batch and the hybrid accuracy refine still go to ElevenLabs Scribe
+// (handleTranscribeBatch). Wire format both directions is base64 PCM16 @ 16 kHz —
+// exactly what the client's audio pump already produces.
+const MISTRAL_REALTIME_MODEL = "voxtral-mini-transcribe-realtime";
+const MISTRAL_REALTIME_URL   = "https://api.mistral.ai/v1/audio/transcriptions/realtime";
+
+// Client (ElevenLabs frame vocabulary) -> Mistral backend events. The client
+// sends every audio frame through one chokepoint:
+//   {message_type:"input_audio_chunk", audio_base_64, commit, sample_rate, …}
+// Returns the Voxtral frames to forward (append, then commit on the final flush).
+// previous_text / keyterms / VAD params have no Voxtral realtime equivalent and
+// are dropped here (documented limitation — the hybrid refine still applies the
+// full keyterm list to the clipboard deliverable on the ElevenLabs batch leg).
+export function voxtralClientToBackend(raw) {
+  let m;
+  try { m = JSON.parse(raw); } catch { return []; }
+  if (!m || m.message_type !== "input_audio_chunk") return [];
+  const out = [];
+  if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
+    out.push(JSON.stringify({ type: "input_audio_buffer.append", audio: m.audio_base_64 }));
+  }
+  if (m.commit) {
+    out.push(JSON.stringify({ type: "input_audio_buffer.commit", final: true }));
+  }
+  return out;
+}
+
+// Mistral backend events -> client (ElevenLabs frame vocabulary). Voxtral streams
+// incremental `transcription.delta` pieces plus a `transcription.done` carrying the
+// full text; the client expects `partial_transcript` (running) + a finalized
+// `committed_transcript` segment. We accumulate deltas and, on done, emit only the
+// NEW (not-yet-committed) portion as a committed segment so nothing double-counts
+// whether the backend's done text is per-segment or cumulative. Any error-bearing
+// event becomes a loud {error} frame so the client's "any string error = loud
+// fail" rule fires — never a silent drop into a patient chart. Returns a stateful
+// translator (one per socket); the same normalized frames also feed the phone room.
+export function makeVoxtralToClient() {
+  let accum = "";        // delta run since the last done
+  let committed = "";    // full text already emitted as committed segments
+  let startedSent = false;
+  return function translate(raw) {
+    let m;
+    try { m = JSON.parse(raw); } catch { return []; }
+    if (!m || typeof m !== "object") return [];
+    const type = String(m.type || m.message_type || m.event || "");
+
+    // Error first: any event whose type says error, or that carries an error/message string.
+    if (/error/i.test(type) || typeof m.error === "string" || (m.error && typeof m.error === "object")) {
+      const msg = (typeof m.error === "string" && m.error) ||
+                  (m.error && (m.error.message || m.error.type)) ||
+                  (typeof m.message === "string" && m.message) ||
+                  "Mistral realtime error";
+      return [JSON.stringify({ message_type: "error", error: String(msg) })];
+    }
+
+    // Session created -> session_started (status line + phone-listener handshake).
+    if (/session/i.test(type) && /creat/i.test(type)) {
+      if (startedSent) return [];
+      startedSent = true;
+      return [JSON.stringify({ message_type: "session_started", config: {} })];
+    }
+
+    // Final/done -> commit the newly-finalized portion as one segment.
+    if (/done|complet/i.test(type)) {
+      const full = (typeof m.text === "string" && m.text) ||
+                   (typeof m.transcript === "string" && m.transcript) || accum;
+      const cumulative = committed && full.indexOf(committed) === 0;
+      let seg = cumulative ? full.slice(committed.length) : full;
+      seg = seg.trim();
+      committed = cumulative ? full : (committed + (committed && seg ? " " : "") + seg);
+      accum = "";
+      // Emit even when empty: the client treats the committed frame as the
+      // "final commit reply" and closes promptly after a PTT release.
+      return [JSON.stringify({ message_type: "committed_transcript", text: seg })];
+    }
+
+    // Delta -> running partial.
+    if (/delta/i.test(type) || typeof m.delta === "string") {
+      const piece = (typeof m.delta === "string" ? m.delta
+                   : typeof m.text === "string" ? m.text : "");
+      if (!piece) return [];
+      accum += piece;
+      return [JSON.stringify({ message_type: "partial_transcript", text: accum })];
+    }
+
+    return []; // usage-only / housekeeping events: ignore
+  };
+}
+
 async function handleTranscribeRealtime(request, env) {
-  // Scribe Realtime uses WebSockets. Verify handshake upgrade
+  // Realtime STT uses WebSockets. Verify handshake upgrade
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Expected WebSocket upgrade", { status: 400 });
   }
@@ -184,8 +275,11 @@ async function handleTranscribeRealtime(request, env) {
   try {
     const url = new URL(request.url);
 
+    // Realtime is Mistral Voxtral: the client may bring its own Mistral key, or
+    // in shared mode the Worker injects the master MISTRAL_API_KEY after the
+    // constant-time passphrase check (the master key never reaches the browser).
     const clientKey  = String(url.searchParams.get("api_key") || "").trim();
-    const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
+    const serverKey  = (env && env.MISTRAL_API_KEY) || "";
     const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
 
     // Phone mic relay: if a session code is present, relay transcript events to
@@ -205,59 +299,24 @@ async function handleTranscribeRealtime(request, env) {
     }
 
     if (!apiKey) {
-      return returnWsError("Missing ElevenLabs API Key configuration");
+      return returnWsError("Missing Mistral API key configuration");
     }
 
-    const noVerbatim = url.searchParams.get("no_verbatim") !== "false";
-    const includeTimestamps = url.searchParams.get("timestamps") !== "none";
-    
-    // Dynamic Server-side VAD variables from UI [3]
-    const vadSilence = url.searchParams.get("vad_silence_threshold_secs");
-    const vadThreshold = url.searchParams.get("vad_threshold");
-    const minSpeech = url.searchParams.get("min_speech_duration_ms");
-
-    // Parse and clean vocab keyterms
-    let keyterms = [];
-    try {
-      keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]");
-    } catch {
-      keyterms = [];
-    }
-
-    // Realtime API caps: 50 terms, each <= 20 chars and <= 5 words.
-    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 20, maxWords: 5, maxTerms: 50 });
-
-    // Construct backend connection parameters for ElevenLabs Scribe Realtime v2
-    const elevenParams = new URLSearchParams();
-    elevenParams.append("model_id", "scribe_v2_realtime");
-    elevenParams.append("audio_format", "pcm_16000");
-    elevenParams.append("language_code", "en");
-    elevenParams.append("commit_strategy", "vad");
-    elevenParams.append("no_verbatim", String(noVerbatim));
-    elevenParams.append("include_timestamps", String(includeTimestamps));
-
-    // Dynamic Scribe tuning parameters [3]
-    if (vadSilence) elevenParams.append("vad_silence_threshold_secs", vadSilence);
-    if (vadThreshold) elevenParams.append("vad_threshold", vadThreshold);
-    if (minSpeech) elevenParams.append("min_speech_duration_ms", minSpeech);
-
-    for (const term of cleanedKeyterms) {
-      elevenParams.append("keyterms", term);
-    }
-
-    // Connect to ElevenLabs using secure Workers fetch
-    const backendWsUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elevenParams.toString();
-
-    const backendResponse = await fetch(backendWsUrl, {
+    // Connect to Mistral's Voxtral realtime STT. Session config (model + the
+    // PCM16/16 kHz audio format) is sent as a session.update frame once the
+    // socket is open — not via query params. The no_verbatim/timestamps/VAD/
+    // keyterms query params the client still sends are ElevenLabs-era and have
+    // no Voxtral realtime equivalent; they are simply not forwarded.
+    const backendResponse = await fetch(MISTRAL_REALTIME_URL, {
       headers: {
         "Upgrade": "websocket",
-        "xi-api-key": apiKey,
+        "Authorization": "Bearer " + apiKey,
       }
     });
 
     if (backendResponse.status !== 101) {
       const errText = await backendResponse.text();
-      return returnWsError(`ElevenLabs Connection Error (${backendResponse.status}): ${errText}`);
+      return returnWsError(`Mistral Connection Error (${backendResponse.status}): ${errText}`);
     }
 
     const backendWs = backendResponse.webSocket;
@@ -268,25 +327,44 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    // Bind events - forward messages between browser and ElevenLabs
+    // First backend frame configures the session (model + audio format).
+    try {
+      backendWs.send(JSON.stringify({
+        type: "session.update",
+        model: MISTRAL_REALTIME_MODEL,
+        audio_format: { encoding: "pcm_s16le", sample_rate: 16000 },
+      }));
+    } catch (e) {}
+
+    const toClient = makeVoxtralToClient();
+
+    // Browser -> Mistral: translate the client's input_audio_chunk frames into
+    // Voxtral append/commit events.
     workerWs.addEventListener("message", (event) => {
-      backendWs.send(event.data);
+      for (const frame of voxtralClientToBackend(event.data)) {
+        try { backendWs.send(frame); } catch (e) {}
+      }
     });
 
+    // Mistral -> browser: translate Voxtral events back into the ElevenLabs frame
+    // vocabulary the client (and the phone-link desktop listener) speak. The same
+    // normalized frames are mirrored into the phone room for live desktop feedback.
     backendWs.addEventListener("message", (event) => {
-      workerWs.send(event.data);
-      if (doStub) {
-        doStub.fetch("https://session-room/broadcast", { method: "POST", body: event.data })
-              .catch(() => {});
+      for (const frame of toClient(event.data)) {
+        try { workerWs.send(frame); } catch (e) {}
+        if (doStub) {
+          doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
+                .catch(() => {});
+        }
       }
     });
 
     workerWs.addEventListener("close", () => {
-      backendWs.close();
+      try { backendWs.close(); } catch (e) {}
     });
 
     backendWs.addEventListener("close", () => {
-      workerWs.close();
+      try { workerWs.close(); } catch (e) {}
       if (doStub) {
         doStub.fetch("https://session-room/broadcast", {
           method: "POST",
@@ -725,8 +803,11 @@ const INDEX_HTML = `<!doctype html>
             <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
           </div>
 
-          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
+          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch / hybrid refine)</label>
           <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+
+          <label for="mistralKey" id="mistralKeyLabel">Mistral API key (realtime / hybrid live)</label>
+          <input id="mistralKey" type="password" placeholder="mistral api key" autocomplete="off" />
 
           <label class="checkbox">
             <input type="checkbox" id="saveApiKey" />
@@ -953,6 +1034,8 @@ right lower quadrant"></textarea>
 
   const apiKeyEl         = document.getElementById("apiKey");
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
+  const mistralKeyEl     = document.getElementById("mistralKey");
+  const mistralKeyLabelEl = document.getElementById("mistralKeyLabel");
   const passphraseEl     = document.getElementById("passphrase");
   const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
@@ -1192,6 +1275,7 @@ right lower quadrant"></textarea>
   const STORE_KEY              = "scribe_v2_transcripts_v9";
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
   const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
+  const MISTRAL_KEY_STORAGE_KEY = "mistral_api_key_browser_v9";
   const PASSPHRASE_STORAGE_KEY = "scribe_v2_passphrase_v9";
   // The pre-merge batch app stored the shared access code under this key;
   // read it as a fallback so those users keep their saved code.
@@ -1464,12 +1548,13 @@ right lower quadrant"></textarea>
      reopens whenever credentials are missing or forgotten. */
   function hasAuth() {
     if (apiKeyEl.value.trim()) return true;
+    if (mistralKeyEl && mistralKeyEl.value.trim()) return true;
     return Boolean(SHARED_MODE && passphraseEl.value.trim());
   }
 
   function updateAuthUI() {
     if (!authSummaryEl) return;
-    if (apiKeyEl.value.trim()) {
+    if (apiKeyEl.value.trim() || (mistralKeyEl && mistralKeyEl.value.trim())) {
       authSummaryEl.textContent = "Access — API key set ✓";
     } else if (SHARED_MODE && passphraseEl.value.trim()) {
       authSummaryEl.textContent = "Access — passphrase set ✓";
@@ -1668,9 +1753,11 @@ right lower quadrant"></textarea>
 
     if (saveApiKeyEl.checked) {
       localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyEl.value.trim());
+      if (mistralKeyEl) localStorage.setItem(MISTRAL_KEY_STORAGE_KEY, mistralKeyEl.value.trim());
       if (passphraseEl) localStorage.setItem(PASSPHRASE_STORAGE_KEY, passphraseEl.value.trim());
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
+      localStorage.removeItem(MISTRAL_KEY_STORAGE_KEY);
       localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
       localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     }
@@ -1731,6 +1818,8 @@ right lower quadrant"></textarea>
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
+        const mk = localStorage.getItem(MISTRAL_KEY_STORAGE_KEY);
+        if (mk && mistralKeyEl) mistralKeyEl.value = mk;
         const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY) ||
                   localStorage.getItem(LEGACY_ACCESS_CODE_KEY);
         if (p && passphraseEl) passphraseEl.value = p;
@@ -2251,16 +2340,31 @@ right lower quadrant"></textarea>
     // the release guards read it).
     if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
-    const apiKey = apiKeyEl.value.trim();
-    if (!apiKey && !(SHARED_MODE && passphraseEl.value.trim())) {
+    // Engine-aware credential check. Realtime + hybrid's live leg need a Mistral
+    // key (Voxtral); batch + hybrid's refine need an ElevenLabs key. In shared
+    // mode the passphrase covers both (the Worker holds both master secrets).
+    const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch / refine)
+    const mistralKey  = mistralKeyEl.value.trim();    // Mistral (realtime / live)
+    const shared      = SHARED_MODE && passphraseEl.value.trim();
+    const needMistral = (engine === "realtime" || engine === "hybrid");
+    const needEleven  = (engine === "batch" || engine === "hybrid");
+    let missing = null;
+    if (!shared) {
+      if (needMistral && !mistralKey)     missing = "mistral";
+      else if (needEleven && !apiKey)     missing = "eleven";
+    }
+    if (missing) {
       await writeSentinel();
       if (authSectionEl) authSectionEl.open = true; // surface the collapsed credentials box
       setBigSettingsVisible(true); // the big-button layout hides it otherwise
       if (SHARED_MODE) {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
+      } else if (missing === "mistral") {
+        setStatus("Enter your Mistral API key first (used for realtime).", "err");
+        mistralKeyEl.focus();
       } else {
-        setStatus("Enter your ElevenLabs API key first.", "err");
+        setStatus("Enter your ElevenLabs API key first (used for batch).", "err");
         apiKeyEl.focus();
       }
       failBeep();
@@ -2350,7 +2454,10 @@ right lower quadrant"></textarea>
     // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
-    if (apiKey) params.append("api_key", apiKey);
+    // Realtime is Mistral Voxtral: send the Mistral key (BYO). In shared mode no
+    // key is sent and the Worker injects the master MISTRAL_API_KEY after the
+    // passphrase check — the master key never reaches the browser.
+    if (mistralKey) params.append("api_key", mistralKey);
     if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
@@ -3607,9 +3714,11 @@ right lower quadrant"></textarea>
 
   forgetKeyBtn.onclick = () => {
     apiKeyEl.value = "";
+    if (mistralKeyEl) mistralKeyEl.value = "";
     if (passphraseEl) passphraseEl.value = "";
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
+    localStorage.removeItem(MISTRAL_KEY_STORAGE_KEY);
     localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     saveSettingsNow();
@@ -3764,7 +3873,7 @@ right lower quadrant"></textarea>
 
   // Credentials box: live summary while typing; collapse once credentials are
   // entered (change fires on blur). Reopen any time via the summary.
-  for (const el of [apiKeyEl, passphraseEl]) {
+  for (const el of [apiKeyEl, mistralKeyEl, passphraseEl]) {
     el.addEventListener("input", updateAuthUI);
     el.addEventListener("change", () => {
       updateAuthUI();
@@ -3776,7 +3885,7 @@ right lower quadrant"></textarea>
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
+    apiKeyEl, mistralKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
     noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
     stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {
@@ -3896,6 +4005,8 @@ right lower quadrant"></textarea>
     passphraseRow.style.display = "";
     if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared passphrase access in use)";
     apiKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
+    if (mistralKeyLabelEl) mistralKeyLabelEl.textContent = "Mistral API key (optional — shared passphrase access in use)";
+    mistralKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
   }
 
   renderPresetRow(); // must precede loadSettings, which re-checks persisted presets

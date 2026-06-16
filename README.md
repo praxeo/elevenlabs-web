@@ -18,7 +18,7 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 
 - **Engine selector** — Realtime / Batch / Hybrid, switchable per dictation, persisted per browser. Mode-specific controls show and hide with it.
 - **Push-to-talk dictation** with a configurable in-app hotkey — default **Ctrl + Space** (tap to start/stop, hold to talk) — plus the F13/F14 contract for existing AutoHotkey CapsLock setups, which keeps working unchanged.
-- **Live transcript** streamed from ElevenLabs Scribe v2 Realtime over a secure WebSocket proxy (the API key never reaches the browser in shared mode).
+- **Live transcript** streamed from Mistral Voxtral realtime STT (`voxtral-mini-transcribe-realtime`) over a secure WebSocket proxy (the API key never reaches the browser in shared mode). Batch and the hybrid refine still use ElevenLabs Scribe v2.
 - **Anti-clipping pipeline** (realtime/hybrid): a ~400 ms pre-roll, buffering while the socket connects, a post-release audio tail, and a commit-then-wait shutdown — so the first and last words survive. In hybrid, all of it is also captured for the batch refine.
 - **Loud failure notification**: dead-mic alarm *while you're dictating*, connect-timeout alarm, failure and warn beeps that play even from a background tab, clipboard sentinel (`##DICTATION_FAILED##`), and mic/link status pills.
 - **Recovery, not just alarm**: in hybrid mode, if the live link dies mid-dictation, the locally captured audio is still re-transcribed through batch — the dictation is recovered, flagged for verification instead of lost.
@@ -62,10 +62,10 @@ Browser (this page, installable PWA)
                     └→ noise gate → MediaRecorder (preview; THE recording in batch mode)  │
                                                                                           ▼
 Cloudflare Worker   /api/transcribe — one path, two protocols
-  ├─ WebSocket upgrade → WS proxy (key injection, keyterm scrub)
-  │       └→ ElevenLabs wss …/v1/speech-to-text/realtime  (scribe_v2_realtime, VAD commits)
-  └─ POST multipart    → batch proxy (key injection, keyterm scrub)
-          └→ ElevenLabs https …/v1/speech-to-text          (scribe_v2)
+  ├─ WebSocket upgrade → WS proxy (Mistral key injection, frame translation)
+  │       └→ Mistral wss …/v1/audio/transcriptions/realtime  (voxtral-mini-transcribe-realtime)
+  └─ POST multipart    → batch proxy (ElevenLabs key injection, keyterm scrub)
+          └→ ElevenLabs https …/v1/speech-to-text             (scribe_v2)
 
 Cloudflare Worker   /api/session/<code> — phone link (one Durable Object room per session)
   ├─ WebSocket → desktop listener (live transcript mirror, deliveries, heartbeat pong)
@@ -94,12 +94,14 @@ Deploys as worker **`eleven`** — the pre-merge batch app's URL, so existing us
 
 Two modes, controlled by Worker environment variables:
 
+Two providers now: **Mistral** powers realtime (and hybrid's live feedback); **ElevenLabs** powers batch (and hybrid's refine deliverable).
+
 | Variable | Effect |
 |---|---|
-| *(none)* | Each user pastes their own ElevenLabs API key into the UI. |
-| `ELEVENLABS_API_KEY` **and** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the master key server-side. |
+| *(none)* | Each user pastes their own keys into the UI — a **Mistral** key for realtime and an **ElevenLabs** key for batch (hybrid needs both). |
+| `MISTRAL_API_KEY` **+** `ELEVENLABS_API_KEY` **+** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the master keys server-side. |
 
-Set secrets with `npx wrangler secret put ELEVENLABS_API_KEY` (and `APP_PASSPHRASE`).
+Set secrets with `npx wrangler secret put MISTRAL_API_KEY`, `…put ELEVENLABS_API_KEY`, and `…put APP_PASSPHRASE`. (Realtime-only or batch-only deployments need just the matching provider key.)
 
 ### Install as an app (optional)
 
@@ -319,7 +321,7 @@ The biggest risk in dictation is speaking a long passage into a dead pipeline an
 
 The mental model: **the clipboard always equals the current note.** Appending recopies the whole note, so a paste at any point yields everything dictated so far; pasting replaces, so nothing is double-entered.
 
-When a dictation continues a note, the tail of the existing text is also sent to Scribe Realtime as context (`previous_text` on the first audio chunk), so capitalization and punctuation stay consistent across presses in the live rendering. The batch API has no equivalent parameter, so refined/batch text can drift slightly in cross-press continuity.
+When a dictation continues a note, the client still emits the tail of the existing text as `previous_text` on the first audio chunk, but the **Mistral Voxtral realtime backend has no `previous_text` equivalent**, so the Worker drops it — like the batch API, which also lacks one. Cross-press capitalization/punctuation continuity can therefore drift slightly in both the live rendering and refined/batch text. (Before the Mistral swap, ElevenLabs Scribe Realtime honored `previous_text` on the live leg.)
 
 ## Notes for pre-merge batch app users
 
@@ -336,6 +338,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 ### Landed
 
+- [x] **Mistral Voxtral realtime swap**: the realtime engine (and hybrid's live-feedback leg) moved from ElevenLabs Scribe v2 Realtime to Mistral `voxtral-mini-transcribe-realtime`; batch and the hybrid refine stay on ElevenLabs Scribe v2. The client keeps speaking the ElevenLabs frame vocabulary — the Worker translates both directions (chunk→`input_audio_buffer.append`/`commit`, Voxtral `delta`→running partial, `done`→committed segment with cumulative/per-segment dedupe, any error event→loud error frame). Adds a second credential (Mistral key, shared-mode `MISTRAL_API_KEY` secret). Known losses vs the old realtime leg: no keyterms and no `previous_text` on the live leg (both unsupported by Voxtral realtime; the refine still carries the full keyterm list).
 - [x] Realtime hardening: anti-clipping (buffer-while-connecting, post-release tail, commit-then-wait), dead-mic watchdog, connect timeout, failure-aware clipboard semantics, always-audible failure beeps, mic re-engagement, append window + chip, Advanced section, pre-roll, ellipsis filter, transcript-first layout, realtime-spec alignment (error-frame taxonomy, `previous_text`, server-confirmed keyterms), PWA, queued PTT, configurable hotkey, jsdom flow harness
 - [x] **Three-engine merge**: dual-protocol Worker (WS + POST on `/api/transcribe`), engine selector with per-mode UI, batch engine (post-gate recording, upload-on-release), **hybrid accuracy mode** — realtime feedback + batch re-transcription of the exact streamed audio (incl. pre-roll) as the clipboard deliverable, with WS-death recovery via the refine, degraded-success warn semantics, and per-engine history (`liveText` kept for comparison)
 - [x] **Compact-UI pass**: batch default engine, append-off default with **click-to-append** (one-shot arm by clicking the transcript box), latest transcript restored on load, collapsible Access/Options/Keyterms sections (Access auto-collapses once credentials are set), tiny-window layout for minimized/PWA use
@@ -383,7 +386,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 ## Thoughts & open questions
 
-- **Realtime vs batch accuracy.** `scribe_v2_realtime` trades accuracy for latency versus batch `scribe_v2`; keyterms narrow but don't close the gap. Hybrid exists precisely because the UX already separates the two moments — live text during, clipboard at the end — so the slower, stronger model can own the deliverable.
+- **Realtime vs batch accuracy.** The realtime model (Mistral `voxtral-mini-transcribe-realtime`) trades accuracy for latency versus batch ElevenLabs `scribe_v2`, and unlike the old ElevenLabs realtime leg it takes **no keyterms** (Voxtral realtime has no keyterm/biasing param) — so drug names and eponyms lean harder on the refine. Hybrid exists precisely because the UX already separates the two moments — live text during, clipboard at the end — so the slower, stronger keyterm-aware model can own the deliverable. **Validate Voxtral realtime on real dictation before trusting it standalone**: like all Whisper-lineage models it can emit fluent-but-wrong text on silence/noise, which in a chart is the exact "silent wrong text" failure the app's loud-failure design guards against.
 - **Hybrid audio fidelity.** The refine gets the 16 kHz averaged-downsample feed (exactly what realtime heard), not the mic's native 48 kHz — the ungated 48 kHz signal is never recorded. Parity-with-realtime is the design goal; if refine accuracy ever disappoints, a parallel ungated 48 kHz capture is the experiment to run.
 - **Why per-dictation sockets.** Sessions are short and the connect cost is masked by buffering, so per-dictation sockets keep the cost model legible and avoid idle-session billing questions.
 - **The gate earns its keep again.** In the realtime-only sibling the gate was vestigial; in the merged app it is load-bearing for batch mode, and the meter/analyser doubles as the health watchdog everywhere.

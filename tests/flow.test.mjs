@@ -239,6 +239,7 @@ check('auth section open while credentials are missing', doc.getElementById('aut
 check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('enter'), doc.getElementById('authSummary').textContent);
 
 doc.getElementById('apiKey').value = 'test-key';
+doc.getElementById('mistralKey').value = 'test-mkey'; // realtime/hybrid live leg uses the Mistral key
 doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true }));
 check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
 check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
@@ -851,6 +852,7 @@ console.log('--- scenario 19: phone mic session ---');
     // Switch to realtime and start recording
     doc19b.getElementById('engRealtime').click();
     doc19b.getElementById('apiKey').value = 'test-key';
+    doc19b.getElementById('mistralKey').value = 'test-mkey';
     doc19b.getElementById('recordBtn').click();
     await sleep(50);
 
@@ -1021,6 +1023,7 @@ console.log('--- scenario 20: phone link resilience ---');
   doc20p.getElementById('phoneJoinBtn').click();
   doc20p.getElementById('engRealtime').click();
   doc20p.getElementById('apiKey').value = 'test-key';
+  doc20p.getElementById('mistralKey').value = 'test-mkey';
   doc20p.getElementById('recordBtn').click();
   await sleep(50);
   const phoneSock = socks20p.find((s) => s.url.includes('/api/transcribe'));
@@ -1182,6 +1185,7 @@ console.log('--- scenario 22: phone link persistence ---');
   check('s22p: join badge restored at boot', doc22p.getElementById('phoneJoinBadge').style.display !== 'none');
   check('s22p: leave button shown for the restored join', doc22p.getElementById('phoneLeaveBtn').style.display !== 'none');
   doc22p.getElementById('apiKey').value = 'test-key';
+  doc22p.getElementById('mistralKey').value = 'test-mkey';
   doc22p.getElementById('recordBtn').click();
   await sleep(50);
   const rejoinedSock = socks22p.find((s) => s.url.includes('/api/transcribe'));
@@ -1258,6 +1262,7 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   const doc23 = dom23.window.document;
   check('s23c: no warm-up without a prior grant (no prompt ambush)', gum23 === 0, gum23);
   doc23.getElementById('apiKey').value = 'test-key';
+  doc23.getElementById('mistralKey').value = 'test-mkey';
   doc23.getElementById('recordBtn').click();
   await sleep(120);
   check('s23c: first dictation acquires the mic', gum23 === 1, gum23);
@@ -1394,6 +1399,7 @@ console.log('--- scenario 24: QR join ---');
   check('s24p: join badge + leave shown after scan', doc23p.getElementById('phoneJoinBadge').style.display !== 'none' && doc23p.getElementById('phoneLeaveBtn').style.display !== 'none');
   check('s24p: join param cleaned from the address bar', !w23p.location.search.includes('join'), w23p.location.href);
   doc23p.getElementById('apiKey').value = 'test-key';
+  doc23p.getElementById('mistralKey').value = 'test-mkey';
   doc23p.getElementById('recordBtn').click();
   await sleep(50);
   const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
@@ -1495,6 +1501,7 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25b: boot badge shows the restored code', dB.getElementById('bigJoinedBadge').textContent.includes('BIGBOOT'));
   check('s25b: screen idle at boot', screenB() === 'idle', screenB());
   dB.getElementById('apiKey').value = 'test-key';
+  dB.getElementById('mistralKey').value = 'test-mkey';
 
   // hold = push-to-talk: pointerdown starts, pointerup past the threshold stops
   const vibesAtStart = B.vibes.length;
@@ -1746,6 +1753,7 @@ console.log('--- scenario 25: big-button layout ---');
   const statusE = () => dE.getElementById('status').textContent;
   E.clipFail = true;
   dE.getElementById('apiKey').value = 'test-key';
+  dE.getElementById('mistralKey').value = 'test-mkey';
 
   // clean dictation, desktop listening: the relay ack announces the outcome
   E.batchText = 'Relay note.';
@@ -1795,6 +1803,59 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25e: unjoined denied copy is still a loud failure', statusE().includes('clipboard copy FAILED') && dE.getElementById('status').className.includes('err'), statusE());
   check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
+}
+
+// ── Scenario 26: Mistral Voxtral realtime frame translation (Worker side) ──
+// The realtime engine proxies to Mistral; the Worker translates between the
+// client's ElevenLabs frame vocabulary and Voxtral's event protocol. These are
+// pure functions, so they test without a browser. Loud-failure is the floor:
+// any error-bearing backend event must surface as a client {error} frame.
+{
+  const c2b = worker.voxtralClientToBackend;
+
+  // Audio chunk -> input_audio_buffer.append (base64 carried verbatim).
+  const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 })).map(JSON.parse);
+  check('s26: audio chunk maps to input_audio_buffer.append', append.length === 1 && append[0].type === 'input_audio_buffer.append' && append[0].audio === 'QUJD', JSON.stringify(append));
+
+  // Final flush (empty audio + commit) -> a single commit, no empty append.
+  const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 })).map(JSON.parse);
+  check('s26: empty final flush maps to one commit(final) frame', commit.length === 1 && commit[0].type === 'input_audio_buffer.commit' && commit[0].final === true, JSON.stringify(commit));
+
+  // Audio + commit on the same frame -> append then commit, in order.
+  const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true })).map(JSON.parse);
+  check('s26: audio+commit maps to append then commit', both.length === 2 && both[0].type === 'input_audio_buffer.append' && both[1].type === 'input_audio_buffer.commit', JSON.stringify(both));
+
+  // Non-audio / garbage frames are ignored, never forwarded.
+  check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
+  check('s26: malformed JSON is dropped, not thrown', c2b('{not json').length === 0);
+
+  // Backend -> client translation is stateful per socket.
+  const toC = worker.makeVoxtralToClient();
+  const created = toC(JSON.stringify({ type: 'transcription.session.created' })).map(JSON.parse);
+  check('s26: session.created -> session_started', created.length === 1 && created[0].message_type === 'session_started');
+
+  // Deltas accumulate into a RUNNING partial (not just the latest piece) — the
+  // client renders currentPartial as the whole in-progress phrase.
+  const d1 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'Patient ' })).map(JSON.parse);
+  const d2 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'presents' })).map(JSON.parse);
+  check('s26: first delta -> partial', d1[0].message_type === 'partial_transcript' && d1[0].text === 'Patient ');
+  check('s26: deltas accumulate into a running partial', d2[0].text === 'Patient presents', d2[0].text);
+
+  // done carries the full text -> one committed segment; accumulator resets.
+  const done1 = toC(JSON.stringify({ type: 'transcription.done', text: 'Patient presents with ascites.' })).map(JSON.parse);
+  check('s26: done -> committed_transcript with the segment', done1[0].message_type === 'committed_transcript' && done1[0].text === 'Patient presents with ascites.', JSON.stringify(done1));
+
+  // A SECOND done whose text is cumulative-from-start must not re-emit the
+  // already-committed prefix (no double-paste into the chart).
+  const d3 = toC(JSON.stringify({ type: 'transcription.delta', delta: 'And more.' }));
+  const done2 = toC(JSON.stringify({ type: 'transcription.done', text: 'Patient presents with ascites. And more.' })).map(JSON.parse);
+  check('s26: cumulative done emits only the NEW portion', done2[0].text === 'And more.', JSON.stringify(done2));
+
+  // Any error-bearing backend event -> loud client {error} frame.
+  const e1 = toC(JSON.stringify({ type: 'transcription.error', error: 'rate limited' })).map(JSON.parse);
+  check('s26: error event -> loud error frame', e1.length === 1 && typeof e1[0].error === 'string' && e1[0].message_type === 'error', JSON.stringify(e1));
+  const e2 = worker.makeVoxtralToClient()(JSON.stringify({ type: 'error', error: { message: 'bad audio', type: 'input_error' } })).map(JSON.parse);
+  check('s26: nested error object -> loud error frame with message', e2[0].error === 'bad audio', JSON.stringify(e2));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

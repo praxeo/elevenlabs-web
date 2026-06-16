@@ -174,7 +174,10 @@ export default {
 // ElevenLabs. Batch and the hybrid accuracy refine still go to ElevenLabs Scribe
 // (handleTranscribeBatch). Wire format both directions is base64 PCM16 @ 16 kHz —
 // exactly what the client's audio pump already produces.
-const MISTRAL_REALTIME_MODEL = "voxtral-mini-transcribe-realtime";
+// Mistral's docs/SDK use the dated id; the bare alias can 403 as an
+// inaccessible model. Override here if your account exposes a different id
+// (check: curl https://api.mistral.ai/v1/models -H "Authorization: Bearer KEY").
+const MISTRAL_REALTIME_MODEL = "voxtral-mini-transcribe-realtime-2602";
 const MISTRAL_REALTIME_URL   = "https://api.mistral.ai/v1/audio/transcriptions/realtime";
 
 // Client (ElevenLabs frame vocabulary) -> Mistral backend events. The client

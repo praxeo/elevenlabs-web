@@ -359,11 +359,21 @@ async function handleTranscribeRealtime(request, env) {
     const toClient = makeVoxtralToClient();
 
     // Browser -> Mistral: translate the client's input_audio_chunk frames into
-    // Voxtral append/commit events.
+    // Voxtral append/flush/end events. Voxtral rejects (and drops the socket on)
+    // any input_audio.append that arrives AFTER input_audio.end — and the client's
+    // ~85 ms audio pump can race a stray frame past the commit. Once we've sent
+    // the end (commit), latch closed and drop anything further so a late frame
+    // can't kill the session mid-finalize.
+    let inputEnded = false;
     workerWs.addEventListener("message", (event) => {
+      if (inputEnded) return;
       for (const frame of voxtralClientToBackend(event.data)) {
         try { backendWs.send(frame); } catch (e) {}
       }
+      try {
+        const m = JSON.parse(event.data);
+        if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
+      } catch (e) {}
     });
 
     // Mistral -> browser: translate Voxtral events back into the ElevenLabs frame
@@ -383,7 +393,15 @@ async function handleTranscribeRealtime(request, env) {
       try { backendWs.close(); } catch (e) {}
     });
 
-    backendWs.addEventListener("close", () => {
+    backendWs.addEventListener("close", (event) => {
+      // An abnormal close mid-dictation is a real drop — surface Mistral's code/
+      // reason as a loud error frame so it's diagnosable, not a generic failure.
+      // A normal 1000 close (e.g. after transcription.done) carries no error.
+      const code = event && event.code;
+      if (code && code !== 1000 && code !== 1005) {
+        const reason = (event && event.reason) ? (": " + event.reason) : "";
+        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Mistral closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
+      }
       try { workerWs.close(); } catch (e) {}
       if (doStub) {
         doStub.fetch("https://session-room/broadcast", {

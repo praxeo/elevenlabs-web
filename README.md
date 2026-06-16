@@ -250,7 +250,8 @@ The #1 way to widen the voice-vs-room gap is the mic itself (close, low gain, po
 | Constant | Default | Meaning / safe range |
 |---|---|---|
 | `CONNECT_TIMEOUT_MS` | 5000 | WebSocket must open within this or the dictation fails loudly. 3000–8000. |
-| `TAIL_MS` | 600 | Audio keeps streaming this long after PTT release. Raise to ~900 if last words still clip. |
+| `TAIL_MS` | 600 | Realtime/hybrid: audio keeps streaming this long after PTT release. Raise to ~900 if last words still clip. |
+| `BATCH_TAIL_MS` | 300 | Batch: the recorder keeps running this long after release so the last word isn't clipped (batch transcribes the recording itself). Smaller than `TAIL_MS` — no streaming pipeline to flush. Raise if batch still clips the end. |
 | `FINAL_WAIT_MS` | 2500 | Max wait for the final committed transcript after commit. |
 | `COMMIT_QUIET_MS` | 350 | Close this soon after the last committed transcript arrives. |
 | `FLATLINE_RMS` | 0.0008 | Below this for the whole session ⇒ dead-mic alarm. Verify against your real noise floor. |

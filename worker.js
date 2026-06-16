@@ -1271,6 +1271,7 @@ right lower quadrant"></textarea>
 
   const CONNECT_TIMEOUT_MS = 5000;  // WebSocket must open within this or the dictation fails loudly
   const TAIL_MS            = 600;   // keep streaming audio this long after PTT release (anti-clipping)
+  const BATCH_TAIL_MS      = 300;   // batch: keep the recorder running this long after release so the last word isn't clipped (no streaming pipeline, so less tail than realtime — and less added latency on the slower engine)
   const FINAL_WAIT_MS      = 2500;  // max wait for the final committed transcript after commit
   const COMMIT_QUIET_MS    = 350;   // close this soon after the last committed transcript arrives
   const PENDING_CHUNK_CAP  = 400;   // ~35s of audio buffered while the socket connects
@@ -2777,15 +2778,21 @@ right lower quadrant"></textarea>
     stopping = true;
 
     if (sessionEngine === "batch") {
-      // No tail/commit phases: stopping the recorder flushes the last chunk,
-      // and its onstop handler drives the finalize/upload.
-      stopPhase = null;
+      // Keep the recorder running briefly after release so the tail of the last
+      // word — still moving through the gate/capture pipeline at release — isn't
+      // clipped. Batch transcribes the recording itself, so a hard stop at
+      // release loses it. The gate stays open through the tail (BATCH_TAIL_MS <
+      // the gate hold). onstop drives the upload.
+      stopPhase = "tail";
       setStatus("Stopping — preparing upload…", "warn");
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
-      } else {
-        finalizeSession(false);
-      }
+      tailTimer = setTimeout(() => {
+        tailTimer = null;
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
+        } else {
+          finalizeSession(false);
+        }
+      }, BATCH_TAIL_MS);
       return;
     }
 
@@ -4028,10 +4035,13 @@ right lower quadrant"></textarea>
     }
     if (e.code === "F14") {
       e.preventDefault();
-      if (recording || stopRequested) stopRecording();
-      // CapsLock released while a queued start was armed (or still pending a
-      // finalize): a session starting AFTER the last F14 would violate the
-      // contract — and open a mic nobody is holding.
+      // Already ending (the post-release tail, finalize, or delivery — where
+      // recording can still read true through the tail): F14 must CANCEL a
+      // queued start, never re-stop. A session starting AFTER the last F14
+      // would violate the contract and open a mic nobody is holding.
+      if (stopping || finishing) cancelQueuedStart();
+      else if (recording || stopRequested) stopRecording();
+      // CapsLock released while a queued start was armed: same contract.
       else cancelQueuedStart();
       return;
     }

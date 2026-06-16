@@ -42,7 +42,7 @@ Users are clinicians doing push-to-talk dictation into Cerner/Citrix via AutoHot
 
 ## Hard invariants — do not break
 
-- **F13 keydown starts, F14 keydown stops — always, unconditionally.** This is the AutoHotkey contract (CapsLock hold). F14 while idle also cancels a queued-but-not-yet-started session (`cancelQueuedStart`) — a session starting *after* the last F14 would violate the contract and open a mic nobody is holding. The configurable in-app hotkey (default Ctrl+Space; tap = toggle, hold > `HOTKEY_TAP_MS` = push-to-talk) is **additive** — it must never replace or shadow F13/F14.
+- **F13 keydown starts, F14 keydown stops — always, unconditionally.** This is the AutoHotkey contract (CapsLock hold). F14 while idle **or already ending** (the post-release tail / finalize / delivery — where `recording` can still read true through the batch/realtime tail) cancels a queued-but-not-yet-started session (`cancelQueuedStart`) instead of re-stopping — a session starting *after* the last F14 would violate the contract and open a mic nobody is holding. The configurable in-app hotkey (default Ctrl+Space; tap = toggle, hold > `HOTKEY_TAP_MS` = push-to-talk) is **additive** — it must never replace or shadow F13/F14.
 - **Clipboard sentinel** is exactly `##DICTATION_FAILED##` (AHK/user workflows recognize it).
 - **Beep semantics**: start/done beeps are gated by the checkbox; **failure (`failBeep`), mic-alarm (`micAlarmBeep`) and warn (`warnBeep`) sounds always play**. Beeps reuse the persistent `audioCtx` when running (a fresh `AudioContext` in a background tab starts suspended and is silent — exactly when the cue matters most). A degraded success (hybrid refine failed, live text delivered) gets `warnBeep`, never `doneBeep`.
 - **Exactly one delivery per session.** Every engine's finalize path ends in exactly one `deliverFinalText()` call — one clipboard outcome, one beep. `sessionFinalized` guards finalize; the `finishing` flag spans the async upload/refine phases and serializes sessions: F13/hotkey during it queues via `pendingStart`, never overlaps.
@@ -62,7 +62,9 @@ idle
     snapshot, append decision (appendArmed one-shot beats checkbox+window),
     sessionBaseText snapshot
      ├─ ENGINE batch: no WebSocket, no pre-roll. Post-gate MediaRecorder is the
-     │  capture path; stopRecording() → recorder.onstop → finalizeSession(false)
+     │  capture path; stopRecording() keeps the recorder running BATCH_TAIL_MS
+     │  after release (the last word isn't clipped — batch transcribes the
+     │  recording itself) → recorder.onstop → finalizeSession(false)
      │  → finishBatchSession(): upload webm → splice onto sessionBaseText
      │  → deliverFinalText
      └─ ENGINE realtime/hybrid: seed pendingChunks with pre-roll
@@ -174,7 +176,8 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | Constant | Default | Meaning |
 |---|---|---|
 | `CONNECT_TIMEOUT_MS` | 5000 | WS must open within this or loud-fail |
-| `TAIL_MS` | 600 | Post-release audio tail (anti-clipping) |
+| `TAIL_MS` | 600 | Post-release audio tail, realtime/hybrid (anti-clipping) |
+| `BATCH_TAIL_MS` | 300 | Batch: keep the recorder running this long after release so the last word isn't clipped (smaller than realtime — no streaming pipeline, and less added latency on the slower engine) |
 | `FINAL_WAIT_MS` | 2500 | Max wait for final commit after flush |
 | `COMMIT_QUIET_MS` | 350 | Close this soon after the last committed transcript |
 | `FLATLINE_RMS` | 0.0008 | Dead-mic threshold for the watchdog |

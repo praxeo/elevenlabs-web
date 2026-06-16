@@ -461,8 +461,10 @@ check('batch status mentions upload-on-release', status().includes('release to u
 // audio crosses the RMS threshold) so the first word's onset is not clipped —
 // in batch the post-gate recording IS what gets transcribed.
 check('batch gate primed OPEN at record start (no first-word clip)', doc.getElementById('gateState').textContent === 'OPEN', doc.getElementById('gateState').textContent);
-doc.getElementById('recordBtn').click(); // stop -> recorder flush -> upload
-await sleep(300);
+doc.getElementById('recordBtn').click(); // stop -> tail -> recorder flush -> upload
+await sleep(100); // still inside the batch tail: the recorder keeps running so the last word isn't clipped
+check('batch keeps a tail after release (no upload yet, recorder still capturing)', fetchCalls.length === fCountBatch, fetchCalls.length - fCountBatch);
+await sleep(700); // BATCH_TAIL_MS elapses -> recorder stops -> upload fires
 check('no WebSocket opened in batch mode', sockets.length === sCountBatch, sockets.length - sCountBatch);
 check('exactly one upload', fetchCalls.length === fCountBatch + 1, fetchCalls.length - fCountBatch);
 const upload = fetchCalls[fetchCalls.length - 1];
@@ -487,7 +489,7 @@ fetchQueue.push({ status: 500, body: { error: 'service exploded' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before the recorder stops + upload
 check('upload failure -> sentinel on clipboard', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('upload failure -> loud err status', statusCls().includes('err') && status().includes('FAILED'), status());
 check('upload failure surfaces the server error', status().includes('service exploded'), status());
@@ -500,16 +502,16 @@ doc.getElementById('freshBtn').click();
 fetchQueue.push({ delayMs: 800, status: 200, body: { text: 'Slow upload note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
-doc.getElementById('recordBtn').click(); // stop -> slow upload starts
-await sleep(120);
+doc.getElementById('recordBtn').click(); // stop -> tail -> slow upload starts
+await sleep(700); // tail (TAIL_MS) elapses, recorder stops, slow upload (800ms) begins
 doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' })); // PTT during upload
 check('still uploading when PTT queued', doc.getElementById('linkPill').textContent === 'uploading…', doc.getElementById('linkPill').textContent);
-await sleep(1100); // upload resolves, queued session starts (~60ms later)
+await sleep(1000); // upload resolves (~1400ms after stop), queued session starts (~60ms later)
 check('slow upload delivered', clipboard.includes('Slow upload note.'), JSON.stringify(clipboard));
 check('queued PTT started the next batch session', doc.getElementById('recordBtn').textContent.includes('Stop'));
 fetchQueue.push({ status: 200, body: { text: 'Second.' } });
 doc.getElementById('recordBtn').click(); // wrap up the queued session
-await sleep(300);
+await sleep(800); // tail + upload
 check('queued session delivered too', clipboard.includes('Second.'), JSON.stringify(clipboard));
 
 // ===== Scenario 12: hybrid happy path — live feedback, refined clipboard =====
@@ -644,7 +646,7 @@ fetchQueue.push({ status: 200, body: { text: 'Alpha.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 check('base note delivered', clipboard.includes('Alpha.'), JSON.stringify(clipboard));
 check('chip hidden with append mode off', doc.getElementById('appendChip').style.display === 'none');
 
@@ -662,14 +664,14 @@ fetchQueue.push({ status: 200, body: { text: 'Beta.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 check('armed dictation appended onto the note', clipboard.includes('Alpha.') && clipboard.includes('Beta.'), JSON.stringify(clipboard));
 
 fetchQueue.push({ status: 200, body: { text: 'Gamma.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 check('arm is one-shot: the following dictation starts fresh', clipboard.includes('Gamma.') && !clipboard.includes('Beta.'), JSON.stringify(clipboard));
 
 // ===== Scenario 18: keyterm presets — injected lists, merge, dedupe, persistence =====
@@ -751,7 +753,7 @@ fetchQueue.push({ status: 200, body: { text: 'Preset leg C.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 const ktC = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
 check('batch call carries the full checked preset list', preset1.terms.every((t) => ktC.includes(t)), ktC.length + ' terms');
 check('batch call carries the always-on list', alwaysTerms.every((t) => ktC.includes(t)));
@@ -765,7 +767,7 @@ fetchQueue.push({ status: 200, body: { text: 'Preset leg D.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 const ktD = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
 check('unchecking removes preset terms from the next call', !ktD.includes(p1Term));
 check('always-on terms survive with box empty and nothing checked', alwaysTerms.every((t) => ktD.includes(t)), ktD.length + ' terms');
@@ -1215,7 +1217,7 @@ doc.getElementById('recordBtn').click();
 await sleep(120);
 check('s23: wake lock acquired for the dictation', wakeLockCalls === wlBefore + 1 && activeWakeLock !== null, wakeLockCalls - wlBefore);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 check('s23: dictation delivered', clipboard.includes('Wake lock note.'), JSON.stringify(clipboard));
 check('s23: wake lock released after delivery', activeWakeLock === null);
 
@@ -1229,7 +1231,7 @@ micTrack.readyState = 'live'; micTrack.muted = false; // the fresh acquisition h
 await sleep(120);
 check('s23: muted track triggers a mic re-acquisition', gumCalls === gumBefore + 1, gumCalls - gumBefore);
 doc.getElementById('recordBtn').click();
-await sleep(300);
+await sleep(800); // batch tail before stop
 check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic note.'), JSON.stringify(clipboard));
 
 // Leg C (fresh DOM, no Permissions API — the iOS Safari situation): the
@@ -1272,7 +1274,7 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   await sleep(120);
   check('s23c: first dictation acquires the mic', gum23 === 1, gum23);
   doc23.getElementById('recordBtn').click();
-  await sleep(300);
+  await sleep(800); // batch tail before stop
   check('s23c: batch note delivered', (w23._clip || '').includes('Warm note.'), JSON.stringify(w23._clip));
   track23.readyState = 'ended'; // iOS killed the stream while the page was hidden
   doc23.dispatchEvent(new dom23.window.Event('visibilitychange'));

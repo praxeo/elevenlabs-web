@@ -169,100 +169,93 @@ export default {
   },
 };
 
-// ─── Mistral Voxtral realtime STT ───
-// The realtime engine (and hybrid's live-feedback leg) proxies here instead of
-// ElevenLabs. Batch and the hybrid accuracy refine still go to ElevenLabs Scribe
-// (handleTranscribeBatch). Wire format both directions is base64 PCM16 @ 16 kHz —
-// exactly what the client's audio pump already produces.
-// Mistral's docs/SDK use the dated id; the bare alias can 403 as an
-// inaccessible model. Override here if your account exposes a different id
-// (check: curl https://api.mistral.ai/v1/models -H "Authorization: Bearer KEY").
-const MISTRAL_REALTIME_MODEL = "voxtral-mini-transcribe-realtime-2602";
-const MISTRAL_REALTIME_URL   = "https://api.mistral.ai/v1/audio/transcriptions/realtime";
+// ─── Soniox realtime STT ───
+// The realtime engine (and hybrid's live-feedback leg) proxies to Soniox's
+// real-time WebSocket. Batch and the hybrid accuracy refine still go to
+// ElevenLabs Scribe (handleTranscribeBatch). The client's audio pump produces
+// 16 kHz s16le PCM; Soniox takes raw PCM bytes (not base64) and confirmed/
+// provisional tokens map cleanly onto the client's committed/partial model.
+const SONIOX_MODEL  = "stt-rt-v5";
+const SONIOX_WS_URL = "https://stt-rt.soniox.com/transcribe-websocket";
 
-// Client (ElevenLabs frame vocabulary) -> Mistral backend events. The client
-// sends every audio frame through one chokepoint:
-//   {message_type:"input_audio_chunk", audio_base_64, commit, sample_rate, …}
-// Voxtral's wire protocol (per the mistralai SDK): audio rides input_audio.append
-// (base64 in `audio`); the final flush sends input_audio.flush (transcribe what's
-// buffered) then input_audio.end (close the stream so the final transcription.done
-// fires). previous_text / keyterms / VAD params have no Voxtral realtime equivalent
-// and are dropped (documented limitation — the hybrid refine still applies the full
-// keyterm list to the clipboard deliverable on the ElevenLabs batch leg).
-export function voxtralClientToBackend(raw) {
+// Decode a base64 string to raw bytes (Soniox wants binary PCM frames).
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Client (ElevenLabs frame vocabulary) -> Soniox backend frames. The client sends
+// every audio frame through one chokepoint:
+//   {message_type:"input_audio_chunk", audio_base_64, commit, …}
+// Soniox wants the raw PCM bytes (base64-decoded) sent as binary WS frames; the
+// final flush (commit) is signalled by an empty string. Returns an array whose
+// items are Uint8Array (audio) or "" (end-of-audio). The session config — incl.
+// the api_key and keyterms — is sent separately by the Worker as the first frame.
+export function sonioxClientToBackend(raw) {
   let m;
   try { m = JSON.parse(raw); } catch { return []; }
   if (!m || m.message_type !== "input_audio_chunk") return [];
   const out = [];
   if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
-    out.push(JSON.stringify({ type: "input_audio.append", audio: m.audio_base_64 }));
+    out.push(b64ToBytes(m.audio_base_64));
   }
   if (m.commit) {
-    out.push(JSON.stringify({ type: "input_audio.flush" }));
-    out.push(JSON.stringify({ type: "input_audio.end" }));
+    out.push(""); // empty string = end-of-audio
   }
   return out;
 }
 
-// Mistral backend events -> client (ElevenLabs frame vocabulary). Voxtral streams
-// incremental `transcription.delta` pieces plus a `transcription.done` carrying the
-// full text; the client expects `partial_transcript` (running) + a finalized
-// `committed_transcript` segment. We accumulate deltas and, on done, emit only the
-// NEW (not-yet-committed) portion as a committed segment so nothing double-counts
-// whether the backend's done text is per-segment or cumulative. Any error-bearing
-// event becomes a loud {error} frame so the client's "any string error = loud
-// fail" rule fires — never a silent drop into a patient chart. Returns a stateful
-// translator (one per socket); the same normalized frames also feed the phone room.
-export function makeVoxtralToClient() {
-  let accum = "";        // delta run since the last done
-  let committed = "";    // full text already emitted as committed segments
+// Soniox responses -> client (ElevenLabs frame vocabulary). Soniox streams token
+// objects with an is_final flag: final tokens are confirmed (sent once, never
+// change), non-final tokens are provisional (resent/updated each response). We
+// accumulate the confirmed text and emit, every response, a partial_transcript
+// holding the full current best text (confirmed + provisional tail); on `finished`
+// we emit a committed_transcript with the confirmed text so the client locks it in
+// and closes promptly. Any `error_code` becomes a loud {error} frame so the client's
+// "any string error = loud fail" rule fires. Returns a stateful translator (one per
+// socket); the same normalized frames also feed the phone room.
+export function makeSonioxToClient() {
+  let finalText = "";    // confirmed text accumulated so far
   let startedSent = false;
   return function translate(raw) {
     let m;
     try { m = JSON.parse(raw); } catch { return []; }
     if (!m || typeof m !== "object") return [];
-    const type = String(m.type || m.message_type || m.event || "");
+    const out = [];
 
-    // Error first: any event whose type says error, or that carries an error/message string.
-    if (/error/i.test(type) || typeof m.error === "string" || (m.error && typeof m.error === "object")) {
-      const msg = (typeof m.error === "string" && m.error) ||
-                  (m.error && (m.error.message || m.error.type)) ||
-                  (typeof m.message === "string" && m.message) ||
-                  "Mistral realtime error";
-      return [JSON.stringify({ message_type: "error", error: String(msg) })];
-    }
-
-    // Session created -> session_started (status line + phone-listener handshake).
-    if (/session/i.test(type) && /creat/i.test(type)) {
-      if (startedSent) return [];
+    if (!startedSent) {
       startedSent = true;
-      return [JSON.stringify({ message_type: "session_started", config: {} })];
+      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
     }
 
-    // Final/done -> commit the newly-finalized portion as one segment.
-    if (/done|complet/i.test(type)) {
-      const full = (typeof m.text === "string" && m.text) ||
-                   (typeof m.transcript === "string" && m.transcript) || accum;
-      const cumulative = committed && full.indexOf(committed) === 0;
-      let seg = cumulative ? full.slice(committed.length) : full;
-      seg = seg.trim();
-      committed = cumulative ? full : (committed + (committed && seg ? " " : "") + seg);
-      accum = "";
-      // Emit even when empty: the client treats the committed frame as the
-      // "final commit reply" and closes promptly after a PTT release.
-      return [JSON.stringify({ message_type: "committed_transcript", text: seg })];
+    if (m.error_code) {
+      out.push(JSON.stringify({
+        message_type: "error",
+        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
+      }));
+      return out;
     }
 
-    // Delta -> running partial.
-    if (/delta/i.test(type) || typeof m.delta === "string") {
-      const piece = (typeof m.delta === "string" ? m.delta
-                   : typeof m.text === "string" ? m.text : "");
-      if (!piece) return [];
-      accum += piece;
-      return [JSON.stringify({ message_type: "partial_transcript", text: accum })];
+    let newFinal = "";
+    let nonFinal = "";
+    if (Array.isArray(m.tokens)) {
+      for (const t of m.tokens) {
+        if (!t || typeof t.text !== "string") continue;
+        if (t.is_final) newFinal += t.text;
+        else nonFinal += t.text;
+      }
     }
+    finalText += newFinal;
 
-    return []; // usage-only / housekeeping events: ignore
+    // Running partial = confirmed-so-far + provisional tail (the complete view).
+    out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText + nonFinal }));
+
+    if (m.finished) {
+      out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+    }
+    return out;
   };
 }
 
@@ -286,11 +279,11 @@ async function handleTranscribeRealtime(request, env) {
   try {
     const url = new URL(request.url);
 
-    // Realtime is Mistral Voxtral: the client may bring its own Mistral key, or
-    // in shared mode the Worker injects the master MISTRAL_API_KEY after the
-    // constant-time passphrase check (the master key never reaches the browser).
+    // Realtime is Soniox: the client may bring its own Soniox key, or in shared
+    // mode the Worker injects the master SONIOX_API_KEY after the constant-time
+    // passphrase check (the master key never reaches the browser).
     const clientKey  = String(url.searchParams.get("api_key") || "").trim();
-    const serverKey  = (env && env.MISTRAL_API_KEY) || "";
+    const serverKey  = (env && env.SONIOX_API_KEY) || "";
     const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
 
     // Phone mic relay: if a session code is present, relay transcript events to
@@ -310,29 +303,25 @@ async function handleTranscribeRealtime(request, env) {
     }
 
     if (!apiKey) {
-      return returnWsError("Missing Mistral API key configuration");
+      return returnWsError("Missing Soniox API key configuration");
     }
 
-    // Connect to Mistral's Voxtral realtime STT. The model (and the optional
-    // streaming-delay knob) ride the connection URL — Mistral gates the realtime
-    // resource on a valid model at handshake time, so connecting without it
-    // 403s even with a good key. Audio format + model are also (re)sent in the
-    // session.update frame once the socket opens.
-    const backendUrl = new URL(MISTRAL_REALTIME_URL);
-    backendUrl.searchParams.set("model", MISTRAL_REALTIME_MODEL);
-    const streamingDelayParam = url.searchParams.get("target_streaming_delay_ms");
-    if (streamingDelayParam) backendUrl.searchParams.set("target_streaming_delay_ms", streamingDelayParam);
+    // Keyterms ride the Soniox session config (context.terms) — realtime keyterm
+    // support is back (Voxtral lacked it). The client also sends them on the batch
+    // leg, so hybrid's clipboard text benefits from the full list too.
+    let keyterms = [];
+    try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
+    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 100 });
 
-    const backendResponse = await fetch(backendUrl.toString(), {
-      headers: {
-        "Upgrade": "websocket",
-        "Authorization": "Bearer " + apiKey,
-      }
+    // Connect to Soniox's realtime WebSocket. Auth is NOT a header — the api_key
+    // rides the first (config) frame, so the upgrade carries no credential.
+    const backendResponse = await fetch(SONIOX_WS_URL, {
+      headers: { "Upgrade": "websocket" }
     });
 
     if (backendResponse.status !== 101) {
       const errText = await backendResponse.text();
-      return returnWsError(`Mistral Connection Error (${backendResponse.status}): ${errText}`);
+      return returnWsError(`Soniox Connection Error (${backendResponse.status}): ${errText}`);
     }
 
     const backendWs = backendResponse.webSocket;
@@ -343,31 +332,33 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    // First backend frame configures the session. Per Voxtral's schema the
-    // config nests under `session` (audio_format + optional streaming delay);
-    // the model is NOT here — it rides the connection URL above. Must be sent
-    // before any audio (audio_format updates are rejected once audio starts).
-    const session = { audio_format: { encoding: "pcm_s16le", sample_rate: 16000 } };
-    const streamingDelay = parseInt(url.searchParams.get("target_streaming_delay_ms") || "", 10);
-    if (Number.isFinite(streamingDelay) && streamingDelay > 0) {
-      session.target_streaming_delay_ms = streamingDelay;
-    }
+    // First backend frame is the JSON session config (carries the api_key, audio
+    // format, language hint, endpoint detection, and keyterms as context.terms).
+    // Must precede any audio.
+    const sonioxConfig = {
+      api_key: apiKey,
+      model: SONIOX_MODEL,
+      audio_format: "pcm_s16le",
+      sample_rate: 16000,
+      num_channels: 1,
+      language_hints: ["en"],
+      enable_endpoint_detection: true,
+    };
+    if (cleanedKeyterms.length) sonioxConfig.context = { terms: cleanedKeyterms };
     try {
-      backendWs.send(JSON.stringify({ type: "session.update", session: session }));
+      backendWs.send(JSON.stringify(sonioxConfig));
     } catch (e) {}
 
-    const toClient = makeVoxtralToClient();
+    const toClient = makeSonioxToClient();
 
-    // Browser -> Mistral: translate the client's input_audio_chunk frames into
-    // Voxtral append/flush/end events. Voxtral rejects (and drops the socket on)
-    // any input_audio.append that arrives AFTER input_audio.end — and the client's
-    // ~85 ms audio pump can race a stray frame past the commit. Once we've sent
-    // the end (commit), latch closed and drop anything further so a late frame
-    // can't kill the session mid-finalize.
+    // Browser -> Soniox: decode the client's base64 audio to raw PCM bytes and
+    // forward as binary frames; the final flush (commit) sends an empty string =
+    // end-of-audio. Once end is sent, latch closed so a late audio frame from the
+    // ~85 ms pump can't reopen/confuse the stream mid-finalize.
     let inputEnded = false;
     workerWs.addEventListener("message", (event) => {
       if (inputEnded) return;
-      for (const frame of voxtralClientToBackend(event.data)) {
+      for (const frame of sonioxClientToBackend(event.data)) {
         try { backendWs.send(frame); } catch (e) {}
       }
       try {
@@ -376,7 +367,7 @@ async function handleTranscribeRealtime(request, env) {
       } catch (e) {}
     });
 
-    // Mistral -> browser: translate Voxtral events back into the ElevenLabs frame
+    // Soniox -> browser: translate token responses into the ElevenLabs frame
     // vocabulary the client (and the phone-link desktop listener) speak. The same
     // normalized frames are mirrored into the phone room for live desktop feedback.
     backendWs.addEventListener("message", (event) => {
@@ -394,13 +385,13 @@ async function handleTranscribeRealtime(request, env) {
     });
 
     backendWs.addEventListener("close", (event) => {
-      // An abnormal close mid-dictation is a real drop — surface Mistral's code/
+      // An abnormal close mid-dictation is a real drop — surface Soniox's code/
       // reason as a loud error frame so it's diagnosable, not a generic failure.
-      // A normal 1000 close (e.g. after transcription.done) carries no error.
+      // A normal 1000 close (e.g. after `finished`) carries no error.
       const code = event && event.code;
       if (code && code !== 1000 && code !== 1005) {
         const reason = (event && event.reason) ? (": " + event.reason) : "";
-        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Mistral closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
+        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Soniox closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
       }
       try { workerWs.close(); } catch (e) {}
       if (doStub) {
@@ -844,8 +835,8 @@ const INDEX_HTML = `<!doctype html>
           <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch / hybrid refine)</label>
           <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
 
-          <label for="mistralKey" id="mistralKeyLabel">Mistral API key (realtime / hybrid live)</label>
-          <input id="mistralKey" type="password" placeholder="mistral api key" autocomplete="off" />
+          <label for="sonioxKey" id="sonioxKeyLabel">Soniox API key (realtime / hybrid live)</label>
+          <input id="sonioxKey" type="password" placeholder="soniox api key" autocomplete="off" />
 
           <label class="checkbox">
             <input type="checkbox" id="saveApiKey" />
@@ -978,11 +969,8 @@ right lower quadrant"></textarea>
           <div id="vadSection">
             <div class="divider"></div>
 
-            <label style="font-weight: bold; color: var(--accent);">Voxtral Realtime Filters</label>
-
-            <label for="streamingDelay">Streaming delay <span class="sliderval" id="streamingDelayVal"></span></label>
-            <input id="streamingDelay" type="range" min="200" max="3000" step="100" value="1000" />
-            <div class="hint">Voxtral's latency-vs-accuracy knob (target_streaming_delay_ms). Lower = faster live text; higher = more context per token, fewer corrections. ~240 ms is snappy, ~2400 ms is the most accurate.</div>
+            <label style="font-weight: bold; color: var(--accent);">Realtime (Soniox)</label>
+            <div class="hint">Live transcription runs on Soniox (stt-rt-v5) with endpoint detection. Accuracy is tuned via the Keyterms section below — they're sent as Soniox context terms on every realtime dictation.</div>
           </div>
 
           <label class="checkbox">
@@ -1067,8 +1055,8 @@ right lower quadrant"></textarea>
 
   const apiKeyEl         = document.getElementById("apiKey");
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
-  const mistralKeyEl     = document.getElementById("mistralKey");
-  const mistralKeyLabelEl = document.getElementById("mistralKeyLabel");
+  const sonioxKeyEl     = document.getElementById("sonioxKey");
+  const sonioxKeyLabelEl = document.getElementById("sonioxKeyLabel");
   const passphraseEl     = document.getElementById("passphrase");
   const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
@@ -1108,8 +1096,6 @@ right lower quadrant"></textarea>
   const highpassValEl    = document.getElementById("highpassVal");
 
   // Realtime tuning VAD elements
-  const streamingDelayEl    = document.getElementById("streamingDelay");
-  const streamingDelayValEl = document.getElementById("streamingDelayVal");
 
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
@@ -1304,7 +1290,7 @@ right lower quadrant"></textarea>
   const STORE_KEY              = "scribe_v2_transcripts_v9";
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
   const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
-  const MISTRAL_KEY_STORAGE_KEY = "mistral_api_key_browser_v9";
+  const SONIOX_KEY_STORAGE_KEY = "soniox_api_key_browser_v9";
   const PASSPHRASE_STORAGE_KEY = "scribe_v2_passphrase_v9";
   // The pre-merge batch app stored the shared access code under this key;
   // read it as a fallback so those users keep their saved code.
@@ -1577,13 +1563,13 @@ right lower quadrant"></textarea>
      reopens whenever credentials are missing or forgotten. */
   function hasAuth() {
     if (apiKeyEl.value.trim()) return true;
-    if (mistralKeyEl && mistralKeyEl.value.trim()) return true;
+    if (sonioxKeyEl && sonioxKeyEl.value.trim()) return true;
     return Boolean(SHARED_MODE && passphraseEl.value.trim());
   }
 
   function updateAuthUI() {
     if (!authSummaryEl) return;
-    if (apiKeyEl.value.trim() || (mistralKeyEl && mistralKeyEl.value.trim())) {
+    if (apiKeyEl.value.trim() || (sonioxKeyEl && sonioxKeyEl.value.trim())) {
       authSummaryEl.textContent = "Access — API key set ✓";
     } else if (SHARED_MODE && passphraseEl.value.trim()) {
       authSummaryEl.textContent = "Access — passphrase set ✓";
@@ -1715,9 +1701,6 @@ right lower quadrant"></textarea>
     gateCloseValEl.textContent = "(" + Number(gateCloseEl.value).toFixed(3) + ")";
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
-    
-    // Voxtral realtime tuning label
-    streamingDelayValEl.textContent = "(" + Number(streamingDelayEl.value) + " ms)";
 
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
@@ -1754,7 +1737,6 @@ right lower quadrant"></textarea>
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
-      streamingDelay: streamingDelayEl.value,
       appendWindow:   appendWindowEl.value,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
@@ -1778,11 +1760,11 @@ right lower quadrant"></textarea>
 
     if (saveApiKeyEl.checked) {
       localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyEl.value.trim());
-      if (mistralKeyEl) localStorage.setItem(MISTRAL_KEY_STORAGE_KEY, mistralKeyEl.value.trim());
+      if (sonioxKeyEl) localStorage.setItem(SONIOX_KEY_STORAGE_KEY, sonioxKeyEl.value.trim());
       if (passphraseEl) localStorage.setItem(PASSPHRASE_STORAGE_KEY, passphraseEl.value.trim());
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
-      localStorage.removeItem(MISTRAL_KEY_STORAGE_KEY);
+      localStorage.removeItem(SONIOX_KEY_STORAGE_KEY);
       localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
       localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     }
@@ -1815,7 +1797,6 @@ right lower quadrant"></textarea>
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
-      if (s.streamingDelay !== undefined) streamingDelayEl.value = s.streamingDelay;
       if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
@@ -1841,8 +1822,8 @@ right lower quadrant"></textarea>
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
-        const mk = localStorage.getItem(MISTRAL_KEY_STORAGE_KEY);
-        if (mk && mistralKeyEl) mistralKeyEl.value = mk;
+        const mk = localStorage.getItem(SONIOX_KEY_STORAGE_KEY);
+        if (mk && sonioxKeyEl) sonioxKeyEl.value = mk;
         const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY) ||
                   localStorage.getItem(LEGACY_ACCESS_CODE_KEY);
         if (p && passphraseEl) passphraseEl.value = p;
@@ -2363,17 +2344,17 @@ right lower quadrant"></textarea>
     // the release guards read it).
     if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
-    // Engine-aware credential check. Realtime + hybrid's live leg need a Mistral
-    // key (Voxtral); batch + hybrid's refine need an ElevenLabs key. In shared
-    // mode the passphrase covers both (the Worker holds both master secrets).
+    // Engine-aware credential check. Realtime + hybrid's live leg need a Soniox
+    // key; batch + hybrid's refine need an ElevenLabs key. In shared mode the
+    // passphrase covers both (the Worker holds both master secrets).
     const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch / refine)
-    const mistralKey  = mistralKeyEl.value.trim();    // Mistral (realtime / live)
+    const sonioxKey   = sonioxKeyEl.value.trim();     // Soniox (realtime / live)
     const shared      = SHARED_MODE && passphraseEl.value.trim();
-    const needMistral = (engine === "realtime" || engine === "hybrid");
+    const needSoniox  = (engine === "realtime" || engine === "hybrid");
     const needEleven  = (engine === "batch" || engine === "hybrid");
     let missing = null;
     if (!shared) {
-      if (needMistral && !mistralKey)     missing = "mistral";
+      if (needSoniox && !sonioxKey)       missing = "soniox";
       else if (needEleven && !apiKey)     missing = "eleven";
     }
     if (missing) {
@@ -2383,9 +2364,9 @@ right lower quadrant"></textarea>
       if (SHARED_MODE) {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
-      } else if (missing === "mistral") {
-        setStatus("Enter your Mistral API key first (used for realtime).", "err");
-        mistralKeyEl.focus();
+      } else if (missing === "soniox") {
+        setStatus("Enter your Soniox API key first (used for realtime).", "err");
+        sonioxKeyEl.focus();
       } else {
         setStatus("Enter your ElevenLabs API key first (used for batch).", "err");
         apiKeyEl.focus();
@@ -2477,18 +2458,16 @@ right lower quadrant"></textarea>
     // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
-    // Realtime is Mistral Voxtral: send the Mistral key (BYO). In shared mode no
-    // key is sent and the Worker injects the master MISTRAL_API_KEY after the
-    // passphrase check — the master key never reaches the browser.
-    if (mistralKey) params.append("api_key", mistralKey);
+    // Realtime is Soniox: send the Soniox key (BYO). In shared mode no key is
+    // sent and the Worker injects the master SONIOX_API_KEY after the passphrase
+    // check — the master key never reaches the browser.
+    if (sonioxKey) params.append("api_key", sonioxKey);
     if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
 
-    // Voxtral realtime tuning: latency vs accuracy. The Worker folds this into
-    // the session.update sent to Mistral.
-    params.append("target_streaming_delay_ms", streamingDelayEl.value);
-
+    // Soniox keyterms ride context.terms in the session config (realtime keyterm
+    // support is back). Batch gets the full list too, so hybrid benefits both legs.
     const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
@@ -3736,11 +3715,11 @@ right lower quadrant"></textarea>
 
   forgetKeyBtn.onclick = () => {
     apiKeyEl.value = "";
-    if (mistralKeyEl) mistralKeyEl.value = "";
+    if (sonioxKeyEl) sonioxKeyEl.value = "";
     if (passphraseEl) passphraseEl.value = "";
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
-    localStorage.removeItem(MISTRAL_KEY_STORAGE_KEY);
+    localStorage.removeItem(SONIOX_KEY_STORAGE_KEY);
     localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     saveSettingsNow();
@@ -3867,7 +3846,6 @@ right lower quadrant"></textarea>
   });
 
   // Dynamic Scribe event listeners
-  streamingDelayEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
 
   keytermsEl.addEventListener("input", updateKeytermHint);
 
@@ -3893,7 +3871,7 @@ right lower quadrant"></textarea>
 
   // Credentials box: live summary while typing; collapse once credentials are
   // entered (change fires on blur). Reopen any time via the summary.
-  for (const el of [apiKeyEl, mistralKeyEl, passphraseEl]) {
+  for (const el of [apiKeyEl, sonioxKeyEl, passphraseEl]) {
     el.addEventListener("input", updateAuthUI);
     el.addEventListener("change", () => {
       updateAuthUI();
@@ -3905,7 +3883,7 @@ right lower quadrant"></textarea>
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, mistralKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
+    apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
     noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
     stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {
@@ -4025,8 +4003,8 @@ right lower quadrant"></textarea>
     passphraseRow.style.display = "";
     if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared passphrase access in use)";
     apiKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
-    if (mistralKeyLabelEl) mistralKeyLabelEl.textContent = "Mistral API key (optional — shared passphrase access in use)";
-    mistralKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
+    if (sonioxKeyLabelEl) sonioxKeyLabelEl.textContent = "Soniox API key (optional — shared passphrase access in use)";
+    sonioxKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
   }
 
   renderPresetRow(); // must precede loadSettings, which re-checks persisted presets

@@ -239,6 +239,7 @@ check('auth section open while credentials are missing', doc.getElementById('aut
 check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('enter'), doc.getElementById('authSummary').textContent);
 
 doc.getElementById('apiKey').value = 'test-key';
+doc.getElementById('sonioxKey').value = 'test-skey';
 doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true }));
 check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
 check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
@@ -259,6 +260,7 @@ doc.getElementById('recordBtn').click();
 await sleep(150);
 const s1 = sockets[0];
 check('socket created, still connecting', s1 && s1.readyState === 0);
+check('realtime socket carries keyterms (Soniox context terms)', typeof new URL(s1.url).searchParams.get('keyterms_json') === 'string', s1.url);
 pump(4); // speak while connecting
 check('no frames sent while connecting', s1.sent.length === 0);
 s1.open();
@@ -851,6 +853,7 @@ console.log('--- scenario 19: phone mic session ---');
     // Switch to realtime and start recording
     doc19b.getElementById('engRealtime').click();
     doc19b.getElementById('apiKey').value = 'test-key';
+    doc19b.getElementById('sonioxKey').value = 'test-skey';
     doc19b.getElementById('recordBtn').click();
     await sleep(50);
 
@@ -1021,6 +1024,7 @@ console.log('--- scenario 20: phone link resilience ---');
   doc20p.getElementById('phoneJoinBtn').click();
   doc20p.getElementById('engRealtime').click();
   doc20p.getElementById('apiKey').value = 'test-key';
+  doc20p.getElementById('sonioxKey').value = 'test-skey';
   doc20p.getElementById('recordBtn').click();
   await sleep(50);
   const phoneSock = socks20p.find((s) => s.url.includes('/api/transcribe'));
@@ -1182,6 +1186,7 @@ console.log('--- scenario 22: phone link persistence ---');
   check('s22p: join badge restored at boot', doc22p.getElementById('phoneJoinBadge').style.display !== 'none');
   check('s22p: leave button shown for the restored join', doc22p.getElementById('phoneLeaveBtn').style.display !== 'none');
   doc22p.getElementById('apiKey').value = 'test-key';
+  doc22p.getElementById('sonioxKey').value = 'test-skey';
   doc22p.getElementById('recordBtn').click();
   await sleep(50);
   const rejoinedSock = socks22p.find((s) => s.url.includes('/api/transcribe'));
@@ -1258,6 +1263,7 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   const doc23 = dom23.window.document;
   check('s23c: no warm-up without a prior grant (no prompt ambush)', gum23 === 0, gum23);
   doc23.getElementById('apiKey').value = 'test-key';
+  doc23.getElementById('sonioxKey').value = 'test-skey';
   doc23.getElementById('recordBtn').click();
   await sleep(120);
   check('s23c: first dictation acquires the mic', gum23 === 1, gum23);
@@ -1394,6 +1400,7 @@ console.log('--- scenario 24: QR join ---');
   check('s24p: join badge + leave shown after scan', doc23p.getElementById('phoneJoinBadge').style.display !== 'none' && doc23p.getElementById('phoneLeaveBtn').style.display !== 'none');
   check('s24p: join param cleaned from the address bar', !w23p.location.search.includes('join'), w23p.location.href);
   doc23p.getElementById('apiKey').value = 'test-key';
+  doc23p.getElementById('sonioxKey').value = 'test-skey';
   doc23p.getElementById('recordBtn').click();
   await sleep(50);
   const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
@@ -1495,6 +1502,7 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25b: boot badge shows the restored code', dB.getElementById('bigJoinedBadge').textContent.includes('BIGBOOT'));
   check('s25b: screen idle at boot', screenB() === 'idle', screenB());
   dB.getElementById('apiKey').value = 'test-key';
+  dB.getElementById('sonioxKey').value = 'test-skey';
 
   // hold = push-to-talk: pointerdown starts, pointerup past the threshold stops
   const vibesAtStart = B.vibes.length;
@@ -1746,6 +1754,7 @@ console.log('--- scenario 25: big-button layout ---');
   const statusE = () => dE.getElementById('status').textContent;
   E.clipFail = true;
   dE.getElementById('apiKey').value = 'test-key';
+  dE.getElementById('sonioxKey').value = 'test-skey';
 
   // clean dictation, desktop listening: the relay ack announces the outcome
   E.batchText = 'Relay note.';
@@ -1795,6 +1804,55 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25e: unjoined denied copy is still a loud failure', statusE().includes('clipboard copy FAILED') && dE.getElementById('status').className.includes('err'), statusE());
   check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
+}
+
+// ── Scenario 26: Soniox realtime frame translation (Worker side) ──
+// The realtime engine proxies to Soniox; the Worker translates between the
+// client's ElevenLabs frame vocabulary and Soniox's token protocol. These are
+// pure functions, so they test without a browser. Loud-failure is the floor:
+// any error_code response must surface as a client {error} frame.
+{
+  const c2b = worker.sonioxClientToBackend;
+
+  // Audio chunk -> raw PCM bytes (base64-decoded into a Uint8Array).
+  const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 }));
+  check('s26: audio chunk -> decoded PCM bytes', append.length === 1 && append[0] instanceof Uint8Array && String.fromCharCode(...append[0]) === 'ABC', JSON.stringify([...(append[0]||[])]));
+
+  // Final flush (empty audio + commit) -> a single empty-string end signal.
+  const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 }));
+  check('s26: empty final flush -> one end-of-audio signal', commit.length === 1 && commit[0] === '', JSON.stringify(commit));
+
+  // Audio + commit on the same frame -> bytes then end, in order.
+  const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true }));
+  check('s26: audio+commit -> bytes then end', both.length === 2 && both[0] instanceof Uint8Array && both[1] === '', JSON.stringify([both[0] instanceof Uint8Array, both[1]]));
+
+  // Non-audio / garbage frames are ignored, never forwarded.
+  check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
+  check('s26: malformed JSON is dropped, not thrown', c2b('{not json').length === 0);
+
+  // Backend -> client translation is stateful per socket. Soniox sends token
+  // objects with is_final; non-final tokens are provisional, final are confirmed.
+  const toC = worker.makeSonioxToClient();
+  const first = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: false }, { text: ' are', is_final: false }] })).map(JSON.parse);
+  check('s26: first response emits session_started then partial', first[0].message_type === 'session_started' && first[1].message_type === 'partial_transcript' && first[1].text === 'How are', JSON.stringify(first));
+
+  // Non-final tokens RESET each response; partial reflects the current provisional tail.
+  const r2 = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: true }, { text: ' are', is_final: true }, { text: ' you', is_final: false }] })).map(JSON.parse);
+  check('s26: confirmed + provisional combine into the running partial', r2[0].message_type === 'partial_transcript' && r2[0].text === 'How are you', r2[0].text);
+
+  // More finals accumulate (confirmed text never resets); provisional tail follows.
+  const r3 = toC(JSON.stringify({ tokens: [{ text: ' you', is_final: true }, { text: ' doing', is_final: false }] })).map(JSON.parse);
+  check('s26: finals accumulate, no double counting', r3[0].text === 'How are you doing', r3[0].text);
+
+  // finished -> committed_transcript with the confirmed text (locks in + closes).
+  const done = toC(JSON.stringify({ tokens: [{ text: ' doing', is_final: true }], finished: true })).map(JSON.parse);
+  const committed = done.find((f) => f.message_type === 'committed_transcript');
+  check('s26: finished -> committed_transcript with confirmed text', committed && committed.text === 'How are you doing', JSON.stringify(done));
+
+  // error_code -> loud {error} frame.
+  const e1 = worker.makeSonioxToClient()(JSON.stringify({ error_code: 401, error_message: 'invalid api key' })).map(JSON.parse);
+  const errFrame = e1.find((f) => f.message_type === 'error');
+  check('s26: error_code -> loud error frame with message', errFrame && /401/.test(errFrame.error) && /invalid api key/.test(errFrame.error), JSON.stringify(e1));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

@@ -18,7 +18,7 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 
 - **Engine selector** — Realtime / Batch / Hybrid, switchable per dictation, persisted per browser. Mode-specific controls show and hide with it.
 - **Push-to-talk dictation** with a configurable in-app hotkey — default **Ctrl + Space** (tap to start/stop, hold to talk) — plus the F13/F14 contract for existing AutoHotkey CapsLock setups, which keeps working unchanged.
-- **Live transcript** streamed from ElevenLabs Scribe v2 Realtime over a secure WebSocket proxy (the API key never reaches the browser in shared mode).
+- **Live transcript** streamed from Soniox realtime STT (`stt-rt-v5`) over a secure WebSocket proxy (the API key never reaches the browser in shared mode). Batch and the hybrid refine still use ElevenLabs Scribe v2.
 - **Anti-clipping pipeline** (realtime/hybrid): a ~400 ms pre-roll, buffering while the socket connects, a post-release audio tail, and a commit-then-wait shutdown — so the first and last words survive. In hybrid, all of it is also captured for the batch refine.
 - **Loud failure notification**: dead-mic alarm *while you're dictating*, connect-timeout alarm, failure and warn beeps that play even from a background tab, clipboard sentinel (`##DICTATION_FAILED##`), and mic/link status pills.
 - **Recovery, not just alarm**: in hybrid mode, if the live link dies mid-dictation, the locally captured audio is still re-transcribed through batch — the dictation is recovered, flagged for verification instead of lost.
@@ -62,10 +62,10 @@ Browser (this page, installable PWA)
                     └→ noise gate → MediaRecorder (preview; THE recording in batch mode)  │
                                                                                           ▼
 Cloudflare Worker   /api/transcribe — one path, two protocols
-  ├─ WebSocket upgrade → WS proxy (key injection, keyterm scrub)
-  │       └→ ElevenLabs wss …/v1/speech-to-text/realtime  (scribe_v2_realtime, VAD commits)
-  └─ POST multipart    → batch proxy (key injection, keyterm scrub)
-          └→ ElevenLabs https …/v1/speech-to-text          (scribe_v2)
+  ├─ WebSocket upgrade → WS proxy (Soniox key in config frame, token translation)
+  │       └→ Soniox wss stt-rt.soniox.com/transcribe-websocket  (stt-rt-v5)
+  └─ POST multipart    → batch proxy (ElevenLabs key injection, keyterm scrub)
+          └→ ElevenLabs https …/v1/speech-to-text             (scribe_v2)
 
 Cloudflare Worker   /api/session/<code> — phone link (one Durable Object room per session)
   ├─ WebSocket → desktop listener (live transcript mirror, deliveries, heartbeat pong)
@@ -94,12 +94,14 @@ Deploys as worker **`eleven`** — the pre-merge batch app's URL, so existing us
 
 Two modes, controlled by Worker environment variables:
 
+Two providers now: **Soniox** powers realtime (and hybrid's live feedback); **ElevenLabs** powers batch (and hybrid's refine deliverable).
+
 | Variable | Effect |
 |---|---|
-| *(none)* | Each user pastes their own ElevenLabs API key into the UI. |
-| `ELEVENLABS_API_KEY` **and** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the master key server-side. |
+| *(none)* | Each user pastes their own keys into the UI — a **Soniox** key for realtime and an **ElevenLabs** key for batch (hybrid needs both). |
+| `SONIOX_API_KEY` **+** `ELEVENLABS_API_KEY` **+** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the master keys server-side. |
 
-Set secrets with `npx wrangler secret put ELEVENLABS_API_KEY` (and `APP_PASSPHRASE`).
+Set secrets with `npx wrangler secret put SONIOX_API_KEY`, `…put ELEVENLABS_API_KEY`, and `…put APP_PASSPHRASE`. (Realtime-only or batch-only deployments need just the matching provider key.)
 
 ### Install as an app (optional)
 
@@ -221,13 +223,11 @@ If the desktop runs `hotkey.ahk` anyway, set `PHONE_POLL_URL` (your worker URL) 
 | **Append mode** | off | all | Off: each dictation is its own note, and clicking the transcript box arms a one-shot append. On: dictations chain automatically within the append window. |
 | **Append window** | 45 s | all | Only applies with append mode on. Shorten if stale text keeps riding along into new notes; lengthen (or 0 = always) if you dictate long notes with long thinking pauses. |
 | **Remove ellipses** | on | all | Scribe writes dictation pauses as "…"/"..." — this strips them. Turn off only if you genuinely dictate ellipses. |
-| **Scribe pause limit** (`vad_silence_threshold_secs`) | 2.0 s | realtime/hybrid | Raise if segments finalize mid-sentence and grammar suffers; lower for snappier commits on short utterances. |
-| **Scribe noise filter** (`vad_threshold`) | 0.55 | realtime/hybrid | Raise in shared/noisy rooms to reject background speech; lower if soft speech is being missed. |
-| **Scribe click filter** (`min_speech_duration_ms`) | 150 ms | realtime/hybrid | Raise if keyboard clicks / rustles produce stray words; lower if clipped single-word utterances get dropped. |
+| **Keyterms (realtime)** | — | realtime/hybrid | Soniox accepts keyterms as `context.terms` on every realtime dictation (curated in the Keyterms section). This restores live keyterm biasing that the brief Voxtral detour lacked. |
 | **Gate open/close, high-pass** | 0.030 / 0.008 / 85 Hz | all (load-bearing in batch) | In realtime/hybrid these shape only the saved preview. **In batch mode they decide what gets transcribed** — see the gate tutorial below. |
 | **Tag audio events** | off | batch/hybrid | Batch Scribe can annotate (laughter), (cough), etc. in the text. |
 | **Timestamps** | none | batch/hybrid (word also plumbed for realtime) | Word/character granularity rides the batch API call; currently unused by the UI. |
-| **Browser noise suppression** | off | all | Browser DSP can distort specialized terms. Try on only if the room is hopeless and raising the Scribe noise filter wasn't enough. |
+| **Browser noise suppression** | off | all | Browser DSP can distort specialized terms. Try on only if the room is hopeless and gate/Voice-Isolation tuning wasn't enough. |
 
 ### Tuning the gate (matters most in batch mode)
 
@@ -319,7 +319,7 @@ The biggest risk in dictation is speaking a long passage into a dead pipeline an
 
 The mental model: **the clipboard always equals the current note.** Appending recopies the whole note, so a paste at any point yields everything dictated so far; pasting replaces, so nothing is double-entered.
 
-When a dictation continues a note, the tail of the existing text is also sent to Scribe Realtime as context (`previous_text` on the first audio chunk), so capitalization and punctuation stay consistent across presses in the live rendering. The batch API has no equivalent parameter, so refined/batch text can drift slightly in cross-press continuity.
+When a dictation continues a note, the client still emits the tail of the existing text as `previous_text` on the first audio chunk, but the Worker drops it for realtime (the Soniox realtime path consumes raw audio + a config frame, not a continuation hint). Cross-press capitalization/punctuation continuity can therefore drift slightly in both the live rendering and refined/batch text — the batch API also lacks a `previous_text` equivalent.
 
 ## Notes for pre-merge batch app users
 
@@ -336,6 +336,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 ### Landed
 
+- [x] **Soniox realtime swap**: the realtime engine (and hybrid's live-feedback leg) moved to Soniox `stt-rt-v5` (after ElevenLabs Scribe v2 Realtime and a brief Mistral Voxtral detour); batch and the hybrid refine stay on ElevenLabs Scribe v2. The client keeps speaking the ElevenLabs frame vocabulary — the Worker translates both directions (audio chunk→raw PCM bytes, commit→empty-string end-of-audio; Soniox non-final tokens→running partial, final tokens accumulate, `finished`→committed; `error_code`/abnormal close→loud error frame). Adds a second credential (Soniox key, shared-mode `SONIOX_API_KEY` secret). **Realtime keyterms are back** via Soniox `context.terms`, plus endpoint detection for low-latency finals.
 - [x] Realtime hardening: anti-clipping (buffer-while-connecting, post-release tail, commit-then-wait), dead-mic watchdog, connect timeout, failure-aware clipboard semantics, always-audible failure beeps, mic re-engagement, append window + chip, Advanced section, pre-roll, ellipsis filter, transcript-first layout, realtime-spec alignment (error-frame taxonomy, `previous_text`, server-confirmed keyterms), PWA, queued PTT, configurable hotkey, jsdom flow harness
 - [x] **Three-engine merge**: dual-protocol Worker (WS + POST on `/api/transcribe`), engine selector with per-mode UI, batch engine (post-gate recording, upload-on-release), **hybrid accuracy mode** — realtime feedback + batch re-transcription of the exact streamed audio (incl. pre-roll) as the clipboard deliverable, with WS-death recovery via the refine, degraded-success warn semantics, and per-engine history (`liveText` kept for comparison)
 - [x] **Compact-UI pass**: batch default engine, append-off default with **click-to-append** (one-shot arm by clicking the transcript box), latest transcript restored on load, collapsible Access/Options/Keyterms sections (Access auto-collapses once credentials are set), tiny-window layout for minimized/PWA use
@@ -383,7 +384,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 ## Thoughts & open questions
 
-- **Realtime vs batch accuracy.** `scribe_v2_realtime` trades accuracy for latency versus batch `scribe_v2`; keyterms narrow but don't close the gap. Hybrid exists precisely because the UX already separates the two moments — live text during, clipboard at the end — so the slower, stronger model can own the deliverable.
+- **Realtime vs batch accuracy.** The realtime model (Soniox `stt-rt-v5`) trades some accuracy for latency versus batch ElevenLabs `scribe_v2`, but it **does** take keyterms (as `context.terms`), so drug names and eponyms get biasing on the live leg too. Hybrid still exists because the UX separates the two moments — live text during, clipboard at the end — so the slower, stronger model can own the deliverable. **Validate realtime on real dictation before trusting it standalone**: any streaming STT can emit fluent-but-wrong text on silence/noise, which in a chart is the exact "silent wrong text" failure the app's loud-failure design guards against.
 - **Hybrid audio fidelity.** The refine gets the 16 kHz averaged-downsample feed (exactly what realtime heard), not the mic's native 48 kHz — the ungated 48 kHz signal is never recorded. Parity-with-realtime is the design goal; if refine accuracy ever disappoints, a parallel ungated 48 kHz capture is the experiment to run.
 - **Why per-dictation sockets.** Sessions are short and the connect cost is masked by buffering, so per-dictation sockets keep the cost model legible and avoid idle-session billing questions.
 - **The gate earns its keep again.** In the realtime-only sibling the gate was vestigial; in the merged app it is load-bearing for batch mode, and the meter/analyser doubles as the health watchdog everywhere.
@@ -402,14 +403,14 @@ This app deploys over the original batch app's URL, and your saved settings, API
 | Text stops mid-dictation, red status | Network/service drop. In hybrid the refine usually recovers the full text (verify the ending); in realtime the partial was copied — verify before pasting. |
 | Two-tone warn beep, amber status | Hybrid's batch refine failed — the *live* text was copied and is usable; the status names the upstream error. If it recurs, check quota/key and consider Realtime mode until resolved. |
 | "uploading…"/"refining…" hangs then fails | Batch API unreachable or slow; deadlines are 30 s (batch) / 8 s (refine). The audio preview still holds the recording. |
-| Last words missing | Should be fixed by the tail + commit-wait flow. If it recurs, raise `TAIL_MS` and/or the Scribe pause limit. |
-| First words missing (realtime/hybrid) | The pre-roll captures ~400 ms before the keypress while the mic is warm. If it persists: lower the Scribe **noise filter** (0.55 → 0.40) and **click filter** (150 → 100 ms). On the very first dictation after a cold open there is no pre-roll yet — speak on the start beep. |
+| Last words missing | Should be fixed by the tail + commit-wait flow. If it recurs, raise `TAIL_MS`. |
+| First words missing (realtime/hybrid) | The pre-roll captures ~400 ms before the keypress while the mic is warm. On the very first dictation after a cold open there is no pre-roll yet — speak on the start beep. |
 | First words missing (batch) | The gate opens late — lower the **open threshold** (red), and speak on the beep; there is no pre-roll in batch mode. |
 | Nothing transcribes in batch mode | The gate never opened (recording too short/empty → sentinel). Watch the gate pill while speaking; retune the thresholds. |
 | Success beep but paste shows `##DICTATION_FAILED##` | The previous dictation failed and left the sentinel; the beep belongs to a newer one. Use the history panel. |
-| Nothing transcribes, *LINK FAIL* | Worker can't reach ElevenLabs or the key/passphrase is wrong — the status line shows the upstream error. |
+| Nothing transcribes, *LINK FAIL* | Worker can't reach the STT backend (Soniox for realtime, ElevenLabs for batch) or the key/passphrase is wrong — the status line shows the upstream error. |
 | No beeps in the background | Beeps reuse the live audio context precisely for this; if the mic was never warmed, there is no running context — warm the mic first (open the app once). On a phone-link desktop (which never records), the beep context is warmed by the Start-session click — after a reload, click the page once. |
 | Phone dictation never reaches the desktop | Check the desktop code badge: **⚠ = reconnecting** (self-heals; deliveries are buffered 2 min and replayed). If the phone showed "desktop link is DOWN", the desktop was offline past the buffer — the text is still in the phone's box and history. |
 | Desktop shows the text but the paste is stale | The tab wasn't focused when the copy ran. Click the browser window once — the held copy lands automatically and the status goes green. For a permanent fix on thin clients, use the AHK poller (`PHONE_POLL_URL`/`PHONE_CODE` in `hotkey.ahk`). |
-| Background voices in the notes (phone) | iOS Control Center → Mic Mode → **Voice Isolation** (the OS-level fix), then raise the **Scribe noise filter** for the live feed. Remember: in hybrid, the clipboard text comes from the batch refine, which hears the ungated mic — Voice Isolation is the lever that cleans it. |
+| Background voices in the notes (phone) | iOS Control Center → Mic Mode → **Voice Isolation** (the OS-level fix). Remember: in hybrid, the clipboard text comes from the batch refine, which hears the ungated mic — Voice Isolation is the lever that cleans it. |
 | iPhone mic cold after reopening the app | It re-warms automatically (boot, visibility, focus — with retries). If the warn status says it couldn't re-engage, tap Start once: acquisition inside a tap always works. Switching apps *mid-dictation* kills that dictation — OS limit, not recoverable. |

@@ -107,6 +107,10 @@ export default {
         headers: {
           "content-type": "application/manifest+json",
           "cache-control": "public, max-age=3600",
+          // Some clinical/proxy middleboxes and extensions 302-redirect static
+          // assets (adding params like ?_sm_byp=…); a redirected fetch is held
+          // to CORS, so advertise it openly to keep the manifest loadable.
+          "access-control-allow-origin": "*",
         },
       });
     }
@@ -120,6 +124,7 @@ export default {
         headers: {
           "content-type": "image/png",
           "cache-control": "public, max-age=86400",
+          "access-control-allow-origin": "*",
         },
       });
     }
@@ -164,8 +169,98 @@ export default {
   },
 };
 
+// ─── Soniox realtime STT ───
+// The realtime engine (and hybrid's live-feedback leg) proxies to Soniox's
+// real-time WebSocket. Batch and the hybrid accuracy refine still go to
+// ElevenLabs Scribe (handleTranscribeBatch). The client's audio pump produces
+// 16 kHz s16le PCM; Soniox takes raw PCM bytes (not base64) and confirmed/
+// provisional tokens map cleanly onto the client's committed/partial model.
+const SONIOX_MODEL  = "stt-rt-v5";
+const SONIOX_WS_URL = "https://stt-rt.soniox.com/transcribe-websocket";
+
+// Decode a base64 string to raw bytes (Soniox wants binary PCM frames).
+function b64ToBytes(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// Client (ElevenLabs frame vocabulary) -> Soniox backend frames. The client sends
+// every audio frame through one chokepoint:
+//   {message_type:"input_audio_chunk", audio_base_64, commit, …}
+// Soniox wants the raw PCM bytes (base64-decoded) sent as binary WS frames; the
+// final flush (commit) is signalled by an empty string. Returns an array whose
+// items are Uint8Array (audio) or "" (end-of-audio). The session config — incl.
+// the api_key and keyterms — is sent separately by the Worker as the first frame.
+export function sonioxClientToBackend(raw) {
+  let m;
+  try { m = JSON.parse(raw); } catch { return []; }
+  if (!m || m.message_type !== "input_audio_chunk") return [];
+  const out = [];
+  if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
+    out.push(b64ToBytes(m.audio_base_64));
+  }
+  if (m.commit) {
+    out.push(""); // empty string = end-of-audio
+  }
+  return out;
+}
+
+// Soniox responses -> client (ElevenLabs frame vocabulary). Soniox streams token
+// objects with an is_final flag: final tokens are confirmed (sent once, never
+// change), non-final tokens are provisional (resent/updated each response). We
+// accumulate the confirmed text and emit, every response, a partial_transcript
+// holding the full current best text (confirmed + provisional tail); on `finished`
+// we emit a committed_transcript with the confirmed text so the client locks it in
+// and closes promptly. Any `error_code` becomes a loud {error} frame so the client's
+// "any string error = loud fail" rule fires. Returns a stateful translator (one per
+// socket); the same normalized frames also feed the phone room.
+export function makeSonioxToClient() {
+  let finalText = "";    // confirmed text accumulated so far
+  let startedSent = false;
+  return function translate(raw) {
+    let m;
+    try { m = JSON.parse(raw); } catch { return []; }
+    if (!m || typeof m !== "object") return [];
+    const out = [];
+
+    if (!startedSent) {
+      startedSent = true;
+      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
+    }
+
+    if (m.error_code) {
+      out.push(JSON.stringify({
+        message_type: "error",
+        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
+      }));
+      return out;
+    }
+
+    let newFinal = "";
+    let nonFinal = "";
+    if (Array.isArray(m.tokens)) {
+      for (const t of m.tokens) {
+        if (!t || typeof t.text !== "string") continue;
+        if (t.is_final) newFinal += t.text;
+        else nonFinal += t.text;
+      }
+    }
+    finalText += newFinal;
+
+    // Running partial = confirmed-so-far + provisional tail (the complete view).
+    out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText + nonFinal }));
+
+    if (m.finished) {
+      out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+    }
+    return out;
+  };
+}
+
 async function handleTranscribeRealtime(request, env) {
-  // Scribe Realtime uses WebSockets. Verify handshake upgrade
+  // Realtime STT uses WebSockets. Verify handshake upgrade
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Expected WebSocket upgrade", { status: 400 });
   }
@@ -184,8 +279,11 @@ async function handleTranscribeRealtime(request, env) {
   try {
     const url = new URL(request.url);
 
+    // Realtime is Soniox: the client may bring its own Soniox key, or in shared
+    // mode the Worker injects the master SONIOX_API_KEY after the constant-time
+    // passphrase check (the master key never reaches the browser).
     const clientKey  = String(url.searchParams.get("api_key") || "").trim();
-    const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
+    const serverKey  = (env && env.SONIOX_API_KEY) || "";
     const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
 
     // Phone mic relay: if a session code is present, relay transcript events to
@@ -205,59 +303,25 @@ async function handleTranscribeRealtime(request, env) {
     }
 
     if (!apiKey) {
-      return returnWsError("Missing ElevenLabs API Key configuration");
+      return returnWsError("Missing Soniox API key configuration");
     }
 
-    const noVerbatim = url.searchParams.get("no_verbatim") !== "false";
-    const includeTimestamps = url.searchParams.get("timestamps") !== "none";
-    
-    // Dynamic Server-side VAD variables from UI [3]
-    const vadSilence = url.searchParams.get("vad_silence_threshold_secs");
-    const vadThreshold = url.searchParams.get("vad_threshold");
-    const minSpeech = url.searchParams.get("min_speech_duration_ms");
-
-    // Parse and clean vocab keyterms
+    // Keyterms ride the Soniox session config (context.terms) — realtime keyterm
+    // support is back (Voxtral lacked it). The client also sends them on the batch
+    // leg, so hybrid's clipboard text benefits from the full list too.
     let keyterms = [];
-    try {
-      keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]");
-    } catch {
-      keyterms = [];
-    }
+    try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
+    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 100 });
 
-    // Realtime API caps: 50 terms, each <= 20 chars and <= 5 words.
-    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 20, maxWords: 5, maxTerms: 50 });
-
-    // Construct backend connection parameters for ElevenLabs Scribe Realtime v2
-    const elevenParams = new URLSearchParams();
-    elevenParams.append("model_id", "scribe_v2_realtime");
-    elevenParams.append("audio_format", "pcm_16000");
-    elevenParams.append("language_code", "en");
-    elevenParams.append("commit_strategy", "vad");
-    elevenParams.append("no_verbatim", String(noVerbatim));
-    elevenParams.append("include_timestamps", String(includeTimestamps));
-
-    // Dynamic Scribe tuning parameters [3]
-    if (vadSilence) elevenParams.append("vad_silence_threshold_secs", vadSilence);
-    if (vadThreshold) elevenParams.append("vad_threshold", vadThreshold);
-    if (minSpeech) elevenParams.append("min_speech_duration_ms", minSpeech);
-
-    for (const term of cleanedKeyterms) {
-      elevenParams.append("keyterms", term);
-    }
-
-    // Connect to ElevenLabs using secure Workers fetch
-    const backendWsUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elevenParams.toString();
-
-    const backendResponse = await fetch(backendWsUrl, {
-      headers: {
-        "Upgrade": "websocket",
-        "xi-api-key": apiKey,
-      }
+    // Connect to Soniox's realtime WebSocket. Auth is NOT a header — the api_key
+    // rides the first (config) frame, so the upgrade carries no credential.
+    const backendResponse = await fetch(SONIOX_WS_URL, {
+      headers: { "Upgrade": "websocket" }
     });
 
     if (backendResponse.status !== 101) {
       const errText = await backendResponse.text();
-      return returnWsError(`ElevenLabs Connection Error (${backendResponse.status}): ${errText}`);
+      return returnWsError(`Soniox Connection Error (${backendResponse.status}): ${errText}`);
     }
 
     const backendWs = backendResponse.webSocket;
@@ -268,25 +332,68 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    // Bind events - forward messages between browser and ElevenLabs
+    // First backend frame is the JSON session config (carries the api_key, audio
+    // format, language hint, endpoint detection, and keyterms as context.terms).
+    // Must precede any audio.
+    const sonioxConfig = {
+      api_key: apiKey,
+      model: SONIOX_MODEL,
+      audio_format: "pcm_s16le",
+      sample_rate: 16000,
+      num_channels: 1,
+      language_hints: ["en"],
+      enable_endpoint_detection: true,
+    };
+    if (cleanedKeyterms.length) sonioxConfig.context = { terms: cleanedKeyterms };
+    try {
+      backendWs.send(JSON.stringify(sonioxConfig));
+    } catch (e) {}
+
+    const toClient = makeSonioxToClient();
+
+    // Browser -> Soniox: decode the client's base64 audio to raw PCM bytes and
+    // forward as binary frames; the final flush (commit) sends an empty string =
+    // end-of-audio. Once end is sent, latch closed so a late audio frame from the
+    // ~85 ms pump can't reopen/confuse the stream mid-finalize.
+    let inputEnded = false;
     workerWs.addEventListener("message", (event) => {
-      backendWs.send(event.data);
+      if (inputEnded) return;
+      for (const frame of sonioxClientToBackend(event.data)) {
+        try { backendWs.send(frame); } catch (e) {}
+      }
+      try {
+        const m = JSON.parse(event.data);
+        if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
+      } catch (e) {}
     });
 
+    // Soniox -> browser: translate token responses into the ElevenLabs frame
+    // vocabulary the client (and the phone-link desktop listener) speak. The same
+    // normalized frames are mirrored into the phone room for live desktop feedback.
     backendWs.addEventListener("message", (event) => {
-      workerWs.send(event.data);
-      if (doStub) {
-        doStub.fetch("https://session-room/broadcast", { method: "POST", body: event.data })
-              .catch(() => {});
+      for (const frame of toClient(event.data)) {
+        try { workerWs.send(frame); } catch (e) {}
+        if (doStub) {
+          doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
+                .catch(() => {});
+        }
       }
     });
 
     workerWs.addEventListener("close", () => {
-      backendWs.close();
+      try { backendWs.close(); } catch (e) {}
     });
 
-    backendWs.addEventListener("close", () => {
-      workerWs.close();
+    backendWs.addEventListener("close", (event) => {
+      // An abnormal close mid-dictation is a real drop — surface Soniox's code/
+      // reason as a loud error frame so it's diagnosable, not a generic failure.
+      // A normal 1000 close (e.g. after `finished`) carries no error.
+      const code = event && event.code;
+      if (code && code !== 1000 && code !== 1005) {
+        const reason = (event && event.reason) ? (": " + event.reason) : "";
+        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Soniox closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
+      }
+      try { workerWs.close(); } catch (e) {}
       if (doStub) {
         doStub.fetch("https://session-room/broadcast", {
           method: "POST",
@@ -725,8 +832,11 @@ const INDEX_HTML = `<!doctype html>
             <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
           </div>
 
-          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (optional)</label>
+          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch / hybrid refine)</label>
           <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+
+          <label for="sonioxKey" id="sonioxKeyLabel">Soniox API key (realtime / hybrid live)</label>
+          <input id="sonioxKey" type="password" placeholder="soniox api key" autocomplete="off" />
 
           <label class="checkbox">
             <input type="checkbox" id="saveApiKey" />
@@ -859,16 +969,8 @@ right lower quadrant"></textarea>
           <div id="vadSection">
             <div class="divider"></div>
 
-            <label style="font-weight: bold; color: var(--accent);">Scribe Realtime Filters</label>
-
-            <label for="vadSilence">Scribe pause limit <span class="sliderval" id="vadSilenceVal"></span></label>
-            <input id="vadSilence" type="range" min="0.3" max="3.0" step="0.1" value="2.0" />
-
-            <label for="vadThreshold">Scribe noise filter <span class="sliderval" id="vadThresholdVal"></span></label>
-            <input id="vadThreshold" type="range" min="0.1" max="0.9" step="0.05" value="0.55" />
-
-            <label for="minSpeech">Scribe click filter <span class="sliderval" id="minSpeechVal"></span></label>
-            <input id="minSpeech" type="range" min="50" max="1000" step="50" value="150" />
+            <label style="font-weight: bold; color: var(--accent);">Realtime (Soniox)</label>
+            <div class="hint">Live transcription runs on Soniox (stt-rt-v5) with endpoint detection. Accuracy is tuned via the Keyterms section below — they're sent as Soniox context terms on every realtime dictation.</div>
           </div>
 
           <label class="checkbox">
@@ -953,6 +1055,8 @@ right lower quadrant"></textarea>
 
   const apiKeyEl         = document.getElementById("apiKey");
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
+  const sonioxKeyEl     = document.getElementById("sonioxKey");
+  const sonioxKeyLabelEl = document.getElementById("sonioxKeyLabel");
   const passphraseEl     = document.getElementById("passphrase");
   const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
@@ -992,12 +1096,6 @@ right lower quadrant"></textarea>
   const highpassValEl    = document.getElementById("highpassVal");
 
   // Realtime tuning VAD elements
-  const vadSilenceEl     = document.getElementById("vadSilence");
-  const vadThresholdEl   = document.getElementById("vadThreshold");
-  const minSpeechEl      = document.getElementById("minSpeech");
-  const vadSilenceValEl  = document.getElementById("vadSilenceVal");
-  const vadThresholdValEl = document.getElementById("vadThresholdVal");
-  const minSpeechValEl   = document.getElementById("minSpeechVal");
 
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
@@ -1192,6 +1290,7 @@ right lower quadrant"></textarea>
   const STORE_KEY              = "scribe_v2_transcripts_v9";
   const SETTINGS_KEY           = "scribe_v2_settings_v9";
   const API_KEY_STORAGE_KEY    = "elevenlabs_api_key_browser_v9";
+  const SONIOX_KEY_STORAGE_KEY = "soniox_api_key_browser_v9";
   const PASSPHRASE_STORAGE_KEY = "scribe_v2_passphrase_v9";
   // The pre-merge batch app stored the shared access code under this key;
   // read it as a fallback so those users keep their saved code.
@@ -1464,12 +1563,13 @@ right lower quadrant"></textarea>
      reopens whenever credentials are missing or forgotten. */
   function hasAuth() {
     if (apiKeyEl.value.trim()) return true;
+    if (sonioxKeyEl && sonioxKeyEl.value.trim()) return true;
     return Boolean(SHARED_MODE && passphraseEl.value.trim());
   }
 
   function updateAuthUI() {
     if (!authSummaryEl) return;
-    if (apiKeyEl.value.trim()) {
+    if (apiKeyEl.value.trim() || (sonioxKeyEl && sonioxKeyEl.value.trim())) {
       authSummaryEl.textContent = "Access — API key set ✓";
     } else if (SHARED_MODE && passphraseEl.value.trim()) {
       authSummaryEl.textContent = "Access — passphrase set ✓";
@@ -1601,11 +1701,6 @@ right lower quadrant"></textarea>
     gateCloseValEl.textContent = "(" + Number(gateCloseEl.value).toFixed(3) + ")";
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
-    
-    // Dynamic Scribe labels
-    vadSilenceValEl.textContent = "(" + Number(vadSilenceEl.value).toFixed(1) + "s)";
-    vadThresholdValEl.textContent = "(" + Number(vadThresholdEl.value).toFixed(2) + " - higher is less sensitive)";
-    minSpeechValEl.textContent = "(" + Number(minSpeechEl.value) + " ms)";
 
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
@@ -1642,9 +1737,6 @@ right lower quadrant"></textarea>
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
-      vadSilence:     vadSilenceEl.value,
-      vadThreshold:   vadThresholdEl.value,
-      minSpeech:      minSpeechEl.value,
       appendWindow:   appendWindowEl.value,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
@@ -1668,9 +1760,11 @@ right lower quadrant"></textarea>
 
     if (saveApiKeyEl.checked) {
       localStorage.setItem(API_KEY_STORAGE_KEY, apiKeyEl.value.trim());
+      if (sonioxKeyEl) localStorage.setItem(SONIOX_KEY_STORAGE_KEY, sonioxKeyEl.value.trim());
       if (passphraseEl) localStorage.setItem(PASSPHRASE_STORAGE_KEY, passphraseEl.value.trim());
     } else {
       localStorage.removeItem(API_KEY_STORAGE_KEY);
+      localStorage.removeItem(SONIOX_KEY_STORAGE_KEY);
       localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
       localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     }
@@ -1703,9 +1797,6 @@ right lower quadrant"></textarea>
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
-      if (s.vadSilence !== undefined) vadSilenceEl.value = s.vadSilence;
-      if (s.vadThreshold !== undefined) vadThresholdEl.value = s.vadThreshold;
-      if (s.minSpeech !== undefined) minSpeechEl.value = s.minSpeech;
       if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
@@ -1731,6 +1822,8 @@ right lower quadrant"></textarea>
       if (saveApiKeyEl.checked) {
         const k = localStorage.getItem(API_KEY_STORAGE_KEY);
         if (k) apiKeyEl.value = k;
+        const mk = localStorage.getItem(SONIOX_KEY_STORAGE_KEY);
+        if (mk && sonioxKeyEl) sonioxKeyEl.value = mk;
         const p = localStorage.getItem(PASSPHRASE_STORAGE_KEY) ||
                   localStorage.getItem(LEGACY_ACCESS_CODE_KEY);
         if (p && passphraseEl) passphraseEl.value = p;
@@ -2251,16 +2344,31 @@ right lower quadrant"></textarea>
     // the release guards read it).
     if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
-    const apiKey = apiKeyEl.value.trim();
-    if (!apiKey && !(SHARED_MODE && passphraseEl.value.trim())) {
+    // Engine-aware credential check. Realtime + hybrid's live leg need a Soniox
+    // key; batch + hybrid's refine need an ElevenLabs key. In shared mode the
+    // passphrase covers both (the Worker holds both master secrets).
+    const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch / refine)
+    const sonioxKey   = sonioxKeyEl.value.trim();     // Soniox (realtime / live)
+    const shared      = SHARED_MODE && passphraseEl.value.trim();
+    const needSoniox  = (engine === "realtime" || engine === "hybrid");
+    const needEleven  = (engine === "batch" || engine === "hybrid");
+    let missing = null;
+    if (!shared) {
+      if (needSoniox && !sonioxKey)       missing = "soniox";
+      else if (needEleven && !apiKey)     missing = "eleven";
+    }
+    if (missing) {
       await writeSentinel();
       if (authSectionEl) authSectionEl.open = true; // surface the collapsed credentials box
       setBigSettingsVisible(true); // the big-button layout hides it otherwise
       if (SHARED_MODE) {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
+      } else if (missing === "soniox") {
+        setStatus("Enter your Soniox API key first (used for realtime).", "err");
+        sonioxKeyEl.focus();
       } else {
-        setStatus("Enter your ElevenLabs API key first.", "err");
+        setStatus("Enter your ElevenLabs API key first (used for batch).", "err");
         apiKeyEl.focus();
       }
       failBeep();
@@ -2350,16 +2458,16 @@ right lower quadrant"></textarea>
     // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
-    if (apiKey) params.append("api_key", apiKey);
+    // Realtime is Soniox: send the Soniox key (BYO). In shared mode no key is
+    // sent and the Worker injects the master SONIOX_API_KEY after the passphrase
+    // check — the master key never reaches the browser.
+    if (sonioxKey) params.append("api_key", sonioxKey);
     if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
 
-    // Pass custom server-side VAD parameters [3]
-    params.append("vad_silence_threshold_secs", vadSilenceEl.value);
-    params.append("vad_threshold", vadThresholdEl.value);
-    params.append("min_speech_duration_ms", minSpeechEl.value);
-
+    // Soniox keyterms ride context.terms in the session config (realtime keyterm
+    // support is back). Batch gets the full list too, so hybrid benefits both legs.
     const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
@@ -3607,9 +3715,11 @@ right lower quadrant"></textarea>
 
   forgetKeyBtn.onclick = () => {
     apiKeyEl.value = "";
+    if (sonioxKeyEl) sonioxKeyEl.value = "";
     if (passphraseEl) passphraseEl.value = "";
     saveApiKeyEl.checked = false;
     localStorage.removeItem(API_KEY_STORAGE_KEY);
+    localStorage.removeItem(SONIOX_KEY_STORAGE_KEY);
     localStorage.removeItem(PASSPHRASE_STORAGE_KEY);
     localStorage.removeItem(LEGACY_ACCESS_CODE_KEY);
     saveSettingsNow();
@@ -3736,9 +3846,6 @@ right lower quadrant"></textarea>
   });
 
   // Dynamic Scribe event listeners
-  vadSilenceEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
-  vadThresholdEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
-  minSpeechEl.addEventListener("input", () => { updateGateLabels(); saveSettings(); });
 
   keytermsEl.addEventListener("input", updateKeytermHint);
 
@@ -3764,7 +3871,7 @@ right lower quadrant"></textarea>
 
   // Credentials box: live summary while typing; collapse once credentials are
   // entered (change fires on blur). Reopen any time via the summary.
-  for (const el of [apiKeyEl, passphraseEl]) {
+  for (const el of [apiKeyEl, sonioxKeyEl, passphraseEl]) {
     el.addEventListener("input", updateAuthUI);
     el.addEventListener("change", () => {
       updateAuthUI();
@@ -3776,7 +3883,7 @@ right lower quadrant"></textarea>
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
+    apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
     noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
     stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
   ]) {
@@ -3896,6 +4003,8 @@ right lower quadrant"></textarea>
     passphraseRow.style.display = "";
     if (apiKeyLabelEl) apiKeyLabelEl.textContent = "ElevenLabs API key (optional — shared passphrase access in use)";
     apiKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
+    if (sonioxKeyLabelEl) sonioxKeyLabelEl.textContent = "Soniox API key (optional — shared passphrase access in use)";
+    sonioxKeyEl.placeholder = "optional — leave blank to use the shared passphrase";
   }
 
   renderPresetRow(); // must precede loadSettings, which re-checks persisted presets

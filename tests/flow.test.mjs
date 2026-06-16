@@ -1871,5 +1871,83 @@ console.log('--- scenario 25: big-button layout ---');
   check('s26: error_code -> loud error frame with message', errFrame && /401/.test(errFrame.error) && /invalid api key/.test(errFrame.error), JSON.stringify(e1));
 }
 
+// ── Scenario 27: AudioWorklet frame pump (mobile realtime fix) ──
+// Realtime/hybrid audio is pumped by an AudioWorklet (off the main thread, so it
+// can't be starved on phones into slow/sparse transcripts) with a ScriptProcessor
+// fallback. The bulk of the suite above runs the FALLBACK path (the harness's
+// MockAudioCtx exposes no audioWorklet); this scenario mocks the worklet so the
+// PRIMARY path is covered: the module loads, an AudioWorkletNode is created (not a
+// ScriptProcessor), and a frame posted on its port drives the same downsample →
+// PCM → stream chokepoint, sending a spec-shaped chunk on the realtime socket.
+console.log('--- scenario 27: AudioWorklet pump ---');
+{
+  let workletNode = null;
+  let addModuleCalls = 0;
+  let scriptProcessorCalls = 0;
+
+  class MockWorkletCtx extends MockAudioCtx {
+    constructor() {
+      super();
+      this.audioWorklet = { addModule: () => { addModuleCalls++; return Promise.resolve(); } };
+    }
+    createScriptProcessor() { scriptProcessorCalls++; return super.createScriptProcessor(); }
+  }
+  class MockAudioWorkletNode {
+    constructor(ctx, name) {
+      this.name = name;
+      this.port = { onmessage: null, postMessage() {} };
+      workletNode = this;
+    }
+    connect() {} disconnect() {}
+  }
+
+  const wsocks = [];
+  const dom27 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:worklet-mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockWorkletCtx;
+      win.AudioWorkletNode = MockAudioWorkletNode;
+      const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+      const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(stream), addEventListener: () => {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      const SockClass = class extends MockWS { constructor(url) { super(url); wsocks.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(100);
+  const d27 = dom27.window.document;
+  d27.getElementById('sonioxKey').value = 'test-skey';
+  d27.getElementById('engRealtime').click();
+  d27.getElementById('recordBtn').click();
+  await sleep(120);
+
+  check('s27: the worklet module was loaded (addModule called)', addModuleCalls === 1, 'addModule=' + addModuleCalls);
+  check('s27: an AudioWorkletNode is the pump, not a ScriptProcessor', !!workletNode && scriptProcessorCalls === 0, 'node=' + !!workletNode + ' sp=' + scriptProcessorCalls);
+  check('s27: the pump wired a port.onmessage handler', typeof workletNode.port.onmessage === 'function');
+
+  const sock27 = wsocks[wsocks.length - 1];
+  sock27.open();
+  await sleep(20);
+  const sentBefore = sock27.sent.length;
+  // A frame posted on the worklet port must flow through handleAudioFrame and be
+  // streamed as a spec-shaped input_audio_chunk (proof the off-thread pump feeds
+  // the same chokepoint the old onaudioprocess did).
+  workletNode.port.onmessage({ data: new dom27.window.Float32Array(4096).fill(0.05) });
+  await sleep(20);
+  const chunk = sock27.sent.slice(sentBefore).map((s) => JSON.parse(s)).find((m) => m.message_type === 'input_audio_chunk');
+  check('s27: a posted frame streams a spec-shaped audio chunk', !!chunk && typeof chunk.audio_base_64 === 'string' && chunk.audio_base_64.length > 0 && chunk.sample_rate === 16000, JSON.stringify(chunk));
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

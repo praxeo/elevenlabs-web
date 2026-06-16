@@ -57,10 +57,10 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 ```
 Browser (this page, installable PWA)
   mic → high-pass → ┬→ analyser (meter, gate UI, health watchdog)
-                    ├→ ScriptProcessor → 16 kHz PCM ─┬→ base64 frames (realtime/hybrid) ─┐
-                    │                                └→ session buffer → WAV (hybrid)     │
-                    └→ noise gate → MediaRecorder (preview; THE recording in batch mode)  │
-                                                                                          ▼
+                    ├→ AudioWorklet pump → 16 kHz PCM ─┬→ base64 frames (realtime/hybrid)  ─┐
+                    │                                  └→ session buffer → WAV (hybrid)     │
+                    └→ noise gate → MediaRecorder (preview; THE recording in batch mode)    │
+                                                                                            ▼
 Cloudflare Worker   /api/transcribe — one path, two protocols
   ├─ WebSocket upgrade → WS proxy (Soniox key in config frame, token translation)
   │       └→ Soniox wss stt-rt.soniox.com/transcribe-websocket  (stt-rt-v5)
@@ -375,7 +375,7 @@ This app deploys over the original batch app's URL, and your saved settings, API
 - [ ] **Direct client-side streaming** — the realtime API accepts single-use tokens (`token` query param, minted via the tokens endpoint); the Worker could become a passphrase-gated token minter and the browser would connect straight to ElevenLabs, dropping the proxy hop from the audio path entirely.
 - [ ] **Zero-retention mode** — `enable_logging=false` puts a session in zero-retention mode (enterprise plans only); worth wiring as an option if PHI policy ever requires it.
 - [ ] **Warm socket** — keep one WebSocket open across dictations for instant start; needs answers on idle billing/session timeout before committing.
-- [ ] **AudioWorklet migration** — `ScriptProcessorNode` is deprecated; works today, but the replacement should land before browsers force the issue.
+- [x] **AudioWorklet migration** — the realtime/hybrid frame pump now runs on the audio render thread (`pcm-pump` worklet), so it can't be starved by main-thread work the way the deprecated `ScriptProcessorNode` was. This fixed slow/sparse realtime on phones (the pump was dropping buffers under UI load, starving the STT). `ScriptProcessorNode` stays as a fallback for browsers without worklet support.
 - [ ] **Passphrase hardening** — shared-mode passphrase travels as a query parameter on the WS path; move to a WebSocket subprotocol header or first-message auth to shrink the exposure surface (logs, proxies).
 - [ ] **Editable transcript box** — let the user correct text in place before copy; cursor-aware appending.
 - [ ] **True streaming into Cerner** — AHK polls clipboard deltas (or a local helper receives text over localhost) and types text as it commits. Big workflow win, big failure-mode surface; prototype now that the hybrid mode has proven out.

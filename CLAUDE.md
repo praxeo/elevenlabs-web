@@ -121,7 +121,7 @@ Resilience contract — every layer of this link fails silently by default; do n
 - **Keyterm presets** live in the `KEYTERM_PRESETS` const (top of `worker.js`, before `MANIFEST`): `always: true` lists apply to every dictation invisibly (every dictation then pays the ~20 % keyterm surcharge); the rest render as checkboxes in the Keyterms section, persisted as `presetIds` in the `_v9` settings (additive field). The Worker injects the sanitized lists via the `__KEYTERM_PRESETS__` token — **function replacer only**; a string replacement would interpret `$`-patterns in term text. The client merges in `effectiveKeyterms` with trim priority **custom > checked presets > always-on** when the realtime 50-term cap overflows; batch (1000) gets everything, so in hybrid the clipboard text benefits from the full list even when the live feed trimmed. Editing/adding a list = edit the const + deploy. `renderPresetRow()` must run before `loadSettings()` at boot.
 - Client → server WS frames: every chunk goes through the `sendAudioChunk` chokepoint: `{"message_type":"input_audio_chunk","audio_base_64":"…","commit":false,"sample_rate":16000}`; the final flush sets `commit:true`. `previous_text` (append-continuation context) may ride **only the first** chunk — but **the Worker drops it** for realtime (cross-press continuity drift, like the batch refine already has). This is the *client* contract; the Worker translates it to Soniox's binary-PCM + empty-string-end protocol.
 - Server → client frames (the vocabulary the **client and phone listener** consume; the Worker emits these by translating Soniox responses): `session_started` (config empty), `partial_transcript`, `committed_transcript`. Client rule: **any frame carrying a string `error` takes the loud error path** — never match error types by name only. The Worker synthesizes an `error` frame then closes `1008` on handshake failures, and maps any Soniox `error_code` (or abnormal close) to one too.
-- Audio pipeline: 48 kHz float (ScriptProcessor, 4096 samples ≈ 85 ms/frame) → averaged downsample to 16 kHz → s16le → base64 (stream) and, in hybrid, the same buffers → `buildWavBlob` (44-byte RIFF header via DataView) → POST.
+- Audio pipeline: 48 kHz float → the **frame pump** (`buildPumpNode`) → `handleAudioFrame` → averaged downsample to 16 kHz → s16le → base64 (stream) and, in hybrid, the same buffers → `buildWavBlob` (44-byte RIFF header via DataView) → POST. The pump is an **AudioWorklet** (`pcm-pump`, loaded from a Blob URL so the no-build-step constraint holds): it buffers the 128-sample render quanta into `PUMP_FRAME_SAMPLES` (4096 ≈ 85 ms) frames **on the audio render thread** and posts owned (transferred) copies to the main thread. Running off the main thread is load-bearing on mobile — the old main-thread `ScriptProcessorNode` got starved by UI/gate-meter/DOM work and dropped buffers, starving Soniox into slow, sparse transcripts (batch was immune: `MediaRecorder` is off-thread). `ScriptProcessorNode` stays as a **fallback** (same `handleAudioFrame`) so capture is never lost if the worklet can't load; the 4096 frame size is matched so every downstream byte count (`capturePcm`, `MIN_REFINE_BYTES`) is unchanged.
 
 ## Validation (no browser needed)
 
@@ -157,7 +157,10 @@ node --check /tmp/served.js
 # override, joined local-copy denial deferring to the
 # relay ack, Soniox realtime frame translation: client chunk→binary PCM/
 # empty-string-end, final/non-final tokens→running partial + committed on
-# finished, error_code→loud error frame):
+# finished, error_code→loud error frame, AudioWorklet pump: module load +
+# AudioWorkletNode (not ScriptProcessor) + a posted frame streaming a
+# spec-shaped audio chunk — the rest of the suite covers the ScriptProcessor
+# fallback path via the same handleAudioFrame):
 npm install --no-save jsdom jsqr
 node tests/flow.test.mjs
 ```
@@ -197,7 +200,7 @@ The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.6
 
 ## Known sharp edges
 
-- `ScriptProcessorNode` is deprecated (AudioWorklet migration is on the roadmap) — don't add new load-bearing logic to it beyond the existing frame pump + `capturePcm`.
+- The frame pump is an **AudioWorklet** now (`buildPumpNode`); `ScriptProcessorNode` is the deprecated fallback only. Keep all per-frame logic in `handleAudioFrame` (shared by both paths) — don't split behavior across the two, and don't add load-bearing logic to the ScriptProcessor branch.
 - Closing the WS immediately after sending `commit:true` loses the final transcript — always go through the await-final path.
 - Clipboard writes require document focus; both `navigator.clipboard` and the `execCommand` fallback fail unfocused. The UX (beeps, sentinel) is built around that constraint — don't "fix" it by silently retrying later. (The phone-link focus-retry is the one sanctioned exception: it is loud while pending and retries only on refocus — see the Phone link section.)
 - The shared-mode passphrase travels as a query param on the WS path (hardening idea in the README roadmap); don't add logging of request URLs in the Worker. The POST path carries it in the form body.

@@ -1235,8 +1235,8 @@ right lower quadrant"></textarea>
   let analyserNode = null;
   let gateNode = null;
   let destNode = null;
-  let recorderNode = null; // Node for real-time downsampling
-  let sinkNode = null;     // Muted sink to keep ScriptProcessor running safely
+  let recorderNode = null; // Frame pump: AudioWorklet (preferred) or ScriptProcessor (fallback)
+  let sinkNode = null;     // Muted sink that keeps the pump node pulled by the graph
   let gateTimer = null;
   let gateBuf = null;
   let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
@@ -1278,6 +1278,7 @@ right lower quadrant"></textarea>
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
   const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
+  const PUMP_FRAME_SAMPLES = 4096;  // pump frame size (≈85ms at 48kHz) — matched the old ScriptProcessor so all downstream byte counts hold
 
   const BATCH_UPLOAD_TIMEOUT_MS = 30000; // pure batch: upload+transcription deadline
   const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
@@ -2115,7 +2116,6 @@ right lower quadrant"></textarea>
     gateNode.gain.value = 0;
 
     destNode = audioCtx.createMediaStreamDestination();
-    recorderNode = audioCtx.createScriptProcessor(4096, 1, 1);
 
     sinkNode = audioCtx.createGain();
     sinkNode.gain.value = 0;
@@ -2123,7 +2123,15 @@ right lower quadrant"></textarea>
     source.connect(hpFilter);
     hpFilter.connect(analyserNode);
 
-    // STT FEED: pre-gate (raw, high-passed) audio -> Scribe.
+    // STT FEED: pre-gate (raw, high-passed) audio -> the realtime pump. Prefer an
+    // AudioWorklet: its processor runs on the audio render thread, so main-thread
+    // load (UI, the 30 ms gate meter, live DOM, the big-button screen) cannot
+    // starve it. The deprecated ScriptProcessorNode ran ON the main thread and on
+    // phones dropped buffers under that load — starving Soniox into slow, sparse
+    // transcripts (batch was immune: it records off-thread via MediaRecorder).
+    // ScriptProcessor stays as the fallback so the capture path is never silently
+    // lost if the worklet cannot load.
+    recorderNode = await buildPumpNode();
     hpFilter.connect(recorderNode);
     recorderNode.connect(sinkNode);
     sinkNode.connect(audioCtx.destination);
@@ -2138,40 +2146,8 @@ right lower quadrant"></textarea>
     lastMeterPct = -1;
     setGateStateUI(false);
 
-    // Audio sampling loop. Keeps streaming through the post-release "tail"
-    // phase so the last word is not clipped, and buffers chunks while the
-    // WebSocket is still connecting so the first word is not lost either.
-    recorderNode.onaudioprocess = (e) => {
-      const live = recording && (!stopping || stopPhase === "tail") && ws;
-      if (!live) {
-        // Idle: keep a short pre-roll ring so the first word — often spoken
-        // the instant the key lands, before the session is armed — survives.
-        // Held in memory only; sent only if a dictation starts within
-        // PREROLL_MS, discarded otherwise. Frames here were never sent, so
-        // prepending them can't double-transcribe anything.
-        prerollFrames.push({
-          t: Date.now(),
-          rate: audioCtx ? audioCtx.sampleRate : 48000,
-          samples: new Float32Array(e.inputBuffer.getChannelData(0)),
-        });
-        while (prerollFrames.length > PREROLL_FRAME_CAP) prerollFrames.shift();
-        return;
-      }
-
-      const floatSamples = e.inputBuffer.getChannelData(0);
-
-      const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
-      const pcmBuffer = floatTo16BitPCM(downsampled);
-      capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
-      const base64Audio = arrayBufferToBase64(pcmBuffer);
-
-      if (ws.readyState === WebSocket.OPEN) {
-        flushPendingChunks();
-        sendAudioChunk(base64Audio, false);
-      } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
-        pendingChunks.push(base64Audio);
-      }
-    };
+    // The frame pump (worklet or ScriptProcessor) is wired in buildPumpNode and
+    // delivers each captured frame to handleAudioFrame.
 
     if (gateTimer) clearInterval(gateTimer);
     gateTimer = setInterval(() => {
@@ -2302,6 +2278,98 @@ right lower quadrant"></textarea>
     if (tailTimer)          { clearTimeout(tailTimer);          tailTimer = null; }
     if (finalDeadlineTimer) { clearTimeout(finalDeadlineTimer); finalDeadlineTimer = null; }
     if (quietTimer)         { clearTimeout(quietTimer);         quietTimer = null; }
+  }
+
+  // One captured frame (an owned Float32Array of PUMP_FRAME_SAMPLES, from the
+  // worklet's port or the ScriptProcessor fallback). Idle frames feed the
+  // pre-roll ring (first-word rescue); live frames downsample -> s16le PCM ->
+  // capturePcm (the hybrid refine's exact copy) -> stream. Keeps streaming
+  // through the post-release "tail" phase so the last word is not clipped, and
+  // buffers chunks while the WebSocket is still connecting so the first word is
+  // not lost either.
+  function handleAudioFrame(floatSamples) {
+    const live = recording && (!stopping || stopPhase === "tail") && ws;
+    if (!live) {
+      // Idle: keep a short pre-roll ring so the first word — often spoken the
+      // instant the key lands, before the session is armed — survives. Held in
+      // memory only; sent only if a dictation starts within PREROLL_MS,
+      // discarded otherwise. Never-sent frames can't double-transcribe.
+      prerollFrames.push({
+        t: Date.now(),
+        rate: audioCtx ? audioCtx.sampleRate : 48000,
+        samples: floatSamples,
+      });
+      while (prerollFrames.length > PREROLL_FRAME_CAP) prerollFrames.shift();
+      return;
+    }
+
+    const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
+    const pcmBuffer = floatTo16BitPCM(downsampled);
+    capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
+    const base64Audio = arrayBufferToBase64(pcmBuffer);
+
+    if (ws.readyState === WebSocket.OPEN) {
+      flushPendingChunks();
+      sendAudioChunk(base64Audio, false);
+    } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
+      pendingChunks.push(base64Audio);
+    }
+  }
+
+  // The AudioWorklet processor source. It buffers the 128-sample render quanta
+  // into PUMP_FRAME_SAMPLES-sized frames (same size the ScriptProcessor used, so
+  // every downstream byte count — capturePcm, MIN_REFINE_BYTES — is unchanged)
+  // and posts each as an owned (transferred) copy to the main thread. Buffering
+  // ON the render thread is the fix: frames are captured even while the main
+  // thread is busy (postMessage queues; audio is never dropped). Loaded from a
+  // Blob URL so the no-build-step / single-file constraint holds.
+  let workletUrl = null;
+  function getWorkletUrl() {
+    if (workletUrl) return workletUrl;
+    const src =
+      "class PcmPump extends AudioWorkletProcessor {" +
+      "constructor(){super();this._buf=new Float32Array(" + PUMP_FRAME_SAMPLES + ");this._n=0;}" +
+      "process(inputs){" +
+        "var input=inputs[0];" +
+        "if(input&&input[0]){" +
+          "var ch=input[0];" +
+          "for(var i=0;i<ch.length;i++){" +
+            "this._buf[this._n++]=ch[i];" +
+            "if(this._n>=this._buf.length){" +
+              "var out=this._buf.slice(0);" +
+              "this.port.postMessage(out,[out.buffer]);" +
+              "this._n=0;" +
+            "}" +
+          "}" +
+        "}" +
+        "return true;" +
+      "}" +
+      "}" +
+      "registerProcessor('pcm-pump',PcmPump);";
+    workletUrl = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
+    return workletUrl;
+  }
+
+  // Build the frame pump: AudioWorklet first (off the main thread), with the
+  // deprecated ScriptProcessor as a fallback. Both deliver frames to the same
+  // handleAudioFrame, so capture/downsample/send/pre-roll behavior is identical.
+  async function buildPumpNode() {
+    if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
+      try {
+        await audioCtx.audioWorklet.addModule(getWorkletUrl());
+        const node = new AudioWorkletNode(audioCtx, "pcm-pump");
+        node.port.onmessage = (e) => { handleAudioFrame(e.data); };
+        return node;
+      } catch (err) {
+        // Worklet unavailable/blocked — fall back so realtime still captures.
+        console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+      }
+    }
+    const sp = audioCtx.createScriptProcessor(PUMP_FRAME_SAMPLES, 1, 1);
+    sp.onaudioprocess = (e) => {
+      handleAudioFrame(new Float32Array(e.inputBuffer.getChannelData(0)));
+    };
+    return sp;
   }
 
   // Single chokepoint for every audio frame: guarantees the spec-required

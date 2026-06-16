@@ -758,9 +758,17 @@ const INDEX_HTML = `<!doctype html>
       border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
     }
     #bigPeek.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    /* While recording, the realtime words ARE the feedback (the reason to pick the
+       realtime engine on mobile) — accent the strip so it reads as live. */
+    #bigPeek.live { border-color: var(--accent); }
     #bigPeekBar { padding: 8px 12px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; -webkit-user-select: none; }
+    #bigPeek.live #bigPeekBar { color: var(--accent); }
     #bigPeekText { padding: 0 12px 8px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 20px; }
     #bigPeek.expanded #bigPeekText { white-space: pre-wrap; overflow: auto; text-overflow: clip; max-height: 38vh; cursor: pointer; }
+    /* Live view: wrap and grow so the newest words stay on-screen instead of
+       scrolling off the right edge of a head-truncated one-liner (the strip
+       looked frozen as the note grew). updateBigPeek pins the scroll to the tail. */
+    #bigPeek.live #bigPeekText { white-space: pre-wrap; overflow-y: auto; text-overflow: clip; max-height: 30vh; min-height: 48px; }
     /* Whole-screen status: the overlay background IS the at-arm's-length
        indicator, derived from the same transitions that drive the pills. */
     body.bigbtn #bigUi[data-screen="connecting"] { background: #3d3008; }
@@ -3628,11 +3636,21 @@ right lower quadrant"></textarea>
   function updateBigPeek() {
     if (!bigPeekEl) return;
     bigPeekTextEl.textContent = latestText || "";
+    // While a dictation is live, show the realtime words wrapped and pinned to the
+    // newest line — a collapsed one-liner truncates from the end, so the latest
+    // recognized words scroll off-screen and the strip looks frozen (the realtime
+    // feedback the mobile/joined user actually needs). Batch has no live text, so
+    // gate on latestText: nothing to show until delivery.
+    var live = (recording || stopping) && !!latestText;
+    bigPeekEl.classList.toggle("live", live);
     bigPeekEl.classList.toggle("expanded", bigPeekExpanded);
     bigPeekEl.classList.toggle("armed", appendArmed && !recording);
-    bigPeekBarEl.textContent = bigPeekExpanded
-      ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
-      : "Latest transcript — tap to expand";
+    bigPeekBarEl.textContent = live
+      ? "Live transcript"
+      : bigPeekExpanded
+        ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
+        : "Latest transcript — tap to expand";
+    if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
   }
 
   // Press/release handling. Pointer capture plus the cancel/lost/document

@@ -268,7 +268,7 @@ await sleep(30);
 check('pre-roll + buffered frames flushed on open', s1.sent.length === 7, s1.sent.length);
 check('status shows live', status().includes('transcribing live'), status());
 s1.msg({ message_type: 'session_started', session_id: 'sess-1', config: { keyterms: ['tachycardia', 'ascites'], no_verbatim: true } });
-check('session_started surfaces server-confirmed keyterms', status().includes('(2 keyterms active)'), status());
+check('session_started surfaces the sent keyterm count', status().includes('(2 keyterms sent)'), status());
 check('link pill LIVE', doc.getElementById('linkPill').textContent === 'LIVE');
 check('mic pill REC', doc.getElementById('micPill').textContent === 'REC');
 s1.msg({ message_type: 'partial_transcript', text: 'patient presents' });
@@ -1846,6 +1846,12 @@ console.log('--- scenario 25: big-button layout ---');
   const first = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: false }, { text: ' are', is_final: false }] })).map(JSON.parse);
   check('s26: first response emits session_started then partial', first[0].message_type === 'session_started' && first[1].message_type === 'partial_transcript' && first[1].text === 'How are', JSON.stringify(first));
 
+  // The synthesized session_started carries the keyterm list the Worker SENT, so
+  // the client can show "(N keyterms sent)" (Soniox never echoes config itself).
+  const ktOut = worker.makeSonioxToClient(['warfarin', 'metoprolol'])(JSON.stringify({ tokens: [] })).map(JSON.parse);
+  const ss = ktOut.find((f) => f.message_type === 'session_started');
+  check('s26: session_started reports the sent keyterm count', ss && Array.isArray(ss.config.keyterms) && ss.config.keyterms.length === 2, JSON.stringify(ss));
+
   // Non-final tokens RESET each response; partial reflects the current provisional tail.
   const r2 = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: true }, { text: ' are', is_final: true }, { text: ' you', is_final: false }] })).map(JSON.parse);
   check('s26: confirmed + provisional combine into the running partial', r2[0].message_type === 'partial_transcript' && r2[0].text === 'How are you', r2[0].text);
@@ -1859,16 +1865,28 @@ console.log('--- scenario 25: big-button layout ---');
   const committed = done.find((f) => f.message_type === 'committed_transcript');
   check('s26: finished -> committed_transcript with confirmed text', committed && committed.text === 'How are you doing', JSON.stringify(done));
 
-  // Soniox endpoint markers (<end>, <fin>) are control tokens, not transcript —
-  // they must never reach the rendered text.
+  // Soniox control markers — <end> (endpoint detection) and <fin> (manual
+  // finalization) — are dropped by EXACT match, never reaching the rendered text,
+  // while real angle-bracket text would survive (the old regex could eat it).
   const ep = worker.makeSonioxToClient();
-  const epOut = ep(JSON.stringify({ tokens: [{ text: 'Done', is_final: true }, { text: '<end>', is_final: true }, { text: ' next', is_final: false }] })).map(JSON.parse);
-  check('s26: endpoint markers filtered out of the transcript', epOut.find((f) => f.message_type === 'partial_transcript').text === 'Done next', JSON.stringify(epOut));
+  const epOut = ep(JSON.stringify({ tokens: [{ text: 'Done', is_final: true }, { text: '<end>', is_final: true }, { text: '<fin>', is_final: true }, { text: ' next', is_final: false }] })).map(JSON.parse);
+  check('s26: endpoint/finalize control tokens filtered out of the transcript', epOut.find((f) => f.message_type === 'partial_transcript').text === 'Done next', JSON.stringify(epOut));
 
-  // error_code -> loud {error} frame.
+  // Error frames -> loud {error}, keyed off the stable error_type slug with an
+  // actionable plain-English lead; the raw error_message is appended verbatim.
   const e1 = worker.makeSonioxToClient()(JSON.stringify({ error_code: 401, error_message: 'invalid api key' })).map(JSON.parse);
   const errFrame = e1.find((f) => f.message_type === 'error');
-  check('s26: error_code -> loud error frame with message', errFrame && /401/.test(errFrame.error) && /invalid api key/.test(errFrame.error), JSON.stringify(e1));
+  check('s26: 401 -> actionable auth error with the raw message appended', errFrame && /auth/i.test(errFrame.error) && /invalid api key/.test(errFrame.error), JSON.stringify(e1));
+
+  // An error_type-only frame (no numeric code) still takes the loud path.
+  const e2 = worker.makeSonioxToClient()(JSON.stringify({ error_type: 'organization_balance_exhausted' })).map(JSON.parse);
+  const errFrame2 = e2.find((f) => f.message_type === 'error');
+  check('s26: error_type quota -> loud, actionable error', errFrame2 && /(quota|balance)/i.test(errFrame2.error), JSON.stringify(e2));
+
+  // An unmapped code still surfaces loudly, carrying the number for diagnosis.
+  const e3 = worker.makeSonioxToClient()(JSON.stringify({ error_code: 503, error_message: 'unavailable' })).map(JSON.parse);
+  const errFrame3 = e3.find((f) => f.message_type === 'error');
+  check('s26: unmapped error_code -> loud error carrying the code', errFrame3 && /503/.test(errFrame3.error) && /unavailable/.test(errFrame3.error), JSON.stringify(e3));
 }
 
 // ── Scenario 27: AudioWorklet frame pump (mobile realtime fix) ──

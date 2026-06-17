@@ -10,3 +10,11 @@ node_modules/
 # the app itself has zero dependencies and no build step.
 package.json
 package-lock.json
+
+# Realtime-accuracy investigation scratch (Session 2) — local-only test harness,
+# TTS corpus, and workflow script. Safe to delete after the investigation.
+.dsp-test.mjs
+.wf-realtime-research.mjs
+.test/
+.tts/
+tmp/

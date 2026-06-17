@@ -268,7 +268,7 @@ await sleep(30);
 check('pre-roll + buffered frames flushed on open', s1.sent.length === 7, s1.sent.length);
 check('status shows live', status().includes('transcribing live'), status());
 s1.msg({ message_type: 'session_started', session_id: 'sess-1', config: { tier: 'medical' } });
-check('session_started surfaces the Nova-3 config tier', status().includes('(Nova-3: medical)'), status());
+check('session_started surfaces the realtime config tier', status().includes('(medical)'), status());
 check('link pill LIVE', doc.getElementById('linkPill').textContent === 'LIVE');
 check('mic pill REC', doc.getElementById('micPill').textContent === 'REC');
 s1.msg({ message_type: 'partial_transcript', text: 'patient presents' });

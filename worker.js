@@ -374,35 +374,34 @@ async function handleTranscribeRealtime(request, env) {
     // which one did (so medical-vs-general is visible). Suspect params, most→least
     // likely to 500: mode:"medical" (the streaming medical variant may not exist),
     // endpointing string, keyterm, sample_rate (absent from nova-3's schema).
-    const ktStr = cleanedKeyterms.length ? cleanedKeyterms.join(" ") : null;
-    const baseCfg = {
-      encoding: "linear16",
-      sample_rate: "16000",
-      channels: 1,
-      language: "en-US",
-      interim_results: true,
-      punctuate: true,
-      smart_format: true,
-      numerals: true,
-    };
+    // Even the barebones nova-3 config 500s (AiError 5030) — so the problem isn't a
+    // specific param; nova-3 may simply not support binding-streaming the way Flux
+    // does. These DIAGNOSTIC tiers isolate that in one shot: nova-3 with the EXACT
+    // proven Flux shape, nova-3 + interim_results, and @cf/deepgram/flux itself
+    // (which Cloudflare documents as working). The first to return a socket wins; the
+    // per-tier statuses are surfaced so we learn whether nova-3 streams at all via the
+    // binding or whether we ride Flux. (The translator already handles Flux's event
+    // shape, so a Flux socket still produces transcripts.)
+    const FLUX_MODEL = "@cf/deepgram/flux";
     const tiers = [
-      { label: "medical", cfg: Object.assign({}, baseCfg, { mode: "medical", endpointing: "false" }, ktStr ? { keyterm: ktStr } : {}) },
-      { label: "general", cfg: Object.assign({}, baseCfg, ktStr ? { keyterm: ktStr } : {}) },
-      { label: "minimal", cfg: { encoding: "linear16", sample_rate: "16000", channels: 1, interim_results: true } },
+      { label: "nova3-bare",    model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000" } },
+      { label: "nova3-interim", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000", interim_results: true } },
+      { label: "flux-bare",     model: FLUX_MODEL,  cfg: { encoding: "linear16", sample_rate: "16000" } },
     ];
 
-    let backendWs = null, usedTier = "", lastDiag = "";
+    let backendWs = null, usedTier = "", diags = [];
     for (const t of tiers) {
       let r = null;
-      try { r = await env.AI.run(NOVA3_MODEL, t.cfg, { websocket: true }); }
-      catch (e) { lastDiag = t.label + " threw " + (e?.message || String(e)); continue; }
+      try { r = await env.AI.run(t.model, t.cfg, { websocket: true }); }
+      catch (e) { diags.push(t.label + ":threw " + (e?.message || String(e)).slice(0, 60)); continue; }
       if (r && r.webSocket) { backendWs = r.webSocket; usedTier = t.label; break; }
-      lastDiag = t.label + " status=" + (r && r.status);
-      try { if (r && typeof r.clone === "function") lastDiag += " body=" + (await r.clone().text()).slice(0, 160); } catch (e) {}
+      let d = t.label + ":status=" + (r && r.status);
+      try { if (r && typeof r.clone === "function") { const b = await r.clone().text(); d += " " + b.slice(0, 70); } } catch (e) {}
+      diags.push(d);
     }
-    try { console.log("nova3 connect tier:", usedTier || "NONE", "| last:", lastDiag); } catch (e) {}
+    try { console.log("realtime connect:", usedTier || "NONE", "|", diags.join(" || ")); } catch (e) {}
     if (!backendWs) {
-      return returnWsError("Nova-3 connect failed on all configs [" + lastDiag + "]");
+      return returnWsError("Realtime connect failed [" + diags.join(" | ") + "]");
     }
 
     backendWs.accept();
@@ -2667,7 +2666,7 @@ right lower quadrant"></textarea>
           const cfg = data.config || {};
           const tier = typeof cfg.tier === "string" ? cfg.tier : "";
           if (!stopping) {
-            setStatus("Listening — transcribing live…" + (tier ? " (Nova-3: " + tier + ")" : ""), "ok");
+            setStatus("Listening — transcribing live…" + (tier ? " (" + tier + ")" : ""), "ok");
           }
         }
         else if (m_type === "partial_transcript") {

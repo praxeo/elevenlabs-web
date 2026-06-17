@@ -389,7 +389,23 @@ async function handleTranscribeRealtime(request, env) {
     }
     const backendWs = aiResp && aiResp.webSocket;
     if (!backendWs) {
-      return returnWsError("Workers AI did not return a WebSocket for Nova-3");
+      // DIAGNOSTIC: capture exactly what env.AI.run returned so we know whether the
+      // config was rejected (a non-101 error Response we can read) or the binding
+      // simply does not expose a server-side socket for middle-layer translation.
+      let diag = "typeof=" + (typeof aiResp);
+      try {
+        if (aiResp && typeof aiResp === "object") {
+          diag += " ctor=" + (aiResp.constructor && aiResp.constructor.name);
+          if ("status" in aiResp) diag += " status=" + aiResp.status;
+          diag += " hasWSkey=" + ("webSocket" in aiResp) + " wsType=" + (typeof aiResp.webSocket);
+          if (typeof aiResp.clone === "function" && typeof aiResp.text === "function") {
+            try { diag += " body=" + (await aiResp.clone().text()).slice(0, 220); } catch (e) { diag += " bodyErr=" + (e && e.message); }
+          } else {
+            try { diag += " keys=" + Object.keys(aiResp).join(","); } catch (e) {}
+          }
+        }
+      } catch (e) { diag += " introspectErr=" + (e && e.message); }
+      return returnWsError("Workers AI did not return a WebSocket for Nova-3 [" + diag + "]");
     }
 
     backendWs.accept();

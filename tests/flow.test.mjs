@@ -1859,14 +1859,16 @@ console.log('--- scenario 25: big-button layout ---');
   const r3 = toC(mkResult('doing', false)).map(JSON.parse);
   check('s26: interim appends to locked final', r3[0].text === 'How are you doing', r3[0].text);
 
-  // from_finalize on an is_final -> committed_transcript (lets the client close fast).
-  const r4 = toC(mkResult('doing well', true, { from_finalize: true })).map(JSON.parse);
-  const committed = r4.find((f) => f.message_type === 'committed_transcript');
-  check('s26: from_finalize -> committed_transcript', committed && committed.text === 'How are you doing well', JSON.stringify(r4));
+  // is_final segments only ever update the running partial — committed is NOT
+  // emitted per-final (that append-duplicated into "hello hello world"); it comes
+  // once on Metadata. So another is_final just extends the partial.
+  const r4 = toC(mkResult('doing well', true)).map(JSON.parse);
+  check('s26: is_final extends partial, does NOT commit', r4[0].message_type === 'partial_transcript' && r4[0].text === 'How are you doing well' && !r4.some((f) => f.message_type === 'committed_transcript'), JSON.stringify(r4));
 
-  // Metadata (end of stream after CloseStream) -> committed with accumulated text.
+  // Metadata (end of stream after CloseStream) -> the ONE committed_transcript with
+  // the full accumulated text. This is the single lock-in (no duplication).
   const meta = toC(JSON.stringify({ type: 'Metadata', request_id: 'x' })).map(JSON.parse);
-  check('s26: Metadata -> committed_transcript', meta.find((f) => f.message_type === 'committed_transcript')?.text === 'How are you doing well', JSON.stringify(meta));
+  check('s26: Metadata -> single committed_transcript with full text', meta.length === 1 && meta[0].message_type === 'committed_transcript' && meta[0].text === 'How are you doing well', JSON.stringify(meta));
 
   // Connected (handshake) / SpeechStarted / UtteranceEnd are benign lifecycle
   // frames -> ignored, NOT surfaced as errors (a fresh translator so the first-frame
@@ -1883,13 +1885,14 @@ console.log('--- scenario 25: big-button layout ---');
   const e2 = worker.makeNova3ToClient()(JSON.stringify({ error: 'quota exceeded' })).map(JSON.parse);
   check('s26: string error field -> loud error frame', e2.find((f) => f.message_type === 'error' && /quota exceeded/.test(f.error)), JSON.stringify(e2));
 
-  // Shape (B): batch-style envelope still yields text (partial + committed).
+  // Shape (B): batch-style envelope surfaces text as a running partial (committed
+  // still comes once via Metadata / the close backstop — no per-frame duplication).
   const b1 = worker.makeNova3ToClient()(JSON.stringify({ results: { channels: [{ alternatives: [{ transcript: 'batch shape' }] }] } })).map(JSON.parse);
-  check('s26: batch-shape frame -> partial + committed', b1.find((f) => f.message_type === 'partial_transcript')?.text === 'batch shape' && b1.find((f) => f.message_type === 'committed_transcript')?.text === 'batch shape', JSON.stringify(b1));
+  check('s26: batch-shape frame -> partial (text surfaced)', b1.find((f) => f.message_type === 'partial_transcript')?.text === 'batch shape', JSON.stringify(b1));
 
-  // Shape (C): Flux-style turn protocol EndOfTurn -> committed.
+  // Shape (C): Flux-style EndOfTurn extends the running partial.
   const c1 = worker.makeNova3ToClient()(JSON.stringify({ event: 'EndOfTurn', transcript: 'turn shape' })).map(JSON.parse);
-  check('s26: flux-shape EndOfTurn -> committed', c1.find((f) => f.message_type === 'committed_transcript')?.text === 'turn shape', JSON.stringify(c1));
+  check('s26: flux-shape EndOfTurn -> partial (text surfaced)', c1.find((f) => f.message_type === 'partial_transcript')?.text === 'turn shape', JSON.stringify(c1));
 
   // Unknown shape with no transcript -> ignored (no fabricated text, no fatal error).
   const unk = worker.makeNova3ToClient()(JSON.stringify({ totally: 'unexpected', shape: 1 })).map(JSON.parse);

@@ -251,57 +251,56 @@ export function makeNova3ToClient(tier) {
       out.push(JSON.stringify({ message_type: "error", error: "Nova-3 " + (m.description || m.message || m.reason || m.type) })); return out;
     }
 
-    // (A) native Deepgram streaming Results.
-    if (m.type === "Results" && m.channel && Array.isArray(m.channel.alternatives) && m.channel.alternatives[0]) {
-      sawText = true;
-      const t = m.channel.alternatives[0].transcript || "";
-      if (m.is_final === true) {
-        if (t) finalText = finalText ? finalText + " " + t : t;
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
-        // Commit on an explicit finalize or natural end-of-speech so the client can
-        // close fast; the FINAL_WAIT_MS path remains the backstop either way.
-        if (m.from_finalize === true || m.speech_final === true) {
-          out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
-        }
-      } else {
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText ? finalText + " " + t : t }));
-      }
-      return out;
-    }
-
-    // Metadata = end of stream after CloseStream -> commit the accumulated text.
+    // Metadata = end of stream after CloseStream -> emit the ONE committed_transcript
+    // that locks the note in (mirrors how the Soniox path committed once on
+    // `finished`). Committing here, NOT on every speech_final, is what prevents the
+    // client (which APPENDS each committed_transcript) from duplicating cumulative
+    // text into "hello hello world".
     if (m.type === "Metadata") {
-      out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
-      return out;
-    }
-
-    // (B) batch-style envelope (in case the WS path returns batch frames).
-    if (m.results && m.results.channels && m.results.channels[0] &&
-        m.results.channels[0].alternatives && m.results.channels[0].alternatives[0]) {
-      sawText = true;
-      const bt = m.results.channels[0].alternatives[0].transcript || "";
-      finalText = bt;
-      out.push(JSON.stringify({ message_type: "partial_transcript", text: bt }));
-      out.push(JSON.stringify({ message_type: "committed_transcript", text: bt }));
-      return out;
-    }
-
-    // (C) Flux-style turn protocol (in case nova-3 WS mirrors it).
-    if (typeof m.event === "string" && typeof m.transcript === "string") {
-      sawText = true;
-      if (m.event === "EndOfTurn") {
-        finalText = finalText ? finalText + " " + m.transcript : m.transcript;
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
-        out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
-      } else {
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText ? finalText + " " + m.transcript : m.transcript }));
-      }
+      if (finalText) out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
       return out;
     }
 
     // Benign Deepgram lifecycle frames — ignore (Connected is the handshake frame
     // sent first; SpeechStarted/UtteranceEnd are streaming events we don't need).
     if (m.type === "Connected" || m.type === "SpeechStarted" || m.type === "UtteranceEnd") return out;
+
+    // Transcript frame. Don't gate on type==="Results" — accept ANY frame carrying a
+    // channel.alternatives[0] (Cloudflare's own example keys off this, not the type).
+    // is_final segments accumulate into finalText; the running partial_transcript
+    // (finalText + the live interim tail) is the live view. committed_transcript is
+    // emitted ONCE, on Metadata, so there is no append-duplication.
+    const alt0 = m.channel && Array.isArray(m.channel.alternatives) && m.channel.alternatives[0];
+    if (alt0) {
+      sawText = true;
+      const t = (alt0.transcript || "").trim();
+      if (m.is_final === true) {
+        if (t) finalText = finalText ? finalText + " " + t : t;
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
+      } else {
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: (finalText ? finalText + " " : "") + t }));
+      }
+      return out;
+    }
+
+    // (B) batch-style envelope (results.channels[]) — defensive; show the text as a
+    // running partial (committed still comes once via Metadata / the close backstop).
+    if (m.results && m.results.channels && m.results.channels[0] &&
+        m.results.channels[0].alternatives && m.results.channels[0].alternatives[0]) {
+      sawText = true;
+      finalText = m.results.channels[0].alternatives[0].transcript || finalText;
+      out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
+      return out;
+    }
+
+    // (C) Flux-style turn protocol (event/transcript) — defensive.
+    if (typeof m.event === "string" && typeof m.transcript === "string") {
+      sawText = true;
+      const tt = m.transcript.trim();
+      if (m.event === "EndOfTurn") { if (tt) finalText = finalText ? finalText + " " + tt : tt; out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText })); }
+      else out.push(JSON.stringify({ message_type: "partial_transcript", text: (finalText ? finalText + " " : "") + tt }));
+      return out;
+    }
 
     // Any other unknown frame: ignore it (do NOT fabricate text, do NOT fail loudly).
     // The discovery diagnostic is retired now that the real protocol is known
@@ -1039,8 +1038,8 @@ right lower quadrant"></textarea>
           <div id="vadSection">
             <div class="divider"></div>
 
-            <label style="font-weight: bold; color: var(--accent);">Realtime (Soniox)</label>
-            <div class="hint">Live transcription runs on Soniox (stt-rt-v5) with endpoint detection. Accuracy is tuned via the Keyterms section below — they're sent as Soniox context terms on every realtime dictation.</div>
+            <label style="font-weight: bold; color: var(--accent);">Realtime (Deepgram Nova-3 on Workers AI)</label>
+            <div class="hint">Live transcription runs on Deepgram Nova-3 via Cloudflare Workers AI (on the edge — no external hop). Accuracy is tuned via the Keyterms section below, sent as Nova-3 keyterms on every realtime dictation.</div>
           </div>
 
           <label class="checkbox">

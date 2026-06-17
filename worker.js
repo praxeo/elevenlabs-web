@@ -84,6 +84,13 @@ export default {
       return new Response("Expected WebSocket upgrade or POST", { status: 400 });
     }
 
+    if (url.pathname === "/api/nova-probe") {
+      // One-shot diagnostic: probe which Nova-3 streaming params Workers AI accepts,
+      // server-side, with no 5 s connect-timeout pressure. GET it once and read the
+      // pass/fail matrix. Gated by the shared passphrase when one is set.
+      return handleNovaProbe(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -468,6 +475,49 @@ async function handleTranscribeRealtime(request, env) {
   } catch (err) {
     return returnWsError(`Worker initialization failed: ${err?.message || String(err)}`);
   }
+}
+
+// One-shot Nova-3 param probe. Opens @cf/deepgram/nova-3 with each candidate config
+// (server-side, no audio) and records whether Workers AI returned a WebSocket (OK)
+// or an error (status + body). Returns the full matrix as JSON so the working param
+// surface is known in ONE request instead of one-deploy-per-guess.
+async function handleNovaProbe(request, env) {
+  if (!env || !env.AI) return json({ error: "Workers AI binding (AI) not configured" }, 500);
+  const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+  if (serverPass) {
+    const given = String(new URL(request.url).searchParams.get("passphrase") || "").trim();
+    if (!safeEqual(given, serverPass)) return json({ error: "Unauthorized (add ?passphrase=...)" }, 401);
+  }
+  const E = "linear16", SR = "16000";
+  const cfgs = [
+    ["bare",            { encoding: E, sample_rate: SR }],
+    ["interim_results", { encoding: E, sample_rate: SR, interim_results: true }],
+    ["language",        { encoding: E, sample_rate: SR, language: "en-US" }],
+    ["smart_format",    { encoding: E, sample_rate: SR, smart_format: true }],
+    ["punctuate",       { encoding: E, sample_rate: SR, punctuate: true }],
+    ["numerals",        { encoding: E, sample_rate: SR, numerals: true }],
+    ["mode_medical",    { encoding: E, sample_rate: SR, mode: "medical" }],
+    ["endpointing_false", { encoding: E, sample_rate: SR, endpointing: "false" }],
+    ["channels",        { encoding: E, sample_rate: SR, channels: 1 }],
+    ["keyterm",         { encoding: E, sample_rate: SR, keyterm: "Cerner" }],
+    ["medical+interim", { encoding: E, sample_rate: SR, mode: "medical", interim_results: true }],
+    ["full",            { encoding: E, sample_rate: SR, mode: "medical", interim_results: true, smart_format: true, punctuate: true, numerals: true, language: "en-US" }],
+  ];
+  const results = {};
+  for (const [label, cfg] of cfgs) {
+    let r = null;
+    try { r = await env.AI.run("@cf/deepgram/nova-3", cfg, { websocket: true }); }
+    catch (e) { results[label] = "threw: " + ((e && e.message) || String(e)).slice(0, 140); continue; }
+    if (r && r.webSocket) {
+      results[label] = "OK";
+      try { r.webSocket.accept(); r.webSocket.close(1000); } catch (e) {}
+    } else {
+      let d = "status=" + (r && r.status);
+      try { if (r && typeof r.clone === "function") d += " " + (await r.clone().text()).slice(0, 160); } catch (e) {}
+      results[label] = d;
+    }
+  }
+  return json({ note: "OK = Workers AI returned a WebSocket for that config", results }, 200);
 }
 
 // Batch proxy: receives the recorded audio blob as multipart form data and

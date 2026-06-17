@@ -226,7 +226,7 @@ export function novaClientToBackend(raw) {
 // finalize / Metadata / end-of-turn. ANY frame carrying a string error takes the
 // loud {error} path. An UNRECOGNIZED first frame is surfaced loudly (test-build
 // diagnostic) so the real shape is observed instead of yielding a silent blank.
-export function makeNova3ToClient() {
+export function makeNova3ToClient(tier) {
   let finalText = "";       // accumulated final (locked) text
   let startedSent = false;
   let sawText = false;      // have we emitted any transcript frame?
@@ -239,7 +239,9 @@ export function makeNova3ToClient() {
 
     if (!startedSent) {
       startedSent = true;
-      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
+      // config.tier surfaces which Nova-3 config opened (medical/general/minimal)
+      // so the live status can show whether the medical model is actually active.
+      out.push(JSON.stringify({ message_type: "session_started", config: { tier: tier || "" } }));
     }
 
     // Loud error path — any error-shaped frame.
@@ -366,52 +368,47 @@ async function handleTranscribeRealtime(request, env) {
     // `model` field — that does not exist in the Workers AI schema); encoding +
     // sample_rate match the 16 kHz s16le pump; interim_results drives live partials;
     // endpointing:"false" stops Deepgram from splitting continuous PTT speech.
-    const nova3Config = {
+    // Workers AI returns a 500 AiError on a config it can't run, and the docs only
+    // prove the minimal Flux shape ({encoding, sample_rate}). Try progressively
+    // simpler configs so realtime opens as soon as ANY tier succeeds, and report
+    // which one did (so medical-vs-general is visible). Suspect params, most→least
+    // likely to 500: mode:"medical" (the streaming medical variant may not exist),
+    // endpointing string, keyterm, sample_rate (absent from nova-3's schema).
+    const ktStr = cleanedKeyterms.length ? cleanedKeyterms.join(" ") : null;
+    const baseCfg = {
       encoding: "linear16",
-      sample_rate: "16000",        // absent from nova-3's published input schema — VERIFY live
+      sample_rate: "16000",
       channels: 1,
       language: "en-US",
-      mode: "medical",
       interim_results: true,
-      smart_format: true,
       punctuate: true,
+      smart_format: true,
       numerals: true,
-      endpointing: "false",
     };
-    if (cleanedKeyterms.length) nova3Config.keyterm = cleanedKeyterms.join(" ");
+    const tiers = [
+      { label: "medical", cfg: Object.assign({}, baseCfg, { mode: "medical", endpointing: "false" }, ktStr ? { keyterm: ktStr } : {}) },
+      { label: "general", cfg: Object.assign({}, baseCfg, ktStr ? { keyterm: ktStr } : {}) },
+      { label: "minimal", cfg: { encoding: "linear16", sample_rate: "16000", channels: 1, interim_results: true } },
+    ];
 
-    // Open the backend socket via the AI binding — no outbound fetch, no external hop.
-    let aiResp;
-    try {
-      aiResp = await env.AI.run(NOVA3_MODEL, nova3Config, { websocket: true });
-    } catch (e) {
-      return returnWsError("Workers AI Nova-3 connect failed: " + (e?.message || String(e)));
+    let backendWs = null, usedTier = "", lastDiag = "";
+    for (const t of tiers) {
+      let r = null;
+      try { r = await env.AI.run(NOVA3_MODEL, t.cfg, { websocket: true }); }
+      catch (e) { lastDiag = t.label + " threw " + (e?.message || String(e)); continue; }
+      if (r && r.webSocket) { backendWs = r.webSocket; usedTier = t.label; break; }
+      lastDiag = t.label + " status=" + (r && r.status);
+      try { if (r && typeof r.clone === "function") lastDiag += " body=" + (await r.clone().text()).slice(0, 160); } catch (e) {}
     }
-    const backendWs = aiResp && aiResp.webSocket;
+    try { console.log("nova3 connect tier:", usedTier || "NONE", "| last:", lastDiag); } catch (e) {}
     if (!backendWs) {
-      // DIAGNOSTIC: capture exactly what env.AI.run returned so we know whether the
-      // config was rejected (a non-101 error Response we can read) or the binding
-      // simply does not expose a server-side socket for middle-layer translation.
-      let diag = "typeof=" + (typeof aiResp);
-      try {
-        if (aiResp && typeof aiResp === "object") {
-          diag += " ctor=" + (aiResp.constructor && aiResp.constructor.name);
-          if ("status" in aiResp) diag += " status=" + aiResp.status;
-          diag += " hasWSkey=" + ("webSocket" in aiResp) + " wsType=" + (typeof aiResp.webSocket);
-          if (typeof aiResp.clone === "function" && typeof aiResp.text === "function") {
-            try { diag += " body=" + (await aiResp.clone().text()).slice(0, 220); } catch (e) { diag += " bodyErr=" + (e && e.message); }
-          } else {
-            try { diag += " keys=" + Object.keys(aiResp).join(","); } catch (e) {}
-          }
-        }
-      } catch (e) { diag += " introspectErr=" + (e && e.message); }
-      return returnWsError("Workers AI did not return a WebSocket for Nova-3 [" + diag + "]");
+      return returnWsError("Nova-3 connect failed on all configs [" + lastDiag + "]");
     }
 
     backendWs.accept();
     workerWs.accept();
 
-    const toClient = makeNova3ToClient();
+    const toClient = makeNova3ToClient(usedTier);
 
     // Once end-of-stream is sent we stop forwarding (and keepalives) so a late
     // ~85 ms pump frame can't reopen the stream mid-finalize.
@@ -2666,11 +2663,11 @@ right lower quadrant"></textarea>
         const m_type = data.message_type;
 
         if (m_type === "session_started") {
-          // Server echoes the applied config — surface proof that keyterms took.
+          // Nova-3: config.tier shows which config opened (medical/general/minimal).
           const cfg = data.config || {};
-          const kt = Array.isArray(cfg.keyterms) ? cfg.keyterms.length : 0;
+          const tier = typeof cfg.tier === "string" ? cfg.tier : "";
           if (!stopping) {
-            setStatus("Listening — transcribing live…" + (kt > 0 ? " (" + kt + " keyterms active)" : ""), "ok");
+            setStatus("Listening — transcribing live…" + (tier ? " (Nova-3: " + tier + ")" : ""), "ok");
           }
         }
         else if (m_type === "partial_transcript") {

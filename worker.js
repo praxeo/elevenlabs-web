@@ -2803,6 +2803,15 @@ right lower quadrant"></textarea>
 
     if (joinedSessionCode) params.append("session", joinedSessionCode);
 
+    // Experimental realtime transport override: ?rt=flux|gw|dgw on the PAGE URL
+    // is forwarded to the Worker (absent/auto = the proven nova-3 binding, the
+    // default). Lets the operator live-test alternative transports that reach an
+    // honored sample_rate without any UI change; an unknown value is ignored.
+    try {
+      var pageRt = new URLSearchParams(window.location.search).get("rt");
+      if (pageRt && /^(flux|gw|dgw|binding|auto)$/.test(pageRt)) params.append("rt", pageRt);
+    } catch (e) {}
+
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
 
     try {

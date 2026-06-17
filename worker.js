@@ -84,6 +84,11 @@ export default {
       return new Response("Expected WebSocket upgrade or POST", { status: 400 });
     }
 
+    // TEMPORARY realtime-accuracy diagnostic (capability-gated; remove later).
+    if (url.pathname === "/api/nova-probe") {
+      return handleNovaProbe(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -472,6 +477,129 @@ async function handleTranscribeRealtime(request, env) {
     });
   } catch (err) {
     return returnWsError(`Worker initialization failed: ${err?.message || String(err)}`);
+  }
+}
+
+// ===== DIAGNOSTIC: realtime STT probe (TEMPORARY — remove after the realtime
+// accuracy investigation concludes). Capability-gated by the env.PROBE_KEY
+// secret (set out-of-band via `wrangler secret put PROBE_KEY`, NEVER committed),
+// so it does not need APP_PASSPHRASE and cannot be driven anonymously despite
+// using the billed AI binding. If PROBE_KEY is unset the endpoint is disabled.
+// It streams caller-supplied 16 kHz s16le PCM to a chosen Workers AI streaming
+// model at a controllable cadence/sample_rate/encoding, sends CloseStream, and
+// returns the transcripts — letting us A/B whether sample_rate is honored,
+// whether real-time vs blast cadence matters, and nova-3 vs flux, no mic. =====
+
+// Minimal server-side 44-byte RIFF/WAVE header (mono s16le) — for the
+// self-describing-container test (does prepending a header make Deepgram
+// auto-detect the rate, sidestepping a dropped sample_rate?).
+function wavHeaderBytes(dataLen, sampleRate) {
+  const h = new ArrayBuffer(44);
+  const v = new DataView(h);
+  const ws = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); v.setUint32(4, 36 + dataLen, true); ws(8, "WAVE");
+  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
+  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  ws(36, "data"); v.setUint32(40, dataLen, true);
+  return new Uint8Array(h);
+}
+
+async function handleNovaProbe(request, env) {
+  try {
+    const url = new URL(request.url);
+    const expectedKey = ((env && env.PROBE_KEY) || "").trim();
+    if (!expectedKey) return json({ error: "probe: disabled (PROBE_KEY unset)" }, 404);
+    if (!safeEqual(String(url.searchParams.get("key") || ""), expectedKey)) {
+      return json({ error: "probe: bad or missing key" }, 403);
+    }
+    if (request.method !== "POST") return json({ error: "probe: POST a JSON body" }, 400);
+    if (!env || !env.AI) return json({ error: "probe: no AI binding" }, 500);
+
+    const body = await request.json();
+    const model = String(body.model || "@cf/deepgram/nova-3");
+    const cfgIn = (body.cfg && typeof body.cfg === "object") ? body.cfg : { encoding: "linear16", sample_rate: "16000" };
+    const cfg = {};                 // binding 500s on non-string values
+    for (const k of Object.keys(cfgIn)) cfg[k] = String(cfgIn[k]);
+    const frameBytes = Math.max(2, (body.frame_bytes | 0) || 2730);   // ~85 ms @16k s16le
+    const cadenceMs  = (body.cadence_ms == null) ? 85 : (body.cadence_ms | 0); // 0 = blast
+    const deadlineMs = Math.min(60000, (body.deadline_ms | 0) || 20000);
+    const prependWav = !!body.prepend_wav;
+    const wavRate    = (body.wav_rate | 0) || 16000;
+
+    let pcm;
+    try {
+      const bin = atob(String(body.pcm_base64 || ""));
+      pcm = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) pcm[i] = bin.charCodeAt(i);
+    } catch (e) { return json({ error: "probe: bad pcm_base64" }, 400); }
+    if (pcm.length < 1000) return json({ error: "probe: pcm too short (" + pcm.length + " bytes)" }, 400);
+
+    const t0 = Date.now();
+    let r;
+    try { r = await env.AI.run(model, cfg, { websocket: true }); }
+    catch (e) { return json({ error: "probe: AI.run threw: " + (e && e.message || String(e)), model, cfg }, 502); }
+    if (!r || !r.webSocket) {
+      let detail = "status=" + (r && r.status);
+      try { if (r && r.clone) detail += " body=" + (await r.clone().text()).slice(0, 200); } catch (e) {}
+      return json({ error: "probe: no backend webSocket (" + detail + ")", model, cfg }, 502);
+    }
+    const be = r.webSocket;
+    be.accept();
+
+    const rawFrames = [];
+    const partials = [];
+    let finalText = "";
+    let metadataSeen = false, closed = false, closeInfo = null;
+
+    const done = new Promise((resolve) => {
+      be.addEventListener("message", (ev) => {
+        const s = (typeof ev.data === "string") ? ev.data : "[binary " + (ev.data && ev.data.byteLength) + "]";
+        if (rawFrames.length < 80) rawFrames.push(s.slice(0, 300));
+        let m; try { m = JSON.parse(s); } catch (e) { return; }
+        if (!m) return;
+        if (m.type === "Metadata") { metadataSeen = true; resolve(); return; }
+        const alt = m.channel && m.channel.alternatives && m.channel.alternatives[0];
+        if (alt) {
+          const t = (alt.transcript || "").trim();
+          if (m.is_final === true) { if (t) finalText = finalText ? finalText + " " + t : t; }
+          else if (t) partials.push(t);
+        }
+        if (typeof m.transcript === "string" && typeof m.event === "string") { // flux
+          const t = m.transcript.trim();
+          if (m.event === "EndOfTurn") { if (t) finalText = finalText ? finalText + " " + t : t; }
+          else if (t) partials.push(t);
+        }
+      });
+      be.addEventListener("close", (ev) => { closed = true; closeInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
+      be.addEventListener("error", () => { resolve(); });
+    });
+
+    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+    if (prependWav) { try { be.send(wavHeaderBytes(pcm.length, wavRate)); } catch (e) {} }
+    let framesSent = 0;
+    for (let off = 0; off < pcm.length; off += frameBytes) {
+      const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
+      try { be.send(chunk); } catch (e) { break; }
+      framesSent++;
+      if (cadenceMs > 0) await sleep(cadenceMs);
+    }
+    try { be.send(JSON.stringify({ type: "CloseStream" })); } catch (e) {}
+    await Promise.race([done, sleep(deadlineMs)]);
+    try { be.close(); } catch (e) {}
+
+    return json({
+      ok: true, model, cfg,
+      frame_bytes: frameBytes, cadence_ms: cadenceMs, prepend_wav: prependWav, wav_rate: prependWav ? wavRate : null,
+      pcm_bytes: pcm.length, frames_sent: framesSent, ms: Date.now() - t0,
+      metadata_seen: metadataSeen, closed, close_info: closeInfo,
+      final_text: finalText,
+      last_partial: partials.length ? partials[partials.length - 1] : "",
+      partial_count: partials.length,
+      raw_first_frames: rawFrames,
+    });
+  } catch (err) {
+    return json({ error: "probe: " + (err && err.message || String(err)) }, 500);
   }
 }
 

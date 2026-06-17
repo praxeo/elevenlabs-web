@@ -382,11 +382,18 @@ async function handleTranscribeRealtime(request, env) {
     // per-tier statuses are surfaced so we learn whether nova-3 streams at all via the
     // binding or whether we ride Flux. (The translator already handles Flux's event
     // shape, so a Flux socket still produces transcripts.)
+    // The nova-3 schema-input has NO sample_rate (only Flux's does) — so passing it
+    // is the prime suspect for the identical 500s on every nova-3 tier. Drop it for
+    // nova-3 (raw linear16; verify accuracy in case the default rate isn't 16 kHz).
+    // Flux DOES take sample_rate, so its tier keeps it.
     const FLUX_MODEL = "@cf/deepgram/flux";
+    const ktStr = cleanedKeyterms.length ? cleanedKeyterms.join(" ") : null;
+    const novaMedical = { encoding: "linear16", language: "en-US", mode: "medical", interim_results: true, smart_format: true, punctuate: true, numerals: true };
+    if (ktStr) novaMedical.keyterm = ktStr;
     const tiers = [
-      { label: "nova3-bare",    model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000" } },
-      { label: "nova3-interim", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000", interim_results: true } },
-      { label: "flux-bare",     model: FLUX_MODEL,  cfg: { encoding: "linear16", sample_rate: "16000" } },
+      { label: "nova3-medical", model: NOVA3_MODEL, cfg: novaMedical },
+      { label: "nova3-min",     model: NOVA3_MODEL, cfg: { encoding: "linear16", interim_results: true } },
+      { label: "flux",          model: FLUX_MODEL,  cfg: { encoding: "linear16", sample_rate: "16000" } },
     ];
 
     let backendWs = null, usedTier = "", diags = [];

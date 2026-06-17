@@ -84,13 +84,6 @@ export default {
       return new Response("Expected WebSocket upgrade or POST", { status: 400 });
     }
 
-    if (url.pathname === "/api/nova-probe") {
-      // One-shot diagnostic: probe which Nova-3 streaming params Workers AI accepts,
-      // server-side, with no 5 s connect-timeout pressure. GET it once and read the
-      // pass/fail matrix. Gated by the shared passphrase when one is set.
-      return handleNovaProbe(request, env);
-    }
-
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -373,25 +366,30 @@ async function handleTranscribeRealtime(request, env) {
     // `model` field — that does not exist in the Workers AI schema); encoding +
     // sample_rate match the 16 kHz s16le pump; interim_results drives live partials;
     // endpointing:"false" stops Deepgram from splitting continuous PTT speech.
-    // Workers AI returns a 500 AiError on a config it can't run, and the docs only
-    // prove the minimal Flux shape ({encoding, sample_rate}). Try progressively
-    // simpler configs so realtime opens as soon as ANY tier succeeds, and report
-    // which one did (so medical-vs-general is visible). Suspect params, most→least
-    // likely to 500: mode:"medical" (the streaming medical variant may not exist),
-    // endpointing string, keyterm, sample_rate (absent from nova-3's schema).
-    // GROUND TRUTH so far: nova-3 STREAMS via the binding — the "nova3-bare" tier
-    // GROUND TRUTH: `bare` ({encoding, sample_rate}) connects; the grouped medical
-    // config (language+mode+smart_format+punctuate+numerals) 500s even WITHOUT
-    // interim_results — so the culprit is one of those format/mode params, NOT
-    // interim_results. Isolate by adding ONE concern at a time to bare, prioritized
-    // so we land the best working combo. `interim_results` is what gives live flow;
-    // `mode:medical` is the accuracy lever. The status shows exactly which opened.
+    // PROVEN CONFIG (live param-probe, /api/nova-probe): the Workers AI nova-3
+    // binding 500s on boolean/number param values — every param value must be a
+    // STRING ("true", "16000", ...). With string values, interim_results (live
+    // partials), smart_format, punctuate, numerals, language, endpointing and
+    // keyterm all work. mode:"medical" 500s even as a string — the medical variant
+    // isn't available on the streaming binding — so we run the general model and
+    // lean on keyterms for clinical vocabulary. endpointing:"false" keeps continuous
+    // PTT speech from being auto-split; CloseStream finalizes on release.
     const SR = "16000";
+    const liveCfg = {
+      encoding: "linear16",
+      sample_rate: SR,
+      language: "en-US",
+      interim_results: "true",
+      smart_format: "true",
+      punctuate: "true",
+      numerals: "true",
+      endpointing: "false",
+    };
+    if (cleanedKeyterms.length) liveCfg.keyterm = cleanedKeyterms.join(" ");
     const tiers = [
-      { label: "medical+live", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, mode: "medical", interim_results: true } },
-      { label: "live",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, interim_results: true } },
-      { label: "medical",      model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, mode: "medical" } },
-      { label: "bare",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
+      { label: "live", model: NOVA3_MODEL, cfg: liveCfg },
+      // Safety fallback: the proven-minimal config (finals only) if the full one ever fails.
+      { label: "bare", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
     ];
 
     let backendWs = null, usedTier = "", diags = [];
@@ -475,49 +473,6 @@ async function handleTranscribeRealtime(request, env) {
   } catch (err) {
     return returnWsError(`Worker initialization failed: ${err?.message || String(err)}`);
   }
-}
-
-// One-shot Nova-3 param probe. Opens @cf/deepgram/nova-3 with each candidate config
-// (server-side, no audio) and records whether Workers AI returned a WebSocket (OK)
-// or an error (status + body). Returns the full matrix as JSON so the working param
-// surface is known in ONE request instead of one-deploy-per-guess.
-async function handleNovaProbe(request, env) {
-  if (!env || !env.AI) return json({ error: "Workers AI binding (AI) not configured" }, 500);
-  // TEMPORARY diagnostic — intentionally UNGATED so it can be read directly. It only
-  // opens brief no-audio Nova-3 connections (≈ zero cost) and exposes no user data.
-  // Remove this whole endpoint once the working realtime param set is locked in.
-  const E = "linear16", SR = "16000";
-  // Round 1 showed every STRING-valued param worked (bare/language/endpointing/
-  // keyterm) and every BOOLEAN/NUMBER param 500'd. Hypothesis: the binding wants
-  // string values (it builds a query string; the Flux example passed sample_rate as
-  // a STRING). So re-probe the booleans/number AS STRINGS ("true"/"1"), plus full
-  // combos, to see if string-typing unlocks interim_results + formatting.
-  const cfgs = [
-    ["interim_str",      { encoding: E, sample_rate: SR, interim_results: "true" }],
-    ["smart_format_str", { encoding: E, sample_rate: SR, smart_format: "true" }],
-    ["punctuate_str",    { encoding: E, sample_rate: SR, punctuate: "true" }],
-    ["numerals_str",     { encoding: E, sample_rate: SR, numerals: "true" }],
-    ["channels_str",     { encoding: E, sample_rate: SR, channels: "1" }],
-    ["mode_medical_str", { encoding: E, sample_rate: SR, mode: "medical" }],
-    ["full_str_general", { encoding: E, sample_rate: SR, language: "en-US", interim_results: "true", smart_format: "true", punctuate: "true", numerals: "true", endpointing: "false" }],
-    ["full_str_medical", { encoding: E, sample_rate: SR, language: "en-US", mode: "medical", interim_results: "true", smart_format: "true", punctuate: "true", numerals: "true", endpointing: "false" }],
-    ["interim+punct_str",{ encoding: E, sample_rate: SR, interim_results: "true", punctuate: "true" }],
-  ];
-  const results = {};
-  for (const [label, cfg] of cfgs) {
-    let r = null;
-    try { r = await env.AI.run("@cf/deepgram/nova-3", cfg, { websocket: true }); }
-    catch (e) { results[label] = "threw: " + ((e && e.message) || String(e)).slice(0, 140); continue; }
-    if (r && r.webSocket) {
-      results[label] = "OK";
-      try { r.webSocket.accept(); r.webSocket.close(1000); } catch (e) {}
-    } else {
-      let d = "status=" + (r && r.status);
-      try { if (r && typeof r.clone === "function") d += " " + (await r.clone().text()).slice(0, 160); } catch (e) {}
-      results[label] = d;
-    }
-  }
-  return json({ note: "OK = Workers AI returned a WebSocket for that config", results }, 200);
 }
 
 // Batch proxy: receives the recorded audio blob as multipart form data and

@@ -487,19 +487,21 @@ async function handleNovaProbe(request, env) {
   // opens brief no-audio Nova-3 connections (≈ zero cost) and exposes no user data.
   // Remove this whole endpoint once the working realtime param set is locked in.
   const E = "linear16", SR = "16000";
+  // Round 1 showed every STRING-valued param worked (bare/language/endpointing/
+  // keyterm) and every BOOLEAN/NUMBER param 500'd. Hypothesis: the binding wants
+  // string values (it builds a query string; the Flux example passed sample_rate as
+  // a STRING). So re-probe the booleans/number AS STRINGS ("true"/"1"), plus full
+  // combos, to see if string-typing unlocks interim_results + formatting.
   const cfgs = [
-    ["bare",            { encoding: E, sample_rate: SR }],
-    ["interim_results", { encoding: E, sample_rate: SR, interim_results: true }],
-    ["language",        { encoding: E, sample_rate: SR, language: "en-US" }],
-    ["smart_format",    { encoding: E, sample_rate: SR, smart_format: true }],
-    ["punctuate",       { encoding: E, sample_rate: SR, punctuate: true }],
-    ["numerals",        { encoding: E, sample_rate: SR, numerals: true }],
-    ["mode_medical",    { encoding: E, sample_rate: SR, mode: "medical" }],
-    ["endpointing_false", { encoding: E, sample_rate: SR, endpointing: "false" }],
-    ["channels",        { encoding: E, sample_rate: SR, channels: 1 }],
-    ["keyterm",         { encoding: E, sample_rate: SR, keyterm: "Cerner" }],
-    ["medical+interim", { encoding: E, sample_rate: SR, mode: "medical", interim_results: true }],
-    ["full",            { encoding: E, sample_rate: SR, mode: "medical", interim_results: true, smart_format: true, punctuate: true, numerals: true, language: "en-US" }],
+    ["interim_str",      { encoding: E, sample_rate: SR, interim_results: "true" }],
+    ["smart_format_str", { encoding: E, sample_rate: SR, smart_format: "true" }],
+    ["punctuate_str",    { encoding: E, sample_rate: SR, punctuate: "true" }],
+    ["numerals_str",     { encoding: E, sample_rate: SR, numerals: "true" }],
+    ["channels_str",     { encoding: E, sample_rate: SR, channels: "1" }],
+    ["mode_medical_str", { encoding: E, sample_rate: SR, mode: "medical" }],
+    ["full_str_general", { encoding: E, sample_rate: SR, language: "en-US", interim_results: "true", smart_format: "true", punctuate: "true", numerals: "true", endpointing: "false" }],
+    ["full_str_medical", { encoding: E, sample_rate: SR, language: "en-US", mode: "medical", interim_results: "true", smart_format: "true", punctuate: "true", numerals: "true", endpointing: "false" }],
+    ["interim+punct_str",{ encoding: E, sample_rate: SR, interim_results: "true", punctuate: "true" }],
   ];
   const results = {};
   for (const [label, cfg] of cfgs) {

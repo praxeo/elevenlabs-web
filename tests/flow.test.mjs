@@ -1816,59 +1816,78 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
 }
 
-// ── Scenario 26: Soniox realtime frame translation (Worker side) ──
-// The realtime engine proxies to Soniox; the Worker translates between the
-// client's ElevenLabs frame vocabulary and Soniox's token protocol. These are
-// pure functions, so they test without a browser. Loud-failure is the floor:
-// any error_code response must surface as a client {error} frame.
+// ── Scenario 26: Deepgram Nova-3 realtime frame translation (Worker side) ──
+// Realtime streams to Deepgram Nova-3 on Workers AI; the Worker translates between
+// the client's frame vocabulary and Deepgram's protocol. Pure functions, so they
+// test without a browser. The translator is DEFENSIVE across the three plausible
+// on-wire shapes (Cloudflare doesn't publish nova-3's streaming envelope) and
+// surfaces an unrecognized frame loudly. Loud-failure is the floor: any error frame
+// must surface as a client {error}.
 {
-  const c2b = worker.sonioxClientToBackend;
+  const c2b = worker.novaClientToBackend;
 
   // Audio chunk -> raw PCM bytes (base64-decoded into a Uint8Array).
   const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 }));
   check('s26: audio chunk -> decoded PCM bytes', append.length === 1 && append[0] instanceof Uint8Array && String.fromCharCode(...append[0]) === 'ABC', JSON.stringify([...(append[0]||[])]));
 
-  // Final flush (empty audio + commit) -> a single empty-string end signal.
+  // Final flush (commit) -> Finalize then CloseStream control JSON (Deepgram's
+  // end-of-stream; replaces Soniox's empty-string convention).
   const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 }));
-  check('s26: empty final flush -> one end-of-audio signal', commit.length === 1 && commit[0] === '', JSON.stringify(commit));
+  const commitTypes = commit.map((f) => { try { return JSON.parse(f).type; } catch { return f; } });
+  check('s26: commit -> Finalize then CloseStream', commit.length === 2 && commitTypes[0] === 'Finalize' && commitTypes[1] === 'CloseStream', JSON.stringify(commitTypes));
 
-  // Audio + commit on the same frame -> bytes then end, in order.
+  // Audio + commit on the same frame -> bytes then the two control frames, in order.
   const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true }));
-  check('s26: audio+commit -> bytes then end', both.length === 2 && both[0] instanceof Uint8Array && both[1] === '', JSON.stringify([both[0] instanceof Uint8Array, both[1]]));
+  check('s26: audio+commit -> bytes then control frames', both.length === 3 && both[0] instanceof Uint8Array && JSON.parse(both[1]).type === 'Finalize' && JSON.parse(both[2]).type === 'CloseStream', JSON.stringify([both[0] instanceof Uint8Array, both[1], both[2]]));
 
   // Non-audio / garbage frames are ignored, never forwarded.
   check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
   check('s26: malformed JSON is dropped, not thrown', c2b('{not json').length === 0);
 
-  // Backend -> client translation is stateful per socket. Soniox sends token
-  // objects with is_final; non-final tokens are provisional, final are confirmed.
-  const toC = worker.makeSonioxToClient();
-  const first = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: false }, { text: ' are', is_final: false }] })).map(JSON.parse);
-  check('s26: first response emits session_started then partial', first[0].message_type === 'session_started' && first[1].message_type === 'partial_transcript' && first[1].text === 'How are', JSON.stringify(first));
+  // Backend -> client: shape (A), native Deepgram streaming Results. The running
+  // partial reflects locked finalText + the current interim tail.
+  const mkResult = (transcript, isFinal, extra) => JSON.stringify(Object.assign({ type: 'Results', is_final: !!isFinal, channel: { alternatives: [{ transcript }] } }, extra || {}));
+  const toC = worker.makeNova3ToClient();
+  const first = toC(mkResult('How are', false)).map(JSON.parse);
+  check('s26: first Results emits session_started then partial', first[0].message_type === 'session_started' && first[1].message_type === 'partial_transcript' && first[1].text === 'How are', JSON.stringify(first));
 
-  // Non-final tokens RESET each response; partial reflects the current provisional tail.
-  const r2 = toC(JSON.stringify({ tokens: [{ text: 'How', is_final: true }, { text: ' are', is_final: true }, { text: ' you', is_final: false }] })).map(JSON.parse);
-  check('s26: confirmed + provisional combine into the running partial', r2[0].message_type === 'partial_transcript' && r2[0].text === 'How are you', r2[0].text);
+  // is_final locks a segment into finalText.
+  const r2 = toC(mkResult('How are you', true)).map(JSON.parse);
+  check('s26: is_final Results locks into finalText', r2[0].message_type === 'partial_transcript' && r2[0].text === 'How are you', r2[0].text);
 
-  // More finals accumulate (confirmed text never resets); provisional tail follows.
-  const r3 = toC(JSON.stringify({ tokens: [{ text: ' you', is_final: true }, { text: ' doing', is_final: false }] })).map(JSON.parse);
-  check('s26: finals accumulate, no double counting', r3[0].text === 'How are you doing', r3[0].text);
+  // A following interim appends to the locked finalText (running view).
+  const r3 = toC(mkResult('doing', false)).map(JSON.parse);
+  check('s26: interim appends to locked final', r3[0].text === 'How are you doing', r3[0].text);
 
-  // finished -> committed_transcript with the confirmed text (locks in + closes).
-  const done = toC(JSON.stringify({ tokens: [{ text: ' doing', is_final: true }], finished: true })).map(JSON.parse);
-  const committed = done.find((f) => f.message_type === 'committed_transcript');
-  check('s26: finished -> committed_transcript with confirmed text', committed && committed.text === 'How are you doing', JSON.stringify(done));
+  // from_finalize on an is_final -> committed_transcript (lets the client close fast).
+  const r4 = toC(mkResult('doing well', true, { from_finalize: true })).map(JSON.parse);
+  const committed = r4.find((f) => f.message_type === 'committed_transcript');
+  check('s26: from_finalize -> committed_transcript', committed && committed.text === 'How are you doing well', JSON.stringify(r4));
 
-  // Soniox endpoint markers (<end>, <fin>) are control tokens, not transcript —
-  // they must never reach the rendered text.
-  const ep = worker.makeSonioxToClient();
-  const epOut = ep(JSON.stringify({ tokens: [{ text: 'Done', is_final: true }, { text: '<end>', is_final: true }, { text: ' next', is_final: false }] })).map(JSON.parse);
-  check('s26: endpoint markers filtered out of the transcript', epOut.find((f) => f.message_type === 'partial_transcript').text === 'Done next', JSON.stringify(epOut));
+  // Metadata (end of stream after CloseStream) -> committed with accumulated text.
+  const meta = toC(JSON.stringify({ type: 'Metadata', request_id: 'x' })).map(JSON.parse);
+  check('s26: Metadata -> committed_transcript', meta.find((f) => f.message_type === 'committed_transcript')?.text === 'How are you doing well', JSON.stringify(meta));
 
-  // error_code -> loud {error} frame.
-  const e1 = worker.makeSonioxToClient()(JSON.stringify({ error_code: 401, error_message: 'invalid api key' })).map(JSON.parse);
-  const errFrame = e1.find((f) => f.message_type === 'error');
-  check('s26: error_code -> loud error frame with message', errFrame && /401/.test(errFrame.error) && /invalid api key/.test(errFrame.error), JSON.stringify(e1));
+  // SpeechStarted / UtteranceEnd are benign lifecycle frames -> no client frame.
+  check('s26: lifecycle frames produce no transcript', toC(JSON.stringify({ type: 'SpeechStarted' })).length === 0);
+
+  // Error-shaped frames -> loud {error}.
+  const e1 = worker.makeNova3ToClient()(JSON.stringify({ type: 'Error', description: 'bad audio' })).map(JSON.parse);
+  check('s26: type:Error -> loud error frame', e1.find((f) => f.message_type === 'error' && /bad audio/.test(f.error)), JSON.stringify(e1));
+  const e2 = worker.makeNova3ToClient()(JSON.stringify({ error: 'quota exceeded' })).map(JSON.parse);
+  check('s26: string error field -> loud error frame', e2.find((f) => f.message_type === 'error' && /quota exceeded/.test(f.error)), JSON.stringify(e2));
+
+  // Shape (B): batch-style envelope still yields text (partial + committed).
+  const b1 = worker.makeNova3ToClient()(JSON.stringify({ results: { channels: [{ alternatives: [{ transcript: 'batch shape' }] }] } })).map(JSON.parse);
+  check('s26: batch-shape frame -> partial + committed', b1.find((f) => f.message_type === 'partial_transcript')?.text === 'batch shape' && b1.find((f) => f.message_type === 'committed_transcript')?.text === 'batch shape', JSON.stringify(b1));
+
+  // Shape (C): Flux-style turn protocol EndOfTurn -> committed.
+  const c1 = worker.makeNova3ToClient()(JSON.stringify({ event: 'EndOfTurn', transcript: 'turn shape' })).map(JSON.parse);
+  check('s26: flux-shape EndOfTurn -> committed', c1.find((f) => f.message_type === 'committed_transcript')?.text === 'turn shape', JSON.stringify(c1));
+
+  // Unknown shape with no transcript -> loud diagnostic so the real wire shape is seen.
+  const unk = worker.makeNova3ToClient()(JSON.stringify({ totally: 'unexpected', shape: 1 })).map(JSON.parse);
+  check('s26: unrecognized frame surfaces loudly (diagnostic)', unk.find((f) => f.message_type === 'error' && /unrecognized/.test(f.error)), JSON.stringify(unk));
 }
 
 // ── Scenario 27: AudioWorklet frame pump (mobile realtime fix) ──

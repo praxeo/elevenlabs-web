@@ -1830,15 +1830,15 @@ console.log('--- scenario 25: big-button layout ---');
   const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 }));
   check('s26: audio chunk -> decoded PCM bytes', append.length === 1 && append[0] instanceof Uint8Array && String.fromCharCode(...append[0]) === 'ABC', JSON.stringify([...(append[0]||[])]));
 
-  // Final flush (commit) -> Finalize then CloseStream control JSON (Deepgram's
-  // end-of-stream; replaces Soniox's empty-string convention).
+  // Final flush (commit) -> ONLY CloseStream control JSON (Deepgram-on-Workers-AI
+  // rejects other control variants; CloseStream alone finalizes + ends the stream).
   const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 }));
   const commitTypes = commit.map((f) => { try { return JSON.parse(f).type; } catch { return f; } });
-  check('s26: commit -> Finalize then CloseStream', commit.length === 2 && commitTypes[0] === 'Finalize' && commitTypes[1] === 'CloseStream', JSON.stringify(commitTypes));
+  check('s26: commit -> CloseStream only', commit.length === 1 && commitTypes[0] === 'CloseStream', JSON.stringify(commitTypes));
 
-  // Audio + commit on the same frame -> bytes then the two control frames, in order.
+  // Audio + commit on the same frame -> bytes then the CloseStream control, in order.
   const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true }));
-  check('s26: audio+commit -> bytes then control frames', both.length === 3 && both[0] instanceof Uint8Array && JSON.parse(both[1]).type === 'Finalize' && JSON.parse(both[2]).type === 'CloseStream', JSON.stringify([both[0] instanceof Uint8Array, both[1], both[2]]));
+  check('s26: audio+commit -> bytes then CloseStream', both.length === 2 && both[0] instanceof Uint8Array && JSON.parse(both[1]).type === 'CloseStream', JSON.stringify([both[0] instanceof Uint8Array, both[1]]));
 
   // Non-audio / garbage frames are ignored, never forwarded.
   check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
@@ -1868,8 +1868,14 @@ console.log('--- scenario 25: big-button layout ---');
   const meta = toC(JSON.stringify({ type: 'Metadata', request_id: 'x' })).map(JSON.parse);
   check('s26: Metadata -> committed_transcript', meta.find((f) => f.message_type === 'committed_transcript')?.text === 'How are you doing well', JSON.stringify(meta));
 
-  // SpeechStarted / UtteranceEnd are benign lifecycle frames -> no client frame.
-  check('s26: lifecycle frames produce no transcript', toC(JSON.stringify({ type: 'SpeechStarted' })).length === 0);
+  // Connected (handshake) / SpeechStarted / UtteranceEnd are benign lifecycle
+  // frames -> ignored, NOT surfaced as errors (a fresh translator so the first-frame
+  // session_started doesn't mask the assertion).
+  check('s26: SpeechStarted produces no client frame', toC(JSON.stringify({ type: 'SpeechStarted' })).length === 0);
+  const conn = worker.makeNova3ToClient()(JSON.stringify({ type: 'Connected', request_id: 'x', sequence_id: 0 })).map(JSON.parse);
+  check('s26: Connected handshake is ignored (only session_started, no error)', conn.length === 1 && conn[0].message_type === 'session_started' && !conn.some((f) => f.message_type === 'error'), JSON.stringify(conn));
+  const unknownF = worker.makeNova3ToClient()(JSON.stringify({ type: 'SomethingNew', foo: 1 })).map(JSON.parse);
+  check('s26: unknown frame is ignored, not a loud error', !unknownF.some((f) => f.message_type === 'error'), JSON.stringify(unknownF));
 
   // Error-shaped frames -> loud {error}.
   const e1 = worker.makeNova3ToClient()(JSON.stringify({ type: 'Error', description: 'bad audio' })).map(JSON.parse);
@@ -1885,9 +1891,9 @@ console.log('--- scenario 25: big-button layout ---');
   const c1 = worker.makeNova3ToClient()(JSON.stringify({ event: 'EndOfTurn', transcript: 'turn shape' })).map(JSON.parse);
   check('s26: flux-shape EndOfTurn -> committed', c1.find((f) => f.message_type === 'committed_transcript')?.text === 'turn shape', JSON.stringify(c1));
 
-  // Unknown shape with no transcript -> loud diagnostic so the real wire shape is seen.
+  // Unknown shape with no transcript -> ignored (no fabricated text, no fatal error).
   const unk = worker.makeNova3ToClient()(JSON.stringify({ totally: 'unexpected', shape: 1 })).map(JSON.parse);
-  check('s26: unrecognized frame surfaces loudly (diagnostic)', unk.find((f) => f.message_type === 'error' && /unrecognized/.test(f.error)), JSON.stringify(unk));
+  check('s26: unknown shape ignored (no transcript, no error)', !unk.some((f) => f.message_type === 'error' || f.message_type === 'partial_transcript' || f.message_type === 'committed_transcript'), JSON.stringify(unk));
 }
 
 // ── Scenario 27: AudioWorklet frame pump (mobile realtime fix) ──

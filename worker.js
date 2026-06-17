@@ -196,12 +196,12 @@ function b64ToBytes(b64) {
 // Client frame vocabulary -> Deepgram backend frames. The client sends every audio
 // frame through one chokepoint: {message_type:"input_audio_chunk", audio_base_64, commit}.
 // Deepgram wants raw PCM bytes as binary WS frames; the final flush (commit) is
-// signalled with JSON control messages: {"type":"Finalize"} forces the final result,
-// {"type":"CloseStream"} ends input so Deepgram returns finals + Metadata then closes.
-// Returns an array whose items are Uint8Array (audio) or a JSON control string.
-// If Workers AI does NOT forward these control frames, the client's FINAL_WAIT_MS
-// close path is the backstop (the trailing partial is already delivered) — so a
-// missed finalize can never lose text.
+// signalled with ONLY {"type":"CloseStream"} — Deepgram-on-Workers-AI rejects other
+// control variants (it returned "unknown variant `Finalize`/`KeepAlive`, expected
+// `CloseStream`"), and CloseStream alone ends input so Deepgram returns finals +
+// Metadata then closes. Returns an array whose items are Uint8Array (audio) or a
+// JSON control string. If the control frame is somehow not honored, the client's
+// FINAL_WAIT_MS close path is the backstop — a missed finalize can't lose text.
 export function novaClientToBackend(raw) {
   let m;
   try { m = JSON.parse(raw); } catch { return []; }
@@ -211,7 +211,6 @@ export function novaClientToBackend(raw) {
     out.push(b64ToBytes(m.audio_base_64));
   }
   if (m.commit) {
-    out.push(JSON.stringify({ type: "Finalize" }));
     out.push(JSON.stringify({ type: "CloseStream" }));
   }
   return out;
@@ -300,15 +299,15 @@ export function makeNova3ToClient(tier) {
       return out;
     }
 
-    // Benign lifecycle frames — ignore.
-    if (m.type === "SpeechStarted" || m.type === "UtteranceEnd") return out;
+    // Benign Deepgram lifecycle frames — ignore (Connected is the handshake frame
+    // sent first; SpeechStarted/UtteranceEnd are streaming events we don't need).
+    if (m.type === "Connected" || m.type === "SpeechStarted" || m.type === "UtteranceEnd") return out;
 
-    // Unknown shape: surface the real frame ONCE, loudly, so ground truth is seen
-    // on the first live dictation (blank-but-loud beats a silent wrong chart).
-    if (!probed && !sawText) {
-      probed = true;
-      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 unrecognized frame (report this): " + raw.slice(0, 300) }));
-    }
+    // Any other unknown frame: ignore it (do NOT fabricate text, do NOT fail loudly).
+    // The discovery diagnostic is retired now that the real protocol is known
+    // (Connected -> Results… -> Metadata); a stray unknown frame must not kill a
+    // dictation. Log server-side for visibility.
+    try { if (!probed) { probed = true; console.log("nova3 unhandled frame:", raw.slice(0, 200)); } } catch (e) {}
     return out;
   };
 }
@@ -410,19 +409,14 @@ async function handleTranscribeRealtime(request, env) {
 
     const toClient = makeNova3ToClient(usedTier);
 
-    // Once end-of-stream is sent we stop forwarding (and keepalives) so a late
-    // ~85 ms pump frame can't reopen the stream mid-finalize.
+    // Once end-of-stream is sent we stop forwarding so a late ~85 ms pump frame
+    // can't reopen the stream mid-finalize. NOTE: no KeepAlive — Deepgram-on-
+    // Workers-AI rejects it ("unknown variant `KeepAlive`"); the PTT audio stream
+    // is continuous (pre-gate) so the ~10 s idle close doesn't bite a held button.
     let inputEnded = false;
 
-    // KeepAlive while audio is paused — Deepgram closes an idle socket (~10 s,
-    // NET-0001). Gated on !inputEnded; cleared on close.
-    const keepaliveTimer = setInterval(() => {
-      if (inputEnded) return;
-      try { backendWs.send(JSON.stringify({ type: "KeepAlive" })); } catch (e) {}
-    }, 5000);
-
     // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
-    // Finalize + CloseStream (novaClientToBackend). Latch closed after commit.
+    // CloseStream (novaClientToBackend). Latch closed after commit.
     workerWs.addEventListener("message", (event) => {
       if (inputEnded) return;
       for (const frame of novaClientToBackend(event.data)) {
@@ -432,7 +426,6 @@ async function handleTranscribeRealtime(request, env) {
         const m = JSON.parse(event.data);
         if (m && m.message_type === "input_audio_chunk" && m.commit) {
           inputEnded = true;
-          clearInterval(keepaliveTimer);
         }
       } catch (e) {}
     });
@@ -450,12 +443,10 @@ async function handleTranscribeRealtime(request, env) {
     });
 
     workerWs.addEventListener("close", () => {
-      clearInterval(keepaliveTimer);
       try { backendWs.close(); } catch (e) {}
     });
 
     backendWs.addEventListener("close", (event) => {
-      clearInterval(keepaliveTimer);
       // An abnormal close mid-dictation is a real drop — surface it loudly so it's
       // diagnosable. A normal 1000 close (after finals) carries no error.
       const code = event && event.code;

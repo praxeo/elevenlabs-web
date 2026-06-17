@@ -358,27 +358,26 @@ async function handleTranscribeRealtime(request, env) {
       ? env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(sessionCode))
       : null;
 
-    // Keyterms (medical proper nouns / drug names) bias recognition. Nova-3 uses
-    // `keyterm`; Workers AI exposes it as a SINGLE string, so terms are space-joined
-    // (whether >1 term boosts through one field is a verify-live item — mode:medical
-    // still carries the bulk of the clinical vocabulary regardless).
+    // Keyterms (medical proper nouns / drug names) bias recognition. On the
+    // in-process binding (default) Workers AI exposes `keyterm` as a SINGLE cfg
+    // string, so terms are space-joined there. On the AI Gateway / native
+    // Deepgram query-string transports the CORRECT form is a REPEATED keyterm
+    // query param per term (Deepgram keyterm prompting), built as ktQuery below.
     let keyterms = [];
     try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
     const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 100 });
+    const ktQuery = cleanedKeyterms.map((t) => "&keyterm=" + encodeURIComponent(t)).join("");
 
-    // Nova-3 streaming config — the SECOND arg of env.AI.run (NOT a query string,
-    // NOT a post-open frame). mode:"medical" selects the clinical model (NOT a
-    // `model` field — that does not exist in the Workers AI schema); encoding +
-    // sample_rate match the 16 kHz s16le pump; interim_results drives live partials;
-    // endpointing:"false" stops Deepgram from splitting continuous PTT speech.
-    // PROVEN CONFIG (live param-probe, /api/nova-probe): the Workers AI nova-3
-    // binding 500s on boolean/number param values — every param value must be a
-    // STRING ("true", "16000", ...). With string values, interim_results (live
-    // partials), smart_format, punctuate, numerals, language, endpointing and
-    // keyterm all work. mode:"medical" 500s even as a string — the medical variant
-    // isn't available on the streaming binding — so we run the general model and
-    // lean on keyterms for clinical vocabulary. endpointing:"false" keeps continuous
-    // PTT speech from being auto-split; CloseStream finalizes on release.
+    // Binding (default) nova-3 config — the SECOND arg of env.AI.run (NOT a query
+    // string, NOT a post-open frame). PROVEN (live param-probe): the Workers AI
+    // nova-3 binding 500s on boolean/number values — every value must be a STRING
+    // ("true", "16000", ...). The binding schema has NO sample_rate property (only
+    // Flux's does); whether it FORWARDS sample_rate to Deepgram is the open
+    // question /api/nova-probe settles, and the leading suspect for
+    // "slow=clean/fast=garbled". mode:"medical" 500s on the binding — Deepgram
+    // streaming has no `mode` param; the clinical model is model=nova-3-medical,
+    // reachable only via the gateway/native transports below. endpointing:"false"
+    // keeps continuous PTT speech from being auto-split; CloseStream finalizes.
     const SR = "16000";
     const liveCfg = {
       encoding: "linear16",
@@ -391,23 +390,74 @@ async function handleTranscribeRealtime(request, env) {
       endpointing: "false",
     };
     if (cleanedKeyterms.length) liveCfg.keyterm = cleanedKeyterms.join(" ");
-    const tiers = [
-      { label: "live", model: NOVA3_MODEL, cfg: liveCfg },
-      // Safety fallback: the proven-minimal config (finals only) if the full one ever fails.
-      { label: "bare", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
-    ];
+
+    // Realtime transport selector (?rt=). DEFAULT/auto = the proven in-process
+    // env.AI binding (current behavior, unchanged). Opt-in alternatives reach an
+    // HONORED sample_rate (the prime suspect for the pace-garble):
+    //   rt=flux -> @cf/deepgram/flux on the SAME binding (its schema REQUIRES
+    //             sample_rate, so CF forwards it) — no new credential.
+    //   rt=gw   -> AI Gateway "workers-ai" URL for @cf/deepgram/nova-3 with
+    //             sample_rate in the query string — needs CF_AIG_* secrets.
+    //   rt=dgw  -> AI Gateway "deepgram" passthrough to nova-3-medical (the
+    //             clinical streaming model) — needs CF_AIG_* + DEEPGRAM_API_KEY.
+    // Gateway paths stay INERT until their secrets exist, so deploying this
+    // changes nothing in production until the operator opts in.
+    const rt = String(url.searchParams.get("rt") || "auto").toLowerCase();
+    const acct = ((env && env.CF_ACCOUNT_ID) || "").trim();
+    const gwName = ((env && env.CF_AIG_GATEWAY) || "").trim();
+    const aigToken = ((env && env.CF_AIG_TOKEN) || "").trim();
+    const dgKey = ((env && env.DEEPGRAM_API_KEY) || "").trim();
 
     let backendWs = null, usedTier = "", diags = [];
-    for (const t of tiers) {
-      let r = null;
-      try { r = await env.AI.run(t.model, t.cfg, { websocket: true }); }
-      catch (e) { diags.push(t.label + ":threw " + (e?.message || String(e)).slice(0, 60)); continue; }
-      if (r && r.webSocket) { backendWs = r.webSocket; usedTier = t.label; break; }
-      let d = t.label + ":status=" + (r && r.status);
-      try { if (r && typeof r.clone === "function") { const b = await r.clone().text(); d += " " + b.slice(0, 70); } } catch (e) {}
-      diags.push(d);
+
+    if (rt === "gw" || rt === "dgw") {
+      // Outbound WebSocket from a Worker: fetch() with an Upgrade header, then read
+      // resp.webSocket (NOT `new WebSocket`). Native query params take real strings.
+      if (!acct || !gwName || !aigToken) {
+        return returnWsError("Gateway transport rt=" + rt + " needs CF_ACCOUNT_ID + CF_AIG_GATEWAY + CF_AIG_TOKEN secrets");
+      }
+      const baseQs = "encoding=linear16&sample_rate=16000&channels=1&language=en-US&interim_results=true&endpointing=false&smart_format=true&punctuate=true&numerals=true";
+      let gwUrl, headers;
+      if (rt === "gw") {
+        gwUrl = "https://gateway.ai.cloudflare.com/v1/" + acct + "/" + gwName +
+          "/workers-ai?model=" + encodeURIComponent("@cf/deepgram/nova-3") + "&" + baseQs + ktQuery;
+        headers = { Upgrade: "websocket", "cf-aig-authorization": "Bearer " + aigToken };
+        usedTier = "gw-nova3";
+      } else {
+        if (!dgKey) return returnWsError("rt=dgw needs DEEPGRAM_API_KEY secret");
+        gwUrl = "https://gateway.ai.cloudflare.com/v1/" + acct + "/" + gwName +
+          "/deepgram/v1/listen?model=nova-3-medical&" + baseQs + ktQuery;
+        headers = { Upgrade: "websocket", "cf-aig-authorization": "Bearer " + aigToken, "Authorization": "Token " + dgKey };
+        usedTier = "dgw-medical";
+      }
+      try {
+        const resp = await fetch(gwUrl, { headers });
+        if (resp && resp.webSocket) backendWs = resp.webSocket;
+        else {
+          diags.push(usedTier + ":status=" + (resp && resp.status));
+          try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 80)); } catch (e) {}
+        }
+      } catch (e) { diags.push(usedTier + ":threw " + ((e && e.message) || String(e)).slice(0, 60)); }
+    } else {
+      // Binding transports (default + flux), all-string cfg.
+      const tiers = (rt === "flux")
+        ? [{ label: "flux", model: "@cf/deepgram/flux", cfg: { encoding: "linear16", sample_rate: SR, eot_threshold: "0.8", eot_timeout_ms: "8000" } }]
+        : [
+            { label: "live", model: NOVA3_MODEL, cfg: liveCfg },
+            // Safety fallback: the proven-minimal config (finals only) if the full one ever fails.
+            { label: "bare", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
+          ];
+      for (const t of tiers) {
+        let r = null;
+        try { r = await env.AI.run(t.model, t.cfg, { websocket: true }); }
+        catch (e) { diags.push(t.label + ":threw " + (e?.message || String(e)).slice(0, 60)); continue; }
+        if (r && r.webSocket) { backendWs = r.webSocket; usedTier = t.label; break; }
+        let d = t.label + ":status=" + (r && r.status);
+        try { if (r && typeof r.clone === "function") { const b = await r.clone().text(); d += " " + b.slice(0, 70); } } catch (e) {}
+        diags.push(d);
+      }
     }
-    try { console.log("realtime connect:", usedTier || "NONE", "|", diags.join(" || ")); } catch (e) {}
+    try { console.log("realtime connect:", usedTier || "NONE", "rt=" + rt, "|", diags.join(" || ")); } catch (e) {}
     if (!backendWs) {
       return returnWsError("Realtime connect failed [" + diags.join(" | ") + "]");
     }
@@ -508,11 +558,16 @@ function wavHeaderBytes(dataLen, sampleRate) {
 async function handleNovaProbe(request, env) {
   try {
     const url = new URL(request.url);
-    const expectedKey = ((env && env.PROBE_KEY) || "").trim();
-    if (!expectedKey) return json({ error: "probe: disabled (PROBE_KEY unset)" }, 404);
-    if (!safeEqual(String(url.searchParams.get("key") || ""), expectedKey)) {
-      return json({ error: "probe: bad or missing key" }, 403);
-    }
+    // Gate: accept the dedicated PROBE_KEY secret OR the existing APP_PASSPHRASE
+    // (the same credential that already gates shared-mode realtime/batch). This
+    // keeps the billed AI binding from being driven anonymously WITHOUT minting a
+    // new secret — a holder of the app passphrase can run the probe directly.
+    const given = String(url.searchParams.get("key") || "");
+    const probeKey = ((env && env.PROBE_KEY) || "").trim();
+    const appPass = ((env && env.APP_PASSPHRASE) || "").trim();
+    const okKey = (probeKey && safeEqual(given, probeKey)) || (appPass && safeEqual(given, appPass));
+    if (!probeKey && !appPass) return json({ error: "probe: disabled (no PROBE_KEY or APP_PASSPHRASE set)" }, 404);
+    if (!okKey) return json({ error: "probe: bad or missing key" }, 403);
     if (request.method !== "POST") return json({ error: "probe: POST a JSON body" }, 400);
     if (!env || !env.AI) return json({ error: "probe: no AI binding" }, 500);
 
@@ -2291,6 +2346,17 @@ right lower quadrant"></textarea>
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) {}
+    }
+    // Diagnostic (one-time): the context takes NO sampleRate option, so
+    // audioCtx.sampleRate is the true hardware rate that downsampleBuffer reads.
+    // A non-48000 rate (e.g. 44100) still downsamples correctly to 16k, but
+    // surface it once so a stealth hardware-rate surprise is never invisible.
+    if (!window.__srLogged) {
+      window.__srLogged = true;
+      try {
+        var msg = "[audio] AudioContext sampleRate = " + audioCtx.sampleRate + " Hz (downsampling to 16000)";
+        if (audioCtx.sampleRate !== 48000) console.warn(msg + " — not 48000; verify capture"); else console.log(msg);
+      } catch (e) {}
     }
 
     const source = audioCtx.createMediaStreamSource(stream);

@@ -216,7 +216,7 @@ export function sonioxClientToBackend(raw) {
 // and closes promptly. Any `error_code` becomes a loud {error} frame so the client's
 // "any string error = loud fail" rule fires. Returns a stateful translator (one per
 // socket); the same normalized frames also feed the phone room.
-export function makeSonioxToClient(appliedKeyterms) {
+export function makeSonioxToClient() {
   let finalText = "";    // confirmed text accumulated so far
   let startedSent = false;
   return function translate(raw) {
@@ -227,36 +227,14 @@ export function makeSonioxToClient(appliedKeyterms) {
 
     if (!startedSent) {
       startedSent = true;
-      // Soniox sends NO config-echo frame; this session_started is synthesized so
-      // the client status line can surface what the Worker actually SENT (model +
-      // keyterm count). It is client-side intent, not server confirmation — Soniox
-      // never acknowledges applied keyterms (a malformed/ignored context would look
-      // identical at runtime), so the client reads this as "sent", not "active".
-      out.push(JSON.stringify({
-        message_type: "session_started",
-        config: { model: SONIOX_MODEL, keyterms: Array.isArray(appliedKeyterms) ? appliedKeyterms : [] },
-      }));
+      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
     }
 
-    if (m.error_code || m.error_type) {
-      // Lead with an actionable, stable message keyed off Soniox's error_type slug
-      // (the docs say branch on error_type, not the human message or the bare code:
-      // 402 is shared by three budget-exhaustion types). The raw error_message is
-      // appended verbatim, and we always emit a string `error` so the client's
-      // "any frame carrying a string error = loud fail" rule still fires.
-      const et = m.error_type || "";
-      let human;
-      if (et === "unauthenticated" || m.error_code === 401) {
-        human = "Soniox auth failed - check the Soniox API key / passphrase (the shared SONIOX_API_KEY may be unset)";
-      } else if (et === "organization_balance_exhausted" || et === "organization_monthly_budget_exhausted" || et === "project_monthly_budget_exhausted" || m.error_code === 402) {
-        human = "Soniox quota/balance exhausted - top up the Soniox account";
-      } else if (et === "limit_exceeded" || m.error_code === 429) {
-        human = "Soniox rate-limited - wait a moment and retry";
-      } else {
-        human = "Soniox error " + String(m.error_code || "") + (et ? " " + et : "");
-      }
-      if (m.error_message) human += " - " + m.error_message;
-      out.push(JSON.stringify({ message_type: "error", error: human }));
+    if (m.error_code) {
+      out.push(JSON.stringify({
+        message_type: "error",
+        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
+      }));
       return out;
     }
 
@@ -265,10 +243,9 @@ export function makeSonioxToClient(appliedKeyterms) {
     if (Array.isArray(m.tokens)) {
       for (const t of m.tokens) {
         if (!t || typeof t.text !== "string") continue;
-        // Drop Soniox control markers by EXACT match: <end> (endpoint detection)
-        // and <fin> (manual finalization). Exact-match can never eat real dictated
-        // text the way the old /<[^>]+>/ regex could.
-        if (t.text === "<end>" || t.text === "<fin>") continue;
+        // Soniox emits control markers (e.g. <end>, <fin>) as standalone tokens
+        // when endpoint detection fires — never real transcript, so drop them.
+        if (/^\s*<[^>]+>\s*$/.test(t.text)) continue;
         if (t.is_final) newFinal += t.text;
         else nonFinal += t.text;
       }
@@ -369,44 +346,19 @@ async function handleTranscribeRealtime(request, env) {
       num_channels: 1,
       language_hints: ["en"],
       enable_endpoint_detection: true,
-      // Dictation tuning Soniox documents for exactly this workload: a low
-      // (negative) sensitivity makes endpoints rare, so the model keeps revising
-      // through clause-level pauses instead of finalizing on every breath.
-      endpoint_sensitivity: -0.5,
     };
-    // context is the documented accuracy lever. Always send a domain hint — this
-    // is an all-medical workload even when the user has no custom keyterms;
-    // "Healthcare" is the value Soniox uses verbatim in its own healthcare example.
-    // Custom keyterms (proper nouns, drug names) ride context.terms, the lever for
-    // important/uncommon words. (Soniox does not echo context, so this is verified
-    // empirically, not via a server ack.)
-    const sonioxContext = { general: [{ key: "domain", value: "Healthcare" }] };
-    if (cleanedKeyterms.length) sonioxContext.terms = cleanedKeyterms;
-    sonioxConfig.context = sonioxContext;
+    if (cleanedKeyterms.length) sonioxConfig.context = { terms: cleanedKeyterms };
     try {
       backendWs.send(JSON.stringify(sonioxConfig));
     } catch (e) {}
 
-    // Once end-of-audio is sent we stop forwarding (and stop keepalives) so a late
-    // ~85 ms pump frame can't reopen/confuse the stream mid-finalize.
-    let inputEnded = false;
-
-    // Keep the backend socket alive when no audio is flowing (between the config
-    // frame and the first flushed chunk, or a stalled/paused graph): Soniox may
-    // close an idle socket after ~20 s. Cheap insurance that matches the official
-    // SDKs. Gated on !inputEnded so a keepalive can never follow end-of-audio, and
-    // cleared when either socket closes.
-    const keepaliveTimer = setInterval(() => {
-      if (inputEnded) return;
-      try { backendWs.send(JSON.stringify({ type: "keepalive" })); } catch (e) {}
-    }, 10000);
-
-    const toClient = makeSonioxToClient(cleanedKeyterms);
+    const toClient = makeSonioxToClient();
 
     // Browser -> Soniox: decode the client's base64 audio to raw PCM bytes and
     // forward as binary frames; the final flush (commit) sends an empty string =
-    // end-of-audio. Once end is sent, latch closed (and stop keepalives) so a late
-    // audio frame from the ~85 ms pump can't reopen/confuse the stream mid-finalize.
+    // end-of-audio. Once end is sent, latch closed so a late audio frame from the
+    // ~85 ms pump can't reopen/confuse the stream mid-finalize.
+    let inputEnded = false;
     workerWs.addEventListener("message", (event) => {
       if (inputEnded) return;
       for (const frame of sonioxClientToBackend(event.data)) {
@@ -414,10 +366,7 @@ async function handleTranscribeRealtime(request, env) {
       }
       try {
         const m = JSON.parse(event.data);
-        if (m && m.message_type === "input_audio_chunk" && m.commit) {
-          inputEnded = true;
-          clearInterval(keepaliveTimer);
-        }
+        if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
       } catch (e) {}
     });
 
@@ -435,17 +384,13 @@ async function handleTranscribeRealtime(request, env) {
     });
 
     workerWs.addEventListener("close", () => {
-      clearInterval(keepaliveTimer);
       try { backendWs.close(); } catch (e) {}
     });
 
     backendWs.addEventListener("close", (event) => {
-      clearInterval(keepaliveTimer);
       // An abnormal close mid-dictation is a real drop — surface Soniox's code/
       // reason as a loud error frame so it's diagnosable, not a generic failure.
-      // Note: documented Soniox errors arrive as an error_code/error_type JSON
-      // frame (handled above) then a 1000 close; this close-code path is the
-      // transport-drop backstop (e.g. 1006), for which no cause string exists.
+      // A normal 1000 close (e.g. after `finished`) carries no error.
       const code = event && event.code;
       if (code && code !== 1000 && code !== 1005) {
         const reason = (event && event.reason) ? (": " + event.reason) : "";
@@ -1037,9 +982,6 @@ right lower quadrant"></textarea>
 
             <label style="font-weight: bold; color: var(--accent);">Realtime (Soniox)</label>
             <div class="hint">Live transcription runs on Soniox (stt-rt-v5) with endpoint detection. Accuracy is tuned via the Keyterms section below — they're sent as Soniox context terms on every realtime dictation.</div>
-
-            <div class="hint" id="latencyReadout" style="margin-top:8px; font-variant-numeric: tabular-nums;"></div>
-            <div class="hint" style="opacity:.7; margin-top:2px;">Latency of the last realtime/hybrid dictation. <b>connect</b> (WS handshake) and <b>finalize</b> (release&nbsp;&rarr;&nbsp;final words) are full round-trips through the Cloudflare proxy to Soniox and back. <b>first word</b> also includes when you started speaking. If connect/finalize are small but it still feels laggy, the proxy hop is not the bottleneck.</div>
           </div>
 
           <label class="checkbox">
@@ -1126,7 +1068,6 @@ right lower quadrant"></textarea>
   const apiKeyLabelEl    = document.getElementById("apiKeyLabel");
   const sonioxKeyEl     = document.getElementById("sonioxKey");
   const sonioxKeyLabelEl = document.getElementById("sonioxKeyLabel");
-  const latencyReadoutEl = document.getElementById("latencyReadout");
   const passphraseEl     = document.getElementById("passphrase");
   const passphraseRow    = document.getElementById("passphraseRow");
   const saveApiKeyEl     = document.getElementById("saveApiKey");
@@ -1243,11 +1184,6 @@ right lower quadrant"></textarea>
   let lastWsError = "";
   let wsOpenAt = 0;
   let recStartedAt = 0;
-  // Per-session realtime latency probe (Advanced readout): timestamps for the
-  // connect handshake, first on-screen word, commit, and final words — so the
-  // Cloudflare-proxy round-trip can be seen, not guessed. Reset per realtime/
-  // hybrid session; null for batch (no live leg).
-  let lat = null;
   let partialCount = 0;
   let speechDetected = false;
   let maxRmsSeen = 0;
@@ -1520,35 +1456,12 @@ right lower quadrant"></textarea>
     return t;
   }
 
-  var lastLiveCombined = null;
   function updateLiveDisplay() {
     const combined = finalizedSegments.join(" ") + (currentPartial ? " " + currentPartial : "");
-    // Soniox resends provisional tokens unchanged between responses; skip the
-    // clean + DOM write + peek repaint when nothing actually changed, so a long
-    // dictation doesn't re-render the whole growing string ~12x/second on a phone.
-    // latestText is already correct from the last change, so delivery is unaffected.
-    if (combined === lastLiveCombined) return;
-    lastLiveCombined = combined;
     const cleaned = cleanTranscript(combined);
     latestText = cleaned;
     latestEl.textContent = cleaned;
     updateBigPeek();
-  }
-
-  // Render the realtime latency probe into the Advanced readout. connect & finalize
-  // are full round-trips through the Cloudflare proxy to Soniox; first-word also
-  // includes speech onset. A missing leg (e.g. an unexpected drop with no commit)
-  // shows "—" rather than a wrong number.
-  function renderLatencyReadout() {
-    if (!latencyReadoutEl) return;
-    if (!lat || !lat.connectStart) { latencyReadoutEl.textContent = ""; return; }
-    const ms = (a, b) => (a && b && b >= a) ? (b - a) + "ms" : "—";
-    const connect   = ms(lat.connectStart, lat.openAt);
-    const firstWord = ms(lat.openAt, lat.firstPartialAt);
-    const finalize  = ms(lat.commitSentAt, lat.finalizeAt);
-    latencyReadoutEl.textContent =
-      "Last realtime: connect " + connect + " · first word " + firstWord +
-      "* · finalize " + finalize + " · " + partialCount + " updates";
   }
 
   function setStatus(msg, cls) {
@@ -2641,10 +2554,6 @@ right lower quadrant"></textarea>
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
 
-    // Start the latency probe just before the handshake so "connect" captures the
-    // full browser -> Worker -> Soniox chain.
-    lat = { connectStart: Date.now(), openAt: 0, firstPartialAt: 0, commitSentAt: 0, finalizeAt: 0 };
-
     try {
       ws = new WebSocket(wsUrl);
     } catch (err) {
@@ -2673,7 +2582,6 @@ right lower quadrant"></textarea>
     ws.onopen = () => {
       if (mySession !== sessionSeq) return;
       wsOpenAt = Date.now();
-      if (lat) lat.openAt = wsOpenAt;
       if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
       setLinkPill("live");
       flushPendingChunks();
@@ -2692,27 +2600,20 @@ right lower quadrant"></textarea>
         const m_type = data.message_type;
 
         if (m_type === "session_started") {
-          // The Worker SYNTHESIZES this frame from the config it sent — Soniox does
-          // not echo config — so the count is what we sent, not a server ack; hence
-          // "sent", not "active".
+          // Server echoes the applied config — surface proof that keyterms took.
           const cfg = data.config || {};
           const kt = Array.isArray(cfg.keyterms) ? cfg.keyterms.length : 0;
           if (!stopping) {
-            setStatus("Listening — transcribing live…" + (kt > 0 ? " (" + kt + " keyterms sent)" : ""), "ok");
+            setStatus("Listening — transcribing live…" + (kt > 0 ? " (" + kt + " keyterms active)" : ""), "ok");
           }
         }
         else if (m_type === "partial_transcript") {
           partialCount++;
-          if (lat && !lat.firstPartialAt && data.text && data.text.trim()) lat.firstPartialAt = Date.now();
           currentPartial = data.text;
           updateLiveDisplay();
         }
         else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
           partialCount++;
-          if (lat) {
-            if (!lat.firstPartialAt && data.text && data.text.trim()) lat.firstPartialAt = Date.now();
-            lat.finalizeAt = Date.now(); // Soniox emits committed once, on finished
-          }
           if (data.text && data.text.trim()) {
             finalizedSegments.push(data.text);
             currentPartial = "";
@@ -2894,7 +2795,6 @@ right lower quadrant"></textarea>
       flushPendingChunks();
       // Final empty chunk with commit: true forces the last segment out
       sendAudioChunk("", true);
-      if (lat && !lat.commitSentAt) lat.commitSentAt = Date.now();
       if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
       finalDeadlineTimer = setTimeout(() => {
         finalDeadlineTimer = null;
@@ -2913,10 +2813,6 @@ right lower quadrant"></textarea>
     if (sessionFinalized) return;
     sessionFinalized = true;
     clearSessionTimers();
-
-    // Refresh the Advanced latency readout for live-leg sessions only (lat is
-    // reset per realtime/hybrid session; batch has no live leg to measure).
-    if (sessionEngine !== "batch") renderLatencyReadout();
 
     // Set BEFORE the button/pill updates below: those trigger the big-screen
     // recalc, and with finishing already true it renders WORKING… through the

@@ -483,11 +483,9 @@ async function handleTranscribeRealtime(request, env) {
 // surface is known in ONE request instead of one-deploy-per-guess.
 async function handleNovaProbe(request, env) {
   if (!env || !env.AI) return json({ error: "Workers AI binding (AI) not configured" }, 500);
-  const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
-  if (serverPass) {
-    const given = String(new URL(request.url).searchParams.get("passphrase") || "").trim();
-    if (!safeEqual(given, serverPass)) return json({ error: "Unauthorized (add ?passphrase=...)" }, 401);
-  }
+  // TEMPORARY diagnostic — intentionally UNGATED so it can be read directly. It only
+  // opens brief no-audio Nova-3 connections (≈ zero cost) and exposes no user data.
+  // Remove this whole endpoint once the working realtime param set is locked in.
   const E = "linear16", SR = "16000";
   const cfgs = [
     ["bare",            { encoding: E, sample_rate: SR }],

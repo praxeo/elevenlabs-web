@@ -374,19 +374,18 @@ async function handleTranscribeRealtime(request, env) {
     // likely to 500: mode:"medical" (the streaming medical variant may not exist),
     // endpointing string, keyterm, sample_rate (absent from nova-3's schema).
     // GROUND TRUTH so far: nova-3 STREAMS via the binding — the "nova3-bare" tier
-    // ({encoding, sample_rate}) connected. So sample_rate is fine (keep it — it tells
-    // nova-3 the audio is 16 kHz) and the earlier identical 500s came from `channels`
-    // and/or `interim_results`. These tiers keep sample_rate, DROP channels, add
-    // mode:medical, and isolate interim_results: tier 1 has it (medical + live
-    // partials), tier 2 drops it (medical, finals only), tier 3 is the proven bare
-    // config as the guaranteed fallback. The status shows which opened.
-    const ktStr = cleanedKeyterms.length ? cleanedKeyterms.join(" ") : null;
-    const novaMed = { encoding: "linear16", sample_rate: "16000", language: "en-US", mode: "medical", smart_format: true, punctuate: true, numerals: true };
-    if (ktStr) novaMed.keyterm = ktStr;
+    // GROUND TRUTH: `bare` ({encoding, sample_rate}) connects; the grouped medical
+    // config (language+mode+smart_format+punctuate+numerals) 500s even WITHOUT
+    // interim_results — so the culprit is one of those format/mode params, NOT
+    // interim_results. Isolate by adding ONE concern at a time to bare, prioritized
+    // so we land the best working combo. `interim_results` is what gives live flow;
+    // `mode:medical` is the accuracy lever. The status shows exactly which opened.
+    const SR = "16000";
     const tiers = [
-      { label: "medical+live", model: NOVA3_MODEL, cfg: Object.assign({}, novaMed, { interim_results: true }) },
-      { label: "medical",      model: NOVA3_MODEL, cfg: novaMed },
-      { label: "bare",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000" } },
+      { label: "medical+live", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, mode: "medical", interim_results: true } },
+      { label: "live",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, interim_results: true } },
+      { label: "medical",      model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR, mode: "medical" } },
+      { label: "bare",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
     ];
 
     let backendWs = null, usedTier = "", diags = [];

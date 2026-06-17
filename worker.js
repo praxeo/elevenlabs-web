@@ -374,26 +374,20 @@ async function handleTranscribeRealtime(request, env) {
     // which one did (so medical-vs-general is visible). Suspect params, most→least
     // likely to 500: mode:"medical" (the streaming medical variant may not exist),
     // endpointing string, keyterm, sample_rate (absent from nova-3's schema).
-    // Even the barebones nova-3 config 500s (AiError 5030) — so the problem isn't a
-    // specific param; nova-3 may simply not support binding-streaming the way Flux
-    // does. These DIAGNOSTIC tiers isolate that in one shot: nova-3 with the EXACT
-    // proven Flux shape, nova-3 + interim_results, and @cf/deepgram/flux itself
-    // (which Cloudflare documents as working). The first to return a socket wins; the
-    // per-tier statuses are surfaced so we learn whether nova-3 streams at all via the
-    // binding or whether we ride Flux. (The translator already handles Flux's event
-    // shape, so a Flux socket still produces transcripts.)
-    // The nova-3 schema-input has NO sample_rate (only Flux's does) — so passing it
-    // is the prime suspect for the identical 500s on every nova-3 tier. Drop it for
-    // nova-3 (raw linear16; verify accuracy in case the default rate isn't 16 kHz).
-    // Flux DOES take sample_rate, so its tier keeps it.
-    const FLUX_MODEL = "@cf/deepgram/flux";
+    // GROUND TRUTH so far: nova-3 STREAMS via the binding — the "nova3-bare" tier
+    // ({encoding, sample_rate}) connected. So sample_rate is fine (keep it — it tells
+    // nova-3 the audio is 16 kHz) and the earlier identical 500s came from `channels`
+    // and/or `interim_results`. These tiers keep sample_rate, DROP channels, add
+    // mode:medical, and isolate interim_results: tier 1 has it (medical + live
+    // partials), tier 2 drops it (medical, finals only), tier 3 is the proven bare
+    // config as the guaranteed fallback. The status shows which opened.
     const ktStr = cleanedKeyterms.length ? cleanedKeyterms.join(" ") : null;
-    const novaMedical = { encoding: "linear16", language: "en-US", mode: "medical", interim_results: true, smart_format: true, punctuate: true, numerals: true };
-    if (ktStr) novaMedical.keyterm = ktStr;
+    const novaMed = { encoding: "linear16", sample_rate: "16000", language: "en-US", mode: "medical", smart_format: true, punctuate: true, numerals: true };
+    if (ktStr) novaMed.keyterm = ktStr;
     const tiers = [
-      { label: "nova3-medical", model: NOVA3_MODEL, cfg: novaMedical },
-      { label: "nova3-min",     model: NOVA3_MODEL, cfg: { encoding: "linear16", interim_results: true } },
-      { label: "flux",          model: FLUX_MODEL,  cfg: { encoding: "linear16", sample_rate: "16000" } },
+      { label: "medical+live", model: NOVA3_MODEL, cfg: Object.assign({}, novaMed, { interim_results: true }) },
+      { label: "medical",      model: NOVA3_MODEL, cfg: novaMed },
+      { label: "bare",         model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: "16000" } },
     ];
 
     let backendWs = null, usedTier = "", diags = [];

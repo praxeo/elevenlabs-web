@@ -169,16 +169,23 @@ export default {
   },
 };
 
-// ─── Soniox realtime STT ───
-// The realtime engine (and hybrid's live-feedback leg) proxies to Soniox's
-// real-time WebSocket. Batch and the hybrid accuracy refine still go to
-// ElevenLabs Scribe (handleTranscribeBatch). The client's audio pump produces
-// 16 kHz s16le PCM; Soniox takes raw PCM bytes (not base64) and confirmed/
-// provisional tokens map cleanly onto the client's committed/partial model.
-const SONIOX_MODEL  = "stt-rt-v5";
-const SONIOX_WS_URL = "https://stt-rt.soniox.com/transcribe-websocket";
+// ─── Deepgram Nova-3 realtime STT (Cloudflare Workers AI) ───
+// The realtime engine (and hybrid's live-feedback leg) streams to Deepgram
+// Nova-3 hosted ON Workers AI (@cf/deepgram/nova-3) via the env.AI binding, so
+// audio never leaves Cloudflare (no external hop — the whole point of the swap).
+// Batch and the hybrid accuracy refine still go to ElevenLabs (handleTranscribeBatch).
+// The client's pump produces 16 kHz s16le mono PCM; Deepgram takes raw binary PCM.
+//
+// VERIFY-ON-LIVE (from the doc research): Cloudflare publishes the {websocket:true}
+// run form and the medical `mode` enum, but does NOT publish nova-3's STREAMING
+// frame shape (only its batch output schema) and `sample_rate` is absent from
+// nova-3's input schema. So the translator below is defensive across the three
+// plausible frame shapes and surfaces an UNRECOGNIZED first frame loudly, so the
+// real wire shape (and whether sample_rate/mode took) is caught on the first test
+// rather than silently producing a blank or wrong chart.
+const NOVA3_MODEL = "@cf/deepgram/nova-3";
 
-// Decode a base64 string to raw bytes (Soniox wants binary PCM frames).
+// Decode a base64 string to raw bytes (Deepgram wants binary PCM frames).
 function b64ToBytes(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
@@ -186,14 +193,16 @@ function b64ToBytes(b64) {
   return bytes;
 }
 
-// Client (ElevenLabs frame vocabulary) -> Soniox backend frames. The client sends
-// every audio frame through one chokepoint:
-//   {message_type:"input_audio_chunk", audio_base_64, commit, …}
-// Soniox wants the raw PCM bytes (base64-decoded) sent as binary WS frames; the
-// final flush (commit) is signalled by an empty string. Returns an array whose
-// items are Uint8Array (audio) or "" (end-of-audio). The session config — incl.
-// the api_key and keyterms — is sent separately by the Worker as the first frame.
-export function sonioxClientToBackend(raw) {
+// Client frame vocabulary -> Deepgram backend frames. The client sends every audio
+// frame through one chokepoint: {message_type:"input_audio_chunk", audio_base_64, commit}.
+// Deepgram wants raw PCM bytes as binary WS frames; the final flush (commit) is
+// signalled with JSON control messages: {"type":"Finalize"} forces the final result,
+// {"type":"CloseStream"} ends input so Deepgram returns finals + Metadata then closes.
+// Returns an array whose items are Uint8Array (audio) or a JSON control string.
+// If Workers AI does NOT forward these control frames, the client's FINAL_WAIT_MS
+// close path is the backstop (the trailing partial is already delivered) — so a
+// missed finalize can never lose text.
+export function novaClientToBackend(raw) {
   let m;
   try { m = JSON.parse(raw); } catch { return []; }
   if (!m || m.message_type !== "input_audio_chunk") return [];
@@ -202,23 +211,26 @@ export function sonioxClientToBackend(raw) {
     out.push(b64ToBytes(m.audio_base_64));
   }
   if (m.commit) {
-    out.push(""); // empty string = end-of-audio
+    out.push(JSON.stringify({ type: "Finalize" }));
+    out.push(JSON.stringify({ type: "CloseStream" }));
   }
   return out;
 }
 
-// Soniox responses -> client (ElevenLabs frame vocabulary). Soniox streams token
-// objects with an is_final flag: final tokens are confirmed (sent once, never
-// change), non-final tokens are provisional (resent/updated each response). We
-// accumulate the confirmed text and emit, every response, a partial_transcript
-// holding the full current best text (confirmed + provisional tail); on `finished`
-// we emit a committed_transcript with the confirmed text so the client locks it in
-// and closes promptly. Any `error_code` becomes a loud {error} frame so the client's
-// "any string error = loud fail" rule fires. Returns a stateful translator (one per
-// socket); the same normalized frames also feed the phone room.
-export function makeSonioxToClient() {
-  let finalText = "";    // confirmed text accumulated so far
+// Deepgram streaming responses -> client frame vocabulary. Defensive across the
+// THREE plausible on-wire shapes (Cloudflare does not publish the nova-3 streaming
+// envelope): (A) native Deepgram Results {type:"Results", is_final, speech_final,
+// from_finalize, channel.alternatives[0].transcript}; (B) batch-style
+// {results.channels[0].alternatives[0].transcript}; (C) Flux-style {event, transcript}.
+// Emits a running partial_transcript as text accrues, and a committed_transcript at
+// finalize / Metadata / end-of-turn. ANY frame carrying a string error takes the
+// loud {error} path. An UNRECOGNIZED first frame is surfaced loudly (test-build
+// diagnostic) so the real shape is observed instead of yielding a silent blank.
+export function makeNova3ToClient() {
+  let finalText = "";       // accumulated final (locked) text
   let startedSent = false;
+  let sawText = false;      // have we emitted any transcript frame?
+  let probed = false;       // have we surfaced the unknown-shape diagnostic?
   return function translate(raw) {
     let m;
     try { m = JSON.parse(raw); } catch { return []; }
@@ -230,33 +242,70 @@ export function makeSonioxToClient() {
       out.push(JSON.stringify({ message_type: "session_started", config: {} }));
     }
 
-    if (m.error_code) {
-      out.push(JSON.stringify({
-        message_type: "error",
-        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
-      }));
+    // Loud error path — any error-shaped frame.
+    if (typeof m.error === "string" && m.error) {
+      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 " + m.error })); return out;
+    }
+    if (typeof m.type === "string" && /error|fatal/i.test(m.type)) {
+      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 " + (m.description || m.message || m.reason || m.type) })); return out;
+    }
+
+    // (A) native Deepgram streaming Results.
+    if (m.type === "Results" && m.channel && Array.isArray(m.channel.alternatives) && m.channel.alternatives[0]) {
+      sawText = true;
+      const t = m.channel.alternatives[0].transcript || "";
+      if (m.is_final === true) {
+        if (t) finalText = finalText ? finalText + " " + t : t;
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
+        // Commit on an explicit finalize or natural end-of-speech so the client can
+        // close fast; the FINAL_WAIT_MS path remains the backstop either way.
+        if (m.from_finalize === true || m.speech_final === true) {
+          out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+        }
+      } else {
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText ? finalText + " " + t : t }));
+      }
       return out;
     }
 
-    let newFinal = "";
-    let nonFinal = "";
-    if (Array.isArray(m.tokens)) {
-      for (const t of m.tokens) {
-        if (!t || typeof t.text !== "string") continue;
-        // Soniox emits control markers (e.g. <end>, <fin>) as standalone tokens
-        // when endpoint detection fires — never real transcript, so drop them.
-        if (/^\s*<[^>]+>\s*$/.test(t.text)) continue;
-        if (t.is_final) newFinal += t.text;
-        else nonFinal += t.text;
-      }
-    }
-    finalText += newFinal;
-
-    // Running partial = confirmed-so-far + provisional tail (the complete view).
-    out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText + nonFinal }));
-
-    if (m.finished) {
+    // Metadata = end of stream after CloseStream -> commit the accumulated text.
+    if (m.type === "Metadata") {
       out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+      return out;
+    }
+
+    // (B) batch-style envelope (in case the WS path returns batch frames).
+    if (m.results && m.results.channels && m.results.channels[0] &&
+        m.results.channels[0].alternatives && m.results.channels[0].alternatives[0]) {
+      sawText = true;
+      const bt = m.results.channels[0].alternatives[0].transcript || "";
+      finalText = bt;
+      out.push(JSON.stringify({ message_type: "partial_transcript", text: bt }));
+      out.push(JSON.stringify({ message_type: "committed_transcript", text: bt }));
+      return out;
+    }
+
+    // (C) Flux-style turn protocol (in case nova-3 WS mirrors it).
+    if (typeof m.event === "string" && typeof m.transcript === "string") {
+      sawText = true;
+      if (m.event === "EndOfTurn") {
+        finalText = finalText ? finalText + " " + m.transcript : m.transcript;
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
+        out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+      } else {
+        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText ? finalText + " " + m.transcript : m.transcript }));
+      }
+      return out;
+    }
+
+    // Benign lifecycle frames — ignore.
+    if (m.type === "SpeechStarted" || m.type === "UtteranceEnd") return out;
+
+    // Unknown shape: surface the real frame ONCE, loudly, so ground truth is seen
+    // on the first live dictation (blank-but-loud beats a silent wrong chart).
+    if (!probed && !sawText) {
+      probed = true;
+      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 unrecognized frame (report this): " + raw.slice(0, 300) }));
     }
     return out;
   };
@@ -282,12 +331,20 @@ async function handleTranscribeRealtime(request, env) {
   try {
     const url = new URL(request.url);
 
-    // Realtime is Soniox: the client may bring its own Soniox key, or in shared
-    // mode the Worker injects the master SONIOX_API_KEY after the constant-time
-    // passphrase check (the master key never reaches the browser).
-    const clientKey  = String(url.searchParams.get("api_key") || "").trim();
-    const serverKey  = (env && env.SONIOX_API_KEY) || "";
+    // Realtime is Deepgram Nova-3 on Workers AI (env.AI) — there is NO third-party
+    // STT key. The only access gate is the shared-mode passphrase (so the billed AI
+    // binding can't be driven anonymously). Single-tenant deploys (no APP_PASSPHRASE)
+    // need no realtime credential — there is no key to protect.
     const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+    if (serverPass) {
+      const given = String(url.searchParams.get("passphrase") || "").trim();
+      if (!safeEqual(given, serverPass)) {
+        return returnWsError("Unauthorized passphrase");
+      }
+    }
+    if (!env || !env.AI) {
+      return returnWsError("Workers AI binding (AI) is not configured");
+    }
 
     // Phone mic relay: if a session code is present, relay transcript events to
     // the DO room so a desktop listener sees them in real time (fire-and-forget).
@@ -296,83 +353,79 @@ async function handleTranscribeRealtime(request, env) {
       ? env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(sessionCode))
       : null;
 
-    let apiKey = clientKey;
-    if (!apiKey && serverKey && serverPass) {
-      const given = String(url.searchParams.get("passphrase") || "").trim();
-      if (!safeEqual(given, serverPass)) {
-        return returnWsError("Unauthorized passphrase");
-      }
-      apiKey = serverKey;
-    }
-
-    if (!apiKey) {
-      return returnWsError("Missing Soniox API key configuration");
-    }
-
-    // Keyterms ride the Soniox session config (context.terms) — realtime keyterm
-    // support is back (Voxtral lacked it). The client also sends them on the batch
-    // leg, so hybrid's clipboard text benefits from the full list too.
+    // Keyterms (medical proper nouns / drug names) bias recognition. Nova-3 uses
+    // `keyterm`; Workers AI exposes it as a SINGLE string, so terms are space-joined
+    // (whether >1 term boosts through one field is a verify-live item — mode:medical
+    // still carries the bulk of the clinical vocabulary regardless).
     let keyterms = [];
     try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
     const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 100 });
 
-    // Connect to Soniox's realtime WebSocket. Auth is NOT a header — the api_key
-    // rides the first (config) frame, so the upgrade carries no credential.
-    const backendResponse = await fetch(SONIOX_WS_URL, {
-      headers: { "Upgrade": "websocket" }
-    });
+    // Nova-3 streaming config — the SECOND arg of env.AI.run (NOT a query string,
+    // NOT a post-open frame). mode:"medical" selects the clinical model (NOT a
+    // `model` field — that does not exist in the Workers AI schema); encoding +
+    // sample_rate match the 16 kHz s16le pump; interim_results drives live partials;
+    // endpointing:"false" stops Deepgram from splitting continuous PTT speech.
+    const nova3Config = {
+      encoding: "linear16",
+      sample_rate: "16000",        // absent from nova-3's published input schema — VERIFY live
+      channels: 1,
+      language: "en-US",
+      mode: "medical",
+      interim_results: true,
+      smart_format: true,
+      punctuate: true,
+      numerals: true,
+      endpointing: "false",
+    };
+    if (cleanedKeyterms.length) nova3Config.keyterm = cleanedKeyterms.join(" ");
 
-    if (backendResponse.status !== 101) {
-      const errText = await backendResponse.text();
-      return returnWsError(`Soniox Connection Error (${backendResponse.status}): ${errText}`);
+    // Open the backend socket via the AI binding — no outbound fetch, no external hop.
+    let aiResp;
+    try {
+      aiResp = await env.AI.run(NOVA3_MODEL, nova3Config, { websocket: true });
+    } catch (e) {
+      return returnWsError("Workers AI Nova-3 connect failed: " + (e?.message || String(e)));
     }
-
-    const backendWs = backendResponse.webSocket;
+    const backendWs = aiResp && aiResp.webSocket;
     if (!backendWs) {
-      return returnWsError("Could not retrieve backend WebSocket");
+      return returnWsError("Workers AI did not return a WebSocket for Nova-3");
     }
 
     backendWs.accept();
     workerWs.accept();
 
-    // First backend frame is the JSON session config (carries the api_key, audio
-    // format, language hint, endpoint detection, and keyterms as context.terms).
-    // Must precede any audio.
-    const sonioxConfig = {
-      api_key: apiKey,
-      model: SONIOX_MODEL,
-      audio_format: "pcm_s16le",
-      sample_rate: 16000,
-      num_channels: 1,
-      language_hints: ["en"],
-      enable_endpoint_detection: true,
-    };
-    if (cleanedKeyterms.length) sonioxConfig.context = { terms: cleanedKeyterms };
-    try {
-      backendWs.send(JSON.stringify(sonioxConfig));
-    } catch (e) {}
+    const toClient = makeNova3ToClient();
 
-    const toClient = makeSonioxToClient();
-
-    // Browser -> Soniox: decode the client's base64 audio to raw PCM bytes and
-    // forward as binary frames; the final flush (commit) sends an empty string =
-    // end-of-audio. Once end is sent, latch closed so a late audio frame from the
-    // ~85 ms pump can't reopen/confuse the stream mid-finalize.
+    // Once end-of-stream is sent we stop forwarding (and keepalives) so a late
+    // ~85 ms pump frame can't reopen the stream mid-finalize.
     let inputEnded = false;
+
+    // KeepAlive while audio is paused — Deepgram closes an idle socket (~10 s,
+    // NET-0001). Gated on !inputEnded; cleared on close.
+    const keepaliveTimer = setInterval(() => {
+      if (inputEnded) return;
+      try { backendWs.send(JSON.stringify({ type: "KeepAlive" })); } catch (e) {}
+    }, 5000);
+
+    // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
+    // Finalize + CloseStream (novaClientToBackend). Latch closed after commit.
     workerWs.addEventListener("message", (event) => {
       if (inputEnded) return;
-      for (const frame of sonioxClientToBackend(event.data)) {
+      for (const frame of novaClientToBackend(event.data)) {
         try { backendWs.send(frame); } catch (e) {}
       }
       try {
         const m = JSON.parse(event.data);
-        if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
+        if (m && m.message_type === "input_audio_chunk" && m.commit) {
+          inputEnded = true;
+          clearInterval(keepaliveTimer);
+        }
       } catch (e) {}
     });
 
-    // Soniox -> browser: translate token responses into the ElevenLabs frame
-    // vocabulary the client (and the phone-link desktop listener) speak. The same
-    // normalized frames are mirrored into the phone room for live desktop feedback.
+    // Deepgram -> browser: translate result frames into the client frame vocabulary
+    // (and mirror into the phone room for live desktop feedback).
     backendWs.addEventListener("message", (event) => {
       for (const frame of toClient(event.data)) {
         try { workerWs.send(frame); } catch (e) {}
@@ -384,17 +437,18 @@ async function handleTranscribeRealtime(request, env) {
     });
 
     workerWs.addEventListener("close", () => {
+      clearInterval(keepaliveTimer);
       try { backendWs.close(); } catch (e) {}
     });
 
     backendWs.addEventListener("close", (event) => {
-      // An abnormal close mid-dictation is a real drop — surface Soniox's code/
-      // reason as a loud error frame so it's diagnosable, not a generic failure.
-      // A normal 1000 close (e.g. after `finished`) carries no error.
+      clearInterval(keepaliveTimer);
+      // An abnormal close mid-dictation is a real drop — surface it loudly so it's
+      // diagnosable. A normal 1000 close (after finals) carries no error.
       const code = event && event.code;
       if (code && code !== 1000 && code !== 1005) {
         const reason = (event && event.reason) ? (": " + event.reason) : "";
-        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Soniox closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
+        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Nova-3 closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
       }
       try { workerWs.close(); } catch (e) {}
       if (doStub) {
@@ -846,8 +900,10 @@ const INDEX_HTML = `<!doctype html>
           <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch / hybrid refine)</label>
           <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
 
-          <label for="sonioxKey" id="sonioxKeyLabel">Soniox API key (realtime / hybrid live)</label>
-          <input id="sonioxKey" type="password" placeholder="soniox api key" autocomplete="off" />
+          <!-- Realtime now runs on Deepgram Nova-3 via Workers AI (no STT key). This
+               legacy field is hidden but kept so saved settings/clear paths still resolve. -->
+          <label for="sonioxKey" id="sonioxKeyLabel" style="display:none">Realtime STT key (unused — realtime runs on Workers AI)</label>
+          <input id="sonioxKey" type="password" placeholder="unused" autocomplete="off" style="display:none" />
 
           <label class="checkbox">
             <input type="checkbox" id="saveApiKey" />
@@ -2423,29 +2479,25 @@ right lower quadrant"></textarea>
     // the release guards read it).
     if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
-    // Engine-aware credential check. Realtime + hybrid's live leg need a Soniox
-    // key; batch + hybrid's refine need an ElevenLabs key. In shared mode the
-    // passphrase covers both (the Worker holds both master secrets).
+    // Engine-aware credential check. Realtime is Deepgram Nova-3 on Workers AI —
+    // NO STT key (the Worker uses env.AI; shared mode gates it on the passphrase).
+    // Batch + hybrid's refine still need an ElevenLabs key. In shared mode the
+    // passphrase covers everything.
     const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch / refine)
-    const sonioxKey   = sonioxKeyEl.value.trim();     // Soniox (realtime / live)
     const shared      = SHARED_MODE && passphraseEl.value.trim();
-    const needSoniox  = (engine === "realtime" || engine === "hybrid");
     const needEleven  = (engine === "batch" || engine === "hybrid");
     let missing = null;
     if (!shared) {
-      if (needSoniox && !sonioxKey)       missing = "soniox";
-      else if (needEleven && !apiKey)     missing = "eleven";
+      if (needEleven && !apiKey)                       missing = SHARED_MODE ? "pass" : "eleven";
+      else if (SHARED_MODE && engine === "realtime")   missing = "pass"; // shared realtime still gates
     }
     if (missing) {
       await writeSentinel();
       if (authSectionEl) authSectionEl.open = true; // surface the collapsed credentials box
       setBigSettingsVisible(true); // the big-button layout hides it otherwise
-      if (SHARED_MODE) {
+      if (missing === "pass") {
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
-      } else if (missing === "soniox") {
-        setStatus("Enter your Soniox API key first (used for realtime).", "err");
-        sonioxKeyEl.focus();
       } else {
         setStatus("Enter your ElevenLabs API key first (used for batch).", "err");
         apiKeyEl.focus();
@@ -2537,16 +2589,14 @@ right lower quadrant"></textarea>
     // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
     const params = new URLSearchParams();
-    // Realtime is Soniox: send the Soniox key (BYO). In shared mode no key is
-    // sent and the Worker injects the master SONIOX_API_KEY after the passphrase
-    // check — the master key never reaches the browser.
-    if (sonioxKey) params.append("api_key", sonioxKey);
+    // Realtime is Deepgram Nova-3 on Workers AI — no STT key travels from the
+    // browser. In shared mode the passphrase gates the Worker's AI binding.
     if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
 
-    // Soniox keyterms ride context.terms in the session config (realtime keyterm
-    // support is back). Batch gets the full list too, so hybrid benefits both legs.
+    // Keyterms ride the Nova-3 config as the keyterm field (server-side). Batch
+    // gets the full list too, so hybrid's clipboard text benefits on both legs.
     const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
     params.append("keyterms_json", JSON.stringify(keyterms));
 

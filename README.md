@@ -18,7 +18,7 @@ Designed for clinicians dictating into **Cerner running inside Citrix**: push-to
 
 - **Engine selector** — Realtime / Batch / Hybrid, switchable per dictation, persisted per browser. Mode-specific controls show and hide with it.
 - **Push-to-talk dictation** with a configurable in-app hotkey — default **Ctrl + Space** (tap to start/stop, hold to talk) — plus the F13/F14 contract for existing AutoHotkey CapsLock setups, which keeps working unchanged.
-- **Live transcript** streamed from Soniox realtime STT (`stt-rt-v5`) over a secure WebSocket proxy (the API key never reaches the browser in shared mode). Batch and the hybrid refine still use ElevenLabs Scribe v2.
+- **Live transcript** streamed from **Deepgram Nova-3 on Cloudflare Workers AI** (`@cf/deepgram/nova-3`, `mode:medical`) over a WebSocket proxy that runs *on* Cloudflare's edge — no external hop, no STT key (the Worker uses the `env.AI` binding). Batch and the hybrid refine still use ElevenLabs Scribe v2. *(Realtime is freshly migrated and pending live verification — see the roadmap.)*
 - **Anti-clipping pipeline** (realtime/hybrid): a ~400 ms pre-roll, buffering while the socket connects, a post-release audio tail, and a commit-then-wait shutdown — so the first and last words survive. In hybrid, all of it is also captured for the batch refine.
 - **Loud failure notification**: dead-mic alarm *while you're dictating*, connect-timeout alarm, failure and warn beeps that play even from a background tab, clipboard sentinel (`##DICTATION_FAILED##`), and mic/link status pills.
 - **Recovery, not just alarm**: in hybrid mode, if the live link dies mid-dictation, the locally captured audio is still re-transcribed through batch — the dictation is recovered, flagged for verification instead of lost.
@@ -94,14 +94,14 @@ Deploys as worker **`eleven`** — the pre-merge batch app's URL, so existing us
 
 Two modes, controlled by Worker environment variables:
 
-Two providers now: **Soniox** powers realtime (and hybrid's live feedback); **ElevenLabs** powers batch (and hybrid's refine deliverable).
+Two providers now: **Deepgram Nova-3 on Workers AI** powers realtime (and hybrid's live feedback) — no key, just the `[ai]` binding; **ElevenLabs** powers batch (and hybrid's refine deliverable).
 
 | Variable | Effect |
 |---|---|
-| *(none)* | Each user pastes their own keys into the UI — a **Soniox** key for realtime and an **ElevenLabs** key for batch (hybrid needs both). |
-| `SONIOX_API_KEY` **+** `ELEVENLABS_API_KEY` **+** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the master keys server-side. |
+| *(none)* | Realtime works out of the box (Workers AI `env.AI` binding). Batch needs an **ElevenLabs** key pasted into the UI (hybrid needs it too, for the refine). |
+| `ELEVENLABS_API_KEY` **+** `APP_PASSPHRASE` | **Shared mode**: users enter only the passphrase; the Worker injects the ElevenLabs key for batch and gates realtime (the billed AI binding) behind the passphrase. |
 
-Set secrets with `npx wrangler secret put SONIOX_API_KEY`, `…put ELEVENLABS_API_KEY`, and `…put APP_PASSPHRASE`. (Realtime-only or batch-only deployments need just the matching provider key.)
+Realtime needs the `[ai]` binding in `wrangler.toml` (`binding = "AI"`) and a Workers-AI-enabled account — **no STT secret**. Set the rest with `npx wrangler secret put ELEVENLABS_API_KEY` and `…put APP_PASSPHRASE`.
 
 ### Install as an app (optional)
 
@@ -336,7 +336,8 @@ This app deploys over the original batch app's URL, and your saved settings, API
 
 ### Landed
 
-- [x] **Soniox realtime swap**: the realtime engine (and hybrid's live-feedback leg) moved to Soniox `stt-rt-v5` (after ElevenLabs Scribe v2 Realtime and a brief Mistral Voxtral detour); batch and the hybrid refine stay on ElevenLabs Scribe v2. The client keeps speaking the ElevenLabs frame vocabulary — the Worker translates both directions (audio chunk→raw PCM bytes, commit→empty-string end-of-audio; Soniox non-final tokens→running partial, final tokens accumulate, `finished`→committed; `error_code`/abnormal close→loud error frame). Adds a second credential (Soniox key, shared-mode `SONIOX_API_KEY` secret). **Realtime keyterms are back** via Soniox `context.terms`, plus endpoint detection for low-latency finals.
+- [ ] **Deepgram Nova-3 on Workers AI (realtime) — built, pending live verification**: the realtime engine (and hybrid's live leg) now streams to `@cf/deepgram/nova-3` via the `env.AI` binding (`mode:"medical"`), running *on* Cloudflare's edge — no external hop, no STT key. Replaces Soniox. The client keeps the same frame vocabulary; the Worker translates via `novaClientToBackend`/`makeNova3ToClient`. **Not yet confirmed:** Cloudflare doesn't publish nova-3's streaming frame shape or `sample_rate` support, so the translator is defensive across 3 shapes and surfaces an unrecognized frame loudly — the first real dictation must confirm the wire shape *and accuracy* (a wrong sample rate silently corrupts text) before this is trusted for charts. Batch stays the deliverable until then.
+- [x] **Soniox realtime swap** *(superseded by Nova-3 above)*: the realtime engine (and hybrid's live-feedback leg) moved to Soniox `stt-rt-v5` (after ElevenLabs Scribe v2 Realtime and a brief Mistral Voxtral detour); batch and the hybrid refine stay on ElevenLabs Scribe v2. The client keeps speaking the ElevenLabs frame vocabulary — the Worker translates both directions (audio chunk→raw PCM bytes, commit→empty-string end-of-audio; Soniox non-final tokens→running partial, final tokens accumulate, `finished`→committed; `error_code`/abnormal close→loud error frame). Adds a second credential (Soniox key, shared-mode `SONIOX_API_KEY` secret). **Realtime keyterms are back** via Soniox `context.terms`, plus endpoint detection for low-latency finals.
 - [x] Realtime hardening: anti-clipping (buffer-while-connecting, post-release tail, commit-then-wait), dead-mic watchdog, connect timeout, failure-aware clipboard semantics, always-audible failure beeps, mic re-engagement, append window + chip, Advanced section, pre-roll, ellipsis filter, transcript-first layout, realtime-spec alignment (error-frame taxonomy, `previous_text`, server-confirmed keyterms), PWA, queued PTT, configurable hotkey, jsdom flow harness
 - [x] **Three-engine merge**: dual-protocol Worker (WS + POST on `/api/transcribe`), engine selector with per-mode UI, batch engine (post-gate recording, upload-on-release), **hybrid accuracy mode** — realtime feedback + batch re-transcription of the exact streamed audio (incl. pre-roll) as the clipboard deliverable, with WS-death recovery via the refine, degraded-success warn semantics, and per-engine history (`liveText` kept for comparison)
 - [x] **Compact-UI pass**: batch default engine, append-off default with **click-to-append** (one-shot arm by clicking the transcript box), latest transcript restored on load, collapsible Access/Options/Keyterms sections (Access auto-collapses once credentials are set), tiny-window layout for minimized/PWA use

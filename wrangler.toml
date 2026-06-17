@@ -5,9 +5,16 @@ compatibility_date = "2025-01-01"
 # Deploy: npx wrangler deploy
 # Deploys over the existing `eleven` worker; its secrets persist across deploys.
 #
-# Shared mode (optional): set both secrets and users only need the passphrase.
-#   npx wrangler secret put ELEVENLABS_API_KEY
-#   npx wrangler secret put APP_PASSPHRASE
+# Shared mode (optional): set secrets and users only need the passphrase.
+#   npx wrangler secret put ELEVENLABS_API_KEY   (batch / hybrid refine — ElevenLabs)
+#   npx wrangler secret put APP_PASSPHRASE        (gates shared access)
+# Realtime is Deepgram Nova-3 on Workers AI via the [ai] binding below — no STT
+# key/secret: it uses the account's Workers AI. In shared mode the passphrase
+# still gates it (so the billed AI binding can't be used anonymously).
+
+# Workers AI binding (realtime STT: @cf/deepgram/nova-3). One [ai] binding per Worker.
+[ai]
+binding = "AI"
 
 [[durable_objects.bindings]]
 name = "SESSION_ROOM"

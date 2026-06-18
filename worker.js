@@ -3863,6 +3863,7 @@ right lower quadrant"></textarea>
 
     if (msg.message_type === "partial_transcript") {
       var partial = (msg.transcript || msg.text || "").trim();
+      if (RT_DEBUG) { try { console.log("[rt-listener " + Math.round(performance.now()) + "] partial(" + partial.length + "): " + JSON.stringify(partial)); } catch (e) {} }
       var combined = remoteCommitted + (remoteCommitted && partial ? " " : "") + partial;
       latestText = cleanTranscript(combined);
       latestEl.textContent = latestText;
@@ -3872,6 +3873,7 @@ right lower quadrant"></textarea>
     if (msg.message_type === "committed_transcript" ||
         msg.message_type === "committed_transcript_with_timestamps") {
       var seg = (msg.transcript || msg.text || "").trim();
+      if (RT_DEBUG) { try { console.log("[rt-listener " + Math.round(performance.now()) + "] COMMIT(" + seg.length + ") remoteCommitted.len=" + remoteCommitted.length + ": " + JSON.stringify(seg)); } catch (e) {} }
       if (seg) remoteCommitted += (remoteCommitted ? " " : "") + seg;
       latestText = cleanTranscript(remoteCommitted);
       latestEl.textContent = latestText;

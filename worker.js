@@ -1451,6 +1451,10 @@ right lower quadrant"></textarea>
   let ws = null;
   let finalizedSegments = [];
   let currentPartial = "";
+  // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
+  // to the console, so a real dictation reveals the exact partial/commit sequence
+  // (duplication vs interim churn vs lag) that synthetic audio can't reproduce.
+  var RT_DEBUG = (window.location.search.indexOf("debug=1") >= 0);
 
   // Per-session flow state
   let sessionSeq = 0;          // bumps each recording; stale socket callbacks bail out
@@ -2937,11 +2941,13 @@ right lower quadrant"></textarea>
         }
         else if (m_type === "partial_transcript") {
           partialCount++;
+          if (RT_DEBUG) { try { console.log("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text)); } catch (e) {} }
           currentPartial = data.text;
           updateLiveDisplay();
         }
         else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
           partialCount++;
+          if (RT_DEBUG) { try { console.log("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text)); } catch (e) {} }
           if (data.text && data.text.trim()) {
             finalizedSegments.push(data.text);
             currentPartial = "";

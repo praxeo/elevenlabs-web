@@ -524,13 +524,14 @@ pump(6); // live speech (with pre-roll: 8 frames ≈ 0.7s, above the refine mini
 s12.msg({ message_type: 'partial_transcript', text: 'live partial words' });
 check('hybrid shows live partials', latest().includes('live partial words'), latest());
 s12.msg({ message_type: 'committed_transcript', text: 'Live committed words.' });
-doc.getElementById('recordBtn').click(); // stop -> tail -> commit -> await final
-await sleep(700);
-s12.msg({ message_type: 'committed_transcript', text: '' }); // final commit reply
-await sleep(450); // quiet period passes -> finalize -> refine begins
+doc.getElementById('recordBtn').click(); // stop -> tail (600ms) -> HYBRID FAST FINALIZE
+// Hybrid no longer blocks the batch refine on the realtime engine's finalize
+// (the old await-final + commit-quiet wait): sessionPcm is complete after the
+// tail, so the refine begins as soon as TAIL_MS elapses.
+await sleep(680); // tail done (600ms); refine has begun (fetch delayMs 400)
 check('refining status shown', status().includes('Refining via batch'), status());
 check('link pill refining', doc.getElementById('linkPill').textContent === 'refining…', doc.getElementById('linkPill').textContent);
-await sleep(600); // refine resolves
+await sleep(450); // refine resolves (~1000ms after stop) and delivers
 check('exactly one refine upload', fetchCalls.length === fCount12 + 1, fetchCalls.length - fCount12);
 const refineCall = fetchCalls[fetchCalls.length - 1];
 const refineFile = refineCall.form && refineCall.form.get('file');

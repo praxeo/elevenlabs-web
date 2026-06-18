@@ -3254,11 +3254,27 @@ right lower quadrant"></textarea>
     }
 
     // Keep streaming audio briefly after PTT release so trailing speech still
-    // in the capture pipeline reaches Scribe (this is what used to clip the
-    // last word or two), then commit and wait for the final transcript.
+    // in the capture pipeline reaches the engine (this is what used to clip the
+    // last word or two), then finalize.
     tailTimer = setTimeout(() => {
       tailTimer = null;
-      beginCommitPhase(false);
+      if (sessionEngine === "hybrid") {
+        // HYBRID FAST FINALIZE: the batch refine is the deliverable, and sessionPcm
+        // is already complete after the tail. Do NOT block the batch on the realtime
+        // engine's finalize (the FINAL_WAIT_MS / commit-quiet wait) — that just adds
+        // 1-2.5 s of dead time before the upload. The live text was only feedback;
+        // commit + close the socket in the background and refine immediately.
+        try {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            flushPendingChunks();
+            sendAudioChunk("", true); // graceful commit to the engine
+          }
+        } catch (e) {}
+        try { if (ws) ws.close(); } catch (e) {} // onclose re-enters finalize; sessionFinalized guards it
+        finalizeSession(false);
+      } else {
+        beginCommitPhase(false);
+      }
     }, TAIL_MS);
   }
 

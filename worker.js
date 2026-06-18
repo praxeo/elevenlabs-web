@@ -427,26 +427,55 @@ async function handleTranscribeRealtime(request, env) {
     };
     if (cleanedKeyterms.length) liveCfg.keyterm = cleanedKeyterms.join(" ");
 
-    // Realtime transport selector (?rt=). DEFAULT/auto = the proven in-process
-    // env.AI binding (current behavior, unchanged). Opt-in alternatives reach an
-    // HONORED sample_rate (the prime suspect for the pace-garble):
-    //   rt=flux -> @cf/deepgram/flux on the SAME binding (its schema REQUIRES
-    //             sample_rate, so CF forwards it) — no new credential.
-    //   rt=gw   -> AI Gateway "workers-ai" URL for @cf/deepgram/nova-3 with
-    //             sample_rate in the query string — needs CF_AIG_* secrets.
-    //   rt=dgw  -> AI Gateway "deepgram" passthrough to nova-3-medical (the
-    //             clinical streaming model) — needs CF_AIG_* + DEEPGRAM_API_KEY.
-    // Gateway paths stay INERT until their secrets exist, so deploying this
-    // changes nothing in production until the operator opts in.
+    // Realtime transport selector (?rt=). DEFAULT/auto = ElevenLabs Scribe v2
+    // Realtime — probe-verified batch-quality accuracy and prompt finalize, and
+    // it uses the EXISTING ELEVENLABS_API_KEY (no new credential). The Workers-AI
+    // Nova-3 binding was relegated because its managed layer floored interim
+    // cadence at ~1/sec and garbled real noisy-mic speech. Alternatives:
+    //   rt=el / rt=scribe / auto -> ElevenLabs Scribe v2 Realtime (default).
+    //   rt=binding / rt=nova     -> @cf/deepgram/nova-3 on the env.AI binding.
+    //   rt=flux                  -> @cf/deepgram/flux on the binding.
+    //   rt=gw  -> AI Gateway "workers-ai" nova-3 (needs CF_AIG_* secrets).
+    //   rt=dgw -> AI Gateway "deepgram" passthrough to nova-3-medical (needs
+    //            CF_AIG_* + DEEPGRAM_API_KEY).
+    // The EL path is a near-IDENTITY passthrough: the client's frame vocabulary
+    // (input_audio_chunk / partial_transcript / committed_transcript / error) was
+    // modeled on EL's native realtime protocol, so the Worker forwards JSON both
+    // ways (dropping previous_text past the first chunk). The Nova/gateway paths
+    // use the makeNova3ToClient / novaClientToBackend translators instead.
     const rt = String(url.searchParams.get("rt") || "auto").toLowerCase();
+    const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
+    const useEl = (rt === "auto" || rt === "el" || rt === "scribe") && !!elKey;
     const acct = ((env && env.CF_ACCOUNT_ID) || "").trim();
     const gwName = ((env && env.CF_AIG_GATEWAY) || "").trim();
     const aigToken = ((env && env.CF_AIG_TOKEN) || "").trim();
     const dgKey = ((env && env.DEEPGRAM_API_KEY) || "").trim();
 
-    let backendWs = null, usedTier = "", diags = [];
+    let backendWs = null, usedTier = "", diags = [], elPassthrough = false;
 
-    if (rt === "gw" || rt === "dgw") {
+    if (useEl) {
+      // ElevenLabs Scribe v2 Realtime. commit_strategy=manual: one final per PTT
+      // push (we drive the commit at release), no VAD mid-utterance splitting.
+      const elTerms = sanitizeKeyterms(keyterms, { maxChars: 20, maxWords: 5, maxTerms: 50 });
+      const noVerbatim = url.searchParams.get("no_verbatim") !== "false";
+      const elp = new URLSearchParams();
+      elp.append("model_id", "scribe_v2_realtime");
+      elp.append("audio_format", "pcm_16000");
+      elp.append("language_code", "en");
+      elp.append("commit_strategy", "manual");
+      elp.append("include_timestamps", "false");
+      elp.append("no_verbatim", String(noVerbatim));
+      for (const t of elTerms) elp.append("keyterms", t);
+      const elUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elp.toString();
+      try {
+        const resp = await fetch(elUrl, { headers: { Upgrade: "websocket", "xi-api-key": elKey } });
+        if (resp && resp.webSocket) { backendWs = resp.webSocket; usedTier = "elevenlabs"; elPassthrough = true; }
+        else {
+          diags.push("el:status=" + (resp && resp.status));
+          try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
+        }
+      } catch (e) { diags.push("el:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
+    } else if (rt === "gw" || rt === "dgw") {
       // Outbound WebSocket from a Worker: fetch() with an Upgrade header, then read
       // resp.webSocket (NOT `new WebSocket`). Native query params take real strings.
       if (!acct || !gwName || !aigToken) {
@@ -501,40 +530,67 @@ async function handleTranscribeRealtime(request, env) {
     backendWs.accept();
     workerWs.accept();
 
-    const toClient = makeNova3ToClient(usedTier);
-
-    // Once end-of-stream is sent we stop forwarding so a late ~85 ms pump frame
-    // can't reopen the stream mid-finalize. NOTE: no KeepAlive — Deepgram-on-
-    // Workers-AI rejects it ("unknown variant `KeepAlive`"); the PTT audio stream
-    // is continuous (pre-gate) so the ~10 s idle close doesn't bite a held button.
+    // Once the client's commit flush is forwarded we latch input closed so a late
+    // ~85 ms pump frame can't reopen the stream mid-finalize. The PTT audio is
+    // continuous (pre-gate), so no KeepAlive is needed before the held release.
     let inputEnded = false;
 
-    // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
-    // CloseStream (novaClientToBackend). Latch closed after commit.
-    workerWs.addEventListener("message", (event) => {
-      if (inputEnded) return;
-      for (const frame of novaClientToBackend(event.data)) {
-        try { backendWs.send(frame); } catch (e) {}
-      }
-      try {
-        const m = JSON.parse(event.data);
-        if (m && m.message_type === "input_audio_chunk" && m.commit) {
-          inputEnded = true;
-        }
-      } catch (e) {}
-    });
-
-    // Deepgram -> browser: translate result frames into the client frame vocabulary
-    // (and mirror into the phone room for live desktop feedback).
-    backendWs.addEventListener("message", (event) => {
-      for (const frame of toClient(event.data)) {
-        try { workerWs.send(frame); } catch (e) {}
+    if (elPassthrough) {
+      // ElevenLabs realtime: the client vocabulary IS EL's native protocol, so
+      // forward JSON both ways (near-identity). The client's empty-audio
+      // {commit:true} flush IS EL's commit — forward as-is, then latch. Drop
+      // previous_text (cross-press drift; EL also rejects it past the first chunk).
+      workerWs.addEventListener("message", (event) => {
+        if (inputEnded) return;
+        let raw = event.data, isCommit = false;
+        try {
+          const m = JSON.parse(event.data);
+          if (m && m.message_type === "input_audio_chunk") {
+            if (m.commit) isCommit = true;
+            if (m.previous_text) { delete m.previous_text; raw = JSON.stringify(m); }
+          }
+        } catch (e) {}
+        try { backendWs.send(raw); } catch (e) {}
+        if (isCommit) inputEnded = true;
+      });
+      // EL -> browser: frames already match the client vocabulary (session_started /
+      // partial_transcript / committed_transcript / error) — forward raw, and mirror
+      // into the phone room for live desktop feedback.
+      backendWs.addEventListener("message", (event) => {
+        try { workerWs.send(event.data); } catch (e) {}
         if (doStub) {
-          doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
+          doStub.fetch("https://session-room/broadcast", { method: "POST", body: event.data })
                 .catch(() => {});
         }
-      }
-    });
+      });
+    } else {
+      const toClient = makeNova3ToClient(usedTier);
+      // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
+      // CloseStream (novaClientToBackend). Latch closed after commit.
+      workerWs.addEventListener("message", (event) => {
+        if (inputEnded) return;
+        for (const frame of novaClientToBackend(event.data)) {
+          try { backendWs.send(frame); } catch (e) {}
+        }
+        try {
+          const m = JSON.parse(event.data);
+          if (m && m.message_type === "input_audio_chunk" && m.commit) {
+            inputEnded = true;
+          }
+        } catch (e) {}
+      });
+      // Deepgram -> browser: translate result frames into the client frame vocabulary
+      // (and mirror into the phone room for live desktop feedback).
+      backendWs.addEventListener("message", (event) => {
+        for (const frame of toClient(event.data)) {
+          try { workerWs.send(frame); } catch (e) {}
+          if (doStub) {
+            doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
+                  .catch(() => {});
+          }
+        }
+      });
+    }
 
     workerWs.addEventListener("close", () => {
       try { backendWs.close(); } catch (e) {}
@@ -546,7 +602,8 @@ async function handleTranscribeRealtime(request, env) {
       const code = event && event.code;
       if (code && code !== 1000 && code !== 1005) {
         const reason = (event && event.reason) ? (": " + event.reason) : "";
-        try { workerWs.send(JSON.stringify({ message_type: "error", error: "Nova-3 closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
+        const who = usedTier === "elevenlabs" ? "ElevenLabs" : "Nova-3";
+        try { workerWs.send(JSON.stringify({ message_type: "error", error: who + " closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
       }
       try { workerWs.close(); } catch (e) {}
       if (doStub) {
@@ -2961,7 +3018,7 @@ right lower quadrant"></textarea>
     // honored sample_rate without any UI change; an unknown value is ignored.
     try {
       var pageRt = new URLSearchParams(window.location.search).get("rt");
-      if (pageRt && /^(flux|gw|dgw|binding|auto)$/.test(pageRt)) params.append("rt", pageRt);
+      if (pageRt && /^(el|scribe|binding|nova|flux|gw|dgw|auto)$/.test(pageRt)) params.append("rt", pageRt);
     } catch (e) {}
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();

@@ -626,6 +626,69 @@ async function handleNovaProbe(request, env) {
     } catch (e) { return json({ error: "probe: bad pcm_base64" }, 400); }
     if (pcm.length < 1000) return json({ error: "probe: pcm too short (" + pcm.length + " bytes)" }, 400);
 
+    // ===== ElevenLabs Scribe v2 Realtime probe branch (transport:"el") =====
+    // Streams the SAME 16k PCM to EL realtime as input_audio_chunk JSON frames and
+    // measures first-partial / first-commit latency — to compare EL's responsiveness
+    // and accuracy against the Workers-AI binding without a live mic.
+    if (String(body.transport || "") === "el") {
+      const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
+      if (!elKey) return json({ error: "probe el: ELEVENLABS_API_KEY not set" }, 500);
+      const elp = new URLSearchParams();
+      elp.append("model_id", String(body.model_id || "scribe_v2_realtime"));
+      elp.append("audio_format", "pcm_16000");
+      elp.append("language_code", "en");
+      elp.append("commit_strategy", String(body.commit_strategy || "manual"));
+      elp.append("include_timestamps", "false");
+      elp.append("no_verbatim", String(body.no_verbatim === true));
+      if (Array.isArray(body.keyterms)) for (const t of body.keyterms.slice(0, 50)) elp.append("keyterms", String(t).slice(0, 20));
+      const elUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elp.toString();
+      const t0el = Date.now();
+      let er;
+      try { er = await fetch(elUrl, { headers: { Upgrade: "websocket", "xi-api-key": elKey } }); }
+      catch (e) { return json({ error: "probe el: fetch threw " + (e && e.message || String(e)) }, 502); }
+      const ews = er && er.webSocket;
+      if (!ews) {
+        let d = "status=" + (er && er.status);
+        try { if (er && er.clone) d += " " + (await er.clone().text()).slice(0, 200); } catch (e) {}
+        return json({ error: "probe el: no webSocket (" + d + ")" }, 502);
+      }
+      ews.accept();
+      const elRaw = [], elPartials = [];
+      let committed = "", elClosed = false, elCloseInfo = null, firstPartialAt = 0, firstCommitAt = 0;
+      const elDone = new Promise((resolve) => {
+        ews.addEventListener("message", (ev) => {
+          const s = (typeof ev.data === "string") ? ev.data : "[binary]";
+          if (elRaw.length < 80) elRaw.push(s.slice(0, 300));
+          let m; try { m = JSON.parse(s); } catch (e) { return; }
+          if (!m) return;
+          if (m.message_type === "partial_transcript") { if (!firstPartialAt) firstPartialAt = Date.now() - t0el; if (typeof m.text === "string") elPartials.push(m.text); }
+          else if (m.message_type === "committed_transcript" || m.message_type === "committed_transcript_with_timestamps") { if (!firstCommitAt) firstCommitAt = Date.now() - t0el; if (m.text) committed += (committed ? " " : "") + m.text; }
+        });
+        ews.addEventListener("close", (ev) => { elClosed = true; elCloseInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
+        ews.addEventListener("error", () => resolve());
+      });
+      const sleepEl = (ms) => new Promise((res) => setTimeout(res, ms));
+      const b64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); };
+      let elFrames = 0;
+      for (let off = 0; off < pcm.length; off += frameBytes) {
+        const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
+        try { ews.send(JSON.stringify({ message_type: "input_audio_chunk", audio_base_64: b64(chunk), commit: false, sample_rate: 16000 })); } catch (e) { break; }
+        elFrames++;
+        if (cadenceMs > 0) await sleepEl(cadenceMs);
+      }
+      try { ews.send(JSON.stringify({ message_type: "input_audio_chunk", audio_base_64: "", commit: true, sample_rate: 16000 })); } catch (e) {}
+      await Promise.race([elDone, sleepEl(deadlineMs)]);
+      try { ews.close(); } catch (e) {}
+      return json({
+        ok: true, transport: "el", model_id: elp.get("model_id"), commit_strategy: elp.get("commit_strategy"),
+        frame_bytes: frameBytes, cadence_ms: cadenceMs, pcm_bytes: pcm.length, frames_sent: elFrames, ms: Date.now() - t0el,
+        first_partial_ms: firstPartialAt, first_commit_ms: firstCommitAt,
+        closed: elClosed, close_info: elCloseInfo,
+        final_text: committed, last_partial: elPartials.length ? elPartials[elPartials.length - 1] : "", partial_count: elPartials.length,
+        raw_first_frames: elRaw,
+      });
+    }
+
     const t0 = Date.now();
     let r;
     try { r = await env.AI.run(model, cfg, { websocket: true }); }

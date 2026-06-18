@@ -1452,9 +1452,26 @@ right lower quadrant"></textarea>
   let finalizedSegments = [];
   let currentPartial = "";
   // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
-  // to the console, so a real dictation reveals the exact partial/commit sequence
-  // (duplication vs interim churn vs lag) that synthetic audio can't reproduce.
+  // to the console AND an on-screen overlay (foolproof when DevTools is filtered
+  // or unavailable), so a real dictation reveals the exact partial/commit
+  // sequence (duplication vs interim churn vs lag) that synthetic audio can't
+  // reproduce. Off by default; purely additive.
   var RT_DEBUG = (window.location.search.indexOf("debug=1") >= 0);
+  function rtDebugLog(line) {
+    if (!RT_DEBUG) return;
+    try { console.log(line); } catch (e) {}
+    try {
+      var box = document.getElementById("rtdbg");
+      if (!box) {
+        box = document.createElement("pre");
+        box.id = "rtdbg";
+        box.style.cssText = "position:fixed;left:0;right:0;bottom:0;max-height:42vh;overflow:auto;margin:0;padding:6px;background:rgba(0,0,0,0.88);color:#3f6;font:11px/1.35 monospace;z-index:2147483647;white-space:pre-wrap;border-top:2px solid #3f6";
+        (document.body || document.documentElement).appendChild(box);
+      }
+      box.textContent += line + "\\n";
+      box.scrollTop = box.scrollHeight;
+    } catch (e) {}
+  }
 
   // Per-session flow state
   let sessionSeq = 0;          // bumps each recording; stale socket callbacks bail out
@@ -2885,6 +2902,7 @@ right lower quadrant"></textarea>
     } catch (e) {}
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
+    rtDebugLog("[rt " + Math.round(performance.now()) + "] connecting ws  engine=" + sessionEngine + " rt=" + ((typeof pageRt !== "undefined" && pageRt) ? pageRt : "auto"));
 
     try {
       ws = new WebSocket(wsUrl);
@@ -2914,6 +2932,7 @@ right lower quadrant"></textarea>
     ws.onopen = () => {
       if (mySession !== sessionSeq) return;
       wsOpenAt = Date.now();
+      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws OPEN");
       if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
       setLinkPill("live");
       flushPendingChunks();
@@ -2941,13 +2960,13 @@ right lower quadrant"></textarea>
         }
         else if (m_type === "partial_transcript") {
           partialCount++;
-          if (RT_DEBUG) { try { console.log("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text)); } catch (e) {} }
+          rtDebugLog("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text));
           currentPartial = data.text;
           updateLiveDisplay();
         }
         else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
           partialCount++;
-          if (RT_DEBUG) { try { console.log("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text)); } catch (e) {} }
+          rtDebugLog("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text));
           if (data.text && data.text.trim()) {
             finalizedSegments.push(data.text);
             currentPartial = "";
@@ -2984,6 +3003,7 @@ right lower quadrant"></textarea>
     ws.onerror = (err) => {
       if (mySession !== sessionSeq) return;
       console.error("WebSocket Error:", err);
+      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws ERROR");
       lastWsError = lastWsError || "pipeline connection error";
       setStatus("Pipeline connection error.", "err");
     };
@@ -2991,6 +3011,7 @@ right lower quadrant"></textarea>
     ws.onclose = () => {
       if (mySession !== sessionSeq) return;
       console.log("WebSocket connection closed.");
+      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws CLOSE  (partials seen this session: " + partialCount + ")");
       setLinkPill(sessionFinalized || userStopped ? "idle" : "fail");
       // A close we did not ask for is a failure and must sound like one.
       finalizeSession(!userStopped);
@@ -3863,7 +3884,7 @@ right lower quadrant"></textarea>
 
     if (msg.message_type === "partial_transcript") {
       var partial = (msg.transcript || msg.text || "").trim();
-      if (RT_DEBUG) { try { console.log("[rt-listener " + Math.round(performance.now()) + "] partial(" + partial.length + "): " + JSON.stringify(partial)); } catch (e) {} }
+      rtDebugLog("[rt-listener " + Math.round(performance.now()) + "] partial(" + partial.length + "): " + JSON.stringify(partial));
       var combined = remoteCommitted + (remoteCommitted && partial ? " " : "") + partial;
       latestText = cleanTranscript(combined);
       latestEl.textContent = latestText;
@@ -3873,7 +3894,7 @@ right lower quadrant"></textarea>
     if (msg.message_type === "committed_transcript" ||
         msg.message_type === "committed_transcript_with_timestamps") {
       var seg = (msg.transcript || msg.text || "").trim();
-      if (RT_DEBUG) { try { console.log("[rt-listener " + Math.round(performance.now()) + "] COMMIT(" + seg.length + ") remoteCommitted.len=" + remoteCommitted.length + ": " + JSON.stringify(seg)); } catch (e) {} }
+      rtDebugLog("[rt-listener " + Math.round(performance.now()) + "] COMMIT(" + seg.length + ") remoteCommitted.len=" + remoteCommitted.length + ": " + JSON.stringify(seg));
       if (seg) remoteCommitted += (remoteCommitted ? " " : "") + seg;
       latestText = cleanTranscript(remoteCommitted);
       latestEl.textContent = latestText;

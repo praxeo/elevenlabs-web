@@ -67,6 +67,29 @@ export class SessionRoom {
   }
 }
 
+// AudioWorklet pump module, served at /pcm-pump.js as a REAL same-origin script.
+// This replaced a Blob-URL worklet that failed in production: some browsers
+// resolve audioCtx.audioWorklet.addModule(blobUrl) WITHOUT actually registering
+// the processor ("The node name 'pcm-pump' is not defined in
+// AudioWorkletGlobalScope"), silently forcing the deprecated main-thread
+// ScriptProcessor fallback — which starves under UI load and drops audio frames,
+// the true root cause of slow/garbled realtime across every engine (batch was
+// immune: MediaRecorder is off-thread). A real same-origin URL with a JS MIME
+// type is the reliable way to load a worklet. The processor name ('pcm-pump')
+// and frame size (4096) MUST match the client (PUMP_FRAME_SAMPLES). It buffers
+// 128-sample render quanta into 4096-sample frames on the audio render thread and
+// posts owned (transferred) copies to the main thread.
+const PCM_PUMP_WORKLET_JS =
+  "class PcmPump extends AudioWorkletProcessor {" +
+  "constructor(){super();this._buf=new Float32Array(4096);this._n=0;}" +
+  "process(inputs){" +
+  "var input=inputs[0];" +
+  "if(input&&input[0]){var ch=input[0];" +
+  "for(var i=0;i<ch.length;i++){this._buf[this._n++]=ch[i];" +
+  "if(this._n>=this._buf.length){var out=this._buf.slice(0);this.port.postMessage(out,[out.buffer]);this._n=0;}}}" +
+  "return true;}}" +
+  "registerProcessor('pcm-pump',PcmPump);";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -136,6 +159,19 @@ export default {
 
     if (url.pathname === "/favicon.ico") {
       return new Response(null, { status: 204 });
+    }
+
+    // AudioWorklet pump module — served as a real same-origin script so the
+    // worklet actually registers (the Blob-URL form silently failed to register
+    // on some browsers, forcing the starving ScriptProcessor fallback).
+    if (url.pathname === "/pcm-pump.js") {
+      return new Response(PCM_PUMP_WORKLET_JS, {
+        headers: {
+          "content-type": "text/javascript; charset=utf-8",
+          "cache-control": "public, max-age=3600",
+          "access-control-allow-origin": "*",
+        },
+      });
     }
 
     // Phone mic session relay via Durable Object
@@ -2608,22 +2644,35 @@ right lower quadrant"></textarea>
   }
 
   // Build the frame pump: AudioWorklet first (off the main thread), with the
-  // deprecated ScriptProcessor as a fallback. Both deliver frames to the same
+  // deprecated ScriptProcessor as a LAST resort. Both deliver frames to the same
   // handleAudioFrame, so capture/downsample/send/pre-roll behavior is identical.
+  //
+  // The worklet is loaded from a REAL same-origin URL (/pcm-pump.js) first, then
+  // a Blob URL. This order matters: the Blob form was observed to resolve
+  // addModule() WITHOUT registering the processor on real browsers ("node name
+  // 'pcm-pump' is not defined"), silently dropping to the ScriptProcessor — whose
+  // main-thread starvation under UI load drops audio frames and was the true
+  // cause of slow/garbled realtime (batch is immune: MediaRecorder is off-thread).
   async function buildPumpNode() {
     if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
-      try {
-        await audioCtx.audioWorklet.addModule(getWorkletUrl());
-        const node = new AudioWorkletNode(audioCtx, "pcm-pump");
-        node.port.onmessage = (e) => { handleAudioFrame(e.data); };
-        return node;
-      } catch (err) {
-        // Worklet unavailable/blocked — fall back so realtime still captures.
-        console.warn("AudioWorklet unavailable, falling back to ScriptProcessor:", err);
+      var sources = ["/pcm-pump.js", "blob"];
+      for (var i = 0; i < sources.length; i++) {
+        try {
+          var modUrl = sources[i] === "blob" ? getWorkletUrl() : sources[i];
+          await audioCtx.audioWorklet.addModule(modUrl);
+          var node = new AudioWorkletNode(audioCtx, "pcm-pump");
+          node.port.onmessage = function (e) { handleAudioFrame(e.data); };
+          try { console.log("[audio] AudioWorklet pump active (" + sources[i] + ")"); } catch (e2) {}
+          return node;
+        } catch (err) {
+          try { console.warn("[audio] worklet load failed (" + sources[i] + "): " + (err && err.message)); } catch (e2) {}
+        }
       }
     }
-    const sp = audioCtx.createScriptProcessor(PUMP_FRAME_SAMPLES, 1, 1);
-    sp.onaudioprocess = (e) => {
+    // Last resort — deprecated, main-thread, can starve under load.
+    try { console.warn("[audio] FALLBACK to ScriptProcessor pump (off-thread worklet unavailable; realtime may degrade under load)"); } catch (e) {}
+    var sp = audioCtx.createScriptProcessor(PUMP_FRAME_SAMPLES, 1, 1);
+    sp.onaudioprocess = function (e) {
       handleAudioFrame(new Float32Array(e.inputBuffer.getChannelData(0)));
     };
     return sp;

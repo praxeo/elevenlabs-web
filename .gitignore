@@ -15,6 +15,8 @@ package-lock.json
 # TTS corpus, and workflow script. Safe to delete after the investigation.
 .dsp-test.mjs
 .wf-realtime-research.mjs
+.wf-accuracy.mjs
 .test/
 .tts/
+.real/
 tmp/

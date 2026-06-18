@@ -3397,7 +3397,7 @@ right lower quadrant"></textarea>
       mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunks.push(e.data);
       };
-      mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
+      mediaRecorder.start();
     }
 
     recording = true;
@@ -3406,7 +3406,6 @@ right lower quadrant"></textarea>
     recordBtn.classList.add("danger");
     setMicPill("rec");
     updateAppendChip();
-    setStatus("Recording — release to upload for transcription…", "ok");
     startBeep();
 
     if (stopRequested) {

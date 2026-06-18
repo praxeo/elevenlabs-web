@@ -648,6 +648,29 @@ async function handleTranscribeRealtime(request, env) {
       // Soniox: config-first (auth + audio format + medical context terms), raw
       // BINARY PCM audio, empty-string end-of-audio on commit. Tokens translate
       // back to the client vocabulary via makeSonioxToClient.
+      // Accuracy-tuned for PTT medical dictation:
+      //  - enable_endpoint_detection:false — PTT supplies the explicit end-of-audio
+      //    (empty-string commit), so semantic endpointing would only finalize
+      //    mid-sentence on natural pauses and lose right-context (Soniox docs: early
+      //    finalization degrades accuracy).
+      //  - language_hints_strict — stronger English signal (docs: recommended for prod).
+      //  - richer general context — domain/specialty/setting/style biasing.
+      // Soniox context has a HARD ~10000-char total budget; trim terms first
+      // (cleanedKeyterms is already ordered custom>presets>always-on) to stay under,
+      // or the WS handshake fails loudly.
+      const sonioxGeneral = [
+        { key: "domain", value: "Healthcare" },
+        { key: "specialty", value: "Wound care and emergency medicine" },
+        { key: "setting", value: "Clinician dictation of a patient note" },
+        { key: "style", value: "Medical terminology, drug names, abbreviations" },
+      ];
+      const sonioxTerms = [];
+      let sonioxBudget = 8000; // headroom under the 10000-char hard limit (general text counts too)
+      for (const t of cleanedKeyterms) {
+        if (sonioxBudget - (t.length + 1) < 0) break;
+        sonioxTerms.push(t);
+        sonioxBudget -= t.length + 1;
+      }
       const sonioxConfig = {
         api_key: sonioxKey,
         model: SONIOX_MODEL,
@@ -655,10 +678,9 @@ async function handleTranscribeRealtime(request, env) {
         sample_rate: 16000,
         num_channels: 1,
         language_hints: ["en"],
-        enable_endpoint_detection: true,
-        context: cleanedKeyterms.length
-          ? { general: [{ key: "domain", value: "Healthcare" }], terms: cleanedKeyterms }
-          : { general: [{ key: "domain", value: "Healthcare" }] },
+        language_hints_strict: true,
+        enable_endpoint_detection: false,
+        context: sonioxTerms.length ? { general: sonioxGeneral, terms: sonioxTerms } : { general: sonioxGeneral },
       };
       try { backendWs.send(JSON.stringify(sonioxConfig)); } catch (e) {}
       const toClient = makeSonioxToClient();
@@ -879,10 +901,19 @@ async function handleNovaProbe(request, env) {
         return json({ error: "probe soniox: no webSocket (" + d + ")" }, 502);
       }
       sws.accept();
+      // Mirror the production Soniox config (endpoint off by default, strict English,
+      // rich general context) so probe scores reflect production. ?enable_endpoint_detection
+      // can override for A/B.
       const cfg2 = {
         api_key: skey, model: "stt-rt-v5", audio_format: "pcm_s16le", sample_rate: 16000, num_channels: 1,
-        language_hints: ["en"], enable_endpoint_detection: (body.enable_endpoint_detection !== false),
-        context: { general: [{ key: "domain", value: "Healthcare" }] },
+        language_hints: ["en"], language_hints_strict: true,
+        enable_endpoint_detection: (body.enable_endpoint_detection === true),
+        context: { general: [
+          { key: "domain", value: "Healthcare" },
+          { key: "specialty", value: "Wound care and emergency medicine" },
+          { key: "setting", value: "Clinician dictation of a patient note" },
+          { key: "style", value: "Medical terminology, drug names, abbreviations" },
+        ] },
       };
       if (Array.isArray(body.keyterms) && body.keyterms.length) cfg2.context.terms = body.keyterms.map(String);
       try { sws.send(JSON.stringify(cfg2)); } catch (e) {}

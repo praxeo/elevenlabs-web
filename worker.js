@@ -352,6 +352,70 @@ export function makeNova3ToClient(tier) {
   };
 }
 
+// ===== Soniox stt-rt-v5 realtime (opt-in via ?rt=soniox) — sub-second word-by-word
+// token streaming, the fastest live-feedback option. Uses SONIOX_API_KEY (set as a
+// secret). Auth + config are the FIRST JSON frame (the Worker sends it, not the
+// client); audio is raw BINARY PCM; the commit flush is an empty string =
+// end-of-audio. The client frame vocabulary is preserved via the translators. =====
+const SONIOX_WS_URL = "https://stt-rt.soniox.com/transcribe-websocket";
+const SONIOX_MODEL = "stt-rt-v5";
+
+// Client input_audio_chunk -> Soniox: base64 audio -> raw binary PCM frame; on
+// commit, an empty string signals end-of-audio (Soniox then flushes finals +
+// `finished` and closes). Exported for tests.
+export function sonioxClientToBackend(raw) {
+  let m;
+  try { m = JSON.parse(raw); } catch { return []; }
+  if (!m || m.message_type !== "input_audio_chunk") return [];
+  const out = [];
+  if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
+    out.push(b64ToBytes(m.audio_base_64));
+  }
+  if (m.commit) out.push(""); // empty string = end-of-audio
+  return out;
+}
+
+// Soniox responses -> client (the normalized frame vocabulary). Soniox streams
+// token objects with an is_final flag: final tokens are confirmed (sent once),
+// non-final are provisional (resent each response). Accumulate confirmed text and
+// emit, each response, a partial_transcript of confirmed + provisional tail; on
+// `finished` emit a committed_transcript with the confirmed text so the client
+// locks it in. Control markers (<end>/<fin>) are dropped. Any error_code becomes a
+// loud {error}. Exported for tests.
+export function makeSonioxToClient() {
+  let finalText = "";
+  let startedSent = false;
+  return function translate(raw) {
+    let m;
+    try { m = JSON.parse(raw); } catch { return []; }
+    if (!m || typeof m !== "object") return [];
+    const out = [];
+    if (!startedSent) {
+      startedSent = true;
+      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
+    }
+    if (m.error_code) {
+      out.push(JSON.stringify({
+        message_type: "error",
+        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
+      }));
+      return out;
+    }
+    let newFinal = "", nonFinal = "";
+    if (Array.isArray(m.tokens)) {
+      for (const t of m.tokens) {
+        if (!t || typeof t.text !== "string") continue;
+        if (/^\s*<[^>]+>\s*$/.test(t.text)) continue; // drop <end>/<fin> markers
+        if (t.is_final) newFinal += t.text; else nonFinal += t.text;
+      }
+    }
+    finalText += newFinal;
+    out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText + nonFinal }));
+    if (m.finished) out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
+    return out;
+  };
+}
+
 async function handleTranscribeRealtime(request, env) {
   // Realtime STT uses WebSockets. Verify handshake upgrade
   if (request.headers.get("Upgrade") !== "websocket") {
@@ -446,12 +510,13 @@ async function handleTranscribeRealtime(request, env) {
     const rt = String(url.searchParams.get("rt") || "auto").toLowerCase();
     const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
     const useEl = (rt === "auto" || rt === "el" || rt === "scribe") && !!elKey;
+    const sonioxKey = ((env && env.SONIOX_API_KEY) || "").trim();
     const acct = ((env && env.CF_ACCOUNT_ID) || "").trim();
     const gwName = ((env && env.CF_AIG_GATEWAY) || "").trim();
     const aigToken = ((env && env.CF_AIG_TOKEN) || "").trim();
     const dgKey = ((env && env.DEEPGRAM_API_KEY) || "").trim();
 
-    let backendWs = null, usedTier = "", diags = [], elPassthrough = false;
+    let backendWs = null, usedTier = "", diags = [], elPassthrough = false, sonioxMode = false;
 
     if (useEl) {
       // ElevenLabs Scribe v2 Realtime. commit_strategy=manual: one final per PTT
@@ -475,6 +540,20 @@ async function handleTranscribeRealtime(request, env) {
           try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
         }
       } catch (e) { diags.push("el:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
+    } else if (rt === "soniox") {
+      // Soniox stt-rt-v5 — sub-second token streaming. Auth + config ride the first
+      // JSON frame (sent in the piping branch), so the handshake is a bare upgrade.
+      if (!sonioxKey) { diags.push("soniox: SONIOX_API_KEY not set"); }
+      else {
+        try {
+          const resp = await fetch(SONIOX_WS_URL, { headers: { Upgrade: "websocket" } });
+          if (resp && resp.webSocket) { backendWs = resp.webSocket; usedTier = "soniox"; sonioxMode = true; }
+          else {
+            diags.push("soniox:status=" + (resp && resp.status));
+            try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
+          }
+        } catch (e) { diags.push("soniox:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
+      }
     } else if (rt === "gw" || rt === "dgw") {
       // Outbound WebSocket from a Worker: fetch() with an Upgrade header, then read
       // resp.webSocket (NOT `new WebSocket`). Native query params take real strings.
@@ -563,6 +642,43 @@ async function handleTranscribeRealtime(request, env) {
                 .catch(() => {});
         }
       });
+    } else if (sonioxMode) {
+      // Soniox: config-first (auth + audio format + medical context terms), raw
+      // BINARY PCM audio, empty-string end-of-audio on commit. Tokens translate
+      // back to the client vocabulary via makeSonioxToClient.
+      const sonioxConfig = {
+        api_key: sonioxKey,
+        model: SONIOX_MODEL,
+        audio_format: "pcm_s16le",
+        sample_rate: 16000,
+        num_channels: 1,
+        language_hints: ["en"],
+        enable_endpoint_detection: true,
+        context: cleanedKeyterms.length
+          ? { general: [{ key: "domain", value: "Healthcare" }], terms: cleanedKeyterms }
+          : { general: [{ key: "domain", value: "Healthcare" }] },
+      };
+      try { backendWs.send(JSON.stringify(sonioxConfig)); } catch (e) {}
+      const toClient = makeSonioxToClient();
+      workerWs.addEventListener("message", (event) => {
+        if (inputEnded) return;
+        for (const frame of sonioxClientToBackend(event.data)) {
+          try { backendWs.send(frame); } catch (e) {}
+        }
+        try {
+          const m = JSON.parse(event.data);
+          if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
+        } catch (e) {}
+      });
+      backendWs.addEventListener("message", (event) => {
+        for (const frame of toClient(event.data)) {
+          try { workerWs.send(frame); } catch (e) {}
+          if (doStub) {
+            doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
+                  .catch(() => {});
+          }
+        }
+      });
     } else {
       const toClient = makeNova3ToClient(usedTier);
       // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
@@ -602,7 +718,7 @@ async function handleTranscribeRealtime(request, env) {
       const code = event && event.code;
       if (code && code !== 1000 && code !== 1005) {
         const reason = (event && event.reason) ? (": " + event.reason) : "";
-        const who = usedTier === "elevenlabs" ? "ElevenLabs" : "Nova-3";
+        const who = usedTier === "elevenlabs" ? "ElevenLabs" : usedTier === "soniox" ? "Soniox" : "Nova-3";
         try { workerWs.send(JSON.stringify({ message_type: "error", error: who + " closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
       }
       try { workerWs.close(); } catch (e) {}
@@ -743,6 +859,72 @@ async function handleNovaProbe(request, env) {
         closed: elClosed, close_info: elCloseInfo,
         final_text: committed, last_partial: elPartials.length ? elPartials[elPartials.length - 1] : "", partial_count: elPartials.length,
         raw_first_frames: elRaw,
+      });
+    }
+
+    // ===== Soniox stt-rt-v5 probe branch (transport:"soniox") =====
+    if (String(body.transport || "") === "soniox") {
+      const skey = ((env && env.SONIOX_API_KEY) || "").trim();
+      if (!skey) return json({ error: "probe soniox: SONIOX_API_KEY not set" }, 500);
+      const t0s = Date.now();
+      let sr;
+      try { sr = await fetch("https://stt-rt.soniox.com/transcribe-websocket", { headers: { Upgrade: "websocket" } }); }
+      catch (e) { return json({ error: "probe soniox: fetch threw " + (e && e.message || String(e)) }, 502); }
+      const sws = sr && sr.webSocket;
+      if (!sws) {
+        let d = "status=" + (sr && sr.status);
+        try { if (sr && sr.clone) d += " " + (await sr.clone().text()).slice(0, 200); } catch (e) {}
+        return json({ error: "probe soniox: no webSocket (" + d + ")" }, 502);
+      }
+      sws.accept();
+      const cfg2 = {
+        api_key: skey, model: "stt-rt-v5", audio_format: "pcm_s16le", sample_rate: 16000, num_channels: 1,
+        language_hints: ["en"], enable_endpoint_detection: (body.enable_endpoint_detection !== false),
+        context: { general: [{ key: "domain", value: "Healthcare" }] },
+      };
+      if (Array.isArray(body.keyterms) && body.keyterms.length) cfg2.context.terms = body.keyterms.map(String);
+      try { sws.send(JSON.stringify(cfg2)); } catch (e) {}
+      const sRaw = [], sPartials = [];
+      let sFinal = "", sClosed = false, sCloseInfo = null, sFirstPartial = 0, sFirstFinal = 0;
+      const sDone = new Promise((resolve) => {
+        sws.addEventListener("message", (ev) => {
+          const s = (typeof ev.data === "string") ? ev.data : "[binary]";
+          if (sRaw.length < 80) sRaw.push(s.slice(0, 300));
+          let m; try { m = JSON.parse(s); } catch (e) { return; }
+          if (!m) return;
+          if (m.error_code) { sRaw.push("ERR " + m.error_code + " " + (m.error_message || "")); resolve(); return; }
+          let nf = "", prov = "";
+          if (Array.isArray(m.tokens)) for (const t of m.tokens) {
+            if (!t || typeof t.text !== "string") continue;
+            if (/^\s*<[^>]+>\s*$/.test(t.text)) continue;
+            if (t.is_final) nf += t.text; else prov += t.text;
+          }
+          if (nf) { if (!sFirstFinal) sFirstFinal = Date.now() - t0s; sFinal += nf; }
+          if ((nf || prov) && !sFirstPartial) sFirstPartial = Date.now() - t0s;
+          if (nf || prov) sPartials.push(sFinal + prov);
+          if (m.finished) resolve();
+        });
+        sws.addEventListener("close", (ev) => { sClosed = true; sCloseInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
+        sws.addEventListener("error", () => resolve());
+      });
+      const sleepS = (ms) => new Promise((res) => setTimeout(res, ms));
+      let sFrames = 0;
+      for (let off = 0; off < pcm.length; off += frameBytes) {
+        const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
+        try { sws.send(chunk); } catch (e) { break; }
+        sFrames++;
+        if (cadenceMs > 0) await sleepS(cadenceMs);
+      }
+      try { sws.send(""); } catch (e) {} // empty = end-of-audio
+      await Promise.race([sDone, sleepS(deadlineMs)]);
+      try { sws.close(); } catch (e) {}
+      return json({
+        ok: true, transport: "soniox", model: "stt-rt-v5", endpoint_detection: cfg2.enable_endpoint_detection,
+        frame_bytes: frameBytes, cadence_ms: cadenceMs, pcm_bytes: pcm.length, frames_sent: sFrames, ms: Date.now() - t0s,
+        first_partial_ms: sFirstPartial, first_final_ms: sFirstFinal,
+        closed: sClosed, close_info: sCloseInfo,
+        final_text: sFinal, last_partial: sPartials.length ? sPartials[sPartials.length - 1] : "", partial_count: sPartials.length,
+        raw_first_frames: sRaw,
       });
     }
 
@@ -3018,7 +3200,7 @@ right lower quadrant"></textarea>
     // honored sample_rate without any UI change; an unknown value is ignored.
     try {
       var pageRt = new URLSearchParams(window.location.search).get("rt");
-      if (pageRt && /^(el|scribe|binding|nova|flux|gw|dgw|auto)$/.test(pageRt)) params.append("rt", pageRt);
+      if (pageRt && /^(el|scribe|soniox|binding|nova|flux|gw|dgw|auto)$/.test(pageRt)) params.append("rt", pageRt);
     } catch (e) {}
 
     const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();

@@ -2643,30 +2643,49 @@ right lower quadrant"></textarea>
     return workletUrl;
   }
 
-  // Build the frame pump: AudioWorklet first (off the main thread), with the
-  // deprecated ScriptProcessor as a LAST resort. Both deliver frames to the same
+  // Build the frame pump: AudioWorklet (off the main thread), with the deprecated
+  // ScriptProcessor as a LAST resort. Both deliver frames to the same
   // handleAudioFrame, so capture/downsample/send/pre-roll behavior is identical.
   //
-  // The worklet is loaded from a REAL same-origin URL (/pcm-pump.js) first, then
-  // a Blob URL. This order matters: the Blob form was observed to resolve
-  // addModule() WITHOUT registering the processor on real browsers ("node name
-  // 'pcm-pump' is not defined"), silently dropping to the ScriptProcessor — whose
-  // main-thread starvation under UI load drops audio frames and was the true
-  // cause of slow/garbled realtime (batch is immune: MediaRecorder is off-thread).
+  // Two real-browser quirks defeated the original Blob-URL worklet, so handle both:
+  //  (1) addModule() RESOLVES a tick before the processor name is visible to
+  //      'new AudioWorkletNode' (first construct throws "not defined", a retry
+  //      succeeds) -- so we retry construction briefly before giving up.
+  //  (2) The AudioContext (and its AudioWorkletGlobalScope) is reused across
+  //      dictations; calling addModule again re-runs registerProcessor →
+  //      "already registered". So we add the module exactly ONCE per context,
+  //      flagged on the context object.
+  // Falling through to the main-thread ScriptProcessor was the true cause of
+  // slow/garbled realtime: it starves under UI load and drops audio frames (batch
+  // is immune — MediaRecorder records off-thread). Prefer the real same-origin
+  // module URL; the Blob URL is only a fallback if that addModule throws outright.
   async function buildPumpNode() {
     if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
-      var sources = ["/pcm-pump.js", "blob"];
-      for (var i = 0; i < sources.length; i++) {
-        try {
-          var modUrl = sources[i] === "blob" ? getWorkletUrl() : sources[i];
-          await audioCtx.audioWorklet.addModule(modUrl);
-          var node = new AudioWorkletNode(audioCtx, "pcm-pump");
-          node.port.onmessage = function (e) { handleAudioFrame(e.data); };
-          try { console.log("[audio] AudioWorklet pump active (" + sources[i] + ")"); } catch (e2) {}
-          return node;
-        } catch (err) {
-          try { console.warn("[audio] worklet load failed (" + sources[i] + "): " + (err && err.message)); } catch (e2) {}
+      try {
+        if (!audioCtx.__pcmPumpAdded) {
+          try {
+            await audioCtx.audioWorklet.addModule("/pcm-pump.js");
+          } catch (e1) {
+            try { console.warn("[audio] /pcm-pump.js addModule failed, trying blob: " + (e1 && e1.message)); } catch (e) {}
+            await audioCtx.audioWorklet.addModule(getWorkletUrl());
+          }
+          audioCtx.__pcmPumpAdded = true;
         }
+        var lastErr = null;
+        for (var attempt = 0; attempt < 12; attempt++) {
+          try {
+            var node = new AudioWorkletNode(audioCtx, "pcm-pump");
+            node.port.onmessage = function (e) { handleAudioFrame(e.data); };
+            try { console.log("[audio] AudioWorklet pump active" + (attempt ? " (after " + attempt + " retr" + (attempt > 1 ? "ies" : "y") + ")" : "")); } catch (e) {}
+            return node;
+          } catch (err) {
+            lastErr = err;
+            await new Promise(function (r) { setTimeout(r, 30); });
+          }
+        }
+        throw lastErr || new Error("AudioWorkletNode could not be constructed");
+      } catch (err) {
+        try { console.warn("[audio] worklet unavailable, ScriptProcessor fallback: " + (err && err.message)); } catch (e) {}
       }
     }
     // Last resort — deprecated, main-thread, can starve under load.

@@ -1906,6 +1906,7 @@ right lower quadrant"></textarea>
   let sessionPcm = [];
   let sessionPcmBytes = 0;
   let sessionPcmTruncated = false;
+  let precomputedBatchKeyterms = null; // [LATENCY] batch keyterms JSON snapshotted at session start, off the stop-to-upload critical path
 
   const METER_MAX    = 0.12;
   const HOLD_SECONDS = 0.9;
@@ -1922,7 +1923,7 @@ right lower quadrant"></textarea>
   const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
   const PUMP_FRAME_SAMPLES = 4096;  // pump frame size (≈85ms at 48kHz) — matched the old ScriptProcessor so all downstream byte counts hold
 
-  const BATCH_UPLOAD_TIMEOUT_MS = 30000; // pure batch: upload+transcription deadline
+  const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
   const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
 
   const SESSION_PCM_CAP_BYTES = 24 * 1024 * 1024; // ~12.5 min @ 32 KB/s; the batch API caps files at 25 MB
@@ -2614,9 +2615,9 @@ right lower quadrant"></textarea>
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", String(noVerbatimEl.checked));
     form.append("tag_audio_events", String(tagEventsEl.checked));
-    form.append("keyterms_json", JSON.stringify(
+    form.append("keyterms_json", precomputedBatchKeyterms || JSON.stringify(
       effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
-    ));
+    )); // [LATENCY] reuse the snapshot taken at session start; fall back if absent
 
     const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     const killer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs) : null;
@@ -3161,7 +3162,20 @@ right lower quadrant"></textarea>
 
     // New session bookkeeping; stale callbacks from a previous socket bail out
     const mySession = ++sessionSeq;
-    sessionEngine = engine; // snapshot: selector changes only affect the NEXT session
+   sessionEngine = engine; // snapshot: selector changes only affect the NEXT session
+    // [LATENCY] Snapshot the batch keyterms JSON now, while recording is starting,
+    // so the stop->upload path doesn't pay the effectiveKeyterms merge/dedup
+    // (which walks the full preset list) on the critical path.
+    precomputedBatchKeyterms = JSON.stringify(
+      effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
+    );
+    // [LATENCY] Pre-warm the TLS connection to the Worker for the upcoming batch
+    // upload. An Image to /favicon.ico (204) opens TCP/TLS without going through
+    // fetch() — so it never consumes a batch-upload queue slot or trips the test
+    // harness's queue-driven fetch mock.
+    if (engine === "batch" || engine === "hybrid") {
+      try { new Image().src = "/favicon.ico?warm=" + Date.now(); } catch (e) {}
+    }
     sessionFinalized = false;
     userStopped = false;
     stopPhase = null;
@@ -3383,7 +3397,7 @@ right lower quadrant"></textarea>
       mediaRecorder.ondataavailable = (e) => {
         if (e.data && e.data.size > 0) chunks.push(e.data);
       };
-      mediaRecorder.start();
+      mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
     }
 
     recording = true;
@@ -3392,6 +3406,7 @@ right lower quadrant"></textarea>
     recordBtn.classList.add("danger");
     setMicPill("rec");
     updateAppendChip();
+    setStatus("Recording — release to upload for transcription…", "ok");
     startBeep();
 
     if (stopRequested) {
@@ -3434,7 +3449,7 @@ right lower quadrant"></textarea>
       if (sessionFinalized) return;
       finalizeSession(false);
     };
-    mediaRecorder.start();
+    mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
 
     recording = true;
     stopping = false;

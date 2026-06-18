@@ -730,7 +730,9 @@ check('checked preset terms ride the realtime call',
   preset1.terms.filter(rtEligible).slice(0, 5).every((t) => ktB.includes(t)), ktB.length + ' terms');
 check('term duplicated between custom box and preset sent once',
   ktB.filter((t) => t.toLowerCase() === p1Term.toLowerCase()).length === 1);
-check('realtime 50-term cap respected', ktB.length <= 50, ktB.length);
+// Default transport is Soniox (large context budget) -> client sends the fuller
+// list (<=300, char-budget-guarded server-side); only ?rt=el uses the 50/20 cap.
+check('realtime keyterm cap respected (Soniox default, <=300)', ktB.length <= 300, ktB.length);
 s18b.open();
 await sleep(30);
 s18b.msg({ message_type: 'committed_transcript', text: 'Preset leg B.' });

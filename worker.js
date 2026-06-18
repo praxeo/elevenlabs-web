@@ -465,7 +465,11 @@ async function handleTranscribeRealtime(request, env) {
     // query param per term (Deepgram keyterm prompting), built as ktQuery below.
     let keyterms = [];
     try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
-    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 100 });
+    // maxTerms 300 so the Soniox path (large context budget) can bias on the full
+    // preset list; the EL realtime branch re-sanitizes to its 50/20 cap, and the
+    // Soniox branch applies an 8000-char total-context budget guard. The Nova
+    // binding/gateway paths just space-join or repeat what fits.
+    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 300 });
     const ktQuery = cleanedKeyterms.map((t) => "&keyterm=" + encodeURIComponent(t)).join("");
 
     // Binding (default) nova-3 config — the SECOND arg of env.AI.run (NOT a query
@@ -3220,9 +3224,16 @@ right lower quadrant"></textarea>
     params.append("no_verbatim", String(noVerbatimEl.checked));
     params.append("timestamps", timestampsEl.value);
 
-    // Keyterms ride the Nova-3 config as the keyterm field (server-side). Batch
-    // gets the full list too, so hybrid's clipboard text benefits on both legs.
-    const keyterms = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS);
+    // Keyterms bias the realtime engine (server-side). The default transport
+    // (Soniox) accepts a large context budget, so send the FULL preset list with
+    // the longer 49-char limit; only the ElevenLabs realtime transport (?rt=el)
+    // needs the 50-term/20-char cap (the Worker also re-caps EL to 50/20). Batch /
+    // hybrid-refine get the full list separately, so the clipboard always benefits.
+    var rtSel = "";
+    try { rtSel = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
+    var keyterms = (rtSel === "el" || rtSel === "scribe")
+      ? effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS)
+      : effectiveKeyterms(49, 300);
     params.append("keyterms_json", JSON.stringify(keyterms));
 
     if (joinedSessionCode) params.append("session", joinedSessionCode);

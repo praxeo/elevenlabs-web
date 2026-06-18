@@ -110,6 +110,16 @@ export const KEYTERM_PRESETS = [
       "cholecystitis", "diverticulitis", "pyelonephritis",
       "nephrolithiasis", "DKA", "diabetic ketoacidosis",
       "laceration", "avulsion",
+      // High-mangle-rate ER drugs (generic + brand) — added 2026-06-17
+      "ondansetron", "Zofran", "ketorolac", "Toradol",
+      "hydromorphone", "Dilaudid", "ceftriaxone", "Rocephin",
+      "piperacillin-tazobactam", "Zosyn", "vancomycin",
+      "enoxaparin", "Lovenox", "tranexamic acid", "TXA",
+      "metoprolol", "diltiazem", "Cardizem", "labetalol",
+      "levetiracetam", "Keppra", "naloxone", "Narcan",
+      "epinephrine", "norepinephrine", "Levophed",
+      "acetaminophen", "ibuprofen", "methylprednisolone", "Solu-Medrol",
+      "famotidine", "Pepcid", "ipratropium", "albuterol", "DuoNeb",
     ],
   },
 ];

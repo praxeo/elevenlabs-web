@@ -495,22 +495,24 @@ async function handleTranscribeRealtime(request, env) {
     // Realtime — probe-verified batch-quality accuracy and prompt finalize, and
     // it uses the EXISTING ELEVENLABS_API_KEY (no new credential). The Workers-AI
     // Nova-3 binding was relegated because its managed layer floored interim
-    // cadence at ~1/sec and garbled real noisy-mic speech. Alternatives:
-    //   rt=el / rt=scribe / auto -> ElevenLabs Scribe v2 Realtime (default).
-    //   rt=binding / rt=nova     -> @cf/deepgram/nova-3 on the env.AI binding.
-    //   rt=flux                  -> @cf/deepgram/flux on the binding.
+    // cadence at ~1/sec and garbled real noisy-mic speech. Transports:
+    //   auto / rt=soniox -> Soniox stt-rt-v5 (DEFAULT — fastest live feedback:
+    //            ~0.8s first word, word-by-word; uses SONIOX_API_KEY).
+    //   rt=el / rt=scribe -> ElevenLabs Scribe v2 Realtime (uses ELEVENLABS_API_KEY).
+    //   rt=binding / rt=nova -> @cf/deepgram/nova-3 on the env.AI binding.
+    //   rt=flux -> @cf/deepgram/flux on the binding.
     //   rt=gw  -> AI Gateway "workers-ai" nova-3 (needs CF_AIG_* secrets).
     //   rt=dgw -> AI Gateway "deepgram" passthrough to nova-3-medical (needs
     //            CF_AIG_* + DEEPGRAM_API_KEY).
-    // The EL path is a near-IDENTITY passthrough: the client's frame vocabulary
-    // (input_audio_chunk / partial_transcript / committed_transcript / error) was
-    // modeled on EL's native realtime protocol, so the Worker forwards JSON both
-    // ways (dropping previous_text past the first chunk). The Nova/gateway paths
-    // use the makeNova3ToClient / novaClientToBackend translators instead.
+    // auto falls back Soniox -> ElevenLabs -> binding by which key is present.
+    // EL is a near-IDENTITY passthrough (the client vocabulary was modeled on EL's
+    // protocol); Soniox uses sonioxClientToBackend/makeSonioxToClient; Nova/gateway
+    // use novaClientToBackend/makeNova3ToClient.
     const rt = String(url.searchParams.get("rt") || "auto").toLowerCase();
     const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
-    const useEl = (rt === "auto" || rt === "el" || rt === "scribe") && !!elKey;
     const sonioxKey = ((env && env.SONIOX_API_KEY) || "").trim();
+    // Default (auto) prefers Soniox; EL only takes auto if no Soniox key.
+    const useEl = (rt === "el" || rt === "scribe" || (rt === "auto" && !sonioxKey)) && !!elKey;
     const acct = ((env && env.CF_ACCOUNT_ID) || "").trim();
     const gwName = ((env && env.CF_AIG_GATEWAY) || "").trim();
     const aigToken = ((env && env.CF_AIG_TOKEN) || "").trim();
@@ -540,9 +542,9 @@ async function handleTranscribeRealtime(request, env) {
           try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
         }
       } catch (e) { diags.push("el:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
-    } else if (rt === "soniox") {
-      // Soniox stt-rt-v5 — sub-second token streaming. Auth + config ride the first
-      // JSON frame (sent in the piping branch), so the handshake is a bare upgrade.
+    } else if (rt === "soniox" || (rt === "auto" && sonioxKey)) {
+      // Soniox stt-rt-v5 (DEFAULT) — sub-second token streaming. Auth + config ride
+      // the first JSON frame (sent in the piping branch); handshake is a bare upgrade.
       if (!sonioxKey) { diags.push("soniox: SONIOX_API_KEY not set"); }
       else {
         try {

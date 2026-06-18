@@ -1267,8 +1267,8 @@ right lower quadrant"></textarea>
           </div>
 
           <label class="checkbox">
-            <input type="checkbox" id="noiseSuppress" />
-            Browser noise suppression
+            <input type="checkbox" id="noiseSuppress" checked />
+            Browser noise suppression <span class="hint">(recommended on — streaming realtime is far more sensitive to background mic noise than batch)</span>
           </label>
 
           <div id="batchOptsSection">

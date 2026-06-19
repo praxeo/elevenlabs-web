@@ -4,7 +4,9 @@ Guidance for AI/dev sessions working in this repo. Read this before touching `wo
 
 ## What this is
 
-A one-file Cloudflare Worker serving a medical dictation app with **three engines** behind one UI:
+> **⚑ DIRECTION (2026-06-19): BATCH-ONLY product.** The owner decided batch is the deliverable — "fast and amazingly accurate" — and **retired Realtime + Hybrid from the UI**: the engine selector is hidden (`#engineSeg` `display:none`), `loadSettings` migrates any saved `engine` to `"batch"`, and recording now shows a **live capture-feedback panel** (`#recFeedback`: a scrolling voice waveform + elapsed timer + "Hearing you" state, driven by the existing analyser — no STT cost) so a batch dictation visibly proves it's capturing. The Realtime/Hybrid/direct-stream/Soniox code below is **DORMANT** (still present + test-covered, unreachable via the UI) pending a dedicated removal — do not treat the three-engine description as the live product. Future work = batch UX + latency/accuracy.
+
+A one-file Cloudflare Worker that grew **three engines** behind one UI (now batch-only — see the banner above):
 
 - **Realtime** — **Soniox `stt-rt-v5` (default)**, proxied through the Worker WS; live **word-by-word feedback** (~0.75 s first word). The realtime transport is selectable via the `?rt=` page/WS param: **`soniox`/`auto` (default)**, **`direct`** = browser streams **straight to Soniox** (temp-key auth via `POST /api/soniox-token`/`handleSonioxToken`, no Worker proxy hop — the lowest-latency path, matching soniox.com's demo; **opt-in**, falls back to the proxy on any mint failure; joined phones also open a `SessionRoom` `?role=pub` publisher so the desktop still mirrors — see `REALTIME_HANDOFF.md` Session 4), **`el`** = ElevenLabs Scribe v2 Realtime, **`binding`/`nova`** = Deepgram Nova-3 on Workers AI (`env.AI`), **`flux`/`gw`/`dgw`** = Deepgram variants. The browser speaks ONE frame vocabulary (`input_audio_chunk` / `session_started` / `partial_transcript` / `committed_transcript` / `error`); the Worker translates per engine: Soniox via `sonioxClientToBackend` / `makeSonioxToClient`, ElevenLabs via a **near-identity passthrough** (the vocabulary was modeled on EL's native realtime protocol), Deepgram via `novaClientToBackend` / `makeNova3ToClient`. Engine history: ElevenLabs Scribe v2 Realtime → Voxtral → Soniox → Nova-3 → **back to Soniox default + EL** (Nova-3's Workers-AI binding floored interim cadence at ~1/sec; see `REALTIME_HANDOFF.md`).
 - **Batch** — the post-gate recording uploads to **ElevenLabs Scribe v2 batch** on release. The accurate path; unchanged.
@@ -149,7 +151,10 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation (28 scenario groups: realtime happy path incl.
+# Full session-flow simulation (29 scenario groups incl. batch-only product:
+# saved Hybrid->Batch migration, hidden selector, live capture feedback shows/
+# hides, no realtime WS in batch; plus the dormant realtime/direct paths still
+# covered. Older groups: realtime happy path incl.
 # pre-roll/buffering/tail/commit-wait, unexpected disconnect, dead-mic alarm,
 # append-window expiry, connect timeout, queued PTT, hotkey tap/hold, engine
 # selector, batch happy/fail/queued-PTT, hybrid happy/refine-fail/recovery/

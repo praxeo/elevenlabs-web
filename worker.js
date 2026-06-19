@@ -1384,6 +1384,16 @@ const INDEX_HTML = `<!doctype html>
     #meterBar { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: var(--ok); }
     #openMark  { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); left: 0%; }
     #closeMark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn);   left: 0%; }
+    /* Live recording feedback: a scrolling voice waveform + timer + speech state,
+       so a batch dictation visibly proves it is capturing (no realtime STT). */
+    #recFeedback { margin-top: 10px; }
+    .recfb-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    #recDot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); flex: none; animation: recpulse 1.3s ease-in-out infinite; }
+    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+    #recState { color: var(--muted); }
+    #recState.live { color: var(--ok); font-weight: 600; }
+    #recTimer { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+    #waveCanvas { width: 100%; height: 46px; margin-top: 6px; display: block; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }
     .pill {
       display: inline-block; margin-left: 8px; font-size: 12px; padding: 1px 8px;
       border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
@@ -1518,12 +1528,16 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <div class="row" id="engineSeg">
+      <!-- Batch-only product: the engine selector is hidden (Realtime/Hybrid were
+           retired from the UI; any saved engine migrates to Batch on load). The
+           buttons remain in the DOM, dormant, so the streaming code stays
+           test-covered until it is removed in a dedicated cleanup. -->
+      <div class="row" id="engineSeg" style="display:none">
         <button id="engRealtime" data-engine="realtime" title="Live streaming text is the deliverable">Realtime</button>
         <button id="engBatch" data-engine="batch" title="Upload after release; strongest model, no live text">Batch</button>
         <button id="engHybrid" data-engine="hybrid" title="Live text as feedback + batch accuracy on the clipboard">Hybrid</button>
       </div>
-      <div class="hint" id="engineHint" style="margin-top: 6px;"></div>
+      <div class="hint" id="engineHint" style="margin-top: 6px; display:none"></div>
 
       <div class="row" style="margin-top: 10px;">
         <button id="recordBtn" class="primary">Start recording</button>
@@ -1538,6 +1552,15 @@ const INDEX_HTML = `<!doctype html>
         <div id="meterBar"></div>
         <div id="closeMark"></div>
         <div id="openMark"></div>
+      </div>
+
+      <div id="recFeedback" style="display:none">
+        <div class="recfb-row">
+          <span id="recDot"></span>
+          <span id="recState">Listening…</span>
+          <span id="recTimer">0:00</span>
+        </div>
+        <canvas id="waveCanvas"></canvas>
       </div>
 
       <div class="status" id="status">
@@ -1700,16 +1723,14 @@ right lower quadrant"></textarea>
 
           <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
 
-          <div id="vadSection">
+          <div id="vadSection" style="display:none">
             <div class="divider"></div>
-
-            <label style="font-weight: bold; color: var(--accent);">Realtime (Deepgram Nova-3 on Workers AI)</label>
-            <div class="hint">Live transcription runs on Deepgram Nova-3 via Cloudflare Workers AI (on the edge — no external hop). Accuracy is tuned via the Keyterms section below, sent as Nova-3 keyterms on every realtime dictation.</div>
+            <label style="font-weight: bold; color: var(--accent);">Realtime (retired)</label>
           </div>
 
           <label class="checkbox">
             <input type="checkbox" id="noiseSuppress" checked />
-            Browser noise suppression <span class="hint">(recommended on — streaming realtime is far more sensitive to background mic noise than batch)</span>
+            Browser noise suppression <span class="hint">(on by default; turn off to A/B if a close, quiet mic transcribes better)</span>
           </label>
 
           <div id="batchOptsSection">
@@ -1835,6 +1856,10 @@ right lower quadrant"></textarea>
   const openMark         = document.getElementById("openMark");
   const closeMark        = document.getElementById("closeMark");
   const gateStateEl      = document.getElementById("gateState");
+  const recFeedbackEl    = document.getElementById("recFeedback");
+  const waveCanvasEl     = document.getElementById("waveCanvas");
+  const recTimerEl       = document.getElementById("recTimer");
+  const recStateEl       = document.getElementById("recState");
 
   const appendWindowEl   = document.getElementById("appendWindow");
   const appendChipEl     = document.getElementById("appendChip");
@@ -2539,6 +2564,76 @@ right lower quadrant"></textarea>
     gateStateEl.className  = isOpen ? "pill open" : "pill";
   }
 
+  // ───── Live recording feedback (waveform + timer + speech state) ─────
+  // Driven by the existing analyser (no STT). Proves a batch dictation is
+  // capturing your voice: a scrolling level history + a "Hearing you" state when
+  // the gate is open + an elapsed timer. Canvas is optional (jsdom has none) — it
+  // degrades to just the timer/state when getContext is unavailable.
+  let waveCtx = null;
+  let waveLevels = [];
+  let waveColor = "#3fb950";
+  let waveColorDim = "#6b7280";
+  let recTimerLastSec = -1;
+  let recFeedbackOn = false;
+
+  function showRecFeedback(on) {
+    if (!recFeedbackEl) return;
+    if (on === recFeedbackOn) return;
+    recFeedbackOn = on;
+    recFeedbackEl.style.display = on ? "" : "none";
+    if (!on) return;
+    waveLevels = [];
+    recTimerLastSec = -1;
+    if (recTimerEl) recTimerEl.textContent = "0:00";
+    if (recStateEl) { recStateEl.textContent = "Listening…"; recStateEl.className = ""; }
+    try {
+      var cs = getComputedStyle(document.documentElement);
+      waveColor = (cs.getPropertyValue("--ok") || "").trim() || waveColor;
+      waveColorDim = (cs.getPropertyValue("--muted") || "").trim() || waveColorDim;
+    } catch (e) {}
+    try {
+      var w = waveCanvasEl.clientWidth || 320;
+      waveCanvasEl.width = w;
+      waveCanvasEl.height = 46;
+      waveCtx = waveCanvasEl.getContext ? waveCanvasEl.getContext("2d") : null;
+    } catch (e) { waveCtx = null; }
+  }
+
+  // Called each gate-meter tick while recording: advance the timer, reflect the
+  // speech state, push the level, and redraw.
+  function updateRecFeedback(rms) {
+    if (!recFeedbackOn) return;
+    var elapsed = recStartedAt ? Math.floor((Date.now() - recStartedAt) / 1000) : 0;
+    if (elapsed !== recTimerLastSec) {
+      recTimerLastSec = elapsed;
+      var mm = Math.floor(elapsed / 60), ss = elapsed % 60;
+      if (recTimerEl) recTimerEl.textContent = mm + ":" + (ss < 10 ? "0" : "") + ss;
+    }
+    if (recStateEl) {
+      if (gateIsOpen) { recStateEl.textContent = "Hearing you"; recStateEl.className = "live"; }
+      else { recStateEl.textContent = "Listening…"; recStateEl.className = ""; }
+    }
+    waveLevels.push(Math.min(1, rms / METER_MAX));
+    drawWave();
+  }
+
+  function drawWave() {
+    if (!waveCtx) return;
+    var W = waveCanvasEl.width, H = waveCanvasEl.height;
+    var step = 4; // 3px bar + 1px gap
+    var maxBars = Math.max(1, Math.floor(W / step));
+    while (waveLevels.length > maxBars) waveLevels.shift();
+    waveCtx.clearRect(0, 0, W, H);
+    var mid = H / 2;
+    for (var i = 0; i < waveLevels.length; i++) {
+      var lv = waveLevels[i];
+      var h = Math.max(2, lv * (H - 6));
+      var x = W - (waveLevels.length - i) * step;
+      waveCtx.fillStyle = lv > 0.05 ? waveColor : waveColorDim;
+      waveCtx.fillRect(x, mid - h / 2, 3, h);
+    }
+  }
+
   /* ───── Storage / Persistence ───── */
   let saveTimer = null;
   function saveSettings() {
@@ -2603,7 +2698,9 @@ right lower quadrant"></textarea>
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return;
       const s = JSON.parse(raw);
-      if (s.engine === "realtime" || s.engine === "batch" || s.engine === "hybrid") engine = s.engine;
+      // Batch-only product: migrate a saved Realtime/Hybrid engine to Batch (the
+      // selector is hidden). Only Batch is restored.
+      engine = (s.engine === "batch") ? "batch" : DEFAULT_ENGINE;
       if (s.keyterms) keytermsEl.value = s.keyterms;
       if (Array.isArray(s.presetIds)) {
         // Unknown ids (a preset later renamed/removed) are ignored harmlessly.
@@ -2989,6 +3086,15 @@ right lower quadrant"></textarea>
       if (Math.abs(pct - lastMeterPct) > 0.5) {
         meterBar.style.width = pct + "%";
         lastMeterPct = pct;
+      }
+
+      // Live recording feedback: visible only while capturing (gateIsOpen is
+      // updated just below, so the displayed state lags one tick — imperceptible).
+      if (recording && !stopping) {
+        showRecFeedback(true);
+        updateRecFeedback(rms);
+      } else if (recFeedbackOn && !recording) {
+        showRecFeedback(false);
       }
 
       const openT  = Number(gateOpenEl.value);
@@ -4078,6 +4184,7 @@ right lower quadrant"></textarea>
     sessionFinalized = true;
     dbgPhase("finalizeSession(unexpected=" + !!unexpected + ")");
     clearSessionTimers();
+    showRecFeedback(false); // recording is over; the status line carries the upload/refine state
     // Stop the direct MediaRecorder if it's still running (an unexpected close
     // bypasses beginCommitPhase). Idempotent — a no-op if already stopped.
     stopDirectRecorder();

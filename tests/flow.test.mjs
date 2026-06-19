@@ -1218,6 +1218,10 @@ console.log('--- scenario 22: phone link persistence ---');
   check('s22p: leave button shown for the restored join', doc22p.getElementById('phoneLeaveBtn').style.display !== 'none');
   doc22p.getElementById('apiKey').value = 'test-key';
   doc22p.getElementById('sonioxKey').value = 'test-skey';
+  // Batch-only migrates the saved engine to Batch; the realtime+join MIRROR still
+  // exists (dormant), so opt into it explicitly to verify the join rides a
+  // streaming dictation. (The user-facing batch+join path relays via /deliver.)
+  doc22p.getElementById('engRealtime').click();
   doc22p.getElementById('recordBtn').click();
   await sleep(50);
   const rejoinedSock = socks22p.find((s) => s.url.includes('/api/transcribe'));
@@ -1432,6 +1436,7 @@ console.log('--- scenario 24: QR join ---');
   check('s24p: join param cleaned from the address bar', !w23p.location.search.includes('join'), w23p.location.href);
   doc23p.getElementById('apiKey').value = 'test-key';
   doc23p.getElementById('sonioxKey').value = 'test-skey';
+  doc23p.getElementById('engRealtime').click(); // opt into the dormant realtime+join mirror (engine migrates to Batch otherwise)
   doc23p.getElementById('recordBtn').click();
   await sleep(50);
   const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
@@ -2284,6 +2289,45 @@ console.log('--- scenario 28: direct stream ---');
     check('s28: hybrid refine uploads the webm to the batch endpoint (no raw WAV)', !!refinePost, 'calls=' + fetchCalls28e.map((c) => c.url.replace('https://dictation.test', '')).join(','));
     check('s28: hybrid refine delivers the refined text to the clipboard', (w28e._clip || '').includes('Refined webm note'), w28e._clip);
   }
+}
+
+// ===== Scenario 29: batch-only product (engine migration + capture feedback) =====
+console.log('--- scenario 29: batch-only product ---');
+{
+  const socks29 = [];
+  let w29;
+  const dom29 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w29 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, muted: false, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Batch note."}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks29.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ engine: 'hybrid' })); // a pre-existing hybrid user
+    },
+  });
+  await sleep(100);
+  const doc29 = dom29.window.document;
+  check('s29: a saved Hybrid engine migrates to Batch', doc29.getElementById('engBatch').className.includes('active') && !doc29.getElementById('engHybrid').className.includes('active'));
+  check('s29: the engine selector is hidden (batch-only)', doc29.getElementById('engineSeg').style.display === 'none');
+
+  doc29.getElementById('apiKey').value = 'test-key';
+  doc29.getElementById('recordBtn').click();
+  await sleep(140); // let the gate-meter loop tick and reveal the capture feedback
+  check('s29: recording shows the live capture feedback (waveform + timer)', doc29.getElementById('recFeedback').style.display !== 'none');
+  check('s29: no realtime WebSocket opens in batch mode', !socks29.some((s) => s.url.includes('/api/transcribe')));
+  doc29.getElementById('recordBtn').click(); // stop -> upload -> deliver
+  await sleep(140);
+  check('s29: capture feedback hides once recording ends', doc29.getElementById('recFeedback').style.display === 'none');
+  check('s29: batch text reaches the clipboard', (w29._clip || '').includes('Batch note'), w29._clip);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

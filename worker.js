@@ -969,11 +969,21 @@ right lower quadrant"></textarea>
   let phoneReconnectTimer = null; // desktop: pending reconnect attempt
   let phoneReconnectDelayMs = 0;  // desktop: current reconnect backoff
   let phoneFallbackTimer = null;  // desktop: grace timer before live-text fallback delivery
-  let lastDeliveryId    = "";   // desktop: dedupe replayed phone_delivery frames
+  let lastDeliveryId    = "";   // desktop: most recent phone_delivery id (migrated into recentDeliveryIds)
+  let recentDeliveryIds = [];   // desktop: ring of recent ids — dedupes BOTH room replays and retried/out-of-order re-POSTs
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
+
+  // Phone-side durable delivery queue (joined device): an undelivered relay is
+  // persisted (pendingDeliveries) and retried — on link heal and at boot —
+  // until a desktop listener acks it, so a phone that dies after transcribing
+  // but before delivering still lands the text. See the queue functions below.
+  let deliveryQueue       = [];   // [{id,text,ts}] awaiting a desktop listener ack
+  let flushChain          = Promise.resolve(); // serializes flushes so re-POSTs never interleave (FIFO room ordering)
+  let deliveryRetryTimer  = null; // scheduled re-flush while the queue is non-empty
+  let deliveryRetryDelayMs = 0;   // current retry backoff
 
   // Big-button layout state. The screen indicator is DERIVED from the same
   // transitions that drive the status line and pills (recorded below) — the
@@ -1034,6 +1044,15 @@ right lower quadrant"></textarea>
   const PHONE_RECONNECT_MAX_MS  = 15000; // reconnect backoff cap
   const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
   const RELAY_TIMEOUT_MS        = 10000; // phone->room delivery ack deadline; a hung relay must fail loudly, and the queued next session waits on the ack
+
+  // Phone-side durable delivery queue: an undelivered relay (POST failed, or a
+  // zero-listener ack means the desktop was down past the room's 2-min replay
+  // buffer) is persisted and retried until a desktop listener acks it.
+  const DELIVERY_QUEUE_RETRY_MS     = 5000;   // backoff floor for re-POSTing a queued delivery while the link is down
+  const DELIVERY_QUEUE_RETRY_MAX_MS = 30000;  // retry backoff cap
+  const DELIVERY_QUEUE_MAX          = 20;     // cap the queue (drop oldest, still in history) so it can never grow unbounded
+  const DELIVERY_QUEUE_TTL_MS       = 30 * 60 * 1000; // drop a delivery too stale to safely auto-land on a chart hours later (still in history)
+  const DELIVERY_DEDUPE_RING        = 12;     // desktop: remember this many recent ids so a retried/out-of-order re-POST can never re-copy stale text
 
   // Batch keyterm caps (the Worker re-enforces these server-side too)
   const BATCH_KEYTERM_MAX_CHARS    = 49;
@@ -1454,6 +1473,8 @@ right lower quadrant"></textarea>
       phoneSessionCode:  phoneSessionCode,
       joinedSessionCode: joinedSessionCode,
       lastDeliveryId:    lastDeliveryId,
+      recentDeliveryIds: recentDeliveryIds, // desktop dedupe ring (per-device)
+      pendingDeliveries: deliveryQueue,     // phone outbound queue, durable across reloads/PWA kills (per-device)
       // iOS has no Permissions API for the mic; persisting the grant is what
       // lets a relaunched PWA re-warm the mic at boot instead of staying cold.
       micGranted:        micEverGranted,
@@ -1522,6 +1543,16 @@ right lower quadrant"></textarea>
       if (typeof s.phoneSessionCode  === "string") phoneSessionCode  = s.phoneSessionCode;
       if (typeof s.joinedSessionCode === "string") joinedSessionCode = s.joinedSessionCode;
       if (typeof s.lastDeliveryId    === "string") lastDeliveryId    = s.lastDeliveryId;
+      if (Array.isArray(s.recentDeliveryIds)) {
+        recentDeliveryIds = s.recentDeliveryIds.filter(function (x) { return typeof x === "string"; }).slice(-DELIVERY_DEDUPE_RING);
+      }
+      // Migrate a pre-ring single id into the ring so a reload still dedupes it.
+      if (lastDeliveryId && recentDeliveryIds.indexOf(lastDeliveryId) === -1) recentDeliveryIds.push(lastDeliveryId);
+      if (Array.isArray(s.pendingDeliveries)) {
+        deliveryQueue = s.pendingDeliveries.filter(function (it) {
+          return it && typeof it.id === "string" && typeof it.text === "string" && typeof it.ts === "number";
+        });
+      }
       if (s.micGranted === true) micEverGranted = true;
       if (bigButtonModeEl && (s.bigButtonMode === "joined" || s.bigButtonMode === "always" || s.bigButtonMode === "never")) {
         bigButtonModeEl.value = s.bigButtonMode;
@@ -2269,22 +2300,27 @@ right lower quadrant"></textarea>
       addHistory(cleaned, { language_code: "en", engine: sessionEngine });
     } catch (e) {}
 
-    let announceRelayOutcome = false; // joined + clean outcome + local copy denied: the relay ack owns the outcome cue
+    // Joined + clean: the DESKTOP clipboard is the deliverable, so the relay
+    // ack owns the SINGLE outcome cue (done on a listener ack, red warn/fail on
+    // zero-listeners/relay failure — see relayDeliveryToDesktop). Suppress any
+    // local beep on THIS device in that case: a local doneBeep before the relay
+    // would be a second cue, and a doneBeep on a relay that then fails would
+    // sound like success on a degraded outcome (CLAUDE.md: a joined degraded
+    // outcome gets warnBeep, never doneBeep). The local copy is still attempted
+    // (best-effort, so the text is on this device too) — it just never beeps
+    // here. iOS denies that copy outright; an Android/desktop join may succeed —
+    // both defer to the relay. Unexpected/mic-alarm joined dictations are NOT
+    // clean, so they keep the loud local fail cue and the relay stays silent.
+    const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
+    const cleanOutcome = !opts.unexpected && !micAlarmFired;
+    let announceRelayOutcome = relayCarries && cleanOutcome;
 
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
-      const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
-      const cleanOutcome = !opts.unexpected && !micAlarmFired;
-      if (!copied && relayCarries && cleanOutcome) {
-        // Joined mode: the deliverable is the DESKTOP clipboard via the
-        // relay. iOS denies local clipboard writes outside a user gesture —
-        // by delivery time (post upload/refine) there is none — which would
-        // brand every successful relay delivery a failure here. The local
-        // copy is best-effort; defer the outcome cue to the relay ack below
-        // (done on a listener ack, red warn/fail on zero-listeners/relay
-        // failure). Exactly one outcome beep either way.
-        announceRelayOutcome = true;
-        setStatus("Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)", "warn");
+      if (announceRelayOutcome) {
+        setStatus(copied
+          ? "Transcript copied here and sent to the desktop — confirming delivery…"
+          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)", "warn");
       } else if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
         failBeep();
@@ -2299,7 +2335,9 @@ right lower quadrant"></textarea>
         doneBeep();
       }
     } else {
-      if (opts.unexpected) {
+      if (announceRelayOutcome) {
+        setStatus("Transcript sent to the desktop — confirming delivery…", "warn");
+      } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
       } else {
@@ -2591,6 +2629,7 @@ right lower quadrant"></textarea>
     remoteCommitted    = "";
     remoteHasDelivery  = false;
     lastDeliveryId     = "";
+    recentDeliveryIds  = [];
     pendingCopyText    = "";
     phoneReconnectDelayMs = 0;
 
@@ -2654,6 +2693,9 @@ right lower quadrant"></textarea>
       if (phoneJoinInputEl) phoneJoinInputEl.value = joinedSessionCode;
       if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
       if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
+      // Crash recovery: a phone that died after transcribing but before its
+      // delivery landed boots with the text still queued — flush it now.
+      if (deliveryQueue.length) backgroundFlush();
     }
   }
 
@@ -2720,6 +2762,7 @@ right lower quadrant"></textarea>
     remoteHasDelivery = false;
     pendingCopyText   = "";
     lastDeliveryId    = "";
+    recentDeliveryIds = [];
     phoneCodeBadgeEl.style.display = "none";
     phoneStopBtnEl.style.display = "none";
     phoneStartBtnEl.style.display = "";
@@ -2798,9 +2841,18 @@ right lower quadrant"></textarea>
 
     if (msg.message_type === "phone_delivery") {
       // The room replays the last delivery to (re)connecting listeners so a
-      // link drop cannot lose it — dedupe those replays by id.
-      if (msg.delivery_id && msg.delivery_id === lastDeliveryId) return;
-      if (msg.delivery_id) { lastDeliveryId = msg.delivery_id; saveSettingsNow(); }
+      // link drop cannot lose it; the phone's delivery queue can also re-POST a
+      // held delivery. Dedupe against a RING of recent ids, not just the last
+      // one: a single-id check would let a retried delivery re-arriving AFTER a
+      // newer one re-copy stale text onto a chart — the exact silent-wrong-text
+      // failure this app exists to prevent.
+      if (msg.delivery_id && recentDeliveryIds.indexOf(msg.delivery_id) !== -1) return;
+      if (msg.delivery_id) {
+        recentDeliveryIds.push(msg.delivery_id);
+        while (recentDeliveryIds.length > DELIVERY_DEDUPE_RING) recentDeliveryIds.shift();
+        lastDeliveryId = msg.delivery_id; // retained for back-compat persistence/migration
+        saveSettingsNow();
+      }
       if (phoneFallbackTimer) { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
       remoteHasDelivery = true;
       var final = (msg.text || "").trim();
@@ -2834,19 +2886,59 @@ right lower quadrant"></textarea>
     }
   }
 
-  // Phone side: push the final text to the session room and check the ack.
-  // The room buffers the last delivery for reconnecting listeners, so a
-  // zero-listener ack means "held for replay", not "gone" — but the desktop
-  // does not have the text yet and the user must hear that.
-  // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
-  // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
-  async function relayDeliveryToDesktop(text, announceOutcome) {
-    var payload = JSON.stringify({
-      message_type: "phone_delivery",
+  /* ───── Phone-side durable delivery queue ─────
+     A joined phone POSTs its final text to the room's /deliver. If that POST
+     fails (phone network blip) or acks zero listeners (desktop down past the
+     room's 2-min replay buffer), the text would survive only in this device's
+     box/history — a desktop that reconnects later would get nothing. The queue
+     makes an undelivered relay durable: persisted to localStorage, retried on
+     link heal (online/visibility/focus/timer) and at boot, until a listener
+     acks it. The desktop dedupes by a ring of recent ids, so a retried re-POST
+     can never re-copy stale text. This narrows the never-lose-a-dictation gap;
+     it never widens it. */
+
+  function enqueueDelivery(text) {
+    var item = {
+      id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
       text: text,
-      delivery_id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
-    });
-    var listeners = -1;
+      ts: Date.now(),
+    };
+    deliveryQueue.push(item);
+    // An unbounded retry buffer is its own failure mode: drop the OLDEST
+    // undelivered item (it stays in this device's history). The just-enqueued
+    // item is at the tail, so it is never the one dropped.
+    while (deliveryQueue.length > DELIVERY_QUEUE_MAX) deliveryQueue.shift();
+    saveSettingsNow();
+    return item;
+  }
+
+  function pruneStaleDeliveries() {
+    if (!deliveryQueue.length) return;
+    var now = Date.now();
+    var before = deliveryQueue.length;
+    // A delivery too old to land safely (the user has moved on) must NOT auto-
+    // paste onto a chart hours later — drop it from the retry queue. It remains
+    // in history, and the original failure was already announced loud.
+    deliveryQueue = deliveryQueue.filter(function (it) { return now - it.ts < DELIVERY_QUEUE_TTL_MS; });
+    if (deliveryQueue.length !== before) saveSettingsNow();
+  }
+
+  function scheduleDeliveryRetry() {
+    if (deliveryRetryTimer || !deliveryQueue.length) return;
+    deliveryRetryDelayMs = Math.min(deliveryRetryDelayMs ? deliveryRetryDelayMs * 2 : DELIVERY_QUEUE_RETRY_MS, DELIVERY_QUEUE_RETRY_MAX_MS);
+    deliveryRetryTimer = setTimeout(function () {
+      deliveryRetryTimer = null;
+      flushDeliveryQueue();
+    }, deliveryRetryDelayMs);
+  }
+
+  // POST one queued item to the room. Resolves to one of:
+  //   "delivered" — a listener received it (drop it from the queue)
+  //   "buffered"  — POST ok but zero listeners (room holds it; keep + retry)
+  //   "failed"    — POST error/timeout (link down; keep + stop this round)
+  async function postDelivery(item) {
+    if (!joinedSessionCode) return "failed";
+    var payload = JSON.stringify({ message_type: "phone_delivery", text: item.text, delivery_id: item.id });
     // A black-holed POST must still produce an outcome: without a deadline a
     // hung relay reports nothing at all (and would stall a queued session).
     var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
@@ -2859,22 +2951,101 @@ right lower quadrant"></textarea>
         signal: ctrl ? ctrl.signal : undefined,
       });
       if (!res.ok) throw new Error("HTTP " + res.status);
+      var listeners = -1;
       try { listeners = JSON.parse(await res.text()).listeners; } catch (e) { listeners = -1; }
+      return listeners > 0 ? "delivered" : "buffered";
     } catch (e) {
-      setStatus("⚠ Desktop relay FAILED — the transcript did NOT reach the desktop clipboard!", "err");
-      failBeep();
-      return;
+      return "failed";
     } finally {
       if (killer) clearTimeout(killer);
     }
-    if (listeners === 0) {
-      setStatus("⚠ Desktop link is DOWN — transcript held for replay when it reconnects. VERIFY it lands before pasting!", "err");
-      warnBeep();
-    } else if (announceOutcome) {
-      // The deferred outcome cue: the desktop received it — this is the
-      // dictation's success moment.
+  }
+
+  // Flush the queue FIFO. Serialized through flushChain so concurrent triggers
+  // (a fresh delivery racing a background retry) never interleave POSTs — room
+  // ordering stays FIFO and every caller learns its own item's outcome.
+  function flushDeliveryQueue(opts) {
+    var run = flushChain.then(function () { return doFlush(opts); });
+    flushChain = run.catch(function () {}); // one failure must not poison the chain
+    return run;
+  }
+
+  async function doFlush(opts) {
+    opts = opts || {};
+    if (!joinedSessionCode) return "";
+    pruneStaleDeliveries();
+    // Process only items present when THIS flush began. An item enqueued mid-
+    // flush (a new dictation racing a background retry) is left for its own
+    // chained flush, so the dictation that enqueued it always learns its own
+    // outcome — and FIFO order is preserved.
+    var snapshot = deliveryQueue.map(function (it) { return it.id; });
+    var blocked = "";          // the result that stopped the round (buffered/failed)
+    var reachedCurrent = false;
+    while (deliveryQueue.length) {
+      var item = deliveryQueue[0];
+      if (snapshot.indexOf(item.id) === -1) break; // enqueued after this flush began
+      var isCurrent = Boolean(opts.currentId && item.id === opts.currentId);
+      var result = await postDelivery(item);
+      if (result === "delivered") {
+        if (isCurrent) reachedCurrent = true;
+        deliveryQueue.shift(); // index 0 is still this item (flushChain serializes mutation)
+        saveSettingsNow();
+        deliveryRetryDelayMs = 0;
+      } else {
+        blocked = result;            // buffered or failed
+        if (isCurrent) reachedCurrent = true;
+        break;                       // head-of-line: nothing behind it can land either
+      }
+    }
+    if (deliveryQueue.length) scheduleDeliveryRetry();
+    if (!opts.currentId) return "";
+    // current delivered ⇒ "delivered"; current itself blocked ⇒ that result;
+    // an EARLIER item blocked (current never reached) ⇒ current is behind a
+    // down desktop, so mirror the blocker (it did not land).
+    if (reachedCurrent) return blocked || "delivered";
+    return blocked || "buffered";
+  }
+
+  // Drive queued deliveries silently when the link may have healed (no current
+  // dictation to announce). The original failure already played its one outcome
+  // cue; a successful drain gives quiet positive closure without a second beep.
+  async function backgroundFlush() {
+    if (!joinedSessionCode || !deliveryQueue.length) return;
+    var had = deliveryQueue.length;
+    await flushDeliveryQueue();
+    // Quiet closure only when idle: a heal event firing mid-dictation must not
+    // overwrite the live REC/upload status line with a stale "delivered".
+    if (had && deliveryQueue.length === 0 && !recording && !stopping && !finishing) {
+      setStatus("Queued transcript" + (had > 1 ? "s" : "") + " delivered to the desktop. Done!", "ok");
+    }
+  }
+
+  // Phone side: relay the final text to the desktop via the durable queue.
+  // Exactly one outcome cue for THIS dictation (one beep per session preserved):
+  // the queue flush returns this item's fate and we translate it here.
+  // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
+  // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
+  async function relayDeliveryToDesktop(text, announceOutcome) {
+    var item = enqueueDelivery(text); // durable BEFORE the network call: a phone that dies now recovers at boot
+    var outcome = await flushDeliveryQueue({ currentId: item.id });
+    // announceOutcome FALSE ⇒ an unexpected/mic-alarm joined dictation:
+    // deliverFinalText already played the loud local cue (fail beep + red
+    // status). The queue still retries the text — we just never add a SECOND
+    // cue (the one-outcome-beep-per-session invariant).
+    if (!announceOutcome) return;
+    if (outcome === "delivered") {
+      // The deferred outcome cue: the desktop received it — the success moment.
       setStatus("Delivered to the desktop clipboard. Done!", "ok");
       doneBeep();
+    } else if (outcome === "buffered") {
+      // POST ok but nobody is listening: the desktop does not have it yet. The
+      // text is queued + retried, but the user must hear that it did not land.
+      setStatus("⚠ Desktop link is DOWN — transcript queued; it delivers when the desktop reconnects. VERIFY it lands before pasting!", "err");
+      warnBeep();
+    } else {
+      // POST failed/timed out: link down. Loud, and queued for retry.
+      setStatus("⚠ Desktop relay FAILED — transcript queued; it retries when the link is back. It has NOT reached the desktop yet!", "err");
+      failBeep();
     }
   }
 
@@ -3096,6 +3267,14 @@ right lower quadrant"></textarea>
   if (phoneJoinBtnEl) phoneJoinBtnEl.onclick = () => {
     var code = (phoneJoinInputEl ? phoneJoinInputEl.value : "").toUpperCase().replace(/[^A-Z0-9]/g, "");
     if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
+    if (code !== joinedSessionCode) {
+      // Switching to a different desktop: queued deliveries target the OLD code
+      // and must never misdeliver to the new one (stale text on the wrong
+      // chart). Drop them (still in history) and start the backoff over.
+      deliveryQueue = [];
+      if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
+      deliveryRetryDelayMs = 0;
+    }
     joinedSessionCode = code;
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
     if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
@@ -3105,6 +3284,11 @@ right lower quadrant"></textarea>
   };
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
     joinedSessionCode = "";
+    // Abandon any deliveries queued for the code we left (they target that
+    // code and can never be acked now; the text stays in this device's history).
+    deliveryQueue = [];
+    if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
+    deliveryRetryDelayMs = 0; // a fresh join must start the retry backoff over (cf. phoneReconnectDelayMs)
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
     phoneLeaveBtnEl.style.display = "none";
     saveSettingsNow();
@@ -3309,6 +3493,7 @@ right lower quadrant"></textarea>
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
+    backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
     if (recording || stopping || finishing) {
       acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides
     } else {
@@ -3319,8 +3504,13 @@ right lower quadrant"></textarea>
   // Standalone PWAs (iOS home-screen installs) sometimes fire only focus —
   // not visibilitychange — when switching back from another app.
   window.addEventListener("focus", () => {
+    backgroundFlush(); // retry any queued phone deliveries on app-switch return
     if (!recording && !stopping && !audioGraphHealthy()) tryWarmOnLoad();
   });
+
+  // The link healing is the cue to retry: drain the phone delivery queue the
+  // moment connectivity returns.
+  window.addEventListener("online", () => { backgroundFlush(); });
 
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
     navigator.mediaDevices.addEventListener("devicechange", () => {

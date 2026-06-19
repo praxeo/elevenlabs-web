@@ -33,6 +33,10 @@
 //      unfocused clipboard copy retries on refocus, session_end grace window
 //      falls back to live text (cancelled by the real delivery), and the
 //      phone treats a zero-listener deliver ack as a loud failure
+//  20q. phone-side durable delivery queue: a failed/zero-listener /deliver
+//      enqueues the text (persisted), an online/boot heal re-POSTs it with the
+//      SAME id until a listener acks (then the queue clears), and the desktop
+//      ring-dedupe drops a stale re-POST arriving after a newer delivery
 //  21. SessionRoom DO contract (direct): ping/pong, listener-count ack,
 //      held-delivery replay inside the window only, transcripts not buffered,
 //      GET /latest for native pollers (fresh delivery vs stale null)
@@ -766,6 +770,170 @@ console.log('--- scenario 20: phone link resilience ---');
   const dBody = dCall ? JSON.parse(dCall.opts.body) : {};
   check('s20p: deliver carries text + delivery_id', dBody.text && dBody.text.includes('Phone note.') && typeof dBody.delivery_id === 'string' && dBody.delivery_id.length > 0, JSON.stringify(dBody.delivery_id));
   check('s20p: zero-listener ack is loud on the phone', status20p().includes('Desktop link is DOWN'), status20p());
+}
+
+// ===== Scenario 20q: phone-side durable delivery queue (durability) =====
+// A joined phone whose /deliver POST fails (or acks zero listeners) must not
+// drop the text: it is persisted and retried on link heal / at boot until a
+// desktop listener acks it. The desktop dedupes retries by a ring of ids so a
+// re-POST can never re-copy stale text onto a chart.
+console.log('--- scenario 20q: phone delivery queue ---');
+{
+  // ---- Phone side: a failed POST enqueues; an online heal re-delivers ----
+  const socks20q = [];
+  const fetch20q = [];
+  let deliverMode = 'fail'; // 'fail' | 'zero' | 'ok'
+  const dom20q = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch20q.push({ url: String(url), opts });
+        if (String(url).includes('/deliver')) {
+          if (deliverMode === 'fail') return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('boom') });
+          const listeners = deliverMode === 'ok' ? 1 : 0;
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":' + listeners + '}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Queue note."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks20q.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc20q = dom20q.window.document;
+  const win20q = dom20q.window;
+  const status20q = () => doc20q.getElementById('status').textContent;
+  const queue20q = () => { try { return JSON.parse(win20q.localStorage.getItem('scribe_v2_settings_v9')).pendingDeliveries || []; } catch (e) { return []; } };
+
+  doc20q.getElementById('phoneJoinInput').value = 'QUE111';
+  doc20q.getElementById('phoneJoinBtn').click();
+  doc20q.getElementById('apiKey').value = 'test-key';
+  doc20q.getElementById('recordBtn').click();
+  await sleep(80);
+  doc20q.getElementById('recordBtn').click(); // stop -> upload -> deliver (fails)
+  await sleep(600);
+
+  const firstDeliver = fetch20q.find((c) => c.url.includes('/deliver'));
+  check('s20q: a /deliver POST was attempted', !!firstDeliver);
+  const firstId = firstDeliver ? JSON.parse(firstDeliver.opts.body).delivery_id : '';
+  check('s20q: a failed relay is loud', status20q().includes('FAILED') && status20q().includes('NOT'), status20q());
+  check('s20q: the undelivered text is queued (durable in localStorage)', queue20q().length === 1 && queue20q()[0].text.includes('Queue note.'), JSON.stringify(queue20q()));
+
+  // Heal the link: an online event drains the queue, re-POSTing the held item.
+  const deliverCount0 = fetch20q.filter((c) => c.url.includes('/deliver')).length;
+  deliverMode = 'ok';
+  win20q.dispatchEvent(new win20q.Event('online'));
+  await sleep(200);
+  const retries = fetch20q.filter((c) => c.url.includes('/deliver')).slice(deliverCount0);
+  check('s20q: the heal triggers a retry POST', retries.length >= 1, retries.length + ' retries');
+  check('s20q: the retry reuses the SAME delivery_id (so the desktop ring dedupes a double)', retries.length > 0 && JSON.parse(retries[0].opts.body).delivery_id === firstId, firstId);
+  check('s20q: a delivered item clears the queue', queue20q().length === 0, JSON.stringify(queue20q()));
+  check('s20q: a drained queue gives quiet positive closure', status20q().includes('delivered to the desktop'), status20q());
+
+  // Leaving the session abandons any queued deliveries (text stays in history).
+  deliverMode = 'fail';
+  doc20q.getElementById('recordBtn').click();
+  await sleep(80);
+  doc20q.getElementById('recordBtn').click();
+  await sleep(600);
+  check('s20q: a second failure re-queues', queue20q().length === 1, JSON.stringify(queue20q()));
+  doc20q.getElementById('phoneLeaveBtn').click();
+  check('s20q: Leave clears the delivery queue', queue20q().length === 0, JSON.stringify(queue20q()));
+}
+
+{
+  // ---- Boot recovery: a persisted queue flushes at startup (phone crash) ----
+  const fetch20q2 = [];
+  const dom20q2 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch20q2.push({ url: String(url), opts });
+        if (String(url).includes('/deliver')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      // Seed a persisted join + an undelivered queued delivery: a phone that
+      // died after transcribing but before its relay landed.
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({
+        saveApiKey: true,
+        joinedSessionCode: 'BOOT22',
+        pendingDeliveries: [{ id: 'boot-1', text: 'Recovered note.', ts: Date.now() }],
+      }));
+    },
+  });
+  await sleep(150);
+  const win20q2 = dom20q2.window;
+  const bootDeliver = fetch20q2.find((c) => c.url.includes('/api/session/BOOT22/deliver') && c.opts && c.opts.method === 'POST');
+  check('s20q2: a persisted queue re-POSTs its delivery at boot (crash recovery)', !!bootDeliver, fetch20q2.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+  check('s20q2: the boot retry carries the persisted id + text', !!bootDeliver && JSON.parse(bootDeliver.opts.body).delivery_id === 'boot-1' && JSON.parse(bootDeliver.opts.body).text.includes('Recovered note.'), bootDeliver && bootDeliver.opts.body);
+  const queue20q2 = () => { try { return JSON.parse(win20q2.localStorage.getItem('scribe_v2_settings_v9')).pendingDeliveries || []; } catch (e) { return []; } };
+  check('s20q2: the recovered delivery clears the queue once acked', queue20q2().length === 0, JSON.stringify(queue20q2()));
+}
+
+{
+  // ---- Desktop ring-dedupe: a retried/out-of-order re-POST can't re-copy ----
+  const socks20q3 = [];
+  let w20q3;
+  const dom20q3 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w20q3 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks20q3.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc20q3 = dom20q3.window.document;
+  doc20q3.getElementById('phoneStartBtn').click();
+  await sleep(20);
+  const sock = socks20q3.find((s) => s.url.includes('/api/session/'));
+  check('s20q3: desktop listener socket opened', !!sock);
+  sock.open();
+  await sleep(10);
+
+  sock.msg({ message_type: 'phone_delivery', text: 'Note one.', delivery_id: 'q1' });
+  await sleep(20);
+  check('s20q3: first delivery copied', (w20q3._clip || '').includes('Note one.'), JSON.stringify(w20q3._clip));
+  sock.msg({ message_type: 'phone_delivery', text: 'Note two.', delivery_id: 'q2' });
+  await sleep(20);
+  check('s20q3: newer delivery copied', (w20q3._clip || '').includes('Note two.'), JSON.stringify(w20q3._clip));
+  // A late retry of q1 arrives AFTER q2 — with the OLD single-id dedupe it would
+  // overwrite the clipboard with stale text. The ring must drop it.
+  w20q3._clip = 'KEEP';
+  sock.msg({ message_type: 'phone_delivery', text: 'Note one.', delivery_id: 'q1' });
+  await sleep(20);
+  check('s20q3: a stale re-POST after a newer one is deduped by the ring', w20q3._clip === 'KEEP', JSON.stringify(w20q3._clip));
+  // A genuinely new id still lands.
+  sock.msg({ message_type: 'phone_delivery', text: 'Note three.', delivery_id: 'q3' });
+  await sleep(20);
+  check('s20q3: a fresh id still lands after the dedupes', (w20q3._clip || '').includes('Note three.'), JSON.stringify(w20q3._clip));
 }
 
 // ===== Scenario 21: SessionRoom Durable Object contract (direct, no jsdom) =====
@@ -1546,6 +1714,59 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25e: unjoined denied copy is still a loud failure', statusE().includes('clipboard copy FAILED') && dE.getElementById('status').className.includes('err'), statusE());
   check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
+
+  // ---- Leg E2 (one-beep regression): a joined device whose LOCAL copy
+  // SUCCEEDS (an Android phone, or a desktop joined to another desktop) must
+  // STILL defer the outcome cue to the relay. A local doneBeep fired before the
+  // relay would be a SECOND beep — and a doneBeep on a relay that then fails
+  // would sound like success on a degraded outcome. Exactly ONE outcome cue per
+  // dictation regardless of the relay result. (Outcome haptics: done=[40,60,40],
+  // warn=[90,90,90], fail=[220,90,220]; the start=30 cue is filtered out.) ----
+  const E2 = mkBigDom({ settings: { joinedSessionCode: 'ANDPHN' } });
+  await sleep(100);
+  const dE2 = E2.dom.window.document;
+  const bigBtnE2 = dE2.getElementById('bigBtn');
+  const screenE2 = () => dE2.getElementById('bigUi').getAttribute('data-screen');
+  const statusE2 = () => dE2.getElementById('status').textContent;
+  dE2.getElementById('apiKey').value = 'test-key';
+  dE2.getElementById('sonioxKey').value = 'test-skey';
+  const outcomes = (vibes) => vibes.filter((v) => { const s = JSON.stringify(v); return s === '[40,60,40]' || s === '[90,90,90]' || s === '[220,90,220]'; });
+  // local copy SUCCEEDS here (E2.clipFail stays false) — the bug only shows when
+  // the local copy did NOT already get short-circuited by an iOS denial.
+
+  // zero-listener relay + a working local copy: ONE cue (warn), never a done
+  E2.deliverListeners = 0;
+  E2.batchText = 'Android down note.';
+  const vE2a = E2.vibes.length;
+  pev(E2.win, bigBtnE2, 'pointerdown', 1);
+  await sleep(550);
+  pev(E2.win, bigBtnE2, 'pointerup', 1);
+  await sleep(400);
+  check('s25e2: the local copy genuinely succeeded', (E2.win._clip || '').includes('Android down note.'), JSON.stringify(E2.win._clip));
+  check('s25e2: zero-listener still fails loudly (relay owns the cue)', statusE2().includes('Desktop link is DOWN') && screenE2() === 'fail', statusE2() + ' / ' + screenE2());
+  check('s25e2: EXACTLY ONE outcome cue and it is the warn (no local doneBeep double)', outcomes(E2.vibes.slice(vE2a)).length === 1 && JSON.stringify(outcomes(E2.vibes.slice(vE2a))[0]) === '[90,90,90]', JSON.stringify(E2.vibes.slice(vE2a)));
+
+  // hard relay POST failure + a working local copy: ONE cue (fail), never a done
+  E2.deliverListeners = 1;
+  E2.deliverFail = true;
+  E2.batchText = 'Android fail note.';
+  const vE2b = E2.vibes.length;
+  pev(E2.win, bigBtnE2, 'pointerdown', 2);
+  await sleep(550);
+  pev(E2.win, bigBtnE2, 'pointerup', 2);
+  await sleep(400);
+  check('s25e2: relay POST failure is EXACTLY ONE fail cue (no local doneBeep double)', outcomes(E2.vibes.slice(vE2b)).length === 1 && JSON.stringify(outcomes(E2.vibes.slice(vE2b))[0]) === '[220,90,220]', JSON.stringify(E2.vibes.slice(vE2b)));
+  E2.deliverFail = false;
+
+  // happy path + a working local copy: still ONE cue (done from the relay ack)
+  E2.batchText = 'Android ok note.';
+  const vE2c = E2.vibes.length;
+  pev(E2.win, bigBtnE2, 'pointerdown', 3);
+  await sleep(550);
+  pev(E2.win, bigBtnE2, 'pointerup', 3);
+  await sleep(400);
+  check('s25e2: a delivered relay is EXACTLY ONE done cue', outcomes(E2.vibes.slice(vE2c)).length === 1 && JSON.stringify(outcomes(E2.vibes.slice(vE2c))[0]) === '[40,60,40]', JSON.stringify(E2.vibes.slice(vE2c)));
+  check('s25e2: the relay ack announced the desktop delivery', statusE2().includes('Delivered to the desktop'), statusE2());
 }
 
 // ===== Scenario 29: batch-only product (engine migration + capture feedback) =====

@@ -1911,6 +1911,11 @@ right lower quadrant"></textarea>
   let directRec = null;
   let directRecMime = "";
   let pendingMediaChunks = [];
+  // DIRECT hybrid: the same off-thread webm we stream to Soniox is ALSO accumulated
+  // here and uploaded for the batch refine — small/compressed (like batch's own
+  // upload, ~8-10x smaller than the raw WAV) and captured off-thread, so a long
+  // "got ahead" dictation finalizes far faster and the tail is never dropped.
+  let directRefineChunks = [];
   // Pre-minted Soniox temp key: minting is an HTTP round-trip (browser -> Worker
   // -> Soniox auth), and doing it inline at PTT-down adds that latency to EVERY
   // dictation's first word. Mint ahead (at boot and after each direct dictation)
@@ -2082,7 +2087,8 @@ right lower quadrant"></textarea>
   const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
 
   const SESSION_PCM_CAP_BYTES = 24 * 1024 * 1024; // ~12.5 min @ 32 KB/s; the batch API caps files at 25 MB
-  const MIN_REFINE_BYTES      = 16000;            // ~0.5 s of audio; below this the refine is skipped
+  const MIN_REFINE_BYTES      = 16000;            // ~0.5 s of raw 16k PCM; below this the WAV refine is skipped
+  const MIN_REFINE_WEBM_BYTES = 1500;             // ~0.3 s of opus webm (incl. header); below this the webm refine is skipped (instant tap)
 
   // Phone link (desktop listener <-> session room)
   const PHONE_PING_INTERVAL_MS  = 25000; // heartbeat cadence on the listener socket
@@ -3492,6 +3498,7 @@ right lower quadrant"></textarea>
   }
   function startDirectRecorder() {
     pendingMediaChunks = [];
+    directRefineChunks = [];
     try {
       directRec = new MediaRecorder(stream, { mimeType: directRecMime, audioBitsPerSecond: 32000 });
     } catch (e) {
@@ -3501,6 +3508,8 @@ right lower quadrant"></textarea>
     }
     directRec.ondataavailable = function (e) {
       if (!e.data || e.data.size === 0) return;
+      // Hybrid: keep every chunk for the batch refine upload (the full webm).
+      if (sessionEngine === "hybrid") directRefineChunks.push(e.data);
       if (ws && ws.readyState === WebSocket.OPEN) {
         try { ws.send(e.data); dbgFramesSent++; } catch (err) {}
       } else if (pendingMediaChunks.length < 300) {
@@ -3740,11 +3749,12 @@ right lower quadrant"></textarea>
       if (minted) {
         directKey = minted;
         // Audio source: a MediaRecorder webm feed (off-thread, like the demo) for
-        // REALTIME when the browser supports a Soniox auto-container; otherwise the
-        // raw-PCM pump (hybrid always keeps the pump — it needs capturePcm). The
+        // REALTIME and HYBRID when the browser supports a Soniox auto-container.
+        // Hybrid also reuses that webm as the batch-refine upload (no raw WAV). A
+        // browser without webm/ogg (iOS) falls back to the raw-PCM pump + WAV. The
         // recorder path doesn't pre-roll (the demo doesn't either) and must not mix
         // raw PCM into the webm stream, so its pendingChunks stays empty.
-        directRecMime = (sessionEngine === "realtime") ? directFeedMime() : "";
+        directRecMime = (sessionEngine === "realtime" || sessionEngine === "hybrid") ? directFeedMime() : "";
         directUsesRec = !!directRecMime;
         if (directUsesRec) {
           pendingChunks = [];
@@ -4001,19 +4011,29 @@ right lower quadrant"></textarea>
       tailTimer = null;
       dbgPhase("tail end -> " + (sessionEngine === "hybrid" ? "commit+close, start batch refine" : "begin commit phase"));
       if (sessionEngine === "hybrid") {
-        // HYBRID FAST FINALIZE: the batch refine is the deliverable, and sessionPcm
-        // is already complete after the tail. Do NOT block the batch on the realtime
-        // engine's finalize (the FINAL_WAIT_MS / commit-quiet wait) — that just adds
-        // 1-2.5 s of dead time before the upload. The live text was only feedback;
-        // commit + close the socket in the background and refine immediately.
-        try {
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            flushPendingChunks();
-            rtSendCommit(); // graceful end-of-audio to the engine (binary "" in direct mode)
-          }
-        } catch (e) {}
-        try { if (ws) ws.close(); } catch (e) {} // onclose re-enters finalize; sessionFinalized guards it
-        finalizeSession(false);
+        // HYBRID FAST FINALIZE: the batch refine is the deliverable, and the capture
+        // (webm chunks or sessionPcm) is already complete after the tail. Do NOT
+        // block the batch on the realtime engine's finalize — the live text was only
+        // feedback; commit + close the socket in the background and refine now.
+        if (directUsesRec) {
+          // Recorder feed: stop it first so its final webm chunk lands in
+          // directRefineChunks (the refine upload) BEFORE we finalize, then
+          // end-of-audio + close.
+          stopDirectRecorder(function () {
+            try { if (ws && ws.readyState === WebSocket.OPEN) rtSendCommit(); } catch (e) {}
+            try { if (ws) ws.close(); } catch (e) {}
+            finalizeSession(false);
+          });
+        } else {
+          try {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              flushPendingChunks();
+              rtSendCommit(); // graceful end-of-audio to the engine
+            }
+          } catch (e) {}
+          try { if (ws) ws.close(); } catch (e) {} // onclose re-enters finalize; sessionFinalized guards it
+          finalizeSession(false);
+        }
       } else {
         beginCommitPhase(false);
       }
@@ -4116,14 +4136,33 @@ right lower quadrant"></textarea>
   // refine doubles as a recovery path.
   async function refineAndDeliverHybrid(unexpected) {
     const liveCleaned = cleanTranscript(latestText);
-    const pcm = sessionPcm;
-    const pcmBytes = sessionPcmBytes;
-    const truncated = sessionPcmTruncated;
-    sessionPcm = []; // a 20 MB buffer must never outlive its session
-    sessionPcmBytes = 0;
-    sessionPcmTruncated = false;
 
-    if (pcmBytes < MIN_REFINE_BYTES) {
+    // Pick the refine upload. DIRECT hybrid uses the off-thread MediaRecorder webm
+    // (compressed, ~8-10x smaller than the raw WAV, and the SAME proven format as
+    // batch mode) — far faster to upload on a long dictation, and complete (no
+    // main-thread pump backlog to drop the tail). The raw-PCM path uses the WAV.
+    let uploadBlob = null, uploadName = "recording.wav", enoughAudio = false, truncated = false;
+    if (directUsesRec) {
+      const webmChunks = directRefineChunks;
+      directRefineChunks = [];
+      const webm = webmChunks.length ? new Blob(webmChunks, { type: directRecMime || "audio/webm" }) : null;
+      uploadBlob = webm;
+      uploadName = "recording.webm";
+      enoughAudio = !!(webm && webm.size >= MIN_REFINE_WEBM_BYTES);
+      dbgPhase("hybrid refine source = webm (" + (webm ? webm.size : 0) + " bytes)");
+    } else {
+      const pcm = sessionPcm;
+      const pcmBytes = sessionPcmBytes;
+      truncated = sessionPcmTruncated;
+      sessionPcm = []; // a 20 MB buffer must never outlive its session
+      sessionPcmBytes = 0;
+      sessionPcmTruncated = false;
+      enoughAudio = pcmBytes >= MIN_REFINE_BYTES;
+      if (enoughAudio) uploadBlob = buildWavBlob(pcm, 16000);
+      dbgPhase("hybrid refine source = wav (" + pcmBytes + " bytes)");
+    }
+
+    if (!enoughAudio) {
       // Instant tap / dead mic: nothing worth refining — deliver as realtime would.
       await deliverFinalText(liveCleaned, { unexpected: unexpected });
       return;
@@ -4132,9 +4171,8 @@ right lower quadrant"></textarea>
     setLinkPill("refining");
     setStatus("Refining via batch transcription…", "warn");
 
-    const wav = buildWavBlob(pcm, 16000);
-    dbgPhase("batch refine POST start (" + pcmBytes + " bytes, timeout " + REFINE_TIMEOUT_MS + "ms)");
-    const r = await batchTranscribe(wav, "recording.wav", REFINE_TIMEOUT_MS);
+    dbgPhase("batch refine POST start (timeout " + REFINE_TIMEOUT_MS + "ms)");
+    const r = await batchTranscribe(uploadBlob, uploadName, REFINE_TIMEOUT_MS);
     dbgPhase("batch refine POST returned (ok=" + (r && r.ok) + ")");
 
     if (truncated && r.ok && r.text && r.text.trim() && liveCleaned.trim()) {

@@ -2225,6 +2225,65 @@ console.log('--- scenario 28: direct stream ---');
     await sleep(700);
     check('s28: recorder feed ends with an empty-string commit after the recorder stops', dsockD.sent.includes(''), JSON.stringify(dsockD.sent.filter((x) => typeof x === 'string')));
   }
+
+  // ---- Part E: hybrid + direct reuses the webm for the batch refine ----
+  // The off-thread webm streamed to Soniox is ALSO the refine upload (compressed,
+  // like batch) — no big raw WAV, complete capture. Refined text -> clipboard.
+  const socks28e = [];
+  const recs28e = [];
+  const fetchCalls28e = [];
+  let w28e;
+  const dom28e = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?rt=direct',
+    beforeParse(win) {
+      w28e = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mkStream()), addEventListener() {} };
+      win.fetch = (url, opts) => {
+        fetchCalls28e.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/api/soniox-token')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"api_key":"tmp-e"}') });
+        if (String(url).includes('/api/transcribe')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Refined webm note."}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class {
+        constructor(stream, opts) { this.state = 'inactive'; this.stream = stream; this.opts = opts || {}; recs28e.push(this); }
+        static isTypeSupported(t) { return /webm/.test(t); }
+        start(ts) { this.state = 'recording'; this.timeslice = ts; }
+        emit(sz) { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(sz || 2000)], { type: this.opts.mimeType || 'audio/webm' }) }); }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; this.emit(500); if (this.onstop) this.onstop(); }
+      };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks28e.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc28e = dom28e.window.document;
+  doc28e.getElementById('engHybrid').click();
+  doc28e.getElementById('apiKey').value = 'test-key';
+  doc28e.getElementById('sonioxKey').value = 'test-skey';
+  doc28e.getElementById('recordBtn').click();
+  await sleep(80);
+  const dsockE = socks28e.find((s) => s.url.includes('stt-rt.soniox.com'));
+  const recE = recs28e.find((r) => r.stream && r.stream.getAudioTracks && r.state === 'recording');
+  check('s28: hybrid+direct uses the MediaRecorder feed too', !!dsockE && !!recE, 'ws=' + !!dsockE + ' rec=' + !!recE);
+  if (dsockE && recE) {
+    dsockE.open();
+    await sleep(10);
+    recE.emit(3000); // a webm chunk: streamed to Soniox live AND kept for the refine
+    await sleep(5);
+    dsockE.msg({ tokens: [{ text: 'live words', is_final: false }] });
+    await sleep(10);
+    doc28e.getElementById('recordBtn').click(); // stop -> tail -> recorder stop -> webm refine
+    await sleep(900);
+    const refinePost = fetchCalls28e.find((c) => c.url.includes('/api/transcribe') && c.opts && c.opts.method === 'POST');
+    check('s28: hybrid refine uploads the webm to the batch endpoint (no raw WAV)', !!refinePost, 'calls=' + fetchCalls28e.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+    check('s28: hybrid refine delivers the refined text to the clipboard', (w28e._clip || '').includes('Refined webm note'), w28e._clip);
+  }
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

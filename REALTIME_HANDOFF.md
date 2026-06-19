@@ -7,6 +7,14 @@
 
 ---
 
+## ✅ CURRENT STATE (2026-06-19) — read this first
+
+**Realtime default = Soniox `stt-rt-v5`.** This is an append-log: the Session 3 entry just below is current; everything from **"TL;DR"** downward (Nova-3 binding, the `sample_rate` hypothesis, the AI-Gateway transports) is the **historical investigation record**, kept for the root-cause trail — *not* the live engine. `?rt=el` = ElevenLabs Scribe v2 Realtime; `?rt=binding`/`flux`/`gw`/`dgw` = the relegated Deepgram fallbacks. Batch + the hybrid clipboard = ElevenLabs Scribe v2.
+
+**Latency ground truth — MEASURED on a real WS (do NOT re-derive; re-measure only if you swap the realtime engine, and don't confuse it with the ~0.75 s *first-word* latency):** after PTT release Soniox returns the committed transcript **~73 ms** later and closes the socket **~84 ms** later, and the full text is already on screen *before* release. So the engine is not the post-speech delay — the client constants were. We cut `TAIL_MS` 600→250 and `COMMIT_QUIET_MS` 350→150, and shortened the batch-upload path (`start(1000)` timeslice recorder, precomputed batch keyterms, TLS pre-warm, `BATCH_UPLOAD_TIMEOUT_MS` 30→15 s); the hybrid refine also no longer waits for the realtime finalize. Full breakdown + the remaining (product-level) hybrid-delivery decision live in **`LATENCY_PLAN.md`**.
+
+---
+
 ## ☀️ SESSION 3 (2026-06-17 late) — engines swapped + accuracy push; MORNING TEST READY
 
 **The big realtime bugs are fixed (AudioWorklet, noise suppression — see Session 2). This session swapped engines and pushed accuracy.** Current state:

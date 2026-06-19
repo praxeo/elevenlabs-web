@@ -281,6 +281,11 @@ doc.getElementById('recordBtn').click();
 check('finalizing status', status().includes('Finalizing'), status());
 pump(3); // trailing speech during tail window
 check('tail audio still streams after stop', s1.sent.length === sentBeforeStop + 3, s1.sent.length - sentBeforeStop);
+// Anti-clipping backstop: a trailing partial during the (now-shorter, 250ms) tail
+// must still render — partials are never discarded at shutdown (the rescue if the
+// final commit reply never arrives). The committed below clears this transient.
+s1.msg({ message_type: 'partial_transcript', text: 'trailing tail words' });
+check('trailing partial during tail is retained', latest().includes('trailing tail words'), latest());
 await sleep(700); // > TAIL_MS
 const commitFrames = s1.sent.filter((d) => JSON.parse(d).commit === true);
 check('commit frame sent after tail', commitFrames.length === 1);
@@ -524,14 +529,14 @@ pump(6); // live speech (with pre-roll: 8 frames ≈ 0.7s, above the refine mini
 s12.msg({ message_type: 'partial_transcript', text: 'live partial words' });
 check('hybrid shows live partials', latest().includes('live partial words'), latest());
 s12.msg({ message_type: 'committed_transcript', text: 'Live committed words.' });
-doc.getElementById('recordBtn').click(); // stop -> tail (600ms) -> HYBRID FAST FINALIZE
+doc.getElementById('recordBtn').click(); // stop -> tail (250ms) -> HYBRID FAST FINALIZE
 // Hybrid no longer blocks the batch refine on the realtime engine's finalize
 // (the old await-final + commit-quiet wait): sessionPcm is complete after the
 // tail, so the refine begins as soon as TAIL_MS elapses.
-await sleep(680); // tail done (600ms); refine has begun (fetch delayMs 400)
+await sleep(400); // tail done (250ms); refine in flight (fetch delayMs 400, resolves ~650ms after stop)
 check('refining status shown', status().includes('Refining via batch'), status());
 check('link pill refining', doc.getElementById('linkPill').textContent === 'refining…', doc.getElementById('linkPill').textContent);
-await sleep(450); // refine resolves (~1000ms after stop) and delivers
+await sleep(450); // refine resolves (~650ms after stop) and delivers
 check('exactly one refine upload', fetchCalls.length === fCount12 + 1, fetchCalls.length - fCount12);
 const refineCall = fetchCalls[fetchCalls.length - 1];
 const refineFile = refineCall.form && refineCall.form.get('file');
@@ -868,11 +873,11 @@ console.log('--- scenario 19: phone mic session ---');
       transcribeSock.msg({ message_type: 'session_started', config: {} });
       // Use `text` field (ElevenLabs format); fires while recording so it seeds finalizedSegments
       transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
-      // Stop recording; tail window runs for TAIL_MS (600ms)
+      // Stop recording; tail window runs for TAIL_MS (250ms)
       doc19b.getElementById('recordBtn').click();
       await sleep(700); // > TAIL_MS — beginCommitPhase now sends commit:true
       // Server responds with a final committed transcript after the commit; this triggers
-      // the COMMIT_QUIET_MS (350ms) close path instead of the 2500ms deadline
+      // the COMMIT_QUIET_MS (150ms) close path instead of the 2500ms deadline
       transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
       await sleep(500); // > COMMIT_QUIET_MS — WS closes -> finalizeSession -> deliverFinalText
       // After delivery, should have POSTed to /api/session/ABC123/deliver

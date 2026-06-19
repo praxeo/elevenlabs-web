@@ -1913,9 +1913,9 @@ right lower quadrant"></textarea>
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
   const CONNECT_TIMEOUT_MS = 5000;  // WebSocket must open within this or the dictation fails loudly
-  const TAIL_MS            = 600;   // keep streaming audio this long after PTT release (anti-clipping)
-  const FINAL_WAIT_MS      = 2500;  // max wait for the final committed transcript after commit
-  const COMMIT_QUIET_MS    = 350;   // close this soon after the last committed transcript arrives
+  const TAIL_MS            = 250;   // [LATENCY] keep streaming audio this long after PTT release (anti-clipping); Soniox finalizes ~73ms post-release so 600 was pure overhead — bump to ~350 if a crisp-ending word ever clips
+  const FINAL_WAIT_MS      = 2500;  // max wait for the final committed transcript after commit (safety deadline; committed arrives ~73ms after commit so it rarely bites)
+  const COMMIT_QUIET_MS    = 150;   // [LATENCY] close this soon after the last committed transcript; tuned for the Soniox default (Soniox closes its own socket ~85ms post-commit, pre-empting this) — ?rt=el finalizes slower
   const PENDING_CHUNK_CAP  = 400;   // ~35s of audio buffered while the socket connects
   const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)

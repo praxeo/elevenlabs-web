@@ -130,6 +130,7 @@ Resilience contract — every layer of this link fails silently by default; do n
 - **Frame vocabulary (engine-agnostic):** Client → server through the `sendAudioChunk` chokepoint: `{"message_type":"input_audio_chunk","audio_base_64":"…","commit":false,"sample_rate":16000}`; final flush sets `commit:true` (empty audio). `previous_text` may ride only the first chunk; the Worker drops it for realtime. Server → client (the client AND phone listener consume these): `session_started`, `partial_transcript`, `committed_transcript`, and **any frame carrying a string `error` takes the loud error path** (never match error types by name). The Worker synthesizes an `error` frame + `1008` close on handshake failure and maps any engine error / abnormal close to one.
 - **Keyterms** live in **`keyterms.js`** (`export const KEYTERM_PRESETS`, imported by `worker.js`), three-tier: `always:true` lists ride every dictation (pay the ~20 % surcharge — keep minimal), the rest are checkboxes (`presetIds` in `_v9` settings). Injected into the page via the `__KEYTERM_PRESETS__` token (**function replacer only**). Client merges via `effectiveKeyterms` (trim priority **custom > checked presets > always-on**). **Cap is transport-gated**: the default Soniox path sends the FULL list (≤300 terms / 49 chars, with an 8000-char total-context budget guard server-side — Soniox hard-caps context at 10000 chars); only `?rt=el` uses the 50-term/20-char cap; batch gets ≤1000. `sanitizeKeyterms` (server) + client caps both apply.
 - **Audio pipeline:** 48 kHz float → `handleAudioFrame` → averaged downsample to 16 kHz → s16le → base64 (stream) and, in hybrid, the same buffers → `buildWavBlob` (44-byte RIFF header) → POST. **getUserMedia constraints: `noiseSuppression` DEFAULTS ON** (streaming STT is far more noise-sensitive than batch — this was a major accuracy win; `autoGainControl:false`, per-device A/B pending). The **frame pump is an AudioWorklet served from a real same-origin route `GET /pcm-pump.js`** (NOT a Blob URL — the Blob form silently failed to register on real browsers, forcing the starving main-thread ScriptProcessor; that was the true cause of garbled realtime). `buildPumpNode` adds the module **once per AudioContext** and **retries `new AudioWorkletNode`** across the registration race; Blob URL is a second fallback, ScriptProcessor the last resort. 4096-sample (~85 ms) frames; the size is matched so `capturePcm`/`MIN_REFINE_BYTES` byte math holds.
+- **Finalize/upload latency optimizations (`[LATENCY]`-tagged in `worker.js`).** Three keep the stop→clipboard path short and are easy to regress: (1) the **batch-mode `MediaRecorder` uses `start(1000)`** (timeslice) so chunks accrue *during* recording and `onstop` only flushes the last <1 s instead of the whole take — don't drop the timeslice arg (the realtime/hybrid *preview* recorder is separate and intentionally plain `start()`). (2) **`precomputedBatchKeyterms`** snapshots the `effectiveKeyterms()` merge/dedup (which walks the full preset list) at session *start*, off the stop→upload critical path. (3) A **TLS pre-warm** (`new Image().src="/favicon.ico?warm=…"` for batch/hybrid at session start) opens TCP/TLS before the upload — deliberately an `Image`, not `fetch()`, so it never consumes a batch queue slot or trips the test harness's queue-driven `fetch` mock. The hybrid refine also no longer waits for the realtime engine's finalize (see the state machine). See `LATENCY_PLAN.md` for the measured breakdown.
 - **`/api/nova-probe`** — a **TEMPORARY** capability-gated diagnostic (gated by `env.PROBE_KEY` OR the app passphrase): POST base64 16k PCM + `transport:"soniox"|"el"` (or a Nova cfg) and it streams it server-side and returns the transcript + `first_partial_ms`/`first_commit_ms`. Used to verify engines/latency without a mic. **Remove after the realtime work concludes** (along with `wavHeaderBytes`/`handleNovaProbe` + the route).
 
 ## Validation (no browser needed)
@@ -183,14 +184,14 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | Constant | Default | Meaning |
 |---|---|---|
 | `CONNECT_TIMEOUT_MS` | 5000 | WS must open within this or loud-fail |
-| `TAIL_MS` | 600 | Post-release audio tail (anti-clipping) |
-| `FINAL_WAIT_MS` | 2500 | Max wait for final commit after flush |
-| `COMMIT_QUIET_MS` | 350 | Close this soon after the last committed transcript |
+| `TAIL_MS` | 250 | Post-release audio tail (anti-clipping). Was 600; cut because Soniox finalizes ~73 ms post-release so the extra tail was pure latency. Bump to ~350 if a crisp-ending word ever clips. |
+| `FINAL_WAIT_MS` | 2500 | Max wait for final commit after flush (safety deadline; committed arrives ~73 ms after commit so it rarely bites) |
+| `COMMIT_QUIET_MS` | 150 | Close this soon after the last committed transcript. Was 350; tuned for the Soniox default (Soniox closes its own socket ~85 ms post-commit, pre-empting this) — `?rt=el` finalizes slower, so re-test if EL becomes a daily path. |
 | `FLATLINE_RMS` | 0.0008 | Dead-mic threshold for the watchdog |
 | `PENDING_CHUNK_CAP` | 400 | ≈ 35 s buffered while connecting |
 | `HOTKEY_TAP_MS` | 400 | Hotkey press shorter = tap (toggle), longer = hold (PTT) |
 | `PREROLL_MS` | 400 | Idle audio prepended at session start (first-word rescue) |
-| `BATCH_UPLOAD_TIMEOUT_MS` | 30000 | Pure batch upload + transcription deadline |
+| `BATCH_UPLOAD_TIMEOUT_MS` | 15000 | Pure batch upload + transcription deadline (was 30000; a hung request now fails faster) |
 | `REFINE_TIMEOUT_MS` | 8000 | Hybrid refine deadline (live text is the fallback) |
 | `SESSION_PCM_CAP_BYTES` | 24 MiB | Hybrid capture cap (~12.5 min); past it, live text wins |
 | `MIN_REFINE_BYTES` | 16000 | ~0.5 s; below this the hybrid refine is skipped |
@@ -201,7 +202,7 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | `RELAY_TIMEOUT_MS` | 10000 | Phone→room delivery ack deadline (a hung relay fails loudly; the queued next session waits on the ack) |
 | `DELIVERY_REPLAY_WINDOW_MS` | 120000 | (Worker, top of file) room replays the held delivery to reconnecting listeners |
 
-The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.6 s + final-wait 2.5 s + refine 8 s ≈ 11 s). If you raise the client deadlines, raise it too.
+The AHK script's `CLIP_TIMEOUT := 20` is sized for hybrid's worst case (tail 0.25 s + final-wait 2.5 s + refine 8 s ≈ 10.75 s; pure batch's 15 s upload deadline also fits under it). If you raise the client deadlines, raise it too.
 
 ## Deployment
 

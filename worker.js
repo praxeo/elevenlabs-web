@@ -23,38 +23,6 @@ export class SessionRoom {
       const [client, server] = Object.values(new WebSocketPair());
       server.accept();
 
-      // PUBLISHER role (the phone in DIRECT-stream mode): it streams straight to
-      // Soniox, so the Worker is no longer in the audio path to mirror transcripts
-      // — the phone pushes its translated frames here instead. Its messages are
-      // broadcast to listeners (and a phone_delivery is retained); on disconnect
-      // we synthesize phone_session_end so the desktop's fallback/grace fires
-      // exactly as it did when the Worker proxied the stream (crash resilience).
-      if (url.searchParams.get("role") === "pub") {
-        const broadcast = (message) => {
-          for (const [lid, lws] of this.listeners) {
-            try { lws.send(message); } catch { this.listeners.delete(lid); }
-          }
-        };
-        server.addEventListener("message", (event) => {
-          const message = typeof event.data === "string" ? event.data : "";
-          if (!message) return;
-          let mt = "";
-          try { mt = (JSON.parse(message) || {}).message_type || ""; } catch {}
-          if (mt === "ping") { try { server.send(JSON.stringify({ message_type: "pong" })); } catch {} return; }
-          if (mt === "phone_delivery") this.lastDelivery = { body: message, ts: Date.now() };
-          broadcast(message);
-        });
-        let ended = false;
-        const onEnd = () => {
-          if (ended) return;
-          ended = true;
-          broadcast(JSON.stringify({ message_type: "phone_session_end" }));
-        };
-        server.addEventListener("close", onEnd);
-        server.addEventListener("error", onEnd);
-        return new Response(null, { status: 101, webSocket: client });
-      }
-
       const id = crypto.randomUUID();
       this.listeners.set(id, server);
       server.addEventListener("close", () => this.listeners.delete(id));
@@ -100,59 +68,16 @@ export class SessionRoom {
   }
 }
 
-// AudioWorklet pump module, served at /pcm-pump.js as a REAL same-origin script.
-// This replaced a Blob-URL worklet that failed in production: some browsers
-// resolve audioCtx.audioWorklet.addModule(blobUrl) WITHOUT actually registering
-// the processor ("The node name 'pcm-pump' is not defined in
-// AudioWorkletGlobalScope"), silently forcing the deprecated main-thread
-// ScriptProcessor fallback — which starves under UI load and drops audio frames,
-// the true root cause of slow/garbled realtime across every engine (batch was
-// immune: MediaRecorder is off-thread). A real same-origin URL with a JS MIME
-// type is the reliable way to load a worklet. The processor name ('pcm-pump')
-// and frame size (4096) MUST match the client (PUMP_FRAME_SAMPLES). It buffers
-// 128-sample render quanta into 4096-sample frames on the audio render thread and
-// posts owned (transferred) copies to the main thread.
-const PCM_PUMP_WORKLET_JS =
-  "class PcmPump extends AudioWorkletProcessor {" +
-  "constructor(){super();this._buf=new Float32Array(4096);this._n=0;}" +
-  "process(inputs){" +
-  "var input=inputs[0];" +
-  "if(input&&input[0]){var ch=input[0];" +
-  "for(var i=0;i<ch.length;i++){this._buf[this._n++]=ch[i];" +
-  "if(this._n>=this._buf.length){var out=this._buf.slice(0);this.port.postMessage(out,[out.buffer]);this._n=0;}}}" +
-  "return true;}}" +
-  "registerProcessor('pcm-pump',PcmPump);";
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
     if (url.pathname === "/api/transcribe") {
-      // One path, two protocols: a WebSocket upgrade reaches the realtime
-      // proxy, a plain POST reaches the batch proxy. Backward compatible
-      // with both pre-merge clients.
-      if (request.headers.get("Upgrade") === "websocket") {
-        return handleTranscribeRealtime(request, env);
-      }
+      // Batch-only: the recorded audio blob is POSTed for transcription.
       if (request.method === "POST") {
         return handleTranscribeBatch(request, env);
       }
-      return new Response("Expected WebSocket upgrade or POST", { status: 400 });
-    }
-
-    // TEMPORARY realtime-accuracy diagnostic (capability-gated; remove later).
-    if (url.pathname === "/api/nova-probe") {
-      return handleNovaProbe(request, env);
-    }
-
-    // Direct-stream auth: mint a short-lived Soniox temporary API key so the
-    // browser can open the realtime WS straight to Soniox (no Worker proxy hop
-    // on the audio path) — the lowest-latency path, matching Soniox's own demo.
-    // The long-lived SONIOX_API_KEY never leaves the Worker; the temp key is
-    // single-use + short-lived + session-duration-capped, and minting is gated
-    // by the shared-mode passphrase exactly like the realtime/batch paths.
-    if (url.pathname === "/api/soniox-token") {
-      return handleSonioxToken(request, env);
+      return new Response("Expected POST", { status: 400 });
     }
 
     if (url.pathname === "/" || url.pathname === "/index.html") {
@@ -204,19 +129,6 @@ export default {
       return new Response(null, { status: 204 });
     }
 
-    // AudioWorklet pump module — served as a real same-origin script so the
-    // worklet actually registers (the Blob-URL form silently failed to register
-    // on some browsers, forcing the starving ScriptProcessor fallback).
-    if (url.pathname === "/pcm-pump.js") {
-      return new Response(PCM_PUMP_WORKLET_JS, {
-        headers: {
-          "content-type": "text/javascript; charset=utf-8",
-          "cache-control": "public, max-age=3600",
-          "access-control-allow-origin": "*",
-        },
-      });
-    }
-
     // Phone mic session relay via Durable Object
     if (url.pathname.startsWith("/api/session/")) {
       const parts = url.pathname.split("/"); // ["","api","session",code,?action]
@@ -252,888 +164,6 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
-
-// ─── Deepgram Nova-3 realtime STT (Cloudflare Workers AI) ───
-// The realtime engine (and hybrid's live-feedback leg) streams to Deepgram
-// Nova-3 hosted ON Workers AI (@cf/deepgram/nova-3) via the env.AI binding, so
-// audio never leaves Cloudflare (no external hop — the whole point of the swap).
-// Batch and the hybrid accuracy refine still go to ElevenLabs (handleTranscribeBatch).
-// The client's pump produces 16 kHz s16le mono PCM; Deepgram takes raw binary PCM.
-//
-// VERIFY-ON-LIVE (from the doc research): Cloudflare publishes the {websocket:true}
-// run form and the medical `mode` enum, but does NOT publish nova-3's STREAMING
-// frame shape (only its batch output schema) and `sample_rate` is absent from
-// nova-3's input schema. So the translator below is defensive across the three
-// plausible frame shapes and surfaces an UNRECOGNIZED first frame loudly, so the
-// real wire shape (and whether sample_rate/mode took) is caught on the first test
-// rather than silently producing a blank or wrong chart.
-const NOVA3_MODEL = "@cf/deepgram/nova-3";
-
-// Decode a base64 string to raw bytes (Deepgram wants binary PCM frames).
-function b64ToBytes(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-// Client frame vocabulary -> Deepgram backend frames. The client sends every audio
-// frame through one chokepoint: {message_type:"input_audio_chunk", audio_base_64, commit}.
-// Deepgram wants raw PCM bytes as binary WS frames; the final flush (commit) is
-// signalled with ONLY {"type":"CloseStream"} — Deepgram-on-Workers-AI rejects other
-// control variants (it returned "unknown variant `Finalize`/`KeepAlive`, expected
-// `CloseStream`"), and CloseStream alone ends input so Deepgram returns finals +
-// Metadata then closes. Returns an array whose items are Uint8Array (audio) or a
-// JSON control string. If the control frame is somehow not honored, the client's
-// FINAL_WAIT_MS close path is the backstop — a missed finalize can't lose text.
-export function novaClientToBackend(raw) {
-  let m;
-  try { m = JSON.parse(raw); } catch { return []; }
-  if (!m || m.message_type !== "input_audio_chunk") return [];
-  const out = [];
-  if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
-    out.push(b64ToBytes(m.audio_base_64));
-  }
-  if (m.commit) {
-    out.push(JSON.stringify({ type: "CloseStream" }));
-  }
-  return out;
-}
-
-// Deepgram streaming responses -> client frame vocabulary. Defensive across the
-// THREE plausible on-wire shapes (Cloudflare does not publish the nova-3 streaming
-// envelope): (A) native Deepgram Results {type:"Results", is_final, speech_final,
-// from_finalize, channel.alternatives[0].transcript}; (B) batch-style
-// {results.channels[0].alternatives[0].transcript}; (C) Flux-style {event, transcript}.
-// Emits a running partial_transcript as text accrues, and a committed_transcript at
-// finalize / Metadata / end-of-turn. ANY frame carrying a string error takes the
-// loud {error} path. An UNRECOGNIZED first frame is surfaced loudly (test-build
-// diagnostic) so the real shape is observed instead of yielding a silent blank.
-export function makeNova3ToClient(tier) {
-  let finalText = "";       // accumulated final (locked) text
-  let startedSent = false;
-  let sawText = false;      // have we emitted any transcript frame?
-  let probed = false;       // have we surfaced the unknown-shape diagnostic?
-  return function translate(raw) {
-    let m;
-    try { m = JSON.parse(raw); } catch { return []; }
-    if (!m || typeof m !== "object") return [];
-    const out = [];
-
-    if (!startedSent) {
-      startedSent = true;
-      // config.tier surfaces which Nova-3 config opened (medical/general/minimal)
-      // so the live status can show whether the medical model is actually active.
-      out.push(JSON.stringify({ message_type: "session_started", config: { tier: tier || "" } }));
-    }
-
-    // Loud error path — any error-shaped frame.
-    if (typeof m.error === "string" && m.error) {
-      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 " + m.error })); return out;
-    }
-    if (typeof m.type === "string" && /error|fatal/i.test(m.type)) {
-      out.push(JSON.stringify({ message_type: "error", error: "Nova-3 " + (m.description || m.message || m.reason || m.type) })); return out;
-    }
-
-    // Metadata = end of stream after CloseStream -> emit the ONE committed_transcript
-    // that locks the note in (mirrors how the Soniox path committed once on
-    // `finished`). Committing here, NOT on every speech_final, is what prevents the
-    // client (which APPENDS each committed_transcript) from duplicating cumulative
-    // text into "hello hello world".
-    if (m.type === "Metadata") {
-      if (finalText) out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
-      return out;
-    }
-
-    // Benign Deepgram lifecycle frames — ignore (Connected is the handshake frame
-    // sent first; SpeechStarted/UtteranceEnd are streaming events we don't need).
-    if (m.type === "Connected" || m.type === "SpeechStarted" || m.type === "UtteranceEnd") return out;
-
-    // Transcript frame. Don't gate on type==="Results" — accept ANY frame carrying a
-    // channel.alternatives[0] (Cloudflare's own example keys off this, not the type).
-    // is_final segments accumulate into finalText; the running partial_transcript
-    // (finalText + the live interim tail) is the live view. committed_transcript is
-    // emitted ONCE, on Metadata, so there is no append-duplication.
-    const alt0 = m.channel && Array.isArray(m.channel.alternatives) && m.channel.alternatives[0];
-    if (alt0) {
-      sawText = true;
-      const t = (alt0.transcript || "").trim();
-      if (m.is_final === true) {
-        if (t) finalText = finalText ? finalText + " " + t : t;
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
-      } else {
-        out.push(JSON.stringify({ message_type: "partial_transcript", text: (finalText ? finalText + " " : "") + t }));
-      }
-      return out;
-    }
-
-    // (B) batch-style envelope (results.channels[]) — defensive; show the text as a
-    // running partial (committed still comes once via Metadata / the close backstop).
-    if (m.results && m.results.channels && m.results.channels[0] &&
-        m.results.channels[0].alternatives && m.results.channels[0].alternatives[0]) {
-      sawText = true;
-      finalText = m.results.channels[0].alternatives[0].transcript || finalText;
-      out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText }));
-      return out;
-    }
-
-    // (C) Flux-style turn protocol (event/transcript) — defensive.
-    if (typeof m.event === "string" && typeof m.transcript === "string") {
-      sawText = true;
-      const tt = m.transcript.trim();
-      if (m.event === "EndOfTurn") { if (tt) finalText = finalText ? finalText + " " + tt : tt; out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText })); }
-      else out.push(JSON.stringify({ message_type: "partial_transcript", text: (finalText ? finalText + " " : "") + tt }));
-      return out;
-    }
-
-    // Any other unknown frame: ignore it (do NOT fabricate text, do NOT fail loudly).
-    // The discovery diagnostic is retired now that the real protocol is known
-    // (Connected -> Results… -> Metadata); a stray unknown frame must not kill a
-    // dictation. Log server-side for visibility.
-    try { if (!probed) { probed = true; console.log("nova3 unhandled frame:", raw.slice(0, 200)); } } catch (e) {}
-    return out;
-  };
-}
-
-// ===== Soniox stt-rt-v5 realtime (opt-in via ?rt=soniox) — sub-second word-by-word
-// token streaming, the fastest live-feedback option. Uses SONIOX_API_KEY (set as a
-// secret). Auth + config are the FIRST JSON frame (the Worker sends it, not the
-// client); audio is raw BINARY PCM; the commit flush is an empty string =
-// end-of-audio. The client frame vocabulary is preserved via the translators. =====
-const SONIOX_WS_URL = "https://stt-rt.soniox.com/transcribe-websocket";
-const SONIOX_MODEL = "stt-rt-v5";
-
-// Client input_audio_chunk -> Soniox: base64 audio -> raw binary PCM frame; on
-// commit, an empty string signals end-of-audio (Soniox then flushes finals +
-// `finished` and closes). Exported for tests.
-export function sonioxClientToBackend(raw) {
-  let m;
-  try { m = JSON.parse(raw); } catch { return []; }
-  if (!m || m.message_type !== "input_audio_chunk") return [];
-  const out = [];
-  if (typeof m.audio_base_64 === "string" && m.audio_base_64.length) {
-    out.push(b64ToBytes(m.audio_base_64));
-  }
-  if (m.commit) out.push(""); // empty string = end-of-audio
-  return out;
-}
-
-// Soniox responses -> client (the normalized frame vocabulary). Soniox streams
-// token objects with an is_final flag: final tokens are confirmed (sent once),
-// non-final are provisional (resent each response). Accumulate confirmed text and
-// emit, each response, a partial_transcript of confirmed + provisional tail; on
-// `finished` emit a committed_transcript with the confirmed text so the client
-// locks it in. Control markers (<end>/<fin>) are dropped. Any error_code becomes a
-// loud {error}. Exported for tests.
-export function makeSonioxToClient() {
-  let finalText = "";
-  let startedSent = false;
-  return function translate(raw) {
-    let m;
-    try { m = JSON.parse(raw); } catch { return []; }
-    if (!m || typeof m !== "object") return [];
-    const out = [];
-    if (!startedSent) {
-      startedSent = true;
-      out.push(JSON.stringify({ message_type: "session_started", config: {} }));
-    }
-    if (m.error_code) {
-      out.push(JSON.stringify({
-        message_type: "error",
-        error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : ""),
-      }));
-      return out;
-    }
-    let newFinal = "", nonFinal = "";
-    if (Array.isArray(m.tokens)) {
-      for (const t of m.tokens) {
-        if (!t || typeof t.text !== "string") continue;
-        if (/^\s*<[^>]+>\s*$/.test(t.text)) continue; // drop <end>/<fin> markers
-        if (t.is_final) newFinal += t.text; else nonFinal += t.text;
-      }
-    }
-    finalText += newFinal;
-    out.push(JSON.stringify({ message_type: "partial_transcript", text: finalText + nonFinal }));
-    if (m.finished) out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
-    return out;
-  };
-}
-
-// Mint a Soniox temporary API key for direct browser streaming. POST (passphrase
-// in the JSON body in shared mode; same constant-time gate as everything else).
-// Returns Soniox's create-temporary-api-key response verbatim ({ api_key,
-// expires_at, ... }). Failures are loud (non-200 + error string) so the client
-// can fall back to the Worker-proxy transport instead of silently breaking.
-const SONIOX_TOKEN_URL = "https://api.soniox.com/v1/auth/temporary-api-key";
-async function handleSonioxToken(request, env) {
-  if (request.method !== "POST") {
-    return json({ error: "Expected POST" }, 405);
-  }
-  let body = {};
-  try { body = await request.json(); } catch { body = {}; }
-
-  // Shared-mode passphrase gate (constant-time), mirroring handleTranscribeRealtime.
-  const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
-  if (serverPass) {
-    const given = String((body && body.passphrase) || "").trim();
-    if (!safeEqual(given, serverPass)) {
-      return json({ error: "Unauthorized passphrase" }, 401);
-    }
-  }
-
-  const sonioxKey = ((env && env.SONIOX_API_KEY) || "").trim();
-  if (!sonioxKey) {
-    return json({ error: "SONIOX_API_KEY not set — direct streaming unavailable" }, 500);
-  }
-
-  // single_use + short expiry + a per-stream duration cap bound a leaked/replayed
-  // key: it can open exactly one stream, only in the next ~2 min, for at most one
-  // long push-to-talk dictation. client_reference_id tags usage logs per session.
-  const ref = String((body && body.client_reference_id) || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
-  const payload = {
-    usage_type: "transcribe_websocket",
-    expires_in_seconds: 120,
-    single_use: true,
-    max_session_duration_seconds: 600,
-  };
-  if (ref) payload.client_reference_id = ref;
-
-  try {
-    const resp = await fetch(SONIOX_TOKEN_URL, {
-      method: "POST",
-      headers: { "Authorization": "Bearer " + sonioxKey, "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const text = await resp.text();
-    if (!resp.ok) {
-      return json({ error: "Soniox token mint failed (" + resp.status + ") " + text.slice(0, 200) }, 502);
-    }
-    // Pass Soniox's JSON straight through (content-type already JSON).
-    return new Response(text, {
-      status: 200,
-      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
-    });
-  } catch (e) {
-    return json({ error: "Soniox token mint threw: " + ((e && e.message) || String(e)).slice(0, 200) }, 502);
-  }
-}
-
-async function handleTranscribeRealtime(request, env) {
-  // Realtime STT uses WebSockets. Verify handshake upgrade
-  if (request.headers.get("Upgrade") !== "websocket") {
-    return new Response("Expected WebSocket upgrade", { status: 400 });
-  }
-
-  // Create client/server pair early so we can safely report errors back to the browser UI
-  const [clientWs, workerWs] = new WebSocketPair();
-
-  // Helper to accept client socket and send a JSON error frame before closing
-  const returnWsError = (errorMsg) => {
-    workerWs.accept();
-    workerWs.send(JSON.stringify({ message_type: "error", error: errorMsg }));
-    workerWs.close(1008, "handshake_failed");
-    return new Response(null, { status: 101, webSocket: clientWs });
-  };
-
-  try {
-    const url = new URL(request.url);
-
-    // Realtime is Deepgram Nova-3 on Workers AI (env.AI) — there is NO third-party
-    // STT key. The only access gate is the shared-mode passphrase (so the billed AI
-    // binding can't be driven anonymously). Single-tenant deploys (no APP_PASSPHRASE)
-    // need no realtime credential — there is no key to protect.
-    const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
-    if (serverPass) {
-      const given = String(url.searchParams.get("passphrase") || "").trim();
-      if (!safeEqual(given, serverPass)) {
-        return returnWsError("Unauthorized passphrase");
-      }
-    }
-    if (!env || !env.AI) {
-      return returnWsError("Workers AI binding (AI) is not configured");
-    }
-
-    // Phone mic relay: if a session code is present, relay transcript events to
-    // the DO room so a desktop listener sees them in real time (fire-and-forget).
-    const sessionCode = (url.searchParams.get("session") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-    const doStub = (sessionCode && sessionCode.length >= 4 && env && env.SESSION_ROOM)
-      ? env.SESSION_ROOM.get(env.SESSION_ROOM.idFromName(sessionCode))
-      : null;
-
-    // Keyterms (medical proper nouns / drug names) bias recognition. On the
-    // in-process binding (default) Workers AI exposes `keyterm` as a SINGLE cfg
-    // string, so terms are space-joined there. On the AI Gateway / native
-    // Deepgram query-string transports the CORRECT form is a REPEATED keyterm
-    // query param per term (Deepgram keyterm prompting), built as ktQuery below.
-    let keyterms = [];
-    try { keyterms = JSON.parse(url.searchParams.get("keyterms_json") || "[]"); } catch { keyterms = []; }
-    // maxTerms 300 so the Soniox path (large context budget) can bias on the full
-    // preset list; the EL realtime branch re-sanitizes to its 50/20 cap, and the
-    // Soniox branch applies an 8000-char total-context budget guard. The Nova
-    // binding/gateway paths just space-join or repeat what fits.
-    const cleanedKeyterms = sanitizeKeyterms(keyterms, { maxChars: 50, maxWords: 10, maxTerms: 300 });
-    const ktQuery = cleanedKeyterms.map((t) => "&keyterm=" + encodeURIComponent(t)).join("");
-
-    // Binding (default) nova-3 config — the SECOND arg of env.AI.run (NOT a query
-    // string, NOT a post-open frame). PROVEN (live param-probe): the Workers AI
-    // nova-3 binding 500s on boolean/number values — every value must be a STRING
-    // ("true", "16000", ...). The binding schema has NO sample_rate property (only
-    // Flux's does); whether it FORWARDS sample_rate to Deepgram is the open
-    // question /api/nova-probe settles, and the leading suspect for
-    // "slow=clean/fast=garbled". mode:"medical" 500s on the binding — Deepgram
-    // streaming has no `mode` param; the clinical model is model=nova-3-medical,
-    // reachable only via the gateway/native transports below. endpointing:"false"
-    // keeps continuous PTT speech from being auto-split; CloseStream finalizes.
-    const SR = "16000";
-    const liveCfg = {
-      encoding: "linear16",
-      sample_rate: SR,
-      language: "en-US",
-      interim_results: "true",
-      smart_format: "true",
-      punctuate: "true",
-      numerals: "true",
-      endpointing: "false",
-    };
-    if (cleanedKeyterms.length) liveCfg.keyterm = cleanedKeyterms.join(" ");
-
-    // Realtime transport selector (?rt=). DEFAULT/auto = ElevenLabs Scribe v2
-    // Realtime — probe-verified batch-quality accuracy and prompt finalize, and
-    // it uses the EXISTING ELEVENLABS_API_KEY (no new credential). The Workers-AI
-    // Nova-3 binding was relegated because its managed layer floored interim
-    // cadence at ~1/sec and garbled real noisy-mic speech. Transports:
-    //   auto / rt=soniox -> Soniox stt-rt-v5 (DEFAULT — fastest live feedback:
-    //            ~0.8s first word, word-by-word; uses SONIOX_API_KEY).
-    //   rt=el / rt=scribe -> ElevenLabs Scribe v2 Realtime (uses ELEVENLABS_API_KEY).
-    //   rt=binding / rt=nova -> @cf/deepgram/nova-3 on the env.AI binding.
-    //   rt=flux -> @cf/deepgram/flux on the binding.
-    //   rt=gw  -> AI Gateway "workers-ai" nova-3 (needs CF_AIG_* secrets).
-    //   rt=dgw -> AI Gateway "deepgram" passthrough to nova-3-medical (needs
-    //            CF_AIG_* + DEEPGRAM_API_KEY).
-    // auto falls back Soniox -> ElevenLabs -> binding by which key is present.
-    // EL is a near-IDENTITY passthrough (the client vocabulary was modeled on EL's
-    // protocol); Soniox uses sonioxClientToBackend/makeSonioxToClient; Nova/gateway
-    // use novaClientToBackend/makeNova3ToClient.
-    const rt = String(url.searchParams.get("rt") || "auto").toLowerCase();
-    const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
-    const sonioxKey = ((env && env.SONIOX_API_KEY) || "").trim();
-    // Default (auto) prefers Soniox; EL only takes auto if no Soniox key.
-    const useEl = (rt === "el" || rt === "scribe" || (rt === "auto" && !sonioxKey)) && !!elKey;
-    const acct = ((env && env.CF_ACCOUNT_ID) || "").trim();
-    const gwName = ((env && env.CF_AIG_GATEWAY) || "").trim();
-    const aigToken = ((env && env.CF_AIG_TOKEN) || "").trim();
-    const dgKey = ((env && env.DEEPGRAM_API_KEY) || "").trim();
-
-    let backendWs = null, usedTier = "", diags = [], elPassthrough = false, sonioxMode = false;
-
-    if (useEl) {
-      // ElevenLabs Scribe v2 Realtime. commit_strategy=manual: one final per PTT
-      // push (we drive the commit at release), no VAD mid-utterance splitting.
-      const elTerms = sanitizeKeyterms(keyterms, { maxChars: 20, maxWords: 5, maxTerms: 50 });
-      const noVerbatim = url.searchParams.get("no_verbatim") !== "false";
-      const elp = new URLSearchParams();
-      elp.append("model_id", "scribe_v2_realtime");
-      elp.append("audio_format", "pcm_16000");
-      elp.append("language_code", "en");
-      elp.append("commit_strategy", "manual");
-      elp.append("include_timestamps", "false");
-      elp.append("no_verbatim", String(noVerbatim));
-      for (const t of elTerms) elp.append("keyterms", t);
-      const elUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elp.toString();
-      try {
-        const resp = await fetch(elUrl, { headers: { Upgrade: "websocket", "xi-api-key": elKey } });
-        if (resp && resp.webSocket) { backendWs = resp.webSocket; usedTier = "elevenlabs"; elPassthrough = true; }
-        else {
-          diags.push("el:status=" + (resp && resp.status));
-          try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
-        }
-      } catch (e) { diags.push("el:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
-    } else if (rt === "soniox" || (rt === "auto" && sonioxKey)) {
-      // Soniox stt-rt-v5 (DEFAULT) — sub-second token streaming. Auth + config ride
-      // the first JSON frame (sent in the piping branch); handshake is a bare upgrade.
-      if (!sonioxKey) { diags.push("soniox: SONIOX_API_KEY not set"); }
-      else {
-        try {
-          const resp = await fetch(SONIOX_WS_URL, { headers: { Upgrade: "websocket" } });
-          if (resp && resp.webSocket) { backendWs = resp.webSocket; usedTier = "soniox"; sonioxMode = true; }
-          else {
-            diags.push("soniox:status=" + (resp && resp.status));
-            try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 120)); } catch (e) {}
-          }
-        } catch (e) { diags.push("soniox:threw " + ((e && e.message) || String(e)).slice(0, 80)); }
-      }
-    } else if (rt === "gw" || rt === "dgw") {
-      // Outbound WebSocket from a Worker: fetch() with an Upgrade header, then read
-      // resp.webSocket (NOT `new WebSocket`). Native query params take real strings.
-      if (!acct || !gwName || !aigToken) {
-        return returnWsError("Gateway transport rt=" + rt + " needs CF_ACCOUNT_ID + CF_AIG_GATEWAY + CF_AIG_TOKEN secrets");
-      }
-      const baseQs = "encoding=linear16&sample_rate=16000&channels=1&language=en-US&interim_results=true&endpointing=false&smart_format=true&punctuate=true&numerals=true";
-      let gwUrl, headers;
-      if (rt === "gw") {
-        gwUrl = "https://gateway.ai.cloudflare.com/v1/" + acct + "/" + gwName +
-          "/workers-ai?model=" + encodeURIComponent("@cf/deepgram/nova-3") + "&" + baseQs + ktQuery;
-        headers = { Upgrade: "websocket", "cf-aig-authorization": "Bearer " + aigToken };
-        usedTier = "gw-nova3";
-      } else {
-        if (!dgKey) return returnWsError("rt=dgw needs DEEPGRAM_API_KEY secret");
-        gwUrl = "https://gateway.ai.cloudflare.com/v1/" + acct + "/" + gwName +
-          "/deepgram/v1/listen?model=nova-3-medical&" + baseQs + ktQuery;
-        headers = { Upgrade: "websocket", "cf-aig-authorization": "Bearer " + aigToken, "Authorization": "Token " + dgKey };
-        usedTier = "dgw-medical";
-      }
-      try {
-        const resp = await fetch(gwUrl, { headers });
-        if (resp && resp.webSocket) backendWs = resp.webSocket;
-        else {
-          diags.push(usedTier + ":status=" + (resp && resp.status));
-          try { if (resp && typeof resp.clone === "function") diags.push((await resp.clone().text()).slice(0, 80)); } catch (e) {}
-        }
-      } catch (e) { diags.push(usedTier + ":threw " + ((e && e.message) || String(e)).slice(0, 60)); }
-    } else {
-      // Binding transports (default + flux), all-string cfg.
-      const tiers = (rt === "flux")
-        ? [{ label: "flux", model: "@cf/deepgram/flux", cfg: { encoding: "linear16", sample_rate: SR, eot_threshold: "0.8", eot_timeout_ms: "8000" } }]
-        : [
-            { label: "live", model: NOVA3_MODEL, cfg: liveCfg },
-            // Safety fallback: the proven-minimal config (finals only) if the full one ever fails.
-            { label: "bare", model: NOVA3_MODEL, cfg: { encoding: "linear16", sample_rate: SR } },
-          ];
-      for (const t of tiers) {
-        let r = null;
-        try { r = await env.AI.run(t.model, t.cfg, { websocket: true }); }
-        catch (e) { diags.push(t.label + ":threw " + (e?.message || String(e)).slice(0, 60)); continue; }
-        if (r && r.webSocket) { backendWs = r.webSocket; usedTier = t.label; break; }
-        let d = t.label + ":status=" + (r && r.status);
-        try { if (r && typeof r.clone === "function") { const b = await r.clone().text(); d += " " + b.slice(0, 70); } } catch (e) {}
-        diags.push(d);
-      }
-    }
-    try { console.log("realtime connect:", usedTier || "NONE", "rt=" + rt, "|", diags.join(" || ")); } catch (e) {}
-    if (!backendWs) {
-      return returnWsError("Realtime connect failed [" + diags.join(" | ") + "]");
-    }
-
-    backendWs.accept();
-    workerWs.accept();
-
-    // Once the client's commit flush is forwarded we latch input closed so a late
-    // ~85 ms pump frame can't reopen the stream mid-finalize. The PTT audio is
-    // continuous (pre-gate), so no KeepAlive is needed before the held release.
-    let inputEnded = false;
-
-    if (elPassthrough) {
-      // ElevenLabs realtime: the client vocabulary IS EL's native protocol, so
-      // forward JSON both ways (near-identity). The client's empty-audio
-      // {commit:true} flush IS EL's commit — forward as-is, then latch. Drop
-      // previous_text (cross-press drift; EL also rejects it past the first chunk).
-      workerWs.addEventListener("message", (event) => {
-        if (inputEnded) return;
-        let raw = event.data, isCommit = false;
-        try {
-          const m = JSON.parse(event.data);
-          if (m && m.message_type === "input_audio_chunk") {
-            if (m.commit) isCommit = true;
-            if (m.previous_text) { delete m.previous_text; raw = JSON.stringify(m); }
-          }
-        } catch (e) {}
-        try { backendWs.send(raw); } catch (e) {}
-        if (isCommit) inputEnded = true;
-      });
-      // EL -> browser: frames already match the client vocabulary (session_started /
-      // partial_transcript / committed_transcript / error) — forward raw, and mirror
-      // into the phone room for live desktop feedback.
-      backendWs.addEventListener("message", (event) => {
-        try { workerWs.send(event.data); } catch (e) {}
-        if (doStub) {
-          doStub.fetch("https://session-room/broadcast", { method: "POST", body: event.data })
-                .catch(() => {});
-        }
-      });
-    } else if (sonioxMode) {
-      // Soniox: config-first (auth + audio format + medical context terms), raw
-      // BINARY PCM audio, empty-string end-of-audio on commit. Tokens translate
-      // back to the client vocabulary via makeSonioxToClient.
-      // Accuracy-tuned for PTT medical dictation:
-      //  - enable_endpoint_detection:false — PTT supplies the explicit end-of-audio
-      //    (empty-string commit), so semantic endpointing would only finalize
-      //    mid-sentence on natural pauses and lose right-context (Soniox docs: early
-      //    finalization degrades accuracy).
-      //  - language_hints_strict — stronger English signal (docs: recommended for prod).
-      //  - richer general context — domain/specialty/setting/style biasing.
-      // Soniox context has a HARD ~10000-char total budget; trim terms first
-      // (cleanedKeyterms is already ordered custom>presets>always-on) to stay under,
-      // or the WS handshake fails loudly.
-      const sonioxGeneral = [
-        { key: "domain", value: "Healthcare" },
-        { key: "specialty", value: "Wound care and emergency medicine" },
-        { key: "setting", value: "Clinician dictation of a patient note" },
-        { key: "style", value: "Medical terminology, drug names, abbreviations" },
-      ];
-      const sonioxTerms = [];
-      let sonioxBudget = 8000; // headroom under the 10000-char hard limit (general text counts too)
-      for (const t of cleanedKeyterms) {
-        if (sonioxBudget - (t.length + 1) < 0) break;
-        sonioxTerms.push(t);
-        sonioxBudget -= t.length + 1;
-      }
-      const sonioxConfig = {
-        api_key: sonioxKey,
-        model: SONIOX_MODEL,
-        audio_format: "pcm_s16le",
-        sample_rate: 16000,
-        num_channels: 1,
-        language_hints: ["en"],
-        language_hints_strict: true,
-        enable_endpoint_detection: false,
-        context: sonioxTerms.length ? { general: sonioxGeneral, terms: sonioxTerms } : { general: sonioxGeneral },
-      };
-      try { backendWs.send(JSON.stringify(sonioxConfig)); } catch (e) {}
-      const toClient = makeSonioxToClient();
-      workerWs.addEventListener("message", (event) => {
-        if (inputEnded) return;
-        for (const frame of sonioxClientToBackend(event.data)) {
-          try { backendWs.send(frame); } catch (e) {}
-        }
-        try {
-          const m = JSON.parse(event.data);
-          if (m && m.message_type === "input_audio_chunk" && m.commit) inputEnded = true;
-        } catch (e) {}
-      });
-      backendWs.addEventListener("message", (event) => {
-        for (const frame of toClient(event.data)) {
-          try { workerWs.send(frame); } catch (e) {}
-          if (doStub) {
-            doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
-                  .catch(() => {});
-          }
-        }
-      });
-    } else {
-      const toClient = makeNova3ToClient(usedTier);
-      // Browser -> Deepgram: decode base64 audio -> raw binary PCM; on commit send
-      // CloseStream (novaClientToBackend). Latch closed after commit.
-      workerWs.addEventListener("message", (event) => {
-        if (inputEnded) return;
-        for (const frame of novaClientToBackend(event.data)) {
-          try { backendWs.send(frame); } catch (e) {}
-        }
-        try {
-          const m = JSON.parse(event.data);
-          if (m && m.message_type === "input_audio_chunk" && m.commit) {
-            inputEnded = true;
-          }
-        } catch (e) {}
-      });
-      // Deepgram -> browser: translate result frames into the client frame vocabulary
-      // (and mirror into the phone room for live desktop feedback).
-      backendWs.addEventListener("message", (event) => {
-        for (const frame of toClient(event.data)) {
-          try { workerWs.send(frame); } catch (e) {}
-          if (doStub) {
-            doStub.fetch("https://session-room/broadcast", { method: "POST", body: frame })
-                  .catch(() => {});
-          }
-        }
-      });
-    }
-
-    workerWs.addEventListener("close", () => {
-      try { backendWs.close(); } catch (e) {}
-    });
-
-    backendWs.addEventListener("close", (event) => {
-      // An abnormal close mid-dictation is a real drop — surface it loudly so it's
-      // diagnosable. A normal 1000 close (after finals) carries no error.
-      const code = event && event.code;
-      if (code && code !== 1000 && code !== 1005) {
-        const reason = (event && event.reason) ? (": " + event.reason) : "";
-        const who = usedTier === "elevenlabs" ? "ElevenLabs" : usedTier === "soniox" ? "Soniox" : "Nova-3";
-        try { workerWs.send(JSON.stringify({ message_type: "error", error: who + " closed the realtime socket (" + code + ")" + reason })); } catch (e) {}
-      }
-      try { workerWs.close(); } catch (e) {}
-      if (doStub) {
-        doStub.fetch("https://session-room/broadcast", {
-          method: "POST",
-          body: JSON.stringify({ message_type: "phone_session_end" }),
-        }).catch(() => {});
-      }
-    });
-
-    return new Response(null, {
-      status: 101,
-      webSocket: clientWs,
-    });
-  } catch (err) {
-    return returnWsError(`Worker initialization failed: ${err?.message || String(err)}`);
-  }
-}
-
-// ===== DIAGNOSTIC: realtime STT probe (TEMPORARY — remove after the realtime
-// accuracy investigation concludes). Capability-gated by the env.PROBE_KEY
-// secret (set out-of-band via `wrangler secret put PROBE_KEY`, NEVER committed),
-// so it does not need APP_PASSPHRASE and cannot be driven anonymously despite
-// using the billed AI binding. If PROBE_KEY is unset the endpoint is disabled.
-// It streams caller-supplied 16 kHz s16le PCM to a chosen Workers AI streaming
-// model at a controllable cadence/sample_rate/encoding, sends CloseStream, and
-// returns the transcripts — letting us A/B whether sample_rate is honored,
-// whether real-time vs blast cadence matters, and nova-3 vs flux, no mic. =====
-
-// Minimal server-side 44-byte RIFF/WAVE header (mono s16le) — for the
-// self-describing-container test (does prepending a header make Deepgram
-// auto-detect the rate, sidestepping a dropped sample_rate?).
-function wavHeaderBytes(dataLen, sampleRate) {
-  const h = new ArrayBuffer(44);
-  const v = new DataView(h);
-  const ws = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
-  ws(0, "RIFF"); v.setUint32(4, 36 + dataLen, true); ws(8, "WAVE");
-  ws(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
-  v.setUint32(24, sampleRate, true); v.setUint32(28, sampleRate * 2, true);
-  v.setUint16(32, 2, true); v.setUint16(34, 16, true);
-  ws(36, "data"); v.setUint32(40, dataLen, true);
-  return new Uint8Array(h);
-}
-
-async function handleNovaProbe(request, env) {
-  try {
-    const url = new URL(request.url);
-    // Gate: accept the dedicated PROBE_KEY secret OR the existing APP_PASSPHRASE
-    // (the same credential that already gates shared-mode realtime/batch). This
-    // keeps the billed AI binding from being driven anonymously WITHOUT minting a
-    // new secret — a holder of the app passphrase can run the probe directly.
-    const given = String(url.searchParams.get("key") || "");
-    const probeKey = ((env && env.PROBE_KEY) || "").trim();
-    const appPass = ((env && env.APP_PASSPHRASE) || "").trim();
-    const okKey = (probeKey && safeEqual(given, probeKey)) || (appPass && safeEqual(given, appPass));
-    if (!probeKey && !appPass) return json({ error: "probe: disabled (no PROBE_KEY or APP_PASSPHRASE set)" }, 404);
-    if (!okKey) return json({ error: "probe: bad or missing key" }, 403);
-    if (request.method !== "POST") return json({ error: "probe: POST a JSON body" }, 400);
-    if (!env || !env.AI) return json({ error: "probe: no AI binding" }, 500);
-
-    const body = await request.json();
-    const model = String(body.model || "@cf/deepgram/nova-3");
-    const cfgIn = (body.cfg && typeof body.cfg === "object") ? body.cfg : { encoding: "linear16", sample_rate: "16000" };
-    const cfg = {};                 // binding 500s on non-string values
-    for (const k of Object.keys(cfgIn)) cfg[k] = String(cfgIn[k]);
-    const frameBytes = Math.max(2, (body.frame_bytes | 0) || 2730);   // ~85 ms @16k s16le
-    const cadenceMs  = (body.cadence_ms == null) ? 85 : (body.cadence_ms | 0); // 0 = blast
-    const deadlineMs = Math.min(60000, (body.deadline_ms | 0) || 20000);
-    const prependWav = !!body.prepend_wav;
-    const wavRate    = (body.wav_rate | 0) || 16000;
-
-    let pcm;
-    try {
-      const bin = atob(String(body.pcm_base64 || ""));
-      pcm = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) pcm[i] = bin.charCodeAt(i);
-    } catch (e) { return json({ error: "probe: bad pcm_base64" }, 400); }
-    if (pcm.length < 1000) return json({ error: "probe: pcm too short (" + pcm.length + " bytes)" }, 400);
-
-    // ===== ElevenLabs Scribe v2 Realtime probe branch (transport:"el") =====
-    // Streams the SAME 16k PCM to EL realtime as input_audio_chunk JSON frames and
-    // measures first-partial / first-commit latency — to compare EL's responsiveness
-    // and accuracy against the Workers-AI binding without a live mic.
-    if (String(body.transport || "") === "el") {
-      const elKey = ((env && env.ELEVENLABS_API_KEY) || "").trim();
-      if (!elKey) return json({ error: "probe el: ELEVENLABS_API_KEY not set" }, 500);
-      const elp = new URLSearchParams();
-      elp.append("model_id", String(body.model_id || "scribe_v2_realtime"));
-      elp.append("audio_format", "pcm_16000");
-      elp.append("language_code", "en");
-      elp.append("commit_strategy", String(body.commit_strategy || "manual"));
-      elp.append("include_timestamps", "false");
-      elp.append("no_verbatim", String(body.no_verbatim === true));
-      if (Array.isArray(body.keyterms)) for (const t of body.keyterms.slice(0, 50)) elp.append("keyterms", String(t).slice(0, 20));
-      const elUrl = "https://api.elevenlabs.io/v1/speech-to-text/realtime?" + elp.toString();
-      const t0el = Date.now();
-      let er;
-      try { er = await fetch(elUrl, { headers: { Upgrade: "websocket", "xi-api-key": elKey } }); }
-      catch (e) { return json({ error: "probe el: fetch threw " + (e && e.message || String(e)) }, 502); }
-      const ews = er && er.webSocket;
-      if (!ews) {
-        let d = "status=" + (er && er.status);
-        try { if (er && er.clone) d += " " + (await er.clone().text()).slice(0, 200); } catch (e) {}
-        return json({ error: "probe el: no webSocket (" + d + ")" }, 502);
-      }
-      ews.accept();
-      const elRaw = [], elPartials = [];
-      let committed = "", elClosed = false, elCloseInfo = null, firstPartialAt = 0, firstCommitAt = 0;
-      const elDone = new Promise((resolve) => {
-        ews.addEventListener("message", (ev) => {
-          const s = (typeof ev.data === "string") ? ev.data : "[binary]";
-          if (elRaw.length < 80) elRaw.push(s.slice(0, 300));
-          let m; try { m = JSON.parse(s); } catch (e) { return; }
-          if (!m) return;
-          if (m.message_type === "partial_transcript") { if (!firstPartialAt) firstPartialAt = Date.now() - t0el; if (typeof m.text === "string") elPartials.push(m.text); }
-          else if (m.message_type === "committed_transcript" || m.message_type === "committed_transcript_with_timestamps") { if (!firstCommitAt) firstCommitAt = Date.now() - t0el; if (m.text) committed += (committed ? " " : "") + m.text; }
-        });
-        ews.addEventListener("close", (ev) => { elClosed = true; elCloseInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
-        ews.addEventListener("error", () => resolve());
-      });
-      const sleepEl = (ms) => new Promise((res) => setTimeout(res, ms));
-      const b64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return btoa(s); };
-      let elFrames = 0;
-      for (let off = 0; off < pcm.length; off += frameBytes) {
-        const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
-        try { ews.send(JSON.stringify({ message_type: "input_audio_chunk", audio_base_64: b64(chunk), commit: false, sample_rate: 16000 })); } catch (e) { break; }
-        elFrames++;
-        if (cadenceMs > 0) await sleepEl(cadenceMs);
-      }
-      try { ews.send(JSON.stringify({ message_type: "input_audio_chunk", audio_base_64: "", commit: true, sample_rate: 16000 })); } catch (e) {}
-      await Promise.race([elDone, sleepEl(deadlineMs)]);
-      try { ews.close(); } catch (e) {}
-      return json({
-        ok: true, transport: "el", model_id: elp.get("model_id"), commit_strategy: elp.get("commit_strategy"),
-        frame_bytes: frameBytes, cadence_ms: cadenceMs, pcm_bytes: pcm.length, frames_sent: elFrames, ms: Date.now() - t0el,
-        first_partial_ms: firstPartialAt, first_commit_ms: firstCommitAt,
-        closed: elClosed, close_info: elCloseInfo,
-        final_text: committed, last_partial: elPartials.length ? elPartials[elPartials.length - 1] : "", partial_count: elPartials.length,
-        raw_first_frames: elRaw,
-      });
-    }
-
-    // ===== Soniox stt-rt-v5 probe branch (transport:"soniox") =====
-    if (String(body.transport || "") === "soniox") {
-      const skey = ((env && env.SONIOX_API_KEY) || "").trim();
-      if (!skey) return json({ error: "probe soniox: SONIOX_API_KEY not set" }, 500);
-      const t0s = Date.now();
-      let sr;
-      try { sr = await fetch("https://stt-rt.soniox.com/transcribe-websocket", { headers: { Upgrade: "websocket" } }); }
-      catch (e) { return json({ error: "probe soniox: fetch threw " + (e && e.message || String(e)) }, 502); }
-      const sws = sr && sr.webSocket;
-      if (!sws) {
-        let d = "status=" + (sr && sr.status);
-        try { if (sr && sr.clone) d += " " + (await sr.clone().text()).slice(0, 200); } catch (e) {}
-        return json({ error: "probe soniox: no webSocket (" + d + ")" }, 502);
-      }
-      sws.accept();
-      // Mirror the production Soniox config (endpoint off by default, strict English,
-      // rich general context) so probe scores reflect production. ?enable_endpoint_detection
-      // can override for A/B.
-      const cfg2 = {
-        api_key: skey, model: "stt-rt-v5", audio_format: "pcm_s16le", sample_rate: 16000, num_channels: 1,
-        language_hints: ["en"], language_hints_strict: true,
-        enable_endpoint_detection: (body.enable_endpoint_detection === true),
-        context: { general: [
-          { key: "domain", value: "Healthcare" },
-          { key: "specialty", value: "Wound care and emergency medicine" },
-          { key: "setting", value: "Clinician dictation of a patient note" },
-          { key: "style", value: "Medical terminology, drug names, abbreviations" },
-        ] },
-      };
-      if (Array.isArray(body.keyterms) && body.keyterms.length) cfg2.context.terms = body.keyterms.map(String);
-      try { sws.send(JSON.stringify(cfg2)); } catch (e) {}
-      const sRaw = [], sPartials = [];
-      let sFinal = "", sClosed = false, sCloseInfo = null, sFirstPartial = 0, sFirstFinal = 0;
-      const sDone = new Promise((resolve) => {
-        sws.addEventListener("message", (ev) => {
-          const s = (typeof ev.data === "string") ? ev.data : "[binary]";
-          if (sRaw.length < 80) sRaw.push(s.slice(0, 300));
-          let m; try { m = JSON.parse(s); } catch (e) { return; }
-          if (!m) return;
-          if (m.error_code) { sRaw.push("ERR " + m.error_code + " " + (m.error_message || "")); resolve(); return; }
-          let nf = "", prov = "";
-          if (Array.isArray(m.tokens)) for (const t of m.tokens) {
-            if (!t || typeof t.text !== "string") continue;
-            if (/^\s*<[^>]+>\s*$/.test(t.text)) continue;
-            if (t.is_final) nf += t.text; else prov += t.text;
-          }
-          if (nf) { if (!sFirstFinal) sFirstFinal = Date.now() - t0s; sFinal += nf; }
-          if ((nf || prov) && !sFirstPartial) sFirstPartial = Date.now() - t0s;
-          if (nf || prov) sPartials.push(sFinal + prov);
-          if (m.finished) resolve();
-        });
-        sws.addEventListener("close", (ev) => { sClosed = true; sCloseInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
-        sws.addEventListener("error", () => resolve());
-      });
-      const sleepS = (ms) => new Promise((res) => setTimeout(res, ms));
-      let sFrames = 0;
-      for (let off = 0; off < pcm.length; off += frameBytes) {
-        const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
-        try { sws.send(chunk); } catch (e) { break; }
-        sFrames++;
-        if (cadenceMs > 0) await sleepS(cadenceMs);
-      }
-      try { sws.send(""); } catch (e) {} // empty = end-of-audio
-      await Promise.race([sDone, sleepS(deadlineMs)]);
-      try { sws.close(); } catch (e) {}
-      return json({
-        ok: true, transport: "soniox", model: "stt-rt-v5", endpoint_detection: cfg2.enable_endpoint_detection,
-        frame_bytes: frameBytes, cadence_ms: cadenceMs, pcm_bytes: pcm.length, frames_sent: sFrames, ms: Date.now() - t0s,
-        first_partial_ms: sFirstPartial, first_final_ms: sFirstFinal,
-        closed: sClosed, close_info: sCloseInfo,
-        final_text: sFinal, last_partial: sPartials.length ? sPartials[sPartials.length - 1] : "", partial_count: sPartials.length,
-        raw_first_frames: sRaw,
-      });
-    }
-
-    const t0 = Date.now();
-    let r;
-    try { r = await env.AI.run(model, cfg, { websocket: true }); }
-    catch (e) { return json({ error: "probe: AI.run threw: " + (e && e.message || String(e)), model, cfg }, 502); }
-    if (!r || !r.webSocket) {
-      let detail = "status=" + (r && r.status);
-      try { if (r && r.clone) detail += " body=" + (await r.clone().text()).slice(0, 200); } catch (e) {}
-      return json({ error: "probe: no backend webSocket (" + detail + ")", model, cfg }, 502);
-    }
-    const be = r.webSocket;
-    be.accept();
-
-    const rawFrames = [];
-    const partials = [];
-    let finalText = "";
-    let metadataSeen = false, closed = false, closeInfo = null;
-
-    const done = new Promise((resolve) => {
-      be.addEventListener("message", (ev) => {
-        const s = (typeof ev.data === "string") ? ev.data : "[binary " + (ev.data && ev.data.byteLength) + "]";
-        if (rawFrames.length < 80) rawFrames.push(s.slice(0, 300));
-        let m; try { m = JSON.parse(s); } catch (e) { return; }
-        if (!m) return;
-        if (m.type === "Metadata") { metadataSeen = true; resolve(); return; }
-        const alt = m.channel && m.channel.alternatives && m.channel.alternatives[0];
-        if (alt) {
-          const t = (alt.transcript || "").trim();
-          if (m.is_final === true) { if (t) finalText = finalText ? finalText + " " + t : t; }
-          else if (t) partials.push(t);
-        }
-        if (typeof m.transcript === "string" && typeof m.event === "string") { // flux
-          const t = m.transcript.trim();
-          if (m.event === "EndOfTurn") { if (t) finalText = finalText ? finalText + " " + t : t; }
-          else if (t) partials.push(t);
-        }
-      });
-      be.addEventListener("close", (ev) => { closed = true; closeInfo = { code: ev && ev.code, reason: ev && ev.reason }; resolve(); });
-      be.addEventListener("error", () => { resolve(); });
-    });
-
-    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
-    if (prependWav) { try { be.send(wavHeaderBytes(pcm.length, wavRate)); } catch (e) {} }
-    let framesSent = 0;
-    for (let off = 0; off < pcm.length; off += frameBytes) {
-      const chunk = pcm.subarray(off, Math.min(off + frameBytes, pcm.length));
-      try { be.send(chunk); } catch (e) { break; }
-      framesSent++;
-      if (cadenceMs > 0) await sleep(cadenceMs);
-    }
-    try { be.send(JSON.stringify({ type: "CloseStream" })); } catch (e) {}
-    await Promise.race([done, sleep(deadlineMs)]);
-    try { be.close(); } catch (e) {}
-
-    return json({
-      ok: true, model, cfg,
-      frame_bytes: frameBytes, cadence_ms: cadenceMs, prepend_wav: prependWav, wav_rate: prependWav ? wavRate : null,
-      pcm_bytes: pcm.length, frames_sent: framesSent, ms: Date.now() - t0,
-      metadata_seen: metadataSeen, closed, close_info: closeInfo,
-      final_text: finalText,
-      last_partial: partials.length ? partials[partials.length - 1] : "",
-      partial_count: partials.length,
-      raw_first_frames: rawFrames,
-    });
-  } catch (err) {
-    return json({ error: "probe: " + (err && err.message || String(err)) }, 500);
-  }
-}
 
 // Batch proxy: receives the recorded audio blob as multipart form data and
 // forwards it to ElevenLabs batch Scribe v2. Serves pure batch mode and the
@@ -1276,7 +306,7 @@ const KEYTERM_PRESETS_CLIENT_JSON = JSON.stringify(
 const MANIFEST = {
   name: "Scribe Dictation",
   short_name: "Dictation",
-  description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 (realtime, batch, or hybrid)",
+  description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 (batch)",
   start_url: "/",
   display: "standalone",
   background_color: "#0b0d10",
@@ -1349,11 +379,7 @@ const INDEX_HTML = `<!doctype html>
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .row > * { flex: 1; }
     .row button { flex: 0 0 auto; }
-    #engineSeg button { flex: 1 1 0; }
     #recordBtn { flex: 1 1 auto; font-weight: 600; }
-    #engineSeg button.active {
-      border-color: var(--accent); background: #0e2a3a; color: var(--accent);
-    }
     .status {
       font-size: 13px; color: var(--muted); margin-top: 10px;
       min-height: 18px; white-space: pre-wrap;
@@ -1437,7 +463,7 @@ const INDEX_HTML = `<!doctype html>
        stay usable; everything else lives in the collapsible sections. */
     @media (max-width: 600px), (max-height: 600px) {
       main { padding: 8px; }
-      h1, #engineHint { display: none; }
+      h1 { display: none; }
       .grid { gap: 8px; }
       .card { padding: 10px; border-radius: 10px; }
       .big { min-height: 72px; font-size: 16px; padding: 10px; }
@@ -1489,8 +515,7 @@ const INDEX_HTML = `<!doctype html>
       border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
     }
     #bigPeek.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-    /* While recording, the realtime words ARE the feedback (the reason to pick the
-       realtime engine on mobile) — accent the strip so it reads as live. */
+    /* Accent the peek strip while it shows live text. */
     #bigPeek.live { border-color: var(--accent); }
     #bigPeekBar { padding: 8px 12px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; -webkit-user-select: none; }
     #bigPeek.live #bigPeekBar { color: var(--accent); }
@@ -1528,17 +553,9 @@ const INDEX_HTML = `<!doctype html>
 
   <div class="grid">
     <section class="card">
-      <!-- Batch-only product: the engine selector is hidden (Realtime/Hybrid were
-           retired from the UI; any saved engine migrates to Batch on load). The
-           buttons remain in the DOM, dormant, so the streaming code stays
-           test-covered until it is removed in a dedicated cleanup. -->
-      <div class="row" id="engineSeg" style="display:none">
-        <button id="engRealtime" data-engine="realtime" title="Live streaming text is the deliverable">Realtime</button>
-        <button id="engBatch" data-engine="batch" title="Upload after release; strongest model, no live text">Batch</button>
-        <button id="engHybrid" data-engine="hybrid" title="Live text as feedback + batch accuracy on the clipboard">Hybrid</button>
-      </div>
-      <div class="hint" id="engineHint" style="margin-top: 6px; display:none"></div>
-
+      <!-- Batch-only product: dictation uploads to ElevenLabs Scribe v2 on
+           release. The live capture-feedback panel below proves the mic is
+           hearing you while you record. -->
       <div class="row" style="margin-top: 10px;">
         <button id="recordBtn" class="primary">Start recording</button>
       </div>
@@ -1587,7 +604,7 @@ const INDEX_HTML = `<!doctype html>
             <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
           </div>
 
-          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch / hybrid refine)</label>
+          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch)</label>
           <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
 
           <!-- Realtime now runs on Deepgram Nova-3 via Workers AI (no STT key). This
@@ -1723,11 +740,6 @@ right lower quadrant"></textarea>
 
           <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
 
-          <div id="vadSection" style="display:none">
-            <div class="divider"></div>
-            <label style="font-weight: bold; color: var(--accent);">Realtime (retired)</label>
-          </div>
-
           <label class="checkbox">
             <input type="checkbox" id="noiseSuppress" checked />
             Browser noise suppression <span class="hint">(on by default; turn off to A/B if a close, quiet mic transcribes better)</span>
@@ -1748,8 +760,7 @@ right lower quadrant"></textarea>
           </div>
 
           <h3>How do these settings work?</h3>
-          <p><strong>Local gate</strong>: in batch mode it decides what gets recorded and transcribed; in realtime/hybrid the feed to Scribe is ungated — the gate shapes only the saved preview. Use the Scribe filters to reject background speech.</p>
-          <p><strong>Pause limit</strong>: higher (e.g. 2.0s) waits longer before finalizing a segment, giving the AI more context to fix grammar/spelling.</p>
+          <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. Use the Scribe filters to reject background speech.</p>
           <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
           <p><strong>Click filter</strong>: higher values stop brief clicks/rustling being read as speech.</p>
         </div>
@@ -1775,7 +786,7 @@ right lower quadrant"></textarea>
 
       <div class="hint" style="margin-top: 14px;">
         English‑only, Scribe v2. Mic stays warm between dictations for instant start.
-        Realtime/hybrid stream over a secure WebSocket through the Worker; batch uploads on release.
+        Audio uploads to ElevenLabs Scribe v2 on release.
       </div>
     </section>
   </div>
@@ -1850,8 +861,6 @@ right lower quadrant"></textarea>
   const highpassEl       = document.getElementById("highpass");
   const highpassValEl    = document.getElementById("highpassVal");
 
-  // Realtime tuning VAD elements
-
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
   const closeMark        = document.getElementById("closeMark");
@@ -1873,10 +882,6 @@ right lower quadrant"></textarea>
   const presetRowEl       = document.getElementById("presetRow");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
-  const engineSegEl      = document.getElementById("engineSeg");
-  const engineHintEl     = document.getElementById("engineHint");
-  const vadSectionEl     = document.getElementById("vadSection");
-  const batchOptsSectionEl = document.getElementById("batchOptsSection");
   const gateHintEl       = document.getElementById("gateHint");
 
   // Phone mic session elements
@@ -1913,48 +918,11 @@ right lower quadrant"></textarea>
   let lastAudioBlob = null;
   let lastAudioUrl = null;
 
-  // Realtime Variables
-  let ws = null;
-  // DIRECT-stream transport: when on, the browser opens the realtime WS straight
-  // to Soniox (temp-key auth) with NO Worker proxy hop on the audio path — the
-  // lowest-latency path, matching soniox.com's own demo. directMode is decided
-  // per session at connect time; directKey holds the minted temp key; directXlate
-  // is the per-session Soniox->client-frame translator.
-  let directMode = false;
-  let directKey = "";
-  let directXlate = null;
-  // DIRECT realtime audio source. soniox.com's demo (and our batch path) capture
-  // with MediaRecorder — OFF the main thread — and Soniox auto-detects the webm
-  // container (audio_format:"auto"). Our raw-PCM AudioWorklet pump downsamples and
-  // sends each frame ON the main thread, which bursts under live-render load and
-  // makes Soniox jittery. So for ?rt=direct realtime we feed Soniox a MediaRecorder
-  // webm stream instead. directUsesRec is set per session (realtime + container
-  // support); a browser without webm/ogg MediaRecorder falls back to the raw-PCM
-  // direct path. directRec is the recorder; pendingMediaChunks buffers webm blobs
-  // captured before the WS opens.
-  let directUsesRec = false;
-  let directRec = null;
-  let directRecMime = "";
-  let pendingMediaChunks = [];
-  // DIRECT hybrid: the same off-thread webm we stream to Soniox is ALSO accumulated
-  // here and uploaded for the batch refine — small/compressed (like batch's own
-  // upload, ~8-10x smaller than the raw WAV) and captured off-thread, so a long
-  // "got ahead" dictation finalizes far faster and the tail is never dropped.
-  let directRefineChunks = [];
-  // Pre-minted Soniox temp key: minting is an HTTP round-trip (browser -> Worker
-  // -> Soniox auth), and doing it inline at PTT-down adds that latency to EVERY
-  // dictation's first word. Mint ahead (at boot and after each direct dictation)
-  // so the start path just reuses a fresh key. single_use, so consumed once.
-  let directKeyCache = "";
-  let directKeyCacheAt = 0;
-  let directKeyMinting = false;
   let finalizedSegments = [];
   let currentPartial = "";
-  // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
-  // to the console AND an on-screen overlay (foolproof when DevTools is filtered
-  // or unavailable), so a real dictation reveals the exact partial/commit
-  // sequence (duplication vs interim churn vs lag) that synthetic audio can't
-  // reproduce. Off by default; purely additive.
+  // Diagnostic: ?debug=1 logs phone-link listener frames to the console AND an
+  // on-screen overlay (foolproof when DevTools is filtered or unavailable). Off
+  // by default; purely additive.
   var RT_DEBUG = (window.location.search.indexOf("debug=1") >= 0);
   function rtDebugLog(line) {
     if (!RT_DEBUG) return;
@@ -1968,51 +936,24 @@ right lower quadrant"></textarea>
         (document.body || document.documentElement).appendChild(box);
       }
       box.textContent += line + "\\n";
-      // Bound the overlay: an ever-growing <pre> reflowed on EVERY partial makes
-      // ?debug=1 itself jank the main thread — worst in direct mode, where audio
-      // sends share that thread, so the diagnostic perturbs what it measures. Keep
-      // the last ~160 lines (cheap split is far less than reflowing 1000+ lines).
       var dbgLines = box.textContent.split("\\n");
       if (dbgLines.length > 160) box.textContent = dbgLines.slice(dbgLines.length - 160).join("\\n");
       box.scrollTop = box.scrollHeight;
     } catch (e) {}
   }
-  // Finalize-timeline stamp: ms since PTT release, so "takes forever to finalize"
-  // shows exactly which phase (tail / commit / engine finalize / batch refine /
-  // clipboard) spends the time. Base (dbgReleaseAt) is set in stopRecording.
-  function dbgPhase(label) {
-    if (!RT_DEBUG) return;
-    var now = Math.round(performance.now());
-    rtDebugLog("[phase " + now + "] " + label + (dbgReleaseAt ? " (+" + (now - Math.round(dbgReleaseAt)) + "ms since release)" : ""));
-  }
 
   // Per-session flow state
-  let sessionSeq = 0;          // bumps each recording; stale socket callbacks bail out
+  let sessionSeq = 0;          // bumps each recording; stale callbacks bail out
   let sessionFinalized = true;
   let userStopped = false;     // distinguishes clean PTT-release from unexpected disconnect
-  let stopPhase = null;        // null | "tail" | "awaitFinal"
+  let stopPhase = null;        // null while batch-only
   let pendingStart = false;    // F13 pressed while previous session was finalizing
   let pendingStartTimer = null; // armed deferred start from maybePendingStart; cancellable until it fires
-  let pendingChunks = [];      // base64 audio captured while the WebSocket is still connecting
-  let prerollFrames = [];      // ring of raw idle frames; prepended at start so the first word survives
-  let sessionPreviousText = ""; // tail of the note being appended to; rides the first chunk as context
-  let firstChunkSent = false;  // previous_text may only accompany the FIRST chunk of a socket
   let lastWsError = "";
-  let wsOpenAt = 0;
   let recStartedAt = 0;
-  let partialCount = 0;
-  // ?debug=1 instrumentation. Surfaces WHERE the realtime path stalls on a real
-  // device (DevTools is often unreachable for the clinician user): which audio
-  // pump is live, whether audio frames keep flowing while partials freeze (engine
-  // vs pump), and the post-release finalize timeline ("takes forever to finalize").
-  let dbgFramesSent = 0;        // live audio frames pushed to the WS this session
-  let dbgPumpKind = "?";        // "worklet" | "scriptprocessor" — which pump is live
-  let dbgLastHeartbeat = 0;     // last per-second cadence print (Date.now ms)
-  let dbgReleaseAt = 0;         // performance.now() at PTT release (finalize timeline base)
   let speechDetected = false;
   let maxRmsSeen = 0;
   let micAlarmFired = false;
-  let sttAlarmFired = false;
   let mutedSince = 0;
   let lastFinalizeAt = 0;
   let connectTimer = null;
@@ -2031,7 +972,6 @@ right lower quadrant"></textarea>
   let lastDeliveryId    = "";   // desktop: dedupe replayed phone_delivery frames
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
-  let pubWs             = null; // phone (DIRECT mode): publisher socket mirroring live frames to the room
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
 
@@ -2060,8 +1000,6 @@ right lower quadrant"></textarea>
   let analyserNode = null;
   let gateNode = null;
   let destNode = null;
-  let recorderNode = null; // Frame pump: AudioWorklet (preferred) or ScriptProcessor (fallback)
-  let sinkNode = null;     // Muted sink that keeps the pump node pulled by the graph
   let gateTimer = null;
   let gateBuf = null;
   let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
@@ -2073,47 +1011,22 @@ right lower quadrant"></textarea>
   let historyVisible = false;
   let appendArmed = false; // one-shot: clicking the transcript box arms "append the next dictation"
 
-  // Engine: which transcription path a dictation uses. The selector value is
-  // snapshotted into sessionEngine at start, so switching mid-session only
-  // affects the NEXT dictation.
+  // Engine: batch-only. sessionEngine is snapshotted at session start.
   const DEFAULT_ENGINE = "batch";
   let engine = DEFAULT_ENGINE;
   let sessionEngine = DEFAULT_ENGINE;
-  let sessionBaseText = "";  // note text this session appends onto (batch/hybrid splice into it)
-  let finishing = false;     // a finalize is still uploading/refining; serializes sessions
-
-  // Hybrid: every 16 kHz s16le frame produced for the realtime feed is also
-  // captured here (pre-roll, while-connecting, live, tail — captured at the
-  // point of production, so frames survive even if the socket never opens).
-  // On finalize the buffer becomes a WAV for the batch re-transcription.
-  let sessionPcm = [];
-  let sessionPcmBytes = 0;
-  let sessionPcmTruncated = false;
+  let sessionBaseText = "";  // note text this session appends onto (batch splices into it)
+  let finishing = false;     // a finalize is still uploading; serializes sessions
   let precomputedBatchKeyterms = null; // [LATENCY] batch keyterms JSON snapshotted at session start, off the stop-to-upload critical path
 
   const METER_MAX    = 0.12;
   const HOLD_SECONDS = 0.9;
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
-  const CONNECT_TIMEOUT_MS = 5000;  // WebSocket must open within this or the dictation fails loudly
-  const TAIL_MS            = 250;   // [LATENCY] keep streaming audio this long after PTT release (anti-clipping); Soniox finalizes ~73ms post-release so 600 was pure overhead — bump to ~350 if a crisp-ending word ever clips
-  const FINAL_WAIT_MS      = 2500;  // max wait for the final committed transcript after commit (safety deadline; committed arrives ~73ms after commit so it rarely bites)
-  const COMMIT_QUIET_MS    = 150;   // [LATENCY] close this soon after the last committed transcript; tuned for the Soniox default (Soniox closes its own socket ~85ms post-commit, pre-empting this) — ?rt=el finalizes slower
-  const PENDING_CHUNK_CAP  = 400;   // ~35s of audio buffered while the socket connects
   const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
-  const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
-  const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
-  const DIRECT_REC_TIMESLICE_MS = 100; // ?rt=direct realtime: MediaRecorder chunk cadence (off-thread; small for low live latency, big enough to avoid webm over-fragmentation)
-  const DIRECT_KEY_TTL_MS = 100000; // reuse a pre-minted temp key only if < ~100s old (120s server expiry, with headroom)
-  const PUMP_FRAME_SAMPLES = 4096;  // pump frame size (≈85ms at 48kHz) — matched the old ScriptProcessor so all downstream byte counts hold
 
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
-  const REFINE_TIMEOUT_MS       = 8000;  // hybrid refine deadline — live text is the fallback
-
-  const SESSION_PCM_CAP_BYTES = 24 * 1024 * 1024; // ~12.5 min @ 32 KB/s; the batch API caps files at 25 MB
-  const MIN_REFINE_BYTES      = 16000;            // ~0.5 s of raw 16k PCM; below this the WAV refine is skipped
-  const MIN_REFINE_WEBM_BYTES = 1500;             // ~0.3 s of opus webm (incl. header); below this the webm refine is skipped (instant tap)
 
   // Phone link (desktop listener <-> session room)
   const PHONE_PING_INTERVAL_MS  = 25000; // heartbeat cadence on the listener socket
@@ -2122,9 +1035,7 @@ right lower quadrant"></textarea>
   const PHONE_FALLBACK_GRACE_MS = 10000; // after phone_session_end, wait this long for the authoritative phone_delivery (hybrid refine worst case) before falling back to live text
   const RELAY_TIMEOUT_MS        = 10000; // phone->room delivery ack deadline; a hung relay must fail loudly, and the queued next session waits on the ack
 
-  // Per-API keyterm caps (the Worker re-enforces these server-side too)
-  const REALTIME_KEYTERM_MAX_CHARS = 20;
-  const REALTIME_KEYTERM_MAX_TERMS = 50;
+  // Batch keyterm caps (the Worker re-enforces these server-side too)
   const BATCH_KEYTERM_MAX_CHARS    = 49;
   const BATCH_KEYTERM_MAX_TERMS    = 1000;
 
@@ -2185,101 +1096,6 @@ right lower quadrant"></textarea>
   // Two-tone warn: degraded-but-usable outcomes (e.g. hybrid refine failed,
   // live text delivered instead). Always audible, like failBeep.
   function warnBeep()  { beep(520, 140, 0); beep(520, 140, 0.20); haptic([90, 90, 90]); }
-
-  /* ───── Audio Downsampling & Float conversion helpers ───── */
-  function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
-    if (inputSampleRate === outputSampleRate) return buffer;
-    const sampleRateRatio = inputSampleRate / outputSampleRate;
-    const newLength = Math.round(buffer.length / sampleRateRatio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetInput = 0;
-    while (offsetResult < result.length) {
-      const nextOffsetInput = Math.round((offsetResult + 1) * sampleRateRatio);
-      let accum = 0, count = 0;
-      for (let i = offsetInput; i < nextOffsetInput && i < buffer.length; i++) {
-        accum += buffer[i];
-        count++;
-      }
-      result[offsetResult] = count > 0 ? accum / count : 0;
-      offsetResult++;
-      offsetInput = nextOffsetInput;
-    }
-    return result;
-  }
-
-  // Converts float values to 16-bit signed PCM
-  function floatTo16BitPCM(input) {
-    const output = new Int16Array(input.length);
-    for (let i = 0; i < input.length; i++) {
-      const s = Math.max(-1, Math.min(1, input[i]));
-      output[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    return output.buffer;
-  }
-
-  function arrayBufferToBase64(buffer) {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-      binary += String.fromCharCode(bytes[i]);
-    }
-    return window.btoa(binary);
-  }
-
-  // Inverse of arrayBufferToBase64 — used by the DIRECT-stream transport, which
-  // sends raw binary PCM frames to Soniox (no base64/JSON wrapper). The pre-roll
-  // and connecting-buffer (pendingChunks) are held as base64 for both transports;
-  // direct mode decodes each back to bytes at send time.
-  function base64ToArrayBuffer(b64) {
-    const binary = window.atob(b64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-
-  // Hybrid capture chokepoint: called exactly once per produced frame, at the
-  // point of production (audio pump + pre-roll build) — never in the socket
-  // send paths, so buffered-then-dropped frames are still captured and
-  // nothing is ever captured twice.
-  function capturePcm(buf) {
-    if (sessionEngine !== "hybrid") return;
-    if (sessionPcmBytes + buf.byteLength > SESSION_PCM_CAP_BYTES) {
-      sessionPcmTruncated = true;
-      return;
-    }
-    sessionPcm.push(buf);
-    sessionPcmBytes += buf.byteLength;
-  }
-
-  // Wrap raw s16le PCM in a 44-byte RIFF/WAVE header: the batch engine gets
-  // bit-identical audio to what the realtime engine heard, including the
-  // pre-roll that no MediaRecorder could have captured.
-  function buildWavBlob(buffers, sampleRate) {
-    let dataLen = 0;
-    for (const b of buffers) dataLen += b.byteLength;
-    const header = new ArrayBuffer(44);
-    const v = new DataView(header);
-    const writeStr = (off, s) => {
-      for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i));
-    };
-    writeStr(0, "RIFF");
-    v.setUint32(4, 36 + dataLen, true);
-    writeStr(8, "WAVE");
-    writeStr(12, "fmt ");
-    v.setUint32(16, 16, true);             // fmt chunk size
-    v.setUint16(20, 1, true);              // PCM
-    v.setUint16(22, 1, true);              // mono
-    v.setUint32(24, sampleRate, true);
-    v.setUint32(28, sampleRate * 2, true); // byte rate (16-bit mono)
-    v.setUint16(32, 2, true);              // block align
-    v.setUint16(34, 16, true);             // bits per sample
-    writeStr(36, "data");
-    v.setUint32(40, dataLen, true);
-    return new Blob([header].concat(buffers), { type: "audio/wav" });
-  }
 
   /* ───── Text processing ───── */
   function cleanTranscript(raw) {
@@ -2371,44 +1187,16 @@ right lower quadrant"></textarea>
     }
   }
 
-  /* ───── Engine selector ───── */
-  const ENGINE_HINTS = {
-    realtime: "Live: text streams onto the screen as you speak and is what lands on the clipboard.",
-    batch: "Batch: audio uploads after release — the noise gate decides what gets transcribed. No live text.",
-    hybrid: "Hybrid: live text is feedback while you speak; the same audio is re-transcribed by the stronger batch model and THAT lands on the clipboard.",
-  };
-
+  /* ───── Engine UI (batch-only) ───── */
   function applyEngineUI() {
-    if (engineSegEl) {
-      const btns = engineSegEl.querySelectorAll("button");
-      for (const b of btns) {
-        b.className = b.getAttribute("data-engine") === engine ? "active" : "";
-      }
-    }
-    if (engineHintEl) engineHintEl.textContent = ENGINE_HINTS[engine] || "";
-
-    // Per-engine controls: VAD sliders steer the realtime feed; tag-events and
-    // timestamp granularity ride the batch API call.
-    if (vadSectionEl) vadSectionEl.style.display = engine !== "batch" ? "" : "none";
-    if (batchOptsSectionEl) batchOptsSectionEl.style.display = engine !== "realtime" ? "" : "none";
-
     if (gateHintEl) {
-      gateHintEl.textContent = engine === "batch"
-        ? "Batch: the gate IS the recording — only audio loud enough to open it gets transcribed."
-        : "The live feed to Scribe is ungated; the gate shapes only the saved audio preview.";
+      gateHintEl.textContent =
+        "Batch: the gate IS the recording — only audio loud enough to open it gets transcribed.";
     }
     if (gateStateEl) {
-      gateStateEl.title = engine === "batch"
-        ? "Local noise gate state (decides what gets recorded and transcribed in batch mode)"
-        : "Local noise gate state (affects the saved audio preview only)";
+      gateStateEl.title =
+        "Local noise gate state (decides what gets recorded and transcribed)";
     }
-  }
-
-  function setEngine(val) {
-    if (val !== "realtime" && val !== "batch" && val !== "hybrid") return;
-    engine = val;
-    applyEngineUI();
-    saveSettings();
   }
 
   /* ───── Access section (API key / passphrase) ─────
@@ -2526,17 +1314,12 @@ right lower quadrant"></textarea>
   function updateKeytermHint() {
     let alwaysCount = 0;
     for (const p of KEYTERM_PRESETS) { if (p.always) alwaysCount += p.terms.length; }
-    const rtAll = effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, Infinity).length;
-    const rt = Math.min(rtAll, REALTIME_KEYTERM_MAX_TERMS);
     const bt = effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS).length;
     keytermHintEl.innerHTML =
       "Scribe biases toward these terms (one per line) plus the checked lists" +
       (alwaysCount ? " and " + alwaysCount + " always-on standard terms" : "") + ". " +
       "<strong>Keyterms add ~20 % to cost.</strong> " +
-      "Realtime sends " + rt + " / 50 (each &lt;= 20 chars" +
-      (rtAll > REALTIME_KEYTERM_MAX_TERMS
-        ? "; over the cap your terms win, then presets, then standard" : "") +
-      "); batch sends " + bt + " / 1000 (each &lt; 50 chars).";
+      "Batch sends " + bt + " / 1000 (each &lt; 50 chars).";
   }
 
   /* ───── Gate UI ───── */
@@ -2944,7 +1727,7 @@ right lower quadrant"></textarea>
     // A stale graph (e.g. restored from bfcache, device unplugged, tab slept)
     // can leave all variables set while the track is silently dead. Validate
     // the actual track so reopening the app reliably re-engages the mic.
-    if (!stream || !audioCtx || audioCtx.state === "closed" || !destNode || !recorderNode) return false;
+    if (!stream || !audioCtx || audioCtx.state === "closed" || !destNode) return false;
     const track = stream.getAudioTracks()[0];
     if (!track || track.readyState !== "live") return false;
     // iOS interruptions (screen lock, Siri, calls) leave the track "live" but
@@ -3014,14 +1797,12 @@ right lower quadrant"></textarea>
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) {}
     }
-    // Diagnostic (one-time): the context takes NO sampleRate option, so
-    // audioCtx.sampleRate is the true hardware rate that downsampleBuffer reads.
-    // A non-48000 rate (e.g. 44100) still downsamples correctly to 16k, but
-    // surface it once so a stealth hardware-rate surprise is never invisible.
+    // Diagnostic (one-time): surface the true hardware sample rate so a stealth
+    // hardware-rate surprise is never invisible.
     if (!window.__srLogged) {
       window.__srLogged = true;
       try {
-        var msg = "[audio] AudioContext sampleRate = " + audioCtx.sampleRate + " Hz (downsampling to 16000)";
+        var msg = "[audio] AudioContext sampleRate = " + audioCtx.sampleRate + " Hz";
         if (audioCtx.sampleRate !== 48000) console.warn(msg + " — not 48000; verify capture"); else console.log(msg);
       } catch (e) {}
     }
@@ -3041,26 +1822,12 @@ right lower quadrant"></textarea>
 
     destNode = audioCtx.createMediaStreamDestination();
 
-    sinkNode = audioCtx.createGain();
-    sinkNode.gain.value = 0;
-
     source.connect(hpFilter);
     hpFilter.connect(analyserNode);
 
-    // STT FEED: pre-gate (raw, high-passed) audio -> the realtime pump. Prefer an
-    // AudioWorklet: its processor runs on the audio render thread, so main-thread
-    // load (UI, the 30 ms gate meter, live DOM, the big-button screen) cannot
-    // starve it. The deprecated ScriptProcessorNode ran ON the main thread and on
-    // phones dropped buffers under that load — starving Soniox into slow, sparse
-    // transcripts (batch was immune: it records off-thread via MediaRecorder).
-    // ScriptProcessor stays as the fallback so the capture path is never silently
-    // lost if the worklet cannot load.
-    recorderNode = await buildPumpNode();
-    hpFilter.connect(recorderNode);
-    recorderNode.connect(sinkNode);
-    sinkNode.connect(audioCtx.destination);
-
-    // LOCAL RECORDING ONLY: keep the noise gate on the playback file.
+    // BATCH CAPTURE: the post-gate audio is what MediaRecorder records and uploads.
+    // The analyser above drives the capture waveform + dead-mic watchdog (read off
+    // the same pre-gate signal).
     hpFilter.connect(gateNode);
     gateNode.connect(destNode);
 
@@ -3069,9 +1836,6 @@ right lower quadrant"></textarea>
     gateLastOpen = 0;
     lastMeterPct = -1;
     setGateStateUI(false);
-
-    // The frame pump (worklet or ScriptProcessor) is wired in buildPumpNode and
-    // delivers each captured frame to handleAudioFrame.
 
     if (gateTimer) clearInterval(gateTimer);
     gateTimer = setInterval(() => {
@@ -3143,13 +1907,6 @@ right lower quadrant"></textarea>
             setStatus("⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.", "err");
           }
         }
-
-        if (!sttAlarmFired && speechDetected && wsOpenAt &&
-            nowMs - wsOpenAt > 8000 && partialCount === 0) {
-          sttAlarmFired = true;
-          warnBeep();
-          setStatus("⚠ Audio is flowing but no text is coming back — the transcription service may be down.", "warn");
-        }
       }
     }, 30);
 
@@ -3161,7 +1918,7 @@ right lower quadrant"></textarea>
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
     stream = null; audioCtx = null; hpFilter = null; analyserNode = null;
-    gateNode = null; destNode = null; recorderNode = null; sinkNode = null; gateBuf = null; gateIsOpen = false;
+    gateNode = null; destNode = null; gateBuf = null; gateIsOpen = false;
     lastMeterPct = -1;
     meterBar.style.width = "0%";
     setGateStateUI(false);
@@ -3213,488 +1970,6 @@ right lower quadrant"></textarea>
     if (quietTimer)         { clearTimeout(quietTimer);         quietTimer = null; }
   }
 
-  // One captured frame (an owned Float32Array of PUMP_FRAME_SAMPLES, from the
-  // worklet's port or the ScriptProcessor fallback). Idle frames feed the
-  // pre-roll ring (first-word rescue); live frames downsample -> s16le PCM ->
-  // capturePcm (the hybrid refine's exact copy) -> stream. Keeps streaming
-  // through the post-release "tail" phase so the last word is not clipped, and
-  // buffers chunks while the WebSocket is still connecting so the first word is
-  // not lost either.
-  function handleAudioFrame(floatSamples) {
-    const live = recording && (!stopping || stopPhase === "tail") && ws;
-    if (!live) {
-      // Idle: keep a short pre-roll ring so the first word — often spoken the
-      // instant the key lands, before the session is armed — survives. Held in
-      // memory only; sent only if a dictation starts within PREROLL_MS,
-      // discarded otherwise. Never-sent frames can't double-transcribe.
-      prerollFrames.push({
-        t: Date.now(),
-        rate: audioCtx ? audioCtx.sampleRate : 48000,
-        samples: floatSamples,
-      });
-      while (prerollFrames.length > PREROLL_FRAME_CAP) prerollFrames.shift();
-      return;
-    }
-
-    // DIRECT + MediaRecorder feed: the recorder streams webm to Soniox OFF the
-    // main thread (the whole point — the raw-PCM pump's per-frame downsample/send
-    // ran here and bursted under render load, jittering Soniox). Do NO per-frame
-    // audio work; just keep the ?debug heartbeat. (Realtime-only path, so no
-    // capturePcm to maintain.)
-    if (!directUsesRec) {
-      const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
-      const pcmBuffer = floatTo16BitPCM(downsampled);
-      capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
-
-      if (ws.readyState === WebSocket.OPEN) {
-        flushPendingChunks();
-        // Direct: ship the raw PCM ArrayBuffer (no base64 on the hot path). Proxy:
-        // base64 JSON through the chokepoint. base64 is only computed when needed.
-        const sent = directMode
-          ? rtSendAudioBinary(pcmBuffer)
-          : sendAudioChunk(arrayBufferToBase64(pcmBuffer), false);
-        if (sent) dbgFramesSent++;
-      } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
-        pendingChunks.push(arrayBufferToBase64(pcmBuffer));
-      }
-    }
-    // Per-second cadence heartbeat (?debug=1). The decisive read: if framesSent
-    // keeps climbing while partials stops rising, audio IS reaching the engine and
-    // the stall is the engine/translator; if framesSent also flatlines, the pump
-    // or mic stalled. A growing wsBuffered means the WS send is backing up
-    // (main-thread jank / network), the classic ScriptProcessor-starvation tell.
-    if (RT_DEBUG) {
-      var nowHb = Date.now();
-      if (nowHb - dbgLastHeartbeat >= 1000) {
-        dbgLastHeartbeat = nowHb;
-        var buffered = (ws && ws.bufferedAmount != null) ? ws.bufferedAmount : "?";
-        rtDebugLog("[audio " + Math.round(performance.now()) + "] pump=" + dbgPumpKind +
-          " framesSent=" + dbgFramesSent + " partials=" + partialCount + " wsBuffered=" + buffered);
-      }
-    }
-  }
-
-  // The AudioWorklet processor source. It buffers the 128-sample render quanta
-  // into PUMP_FRAME_SAMPLES-sized frames (same size the ScriptProcessor used, so
-  // every downstream byte count — capturePcm, MIN_REFINE_BYTES — is unchanged)
-  // and posts each as an owned (transferred) copy to the main thread. Buffering
-  // ON the render thread is the fix: frames are captured even while the main
-  // thread is busy (postMessage queues; audio is never dropped). Loaded from a
-  // Blob URL so the no-build-step / single-file constraint holds.
-  let workletUrl = null;
-  function getWorkletUrl() {
-    if (workletUrl) return workletUrl;
-    const src =
-      "class PcmPump extends AudioWorkletProcessor {" +
-      "constructor(){super();this._buf=new Float32Array(" + PUMP_FRAME_SAMPLES + ");this._n=0;}" +
-      "process(inputs){" +
-        "var input=inputs[0];" +
-        "if(input&&input[0]){" +
-          "var ch=input[0];" +
-          "for(var i=0;i<ch.length;i++){" +
-            "this._buf[this._n++]=ch[i];" +
-            "if(this._n>=this._buf.length){" +
-              "var out=this._buf.slice(0);" +
-              "this.port.postMessage(out,[out.buffer]);" +
-              "this._n=0;" +
-            "}" +
-          "}" +
-        "}" +
-        "return true;" +
-      "}" +
-      "}" +
-      "registerProcessor('pcm-pump',PcmPump);";
-    workletUrl = URL.createObjectURL(new Blob([src], { type: "application/javascript" }));
-    return workletUrl;
-  }
-
-  // Build the frame pump: AudioWorklet (off the main thread), with the deprecated
-  // ScriptProcessor as a LAST resort. Both deliver frames to the same
-  // handleAudioFrame, so capture/downsample/send/pre-roll behavior is identical.
-  //
-  // Two real-browser quirks defeated the original Blob-URL worklet, so handle both:
-  //  (1) addModule() RESOLVES a tick before the processor name is visible to
-  //      'new AudioWorkletNode' (first construct throws "not defined", a retry
-  //      succeeds) -- so we retry construction briefly before giving up.
-  //  (2) The AudioContext (and its AudioWorkletGlobalScope) is reused across
-  //      dictations; calling addModule again re-runs registerProcessor →
-  //      "already registered". So we add the module exactly ONCE per context,
-  //      flagged on the context object.
-  // Falling through to the main-thread ScriptProcessor was the true cause of
-  // slow/garbled realtime: it starves under UI load and drops audio frames (batch
-  // is immune — MediaRecorder records off-thread). Prefer the real same-origin
-  // module URL; the Blob URL is only a fallback if that addModule throws outright.
-  async function buildPumpNode() {
-    if (audioCtx.audioWorklet && typeof AudioWorkletNode === "function") {
-      try {
-        if (!audioCtx.__pcmPumpAdded) {
-          try {
-            await audioCtx.audioWorklet.addModule("/pcm-pump.js");
-          } catch (e1) {
-            try { console.warn("[audio] /pcm-pump.js addModule failed, trying blob: " + (e1 && e1.message)); } catch (e) {}
-            await audioCtx.audioWorklet.addModule(getWorkletUrl());
-          }
-          audioCtx.__pcmPumpAdded = true;
-        }
-        var lastErr = null;
-        for (var attempt = 0; attempt < 12; attempt++) {
-          try {
-            var node = new AudioWorkletNode(audioCtx, "pcm-pump");
-            node.port.onmessage = function (e) { handleAudioFrame(e.data); };
-            dbgPumpKind = "worklet";
-            var okMsg = "[audio] AudioWorklet pump active" + (attempt ? " (after " + attempt + " retr" + (attempt > 1 ? "ies" : "y") + ")" : "");
-            try { console.log(okMsg); } catch (e) {}
-            rtDebugLog(okMsg);
-            return node;
-          } catch (err) {
-            lastErr = err;
-            await new Promise(function (r) { setTimeout(r, 30); });
-          }
-        }
-        throw lastErr || new Error("AudioWorkletNode could not be constructed");
-      } catch (err) {
-        try { console.warn("[audio] worklet unavailable, ScriptProcessor fallback: " + (err && err.message)); } catch (e) {}
-      }
-    }
-    // Last resort — deprecated, main-thread, can starve under load.
-    dbgPumpKind = "scriptprocessor";
-    var fbMsg = "[audio] FALLBACK to ScriptProcessor pump (off-thread worklet unavailable; realtime may degrade under load)";
-    try { console.warn(fbMsg); } catch (e) {}
-    rtDebugLog("!! " + fbMsg);
-    var sp = audioCtx.createScriptProcessor(PUMP_FRAME_SAMPLES, 1, 1);
-    sp.onaudioprocess = function (e) {
-      handleAudioFrame(new Float32Array(e.inputBuffer.getChannelData(0)));
-    };
-    return sp;
-  }
-
-  // Single chokepoint for every audio frame: guarantees the spec-required
-  // commit/sample_rate fields and that previous_text rides only the first chunk.
-  function sendAudioChunk(base64, commit) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    const msg = {
-      message_type: "input_audio_chunk",
-      audio_base_64: base64,
-      commit: !!commit,
-      sample_rate: 16000
-    };
-    if (!firstChunkSent && sessionPreviousText) {
-      msg.previous_text = sessionPreviousText;
-    }
-    try { ws.send(JSON.stringify(msg)); } catch (e) { return false; }
-    firstChunkSent = true;
-    return true;
-  }
-
-  // Transport-aware audio send. PROXY: base64 JSON frame through sendAudioChunk
-  // (the Worker translates). DIRECT: raw binary PCM straight to Soniox — no
-  // base64, no JSON, no main-thread encode jitter. Returns true on success.
-  function rtSendAudioB64(b64) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    if (directMode) {
-      try { ws.send(base64ToArrayBuffer(b64)); } catch (e) { return false; }
-      return true;
-    }
-    return sendAudioChunk(b64, false);
-  }
-
-  // DIRECT live-frame fast path: send the raw PCM ArrayBuffer straight to Soniox.
-  // The per-frame path must NOT base64-encode (and rtSendAudioB64 must NOT decode
-  // it back) — that round-trip was pure main-thread work ~12x/sec and a real
-  // source of the "jittery" cadence. Used for live frames; the pre-roll/connecting
-  // buffer stays base64 and is decoded once on flush (not the hot path).
-  function rtSendAudioBinary(buf) {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    try { ws.send(buf); } catch (e) { return false; }
-    return true;
-  }
-
-  // Transport-aware end-of-audio commit. PROXY: {commit:true} empty chunk (the
-  // Worker turns it into Soniox's empty-string end-of-audio). DIRECT: send the
-  // empty string straight to Soniox.
-  function rtSendCommit() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
-    if (directMode) {
-      try { ws.send(""); } catch (e) { return false; }
-      return true;
-    }
-    return sendAudioChunk("", true);
-  }
-
-  function flushPendingChunks() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    while (pendingChunks.length) {
-      if (!rtSendAudioB64(pendingChunks[0])) break;
-      pendingChunks.shift();
-    }
-  }
-
-  function buildPrerollChunks() {
-    // Encode the idle frames captured just before this session started.
-    // Anything older than PREROLL_MS is stale chatter and dropped.
-    const minT = Date.now() - PREROLL_MS;
-    const out = [];
-    for (const f of prerollFrames) {
-      if (f.t <= minT) continue;
-      const downsampled = downsampleBuffer(f.samples, f.rate, 16000);
-      const pcmBuffer = floatTo16BitPCM(downsampled);
-      capturePcm(pcmBuffer); // hybrid: pre-roll belongs in the refine audio too
-      out.push(arrayBufferToBase64(pcmBuffer));
-    }
-    prerollFrames = [];
-    return out;
-  }
-
-  // ───── DIRECT-stream transport (browser -> Soniox, no Worker proxy hop) ─────
-
-  var SONIOX_DIRECT_URL = "wss://stt-rt.soniox.com/transcribe-websocket";
-  var SONIOX_DIRECT_MODEL = "stt-rt-v5";
-
-  // Mint a short-lived Soniox temporary API key via the Worker (passphrase-gated).
-  // Returns the key string, or null on any failure (caller falls back to proxy).
-  async function mintSonioxKey() {
-    try {
-      var body = {};
-      if (SHARED_MODE) body.passphrase = passphraseEl.value.trim();
-      var ref = joinedSessionCode || phoneSessionCode || "";
-      if (ref) body.client_reference_id = ref;
-      var resp = await fetch("/api/soniox-token", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      var jd = null;
-      try { jd = JSON.parse(await resp.text()); } catch (e) {}
-      if (!resp.ok || !jd) {
-        rtDebugLog("[rt] token mint HTTP " + (resp && resp.status) + " " + ((jd && jd.error) || ""));
-        return null;
-      }
-      // The REST field name isn't pinned in the docs; accept the plausible ones.
-      var key = jd.api_key || jd.apiKey || jd.key || jd.temporary_api_key || jd.token || "";
-      if (!key) { rtDebugLog("[rt] token mint: no key in response"); return null; }
-      return key;
-    } catch (e) {
-      rtDebugLog("[rt] token mint threw: " + ((e && e.message) || e));
-      return null;
-    }
-  }
-
-  // Pre-mint a temp key ahead of the next dictation so the round-trip is off the
-  // start path. Best-effort, only on the direct transport; no-op if a fresh key is
-  // already cached or a mint is in flight.
-  async function prewarmDirectKey() {
-    var rtP = "";
-    try { rtP = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
-    if (rtP !== "direct" || directKeyMinting) return;
-    if (directKeyCache && (Date.now() - directKeyCacheAt) < DIRECT_KEY_TTL_MS) return;
-    directKeyMinting = true;
-    try {
-      var k = await mintSonioxKey();
-      if (k) { directKeyCache = k; directKeyCacheAt = Date.now(); rtDebugLog("[rt] pre-minted direct key"); }
-    } finally { directKeyMinting = false; }
-  }
-
-  // Build the Soniox config (first WS frame) client-side — same shape the Worker
-  // sends on the proxy path: PTT-tuned (endpoint detection OFF), English-strict,
-  // medical general-context, and the full keyterm list trimmed to Soniox's
-  // ~8000-char context budget (custom > presets > always-on order preserved).
-  function buildSonioxDirectConfig(tempKey) {
-    var terms = effectiveKeyterms(49, 300);
-    var general = [
-      { key: "domain", value: "Healthcare" },
-      { key: "specialty", value: "Wound care and emergency medicine" },
-      { key: "setting", value: "Clinician dictation of a patient note" },
-      { key: "style", value: "Medical terminology, drug names, abbreviations" },
-    ];
-    var budget = 8000, picked = [];
-    for (var i = 0; i < terms.length; i++) {
-      var t = terms[i];
-      if (budget - (t.length + 1) < 0) break;
-      picked.push(t); budget -= t.length + 1;
-    }
-    var cfg = {
-      api_key: tempKey,
-      model: SONIOX_DIRECT_MODEL,
-      language_hints: ["en"],
-      language_hints_strict: true,
-      enable_endpoint_detection: false,
-      context: picked.length ? { general: general, terms: picked } : { general: general },
-    };
-    if (directUsesRec) {
-      // MediaRecorder feed: Soniox auto-detects the webm/ogg container from the
-      // stream header — no sample_rate/encoding needed (and the recorder is the
-      // native mic rate, not our downsample).
-      cfg.audio_format = "auto";
-    } else {
-      cfg.audio_format = "pcm_s16le";
-      cfg.sample_rate = 16000;
-      cfg.num_channels = 1;
-    }
-    return cfg;
-  }
-
-  // Client-side mirror of the Worker's makeSonioxToClient: turns each Soniox
-  // token response into the app frame vocabulary. Final tokens accumulate; the
-  // running partial is confirmed + provisional tail; committed lands on finished;
-  // <end>/<fin> markers drop; error_code -> loud error. Emits frame OBJECTS that
-  // feed the shared handleServerFrame (and the phone-link mirror).
-  function makeSonioxClientTranslator() {
-    var finalText = "";
-    var startedSent = false;
-    return function (raw) {
-      var m;
-      try { m = JSON.parse(raw); } catch (e) { return []; }
-      if (!m || typeof m !== "object") return [];
-      var out = [];
-      if (!startedSent) { startedSent = true; out.push({ message_type: "session_started", config: {} }); }
-      if (m.error_code) {
-        out.push({ message_type: "error", error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : "") });
-        return out;
-      }
-      var newFinal = "", nonFinal = "";
-      if (Array.isArray(m.tokens)) {
-        for (var i = 0; i < m.tokens.length; i++) {
-          var tk = m.tokens[i];
-          if (!tk || typeof tk.text !== "string") continue;
-          var tt = tk.text.trim();
-          if (tt.length >= 2 && tt.charAt(0) === "<" && tt.charAt(tt.length - 1) === ">") continue; // drop <end>/<fin>
-          if (tk.is_final) newFinal += tk.text; else nonFinal += tk.text;
-        }
-      }
-      finalText += newFinal;
-      out.push({ message_type: "partial_transcript", text: finalText + nonFinal });
-      if (m.finished) out.push({ message_type: "committed_transcript", text: finalText });
-      return out;
-    };
-  }
-
-  // ───── Phone-link mirror for DIRECT mode (joined phone -> desktop) ─────
-  // On the proxy path the Worker mirrors transcript frames into the room. In
-  // direct mode the Worker is out of the audio path, so the phone opens a
-  // PUBLISHER socket to the room and pushes its translated frames itself. The
-  // room broadcasts them to the desktop listener and, on this socket's close,
-  // synthesizes phone_session_end — so the desktop's grace/fallback fires exactly
-  // as before, including if the phone dies mid-dictation. The authoritative final
-  // text still travels the existing /deliver POST (deliverFinalText) — unchanged.
-  function openPhonePublisher() {
-    if (!joinedSessionCode) return;
-    closePhonePublisher();
-    try {
-      var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-      pubWs = new WebSocket(proto + "//" + window.location.host + "/api/session/" + joinedSessionCode + "?role=pub");
-    } catch (e) { pubWs = null; }
-  }
-  function publishToRoom(frame) {
-    if (!pubWs || pubWs.readyState !== WebSocket.OPEN) return;
-    try { pubWs.send(JSON.stringify(frame)); } catch (e) {}
-  }
-  function closePhonePublisher() {
-    if (pubWs) { try { pubWs.close(); } catch (e) {} pubWs = null; }
-  }
-
-  // ───── DIRECT realtime: MediaRecorder feed (off-thread, like the demo) ─────
-  // A Soniox auto-detectable container (webm/ogg). iOS Safari yields neither
-  // (it records mp4, which Soniox's auto list excludes), so directFeedMime()
-  // returns "" there and the caller falls back to the raw-PCM pump.
-  function directFeedMime() {
-    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
-    var cands = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"];
-    for (var i = 0; i < cands.length; i++) { if (MediaRecorder.isTypeSupported(cands[i])) return cands[i]; }
-    return "";
-  }
-  function startDirectRecorder() {
-    pendingMediaChunks = [];
-    directRefineChunks = [];
-    try {
-      directRec = new MediaRecorder(stream, { mimeType: directRecMime, audioBitsPerSecond: 32000 });
-    } catch (e) {
-      directRec = null; directUsesRec = false;
-      rtDebugLog("[rt] direct recorder failed (" + ((e && e.message) || e) + ") -> raw-PCM fallback");
-      return;
-    }
-    directRec.ondataavailable = function (e) {
-      if (!e.data || e.data.size === 0) return;
-      // Hybrid: keep every chunk for the batch refine upload (the full webm).
-      if (sessionEngine === "hybrid") directRefineChunks.push(e.data);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try { ws.send(e.data); dbgFramesSent++; } catch (err) {}
-      } else if (pendingMediaChunks.length < 300) {
-        pendingMediaChunks.push(e.data);
-      }
-    };
-    try { directRec.start(DIRECT_REC_TIMESLICE_MS); }
-    catch (e) { directRec = null; directUsesRec = false; rtDebugLog("[rt] direct recorder start failed -> raw-PCM fallback"); }
-  }
-  function flushPendingMediaChunks() {
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    while (pendingMediaChunks.length) {
-      try { ws.send(pendingMediaChunks.shift()); } catch (e) { break; }
-    }
-  }
-  // Stop the recorder, then run cb AFTER its final chunk has been delivered
-  // (onstop fires after the last ondataavailable) — so end-of-audio is signaled
-  // only once Soniox has every byte.
-  function stopDirectRecorder(cb) {
-    if (!directRec || directRec.state === "inactive") { directRec = null; if (cb) cb(); return; }
-    directRec.onstop = function () { directRec = null; if (cb) cb(); };
-    try { directRec.stop(); } catch (e) { directRec = null; if (cb) cb(); }
-  }
-
-  // Shared downstream handler for one server frame in the app vocabulary. Both
-  // transports feed it: the PROXY path parses the Worker's JSON; the DIRECT path
-  // translates Soniox tokens client-side (makeSonioxClientTranslator) and feeds
-  // the resulting frame objects here. Keeping ONE handler means the live display,
-  // finalize/commit-quiet logic, and loud error path are identical on both paths.
-  function handleServerFrame(data, sess) {
-    if (!data || typeof data !== "object") return;
-    const m_type = data.message_type;
-    if (m_type === "session_started") {
-      // Nova-3: config.tier shows which config opened (medical/general/minimal).
-      const cfg = data.config || {};
-      const tier = typeof cfg.tier === "string" ? cfg.tier : "";
-      if (!stopping) {
-        setStatus("Listening — transcribing live…" + (tier ? " (" + tier + ")" : ""), "ok");
-      }
-    }
-    else if (m_type === "partial_transcript") {
-      partialCount++;
-      rtDebugLog("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text));
-      currentPartial = data.text;
-      updateLiveDisplay();
-    }
-    else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
-      partialCount++;
-      rtDebugLog("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text));
-      if (data.text && data.text.trim()) {
-        finalizedSegments.push(data.text);
-        currentPartial = "";
-        updateLiveDisplay();
-      }
-      if (stopPhase === "awaitFinal") {
-        // The final words arrived — close as soon as the server goes quiet
-        // instead of waiting out the whole deadline.
-        dbgPhase("final committed arrived; closing in " + COMMIT_QUIET_MS + "ms");
-        if (quietTimer) clearTimeout(quietTimer);
-        quietTimer = setTimeout(() => {
-          quietTimer = null;
-          if (sess !== sessionSeq) return;
-          try { if (ws) ws.close(); } catch (e) {}
-          finalizeSession(false);
-        }, COMMIT_QUIET_MS);
-      }
-    }
-    else if (typeof data.error === "string" && data.error) {
-      // Covers the whole error-frame family: error, auth_error, quota_exceeded,
-      // rate_limited, commit_throttled, input_error, session_time_limit_exceeded,
-      // chunk_size_exceeded, … — any frame carrying an error string is loud.
-      const tag = (m_type && m_type !== "error") ? (m_type + ": ") : "";
-      lastWsError = tag + data.error;
-      console.error("Scribe error frame:", lastWsError);
-      setStatus("Transcription service error — " + lastWsError, "err");
-      failBeep();
-    }
-  }
-
   async function startRecording() {
     if (recording || stopping || finishing) return;
     stopRequested = false;
@@ -3704,17 +1979,14 @@ right lower quadrant"></textarea>
     // the release guards read it).
     if (pendingStartTimer) { clearTimeout(pendingStartTimer); pendingStartTimer = null; }
 
-    // Engine-aware credential check. Realtime is Deepgram Nova-3 on Workers AI —
-    // NO STT key (the Worker uses env.AI; shared mode gates it on the passphrase).
-    // Batch + hybrid's refine still need an ElevenLabs key. In shared mode the
-    // passphrase covers everything.
-    const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch / refine)
+    // Credential check. Batch uploads to ElevenLabs Scribe v2 and needs an
+    // ElevenLabs key; in shared mode the passphrase covers it.
+    const apiKey      = apiKeyEl.value.trim();        // ElevenLabs (batch)
     const shared      = SHARED_MODE && passphraseEl.value.trim();
-    const needEleven  = (engine === "batch" || engine === "hybrid");
+    const needEleven  = true;
     let missing = null;
     if (!shared) {
-      if (needEleven && !apiKey)                       missing = SHARED_MODE ? "pass" : "eleven";
-      else if (SHARED_MODE && engine === "realtime")   missing = "pass"; // shared realtime still gates
+      if (needEleven && !apiKey) missing = SHARED_MODE ? "pass" : "eleven";
     }
     if (missing) {
       await writeSentinel();
@@ -3768,28 +2040,15 @@ right lower quadrant"></textarea>
     // upload. An Image to /favicon.ico (204) opens TCP/TLS without going through
     // fetch() — so it never consumes a batch-upload queue slot or trips the test
     // harness's queue-driven fetch mock.
-    if (engine === "batch" || engine === "hybrid") {
-      try { new Image().src = "/favicon.ico?warm=" + Date.now(); } catch (e) {}
-    }
+    try { new Image().src = "/favicon.ico?warm=" + Date.now(); } catch (e) {}
     sessionFinalized = false;
     userStopped = false;
     stopPhase = null;
-    sessionPcm = [];
-    sessionPcmBytes = 0;
-    sessionPcmTruncated = false;
-    pendingChunks = buildPrerollChunks(); // first-word rescue: lead with the pre-roll
-    firstChunkSent = false;
     lastWsError = "";
-    wsOpenAt = 0;
     recStartedAt = Date.now();
-    partialCount = 0;
-    dbgFramesSent = 0;
-    dbgLastHeartbeat = 0;
-    dbgReleaseAt = 0;
     speechDetected = false;
     maxRmsSeen = 0;
     micAlarmFired = false;
-    sttAlarmFired = false;
     mutedSince = 0;
     clearSessionTimers();
 
@@ -3809,224 +2068,14 @@ right lower quadrant"></textarea>
     currentPartial = "";
     updateLiveDisplay();
 
-    // The note text this session extends. Batch/hybrid delivery splices the
-    // freshly transcribed text onto this base instead of live segments.
+    // The note text this session extends. Batch delivery splices the freshly
+    // transcribed text onto this base instead of live segments.
     sessionBaseText = finalizedSegments.join(" ");
 
-    // When continuing a note, hand the model the tail of the existing text as
-    // context (rides only the first chunk). Fresh notes send nothing — stale
-    // context would mislead the model.
-    sessionPreviousText = latestText && latestText.trim() ? latestText.trim().slice(-300) : "";
-
-    if (sessionEngine === "batch") {
-      // Pure batch: no WebSocket, no pre-roll (the gate-in-path recording
-      // cannot splice in pre-gate frames). The post-gate MediaRecorder IS the
-      // capture path; upload happens on stop.
-      pendingChunks = [];
-      startBatchRecording();
-      return;
-    }
-
-    // Transport decision. ?rt=direct on the PAGE URL selects the DIRECT stream
-    // (browser -> Soniox via temp key, no Worker proxy hop) — for SOLO and for
-    // JOINED (phone-link) sessions alike: a joined phone streams direct AND opens
-    // a room publisher socket so the desktop keeps live feedback. Any direct setup
-    // failure falls back to the proxy transport — never a dead mic.
-    var pageRt = "";
-    try { pageRt = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
-    directMode = (pageRt === "direct");
-    directXlate = null;
-    directKey = "";
-    directUsesRec = false;
-    directRecMime = "";
-
-    if (directMode) {
-      setLinkPill("connecting");
-      // Use a pre-minted key if one is fresh (no round-trip on the start path);
-      // otherwise mint inline. Either way kick off a pre-mint for the NEXT one.
-      var minted = "";
-      if (directKeyCache && (Date.now() - directKeyCacheAt) < DIRECT_KEY_TTL_MS) {
-        minted = directKeyCache; directKeyCache = ""; directKeyCacheAt = 0; // single-use: consume
-        rtDebugLog("[rt] using pre-minted direct key");
-      } else {
-        minted = await mintSonioxKey();
-        if (mySession !== sessionSeq) return; // session superseded during the await
-      }
-      if (minted) {
-        directKey = minted;
-        // Audio source: a MediaRecorder webm feed (off-thread, like the demo) for
-        // REALTIME and HYBRID when the browser supports a Soniox auto-container.
-        // Hybrid also reuses that webm as the batch-refine upload (no raw WAV). A
-        // browser without webm/ogg (iOS) falls back to the raw-PCM pump + WAV. The
-        // recorder path doesn't pre-roll (the demo doesn't either) and must not mix
-        // raw PCM into the webm stream, so its pendingChunks stays empty.
-        directRecMime = (sessionEngine === "realtime" || sessionEngine === "hybrid") ? directFeedMime() : "";
-        directUsesRec = !!directRecMime;
-        if (directUsesRec) {
-          pendingChunks = [];
-          startDirectRecorder(); // may clear directUsesRec on failure
-        }
-        if (!directUsesRec) {
-          // Raw-PCM direct path: fold the mint-await pre-roll back in so the
-          // opening words aren't clipped.
-          pendingChunks = pendingChunks.concat(buildPrerollChunks());
-        }
-        // Joined: mirror live frames to the desktop via a room publisher socket
-        // (the Worker no longer sees the stream to mirror it).
-        if (joinedSessionCode) openPhonePublisher();
-      } else {
-        directMode = false; // loud-but-safe: fall back to the proven proxy path
-        rtDebugLog("[rt] direct mint failed -> proxy fallback");
-      }
-    }
-
-    const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    var wsUrl;
-    if (directMode) {
-      wsUrl = SONIOX_DIRECT_URL;
-      directXlate = makeSonioxClientTranslator();
-    } else {
-      // Proxy path: connect through the Cloudflare Worker. No STT key travels
-      // from the browser; in shared mode the passphrase gates the Worker.
-      const params = new URLSearchParams();
-      if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
-      params.append("no_verbatim", String(noVerbatimEl.checked));
-      params.append("timestamps", timestampsEl.value);
-      // Keyterms bias the engine server-side. Soniox (default) takes a large
-      // context budget, so send the FULL preset list at the 49-char limit; only
-      // ?rt=el needs the 50/20 cap (the Worker also re-caps EL).
-      var keyterms = (pageRt === "el" || pageRt === "scribe")
-        ? effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS)
-        : effectiveKeyterms(49, 300);
-      params.append("keyterms_json", JSON.stringify(keyterms));
-      if (joinedSessionCode) params.append("session", joinedSessionCode);
-      // Experimental transport override (?rt=...) forwarded to the Worker; an
-      // unknown value is ignored (absent/auto = the default Soniox proxy).
-      if (pageRt && /^(el|scribe|soniox|binding|nova|flux|gw|dgw|auto)$/.test(pageRt)) params.append("rt", pageRt);
-      wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
-    }
-    rtDebugLog("[rt " + Math.round(performance.now()) + "] connecting ws  engine=" + sessionEngine + " rt=" + (directMode ? "direct" : (pageRt || "auto")));
-
-    try {
-      ws = new WebSocket(wsUrl);
-    } catch (err) {
-      await writeSentinel();
-      sessionFinalized = true;
-      setLinkPill("fail");
-      setStatus("Could not open transcription pipeline.", "err");
-      failBeep();
-      return;
-    }
-    if (directMode) { try { ws.binaryType = "arraybuffer"; } catch (e) {} }
-
-    setLinkPill("connecting");
-
-    // Fail LOUDLY if the pipe cannot open, before a long dictation is lost.
-    connectTimer = setTimeout(() => {
-      connectTimer = null;
-      if (mySession !== sessionSeq || sessionFinalized) return;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        lastWsError = lastWsError || "could not reach the transcription service";
-        setLinkPill("fail");
-        try { if (ws) ws.close(); } catch (e) {}
-        finalizeSession(true);
-      }
-    }, CONNECT_TIMEOUT_MS);
-
-    ws.onopen = () => {
-      if (mySession !== sessionSeq) return;
-      wsOpenAt = Date.now();
-      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws OPEN" + (directMode ? " (direct)" : ""));
-      if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
-      // DIRECT: the auth + audio-format + medical-context config rides the FIRST
-      // WS frame (Soniox's config-first protocol), then audio streams as binary.
-      if (directMode) {
-        try { ws.send(JSON.stringify(buildSonioxDirectConfig(directKey))); } catch (e) {}
-      }
-      setLinkPill("live");
-      // Recorder feed flushes buffered webm; raw-PCM paths flush base64 chunks.
-      // Never both — mixing raw PCM into the webm stream would corrupt it.
-      if (directUsesRec) flushPendingMediaChunks();
-      else flushPendingChunks();
-      setStatus("Listening — transcribing live…", "ok");
-      if (stopPhase === "awaitFinal") {
-        // PTT was released while still connecting: buffered speech was just
-        // flushed; give the server a moment to chew on it, then commit.
-        setTimeout(() => { if (mySession === sessionSeq) beginCommitPhase(true); }, 400);
-      }
-    };
-
-    ws.onmessage = async (event) => {
-      if (mySession !== sessionSeq) return;
-      try {
-        if (directMode) {
-          // Soniox token frames -> app frames, on-device, then the shared handler.
-          // Joined: also mirror each frame to the desktop via the room publisher.
-          var frames = directXlate ? directXlate(event.data) : [];
-          for (var fi = 0; fi < frames.length; fi++) {
-            handleServerFrame(frames[fi], mySession);
-            publishToRoom(frames[fi]);
-          }
-        } else {
-          handleServerFrame(JSON.parse(event.data), mySession);
-        }
-      } catch (err) {
-        console.error("Error processing message:", err);
-      }
-    };
-
-    ws.onerror = (err) => {
-      if (mySession !== sessionSeq) return;
-      console.error("WebSocket Error:", err);
-      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws ERROR");
-      lastWsError = lastWsError || "pipeline connection error";
-      setStatus("Pipeline connection error.", "err");
-    };
-
-    ws.onclose = () => {
-      if (mySession !== sessionSeq) return;
-      console.log("WebSocket connection closed.");
-      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws CLOSE  (partials seen this session: " + partialCount + ")");
-      setLinkPill(sessionFinalized || userStopped ? "idle" : "fail");
-      // A close we did not ask for is a failure and must sound like one.
-      finalizeSession(!userStopped);
-    };
-
-    // Parallel local audio recording for playback bar
-    chunks = [];
-    const preferred = [
-      "audio/webm;codecs=opus",
-      "audio/webm",
-      "audio/ogg;codecs=opus",
-    ].find((type) => MediaRecorder.isTypeSupported(type));
-
-    try {
-      const recOpts = { audioBitsPerSecond: 64000 };
-      if (preferred) recOpts.mimeType = preferred;
-      mediaRecorder = new MediaRecorder(destNode.stream, recOpts);
-    } catch (e) {
-      console.warn("Local browser playbar preview recorder failed to initiate.");
-    }
-
-    if (mediaRecorder) {
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunks.push(e.data);
-      };
-      mediaRecorder.start();
-    }
-
-    recording = true;
-    stopping = false;
-    recordBtn.textContent = "Stop recording";
-    recordBtn.classList.add("danger");
-    setMicPill("rec");
-    updateAppendChip();
-    startBeep();
-
-    if (stopRequested) {
-      stopRequested = false;
-      stopRecording();
-    }
+    // Pure batch: no WebSocket, no pre-roll (the gate-in-path recording cannot
+    // splice in pre-gate frames). The post-gate MediaRecorder IS the capture
+    // path; upload happens on stop.
+    startBatchRecording();
   }
 
   // Batch-mode recording: the same post-gate MediaRecorder the other engines
@@ -4087,111 +2136,23 @@ right lower quadrant"></textarea>
     }
     userStopped = true;
     stopping = true;
-    dbgReleaseAt = performance.now();
-    dbgPhase("release (engine=" + sessionEngine + ", framesSent=" + dbgFramesSent + ", partials=" + partialCount + ")");
 
-    if (sessionEngine === "batch") {
-      // No tail/commit phases: stopping the recorder flushes the last chunk,
-      // and its onstop handler drives the finalize/upload.
-      stopPhase = null;
-      setStatus("Stopping — preparing upload…", "warn");
-      if (mediaRecorder && mediaRecorder.state !== "inactive") {
-        try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
-      } else {
-        finalizeSession(false);
-      }
-      return;
-    }
-
-    stopPhase = "tail";
-    setStatus("Finalizing live speech transcript…", "warn");
-
+    // No tail/commit phases: stopping the recorder flushes the last chunk,
+    // and its onstop handler drives the finalize/upload.
+    stopPhase = null;
+    setStatus("Stopping — preparing upload…", "warn");
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      mediaRecorder.stop();
-    }
-
-    // Keep streaming audio briefly after PTT release so trailing speech still
-    // in the capture pipeline reaches the engine (this is what used to clip the
-    // last word or two), then finalize.
-    tailTimer = setTimeout(() => {
-      tailTimer = null;
-      dbgPhase("tail end -> " + (sessionEngine === "hybrid" ? "commit+close, start batch refine" : "begin commit phase"));
-      if (sessionEngine === "hybrid") {
-        // HYBRID FAST FINALIZE: the batch refine is the deliverable, and the capture
-        // (webm chunks or sessionPcm) is already complete after the tail. Do NOT
-        // block the batch on the realtime engine's finalize — the live text was only
-        // feedback; commit + close the socket in the background and refine now.
-        if (directUsesRec) {
-          // Recorder feed: stop it first so its final webm chunk lands in
-          // directRefineChunks (the refine upload) BEFORE we finalize, then
-          // end-of-audio + close.
-          stopDirectRecorder(function () {
-            try { if (ws && ws.readyState === WebSocket.OPEN) rtSendCommit(); } catch (e) {}
-            try { if (ws) ws.close(); } catch (e) {}
-            finalizeSession(false);
-          });
-        } else {
-          try {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-              flushPendingChunks();
-              rtSendCommit(); // graceful end-of-audio to the engine
-            }
-          } catch (e) {}
-          try { if (ws) ws.close(); } catch (e) {} // onclose re-enters finalize; sessionFinalized guards it
-          finalizeSession(false);
-        }
-      } else {
-        beginCommitPhase(false);
-      }
-    }, TAIL_MS);
-  }
-
-  function beginCommitPhase(fromOpen) {
-    if (sessionFinalized) return;
-    stopPhase = "awaitFinal";
-
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      // Recorder feed: stop the recorder first so its final webm chunk flushes,
-      // THEN signal end-of-audio (no raw-PCM flush — it must not mix into webm).
-      // Raw-PCM paths: flush remaining chunks, then commit.
-      if (directUsesRec) {
-        // rtSendCommit/flush both no-op if the socket isn't OPEN, so a stale
-        // callback after a finalize is harmless — no session guard needed.
-        stopDirectRecorder(function () { flushPendingMediaChunks(); rtSendCommit(); });
-      } else {
-        flushPendingChunks();
-        // Final end-of-audio forces the last segment out (binary "" in direct mode,
-        // {commit:true} through the Worker in proxy mode)
-        rtSendCommit();
-      }
-      dbgPhase("commit sent -> awaiting final committed (deadline " + FINAL_WAIT_MS + "ms)");
-      if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
-      finalDeadlineTimer = setTimeout(() => {
-        finalDeadlineTimer = null;
-        try { if (ws) ws.close(); } catch (e) {}
-        finalizeSession(false);
-      }, FINAL_WAIT_MS);
-    } else if (ws && ws.readyState === WebSocket.CONNECTING && !fromOpen) {
-      // Still connecting: ws.onopen sees stopPhase === "awaitFinal" and calls
-      // us back; the connect timeout covers the never-opens case.
+      try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
     } else {
-      finalizeSession(!userStopped);
+      finalizeSession(false);
     }
   }
 
   async function finalizeSession(unexpected) {
     if (sessionFinalized) return;
     sessionFinalized = true;
-    dbgPhase("finalizeSession(unexpected=" + !!unexpected + ")");
     clearSessionTimers();
-    showRecFeedback(false); // recording is over; the status line carries the upload/refine state
-    // Stop the direct MediaRecorder if it's still running (an unexpected close
-    // bypasses beginCommitPhase). Idempotent — a no-op if already stopped.
-    stopDirectRecorder();
-    // Closing the publisher makes the room emit phone_session_end to the desktop
-    // (its grace timer then waits for the authoritative /deliver), matching the
-    // proxy path's per-dictation end signal. No-op when not a direct joined mic.
-    closePhonePublisher();
+    showRecFeedback(false); // recording is over; the status line carries the upload state
 
     // Set BEFORE the button/pill updates below: those trigger the big-screen
     // recalc, and with finishing already true it renders WORKING… through the
@@ -4223,109 +2184,7 @@ right lower quadrant"></textarea>
 
     lastFinalizeAt = Date.now();
 
-    if (sessionEngine === "batch") {
-      await finishBatchSession(unexpected);
-      return;
-    }
-    if (sessionEngine === "hybrid") {
-      await refineAndDeliverHybrid(unexpected);
-      return;
-    }
-
-    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected });
-  }
-
-  // Hybrid delivery: the realtime text on screen was live feedback; the same
-  // audio — pre-roll, live, tail, exactly as produced for the stream — is
-  // re-transcribed by the stronger batch model and THAT lands on the
-  // clipboard. If the refine fails, the live text is delivered with an
-  // always-audible warn. If the live link died but audio was captured, the
-  // refine doubles as a recovery path.
-  async function refineAndDeliverHybrid(unexpected) {
-    const liveCleaned = cleanTranscript(latestText);
-
-    // Pick the refine upload. DIRECT hybrid uses the off-thread MediaRecorder webm
-    // (compressed, ~8-10x smaller than the raw WAV, and the SAME proven format as
-    // batch mode) — far faster to upload on a long dictation, and complete (no
-    // main-thread pump backlog to drop the tail). The raw-PCM path uses the WAV.
-    let uploadBlob = null, uploadName = "recording.wav", enoughAudio = false, truncated = false;
-    if (directUsesRec) {
-      const webmChunks = directRefineChunks;
-      directRefineChunks = [];
-      const webm = webmChunks.length ? new Blob(webmChunks, { type: directRecMime || "audio/webm" }) : null;
-      uploadBlob = webm;
-      uploadName = "recording.webm";
-      enoughAudio = !!(webm && webm.size >= MIN_REFINE_WEBM_BYTES);
-      dbgPhase("hybrid refine source = webm (" + (webm ? webm.size : 0) + " bytes)");
-    } else {
-      const pcm = sessionPcm;
-      const pcmBytes = sessionPcmBytes;
-      truncated = sessionPcmTruncated;
-      sessionPcm = []; // a 20 MB buffer must never outlive its session
-      sessionPcmBytes = 0;
-      sessionPcmTruncated = false;
-      enoughAudio = pcmBytes >= MIN_REFINE_BYTES;
-      if (enoughAudio) uploadBlob = buildWavBlob(pcm, 16000);
-      dbgPhase("hybrid refine source = wav (" + pcmBytes + " bytes)");
-    }
-
-    if (!enoughAudio) {
-      // Instant tap / dead mic: nothing worth refining — deliver as realtime would.
-      await deliverFinalText(liveCleaned, { unexpected: unexpected });
-      return;
-    }
-
-    setLinkPill("refining");
-    setStatus("Refining via batch transcription…", "warn");
-
-    dbgPhase("batch refine POST start (timeout " + REFINE_TIMEOUT_MS + "ms)");
-    const r = await batchTranscribe(uploadBlob, uploadName, REFINE_TIMEOUT_MS);
-    dbgPhase("batch refine POST returned (ok=" + (r && r.ok) + ")");
-
-    if (truncated && r.ok && r.text && r.text.trim() && liveCleaned.trim()) {
-      // The capture buffer capped out, so the refined text is missing the
-      // tail. The live text is complete — deliver that instead, loudly.
-      setLinkPill("fail");
-      await deliverFinalText(liveCleaned, {
-        unexpected: unexpected,
-        refineFailed: "recording exceeded the refine cap; complete LIVE text delivered instead",
-      });
-      return;
-    }
-
-    if (r.ok && r.text && r.text.trim()) {
-      finalizedSegments = sessionBaseText ? [sessionBaseText, r.text] : [r.text];
-      currentPartial = "";
-      updateLiveDisplay(); // the box swaps live text -> refined text
-      setLinkPill(unexpected ? "fail" : "idle");
-      const refinedCleaned = cleanTranscript(latestText);
-      await deliverFinalText(refinedCleaned, {
-        unexpected: unexpected,
-        label: "Refined transcript",
-        unexpectedMsg: "⚠ Live link lost mid-dictation — audio recovered via batch re-transcription. VERIFY the ending (it may cut off early)!",
-        liveText: liveCleaned !== refinedCleaned ? liveCleaned : undefined,
-      });
-      return;
-    }
-
-    if (liveCleaned.trim()) {
-      // Refine failed but the live text exists: deliver it, degraded-loudly.
-      setLinkPill("fail");
-      await deliverFinalText(liveCleaned, {
-        unexpected: unexpected,
-        refineFailed: r.error || "no text returned",
-      });
-      return;
-    }
-
-    // Neither engine produced text.
-    setLinkPill("fail");
-    if (r.ok) {
-      await deliverFinalText("", { unexpected: unexpected }); // genuine no-speech
-    } else {
-      lastWsError = "batch refine: " + (r.error || "failed");
-      await deliverFinalText("", { unexpected: true });
-    }
+    await finishBatchSession(unexpected);
   }
 
   // Pure batch delivery: upload the post-gate recording, splice the result
@@ -4374,19 +2233,15 @@ right lower quadrant"></textarea>
     await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected, label: "Transcript" });
   }
 
-  // The single delivery exit for every engine: exactly one clipboard outcome
-  // and one beep per session ends up here. opts:
+  // The single delivery exit: exactly one clipboard outcome and one beep per
+  // session ends up here. opts:
   //   unexpected    — the session ended on a failure we did not request
-  //   label         — what to call the text in the success status ("Live transcript", …)
-  //   unexpectedMsg — engine-specific override for the unexpected status line
-  //   refineFailed  — hybrid only: batch refine failed; deliver live text with a warn
-  //   liveText      — hybrid only: realtime rendering saved alongside for comparison
+  //   label         — what to call the text in the success status ("Transcript", …)
+  //   unexpectedMsg — override for the unexpected status line
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
     releaseWakeLock(); // the screen may sleep again once the outcome is delivered
-    const label = opts.label || "Live transcript";
-    dbgPhase("deliverFinalText (" + (cleaned ? cleaned.length : 0) + " chars) — END of finalize timeline");
-    prewarmDirectKey(); // mint the next direct key now so the next PTT starts instantly (self-gates)
+    const label = opts.label || "Transcript";
 
     if (!cleaned.trim()) {
       await writeSentinel();
@@ -4411,7 +2266,7 @@ right lower quadrant"></textarea>
     // Save final clean output to browser storage. A storage failure (quota)
     // must not block the actual deliverable — the clipboard write and beep.
     try {
-      addHistory(cleaned, { language_code: "en", engine: sessionEngine, liveText: opts.liveText });
+      addHistory(cleaned, { language_code: "en", engine: sessionEngine });
     } catch (e) {}
 
     let announceRelayOutcome = false; // joined + clean outcome + local copy denied: the relay ack owns the outcome cue
@@ -4419,7 +2274,7 @@ right lower quadrant"></textarea>
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
       const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
-      const cleanOutcome = !opts.unexpected && !micAlarmFired && !opts.refineFailed;
+      const cleanOutcome = !opts.unexpected && !micAlarmFired;
       if (!copied && relayCarries && cleanOutcome) {
         // Joined mode: the deliverable is the DESKTOP clipboard via the
         // relay. iOS denies local clipboard writes outside a user gesture —
@@ -4439,9 +2294,6 @@ right lower quadrant"></textarea>
       } else if (micAlarmFired) {
         setStatus("⚠ Mic signal dropped during this dictation — verify the text before pasting!", "err");
         failBeep();
-      } else if (opts.refineFailed) {
-        setStatus("⚠ Batch refine failed — LIVE transcript copied (less accurate). " + opts.refineFailed, "warn");
-        warnBeep();
       } else {
         setStatus(label + " saved & copied. Done!", "ok");
         doneBeep();
@@ -4450,9 +2302,6 @@ right lower quadrant"></textarea>
       if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
-      } else if (opts.refineFailed) {
-        setStatus("⚠ Batch refine failed — live transcript saved, not copied. " + opts.refineFailed, "warn");
-        warnBeep();
       } else {
         setStatus(label + " saved.", "ok");
         doneBeep();
@@ -5346,15 +3195,6 @@ right lower quadrant"></textarea>
     tryWarmOnLoad();
   });
 
-  if (engineSegEl) {
-    engineSegEl.addEventListener("click", (e) => {
-      const t = e.target;
-      if (t && t.getAttribute && t.getAttribute("data-engine")) {
-        setEngine(t.getAttribute("data-engine"));
-      }
-    });
-  }
-
   appendModeEl.addEventListener("change", updateAppendChip);
   appendWindowEl.addEventListener("input", () => { saveSettings(); updateAppendChip(); });
   if (advancedEl) advancedEl.addEventListener("toggle", saveSettings);
@@ -5513,7 +3353,6 @@ right lower quadrant"></textarea>
   renderHistory();
   updateAppendChip();
   tryWarmOnLoad();
-  prewarmDirectKey(); // ?rt=direct: have a temp key ready so the FIRST dictation is instant too
 })();
 </script>
 </body>

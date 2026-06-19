@@ -1811,6 +1811,14 @@ right lower quadrant"></textarea>
       box.scrollTop = box.scrollHeight;
     } catch (e) {}
   }
+  // Finalize-timeline stamp: ms since PTT release, so "takes forever to finalize"
+  // shows exactly which phase (tail / commit / engine finalize / batch refine /
+  // clipboard) spends the time. Base (dbgReleaseAt) is set in stopRecording.
+  function dbgPhase(label) {
+    if (!RT_DEBUG) return;
+    var now = Math.round(performance.now());
+    rtDebugLog("[phase " + now + "] " + label + (dbgReleaseAt ? " (+" + (now - Math.round(dbgReleaseAt)) + "ms since release)" : ""));
+  }
 
   // Per-session flow state
   let sessionSeq = 0;          // bumps each recording; stale socket callbacks bail out
@@ -1827,6 +1835,14 @@ right lower quadrant"></textarea>
   let wsOpenAt = 0;
   let recStartedAt = 0;
   let partialCount = 0;
+  // ?debug=1 instrumentation. Surfaces WHERE the realtime path stalls on a real
+  // device (DevTools is often unreachable for the clinician user): which audio
+  // pump is live, whether audio frames keep flowing while partials freeze (engine
+  // vs pump), and the post-release finalize timeline ("takes forever to finalize").
+  let dbgFramesSent = 0;        // live audio frames pushed to the WS this session
+  let dbgPumpKind = "?";        // "worklet" | "scriptprocessor" — which pump is live
+  let dbgLastHeartbeat = 0;     // last per-second cadence print (Date.now ms)
+  let dbgReleaseAt = 0;         // performance.now() at PTT release (finalize timeline base)
   let speechDetected = false;
   let maxRmsSeen = 0;
   let micAlarmFired = false;
@@ -2964,9 +2980,23 @@ right lower quadrant"></textarea>
 
     if (ws.readyState === WebSocket.OPEN) {
       flushPendingChunks();
-      sendAudioChunk(base64Audio, false);
+      if (sendAudioChunk(base64Audio, false)) dbgFramesSent++;
     } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
       pendingChunks.push(base64Audio);
+    }
+    // Per-second cadence heartbeat (?debug=1). The decisive read: if framesSent
+    // keeps climbing while partials stops rising, audio IS reaching the engine and
+    // the stall is the engine/translator; if framesSent also flatlines, the pump
+    // or mic stalled. A growing wsBuffered means the WS send is backing up
+    // (main-thread jank / network), the classic ScriptProcessor-starvation tell.
+    if (RT_DEBUG) {
+      var nowHb = Date.now();
+      if (nowHb - dbgLastHeartbeat >= 1000) {
+        dbgLastHeartbeat = nowHb;
+        var buffered = (ws && ws.bufferedAmount != null) ? ws.bufferedAmount : "?";
+        rtDebugLog("[audio " + Math.round(performance.now()) + "] pump=" + dbgPumpKind +
+          " framesSent=" + dbgFramesSent + " partials=" + partialCount + " wsBuffered=" + buffered);
+      }
     }
   }
 
@@ -3037,7 +3067,10 @@ right lower quadrant"></textarea>
           try {
             var node = new AudioWorkletNode(audioCtx, "pcm-pump");
             node.port.onmessage = function (e) { handleAudioFrame(e.data); };
-            try { console.log("[audio] AudioWorklet pump active" + (attempt ? " (after " + attempt + " retr" + (attempt > 1 ? "ies" : "y") + ")" : "")); } catch (e) {}
+            dbgPumpKind = "worklet";
+            var okMsg = "[audio] AudioWorklet pump active" + (attempt ? " (after " + attempt + " retr" + (attempt > 1 ? "ies" : "y") + ")" : "");
+            try { console.log(okMsg); } catch (e) {}
+            rtDebugLog(okMsg);
             return node;
           } catch (err) {
             lastErr = err;
@@ -3050,7 +3083,10 @@ right lower quadrant"></textarea>
       }
     }
     // Last resort — deprecated, main-thread, can starve under load.
-    try { console.warn("[audio] FALLBACK to ScriptProcessor pump (off-thread worklet unavailable; realtime may degrade under load)"); } catch (e) {}
+    dbgPumpKind = "scriptprocessor";
+    var fbMsg = "[audio] FALLBACK to ScriptProcessor pump (off-thread worklet unavailable; realtime may degrade under load)";
+    try { console.warn(fbMsg); } catch (e) {}
+    rtDebugLog("!! " + fbMsg);
     var sp = audioCtx.createScriptProcessor(PUMP_FRAME_SAMPLES, 1, 1);
     sp.onaudioprocess = function (e) {
       handleAudioFrame(new Float32Array(e.inputBuffer.getChannelData(0)));
@@ -3188,6 +3224,9 @@ right lower quadrant"></textarea>
     wsOpenAt = 0;
     recStartedAt = Date.now();
     partialCount = 0;
+    dbgFramesSent = 0;
+    dbgLastHeartbeat = 0;
+    dbgReleaseAt = 0;
     speechDetected = false;
     maxRmsSeen = 0;
     micAlarmFired = false;
@@ -3335,6 +3374,7 @@ right lower quadrant"></textarea>
           if (stopPhase === "awaitFinal") {
             // The final words arrived — close as soon as the server goes quiet
             // instead of waiting out the whole deadline.
+            dbgPhase("final committed arrived; closing in " + COMMIT_QUIET_MS + "ms");
             if (quietTimer) clearTimeout(quietTimer);
             quietTimer = setTimeout(() => {
               quietTimer = null;
@@ -3472,6 +3512,8 @@ right lower quadrant"></textarea>
     }
     userStopped = true;
     stopping = true;
+    dbgReleaseAt = performance.now();
+    dbgPhase("release (engine=" + sessionEngine + ", framesSent=" + dbgFramesSent + ", partials=" + partialCount + ")");
 
     if (sessionEngine === "batch") {
       // No tail/commit phases: stopping the recorder flushes the last chunk,
@@ -3498,6 +3540,7 @@ right lower quadrant"></textarea>
     // last word or two), then finalize.
     tailTimer = setTimeout(() => {
       tailTimer = null;
+      dbgPhase("tail end -> " + (sessionEngine === "hybrid" ? "commit+close, start batch refine" : "begin commit phase"));
       if (sessionEngine === "hybrid") {
         // HYBRID FAST FINALIZE: the batch refine is the deliverable, and sessionPcm
         // is already complete after the tail. Do NOT block the batch on the realtime
@@ -3526,6 +3569,7 @@ right lower quadrant"></textarea>
       flushPendingChunks();
       // Final empty chunk with commit: true forces the last segment out
       sendAudioChunk("", true);
+      dbgPhase("commit sent -> awaiting final committed (deadline " + FINAL_WAIT_MS + "ms)");
       if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
       finalDeadlineTimer = setTimeout(() => {
         finalDeadlineTimer = null;
@@ -3543,6 +3587,7 @@ right lower quadrant"></textarea>
   async function finalizeSession(unexpected) {
     if (sessionFinalized) return;
     sessionFinalized = true;
+    dbgPhase("finalizeSession(unexpected=" + !!unexpected + ")");
     clearSessionTimers();
 
     // Set BEFORE the button/pill updates below: those trigger the big-screen
@@ -3612,7 +3657,9 @@ right lower quadrant"></textarea>
     setStatus("Refining via batch transcription…", "warn");
 
     const wav = buildWavBlob(pcm, 16000);
+    dbgPhase("batch refine POST start (" + pcmBytes + " bytes, timeout " + REFINE_TIMEOUT_MS + "ms)");
     const r = await batchTranscribe(wav, "recording.wav", REFINE_TIMEOUT_MS);
+    dbgPhase("batch refine POST returned (ok=" + (r && r.ok) + ")");
 
     if (truncated && r.ok && r.text && r.text.trim() && liveCleaned.trim()) {
       // The capture buffer capped out, so the refined text is missing the
@@ -3717,6 +3764,7 @@ right lower quadrant"></textarea>
     opts = opts || {};
     releaseWakeLock(); // the screen may sleep again once the outcome is delivered
     const label = opts.label || "Live transcript";
+    dbgPhase("deliverFinalText (" + (cleaned ? cleaned.length : 0) + " chars) — END of finalize timeline");
 
     if (!cleaned.trim()) {
       await writeSentinel();

@@ -1,5 +1,32 @@
 # Realtime STT Investigation — Handoff
 
+> ## 🗄️ STATUS (2026-06-19): REALTIME + HYBRID **REMOVED** from the codebase — learnings archive
+>
+> The product is **batch-only** now (owner call: batch is "fast and amazingly accurate", realtime is expensive and not necessary; the *reassurance* realtime gave is now a free on-device **capture waveform** — see `CLAUDE.md`). The realtime/hybrid/direct-stream/Soniox code was **deleted** in the batch-only cleanup. **This document is preserved on purpose — the owner has NOT given up on realtime.** Everything below is the full investigation log; this banner is the executive summary + how to bring it back.
+>
+> ### The one thing that mattered (root cause, finally found)
+> **Our app was jittery while soniox.com's demo (same engine) was smooth — because of HOW we captured audio, not the network.** Our realtime used a raw-PCM **AudioWorklet pump** whose per-frame **downsample + WebSocket send ran on the MAIN THREAD**, so under live-render load they fired in bursts and Soniox received jittery audio. Soniox's own demo (and our **batch** path) capture with **`MediaRecorder`**, which runs **off the main thread**, and Soniox **auto-detects the webm container** (`audio_format:"auto"`). That off-thread vs main-thread difference is the whole story — it's also why **batch was always flawless** and realtime never was, and why removing the Worker proxy hop alone did *not* fix it.
+>
+> ### The approach that WORKED (rebuild from here)
+> 1. **Direct stream**: browser opens the WS **straight to Soniox** (`wss://stt-rt.soniox.com/transcribe-websocket`), authenticated by a **temporary API key** the Worker mints (`POST /api/soniox-token`, passphrase-gated, `single_use`/120 s/600 s). No Worker proxy hop on the audio path. The long-lived `SONIOX_API_KEY` never reaches the browser.
+> 2. **Off-thread capture**: feed Soniox a **`MediaRecorder` webm stream** (`audio_format:"auto"`), NOT a raw-PCM pump. This is the fix for the jitter.
+> 3. **Pre-mint** the temp key (at boot + after each dictation) so the mint round-trip is off the PTT-down start path.
+> 4. **Hybrid** (if revived): reuse the same off-thread webm as the batch-refine upload (compressed, ~8-10× smaller than the raw WAV, complete capture) instead of `buildWavBlob(sessionPcm)`.
+> 5. **Phone link + direct**: the joined phone opens a `SessionRoom` **`?role=pub` publisher** socket to mirror its translated frames to the desktop; the room synthesizes `phone_session_end` on publisher disconnect (crash resilience).
+> 6. **Soniox config** (PTT-tuned): `model:"stt-rt-v5"`, `enable_endpoint_detection:false` (PTT gives the end-of-audio = empty-string frame), `language_hints_strict:true`, medical `context.general` + full keyterms under the ~8000-char budget. Soniox finalizes **~73 ms** after the empty-string commit.
+>
+> ### Known OPEN issues when it was removed
+> - **iOS Safari**: `MediaRecorder` produces **mp4**, which is NOT in Soniox's auto-detect list (`aac, aiff, amr, asf, flac, mp3, ogg, wav, webm`) — so iOS fell back to the (jittery) raw-PCM pump. **iOS needs a separate capture path** (e.g. transcode, or a different container) before realtime is good on iPhone.
+> - First-word latency still ~1–1.5 s (mint + connect + first chunk); pre-minting helped, a kept-warm connection would help more.
+> - The live interim text inherently wobbles (streaming has no right-context) — that's why batch/hybrid existed; the live feed is feedback, never the deliverable.
+>
+> ### 🧬 RESURRECTION — the full implementation is in git
+> The realtime engine was built and refined across **PR #24** (commits `2cdff67` … `c7617e4`); `f93c620` retired it from the UI; the subsequent cleanup commit deleted the code. **To bring it back: cherry-pick / revert those commits, or rebuild from the 6 steps above.** Reference implementations to recover from history: the client `mintSonioxKey` / `buildSonioxDirectConfig` / `makeSonioxClientTranslator` / `startDirectRecorder`, the Worker `sonioxClientToBackend` / `makeSonioxToClient` / `handleSonioxToken` / `handleTranscribeRealtime`, and the `SessionRoom` publisher role. The detailed engine-evolution + ruled-out hypotheses are below.
+
+---
+
+## Realtime STT Investigation — original handoff (historical)
+
 > **Purpose:** restart context for getting **good live/interim realtime speech-to-text**
 > working in this medical dictation app **via Cloudflare** (Workers AI / AI Gateway).
 > Batch works great; realtime/hybrid is the goal that keeps slipping. This doc is the

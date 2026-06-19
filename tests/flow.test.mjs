@@ -104,8 +104,7 @@ class MockWS {
 }
 MockWS.CONNECTING = 0; MockWS.OPEN = 1; MockWS.CLOSING = 2; MockWS.CLOSED = 3;
 
-let micRms = 0.05; // pretend speech level
-let scriptNode = null;
+let micRms = 0.05; // pretend speech level; the gate-meter watchdog reads it
 
 class MockAudioCtx {
   constructor() { this.state = 'running'; this.currentTime = 0; this.sampleRate = 48000; this.destination = {}; }
@@ -122,10 +121,6 @@ class MockAudioCtx {
   }
   createGain() { return { gain: { value: 0, setTargetAtTime() {} }, connect() {} }; }
   createMediaStreamDestination() { return { stream: { tag: 'dest' }, connect() {} }; }
-  createScriptProcessor() {
-    scriptNode = { connect() {}, onaudioprocess: null };
-    return scriptNode;
-  }
   createOscillator() { return { frequency: { value: 0 }, connect() {}, start() {}, stop() {} }; }
 }
 
@@ -221,18 +216,12 @@ const doc = w.document;
 const status = () => doc.getElementById('status').textContent.trim();
 const statusCls = () => doc.getElementById('status').className;
 const latest = () => doc.getElementById('latest').textContent;
-const pump = (n = 3) => { // fire onaudioprocess n times (~85ms of audio each)
-  for (let i = 0; i < n; i++) {
-    scriptNode.onaudioprocess({ inputBuffer: { getChannelData: () => new Float32Array(4096).fill(0.05) } });
-  }
-};
 
 await sleep(200);
 
 // ===== Scenario 0: boot state — migration shim + defaults + restore =====
 console.log('--- scenario 0: boot migration + defaults + restore ---');
 check('legacy access code surfaced as passphrase', doc.getElementById('passphrase').value === 'legacy-code', JSON.stringify(doc.getElementById('passphrase').value));
-check('default engine is batch', doc.getElementById('engBatch').className.includes('active'));
 check('append mode unchecked by default', !doc.getElementById('appendMode').checked);
 check('latest transcript restored from history on boot', latest().includes('Restored note.'), latest());
 check('auth section open while credentials are missing', doc.getElementById('authSection').open === true);
@@ -244,213 +233,88 @@ doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true
 check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
 check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
 
-// Scenarios 1–7 exercise the realtime engine and append-mode-on behavior
-// explicitly (both defaults now differ); the engine scenarios below switch
-// modes themselves, and scenario 17 covers the append-off default.
-doc.getElementById('engRealtime').click();
+// Turn append mode on for the append-window scenario (scenario 4); scenario 17
+// covers the append-off default.
 doc.getElementById('appendMode').click();
-check('append mode toggled on for the legacy scenarios', doc.getElementById('appendMode').checked);
-doc.getElementById('freshBtn').click(); // clear the restored note so scenario 1 starts fresh
+check('append mode toggled on for the append-window scenario', doc.getElementById('appendMode').checked);
+doc.getElementById('freshBtn').click(); // clear the restored note so the next scenario starts fresh
 
-// ===== Scenario 1: happy path with slow connect (pre-roll + buffer + flush), tail, commit, final =====
-console.log('--- scenario 1: happy path ---');
-check('mic warmed on load (pre-roll possible)', scriptNode !== null);
-pump(3); // speaking as/just before the key lands -> pre-roll ring, not discarded
-doc.getElementById('recordBtn').click();
-await sleep(150);
-const s1 = sockets[0];
-check('socket created, still connecting', s1 && s1.readyState === 0);
-check('realtime socket carries keyterms (Soniox context terms)', typeof new URL(s1.url).searchParams.get('keyterms_json') === 'string', s1.url);
-pump(4); // speak while connecting
-check('no frames sent while connecting', s1.sent.length === 0);
-s1.open();
-await sleep(30);
-check('pre-roll + buffered frames flushed on open', s1.sent.length === 7, s1.sent.length);
-check('status shows live', status().includes('transcribing live'), status());
-s1.msg({ message_type: 'session_started', session_id: 'sess-1', config: { tier: 'medical' } });
-check('session_started surfaces the realtime config tier', status().includes('(medical)'), status());
-check('link pill LIVE', doc.getElementById('linkPill').textContent === 'LIVE');
-check('mic pill REC', doc.getElementById('micPill').textContent === 'REC');
-s1.msg({ message_type: 'partial_transcript', text: 'patient presents' });
-s1.msg({ message_type: 'committed_transcript', text: 'Patient presents with... ascites.' }); // pause artifact
-check('committed text displayed, ellipsis stripped', latest().includes('Patient presents with ascites.'), latest());
-
-// stop (PTT release) — audio must keep flowing during the tail
-const sentBeforeStop = s1.sent.length;
-doc.getElementById('recordBtn').click();
-check('finalizing status', status().includes('Finalizing'), status());
-pump(3); // trailing speech during tail window
-check('tail audio still streams after stop', s1.sent.length === sentBeforeStop + 3, s1.sent.length - sentBeforeStop);
-// Anti-clipping backstop: a trailing partial during the (now-shorter, 250ms) tail
-// must still render — partials are never discarded at shutdown (the rescue if the
-// final commit reply never arrives). The committed below clears this transient.
-s1.msg({ message_type: 'partial_transcript', text: 'trailing tail words' });
-check('trailing partial during tail is retained', latest().includes('trailing tail words'), latest());
-await sleep(700); // > TAIL_MS
-const commitFrames = s1.sent.filter((d) => JSON.parse(d).commit === true);
-check('commit frame sent after tail', commitFrames.length === 1);
-pump(2);
-check('no audio after commit phase', s1.sent.filter((d) => !JSON.parse(d).commit).length === sentBeforeStop + 3);
-// server returns the final commit for the trailing words (unicode pause artifact)
-s1.msg({ message_type: 'committed_transcript', text: 'Last words… intact.' });
-await sleep(500); // > COMMIT_QUIET_MS
-check('socket closed after quiet period', s1.closed);
-check('final text includes trailing commit', latest().includes('Last words intact.'), latest());
-check('success status', status().includes('Done!'), status());
-check('clipboard holds full text', clipboard.includes('Patient presents with ascites.') && clipboard.includes('Last words intact.'), JSON.stringify(clipboard));
-check('no ellipses reach the clipboard', !clipboard.includes('...') && !clipboard.includes('…'), JSON.stringify(clipboard));
-check('append chip visible + appending', doc.getElementById('appendChip').textContent.includes('append'), doc.getElementById('appendChip').textContent);
-const frames1 = s1.sent.map((d) => JSON.parse(d));
-check('every frame carries sample_rate 16000 + boolean commit', frames1.every((f) => f.sample_rate === 16000 && typeof f.commit === 'boolean'), frames1.length + ' frames');
-check('fresh note sends no previous_text', frames1.every((f) => !('previous_text' in f)));
-
-// ===== Scenario 2: append within window, then unexpected mid-dictation disconnect =====
-console.log('--- scenario 2: unexpected disconnect ---');
-doc.getElementById('recordBtn').click();
-await sleep(80);
-const s2 = sockets[1];
-s2.open();
-await sleep(30);
-pump(2); // speak: frames should now carry the append context on the first one only
-const f2 = s2.sent.map((d) => JSON.parse(d));
-check('append session: first frame carries previous_text tail', f2.length >= 2 && typeof f2[0].previous_text === 'string' && f2[0].previous_text.endsWith('Last words intact.'), JSON.stringify(f2[0] && f2[0].previous_text));
-check('previous_text only on the first frame', f2.slice(1).every((f) => !('previous_text' in f)));
-s2.msg({ message_type: 'committed_transcript', text: 'More findings.' });
-check('append mode kept earlier text', latest().includes('Last words intact.') && latest().includes('More findings.'), latest());
-s2.msg({ message_type: 'auth_error', error: 'invalid key' });
-check('non-generic error frame surfaces loudly', statusCls().includes('err') && status().includes('auth_error: invalid key'), status());
-s2.serverClose(); // dies mid-dictation, no user stop
-await sleep(100);
-check('unexpected close -> error status', statusCls().includes('err') && status().includes('Connection lost'), status());
-check('partial copied to clipboard anyway', clipboard.includes('More findings.'));
-check('link pill FAIL', doc.getElementById('linkPill').textContent === 'LINK FAIL');
-
-// ===== Scenario 3: dead mic flatline alarm =====
-console.log('--- scenario 3: dead mic alarm ---');
-doc.getElementById('freshBtn').click(); // empty buffer so the sentinel path is hit
+// ===== Scenario 3 (batch): dead mic flatline alarm =====
+// The mic watchdog runs in batch mode too (no WS dependency): a flatline signal
+// fires the alarm, and a no-text finalize copies the sentinel.
+console.log('--- scenario 3: batch dead mic alarm ---');
+doc.getElementById('freshBtn').click();
 micRms = 0.0; // flatline
 doc.getElementById('recordBtn').click();
-await sleep(80);
-const s3 = sockets[2];
-s3.open();
-await sleep(2800); // > 2.5s flatline detection
-check('mic alarm fired', status().includes('MIC NOT CAPTURING'), status());
+await sleep(2900); // > 2.5s flatline detection
+check('mic alarm fired in batch mode', status().includes('MIC NOT CAPTURING'), status());
 check('mic pill FAIL', doc.getElementById('micPill').textContent === 'MIC FAIL');
-doc.getElementById('recordBtn').click();
-await sleep(700);
-await sleep(2700); // FINAL_WAIT deadline, no commits coming
-check('finalize after deadline with no text -> sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+// A flatline recording still uploads; the empty transcript + the fired mic alarm
+// drive the no-speech sentinel path.
+fetchQueue.push({ status: 200, body: { text: '' } });
+doc.getElementById('recordBtn').click(); // stop -> upload empty -> sentinel
+await sleep(300);
+check('dead-mic finalize -> sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('no-speech status mentions mic', status().includes('microphone never produced a signal'), status());
 micRms = 0.05;
 
-// ===== Scenario 4: append window expiry starts fresh =====
-console.log('--- scenario 4: append window expiry ---');
+// ===== Scenario 4 (batch): append window expiry starts fresh =====
+console.log('--- scenario 4: batch append window expiry ---');
 doc.getElementById('appendWindow').value = '1'; // 1 second window
+fetchQueue.push({ status: 200, body: { text: 'First note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(80);
-const s4 = sockets[3];
-s4.open();
-s4.msg({ message_type: 'committed_transcript', text: 'First note.' });
 doc.getElementById('recordBtn').click();
-await sleep(700);
-s4.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(500);
-check('note saved', clipboard.includes('First note.'), JSON.stringify(clipboard));
-await sleep(1300); // exceed 1s append window
-doc.getElementById('recordBtn').click();
-await sleep(80);
-const s5 = sockets[4];
-s5.open();
-s5.msg({ message_type: 'partial_transcript', text: 'Second note' });
-check('window expired -> old text dropped', !latest().includes('First note.') && latest().includes('Second note'), latest());
-doc.getElementById('recordBtn').click();
-await sleep(3300);
-
-// ===== Scenario 5: connect timeout fails loudly =====
-console.log('--- scenario 5: connect timeout ---');
-doc.getElementById('freshBtn').click();
-doc.getElementById('recordBtn').click();
-await sleep(120);
-check('recording started (connecting)', doc.getElementById('recordBtn').textContent.includes('Stop'));
-await sleep(5300); // CONNECT_TIMEOUT_MS
-check('timeout -> failed status', statusCls().includes('err') && status().includes('FAILED'), status());
-check('sentinel on clipboard', clipboard === '##DICTATION_FAILED##');
-check('record button reset', doc.getElementById('recordBtn').textContent.includes('Start'));
-
-// ===== Scenario 6: F13 during finalization queues a new dictation =====
-console.log('--- scenario 6: queued PTT restart ---');
-doc.getElementById('recordBtn').click();
-await sleep(80);
-const s7 = sockets[sockets.length - 1];
-s7.open();
-s7.msg({ message_type: 'committed_transcript', text: 'Quick one.' });
-doc.getElementById('recordBtn').click(); // stop -> finalizing
-doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' })); // PTT again immediately
-await sleep(700);
-s7.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(600);
-const sCount = sockets.length;
 await sleep(300);
-check('pending start spawned a new session', sockets.length === sCount + 1 || doc.getElementById('recordBtn').textContent.includes('Stop'), 'sockets=' + sockets.length);
+check('first note saved', latest().includes('First note.'), latest());
+await sleep(1300); // exceed the 1s append window
+fetchQueue.push({ status: 200, body: { text: 'Second note.' } });
+doc.getElementById('recordBtn').click();
+await sleep(80);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('window expired -> old text dropped', !latest().includes('First note.') && latest().includes('Second note.'), latest());
+doc.getElementById('appendMode').click(); // back to default (off) for the remaining scenarios
+doc.getElementById('freshBtn').click();
 
-// ===== Scenario 7: configurable hotkey (default Ctrl+Space) =====
-console.log('--- scenario 7: hotkey tap + hold ---');
-// clean up whatever scenario 6 left running (its socket never opens -> connect timeout)
-if (doc.getElementById('recordBtn').textContent.includes('Stop')) {
-  doc.getElementById('recordBtn').click();
-  await sleep(6500);
-}
+// ===== Scenario 7 (batch): configurable hotkey (default Ctrl+Space) + F13/F14 =====
+console.log('--- scenario 7: batch hotkey tap + hold ---');
 check('idle before hotkey tests', doc.getElementById('recordBtn').textContent.includes('Start'));
 const kd = (init) => doc.dispatchEvent(new w.KeyboardEvent('keydown', init));
 const ku = (init) => doc.dispatchEvent(new w.KeyboardEvent('keyup', init));
 
 // tap = toggle on
-const sBeforeHk = sockets.length;
 kd({ code: 'Space', ctrlKey: true });
 await sleep(80);
 ku({ code: 'Space', ctrlKey: true }); // released quickly -> tap
 await sleep(80);
 check('hotkey tap started recording', doc.getElementById('recordBtn').textContent.includes('Stop'));
-check('hotkey opened a new socket', sockets.length === sBeforeHk + 1, sockets.length - sBeforeHk);
-const hk1 = sockets[sockets.length - 1];
-hk1.open();
-hk1.msg({ message_type: 'committed_transcript', text: 'Hotkey tap note.' });
+fetchQueue.push({ status: 200, body: { text: 'Hotkey tap note.' } });
 // tap again = toggle off
 kd({ code: 'Space', ctrlKey: true });
 ku({ code: 'Space', ctrlKey: true });
-await sleep(700);
-hk1.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(500);
+await sleep(300);
 check('hotkey tap-off saved + copied', clipboard.includes('Hotkey tap note.'), JSON.stringify(clipboard));
 
 // hold = push-to-talk
 kd({ code: 'Space', ctrlKey: true });
 await sleep(600); // > HOTKEY_TAP_MS
-const hk2 = sockets[sockets.length - 1];
-hk2.open();
-hk2.msg({ message_type: 'committed_transcript', text: 'Hotkey held note.' });
+check('hotkey hold started recording', doc.getElementById('recordBtn').textContent.includes('Stop'));
+fetchQueue.push({ status: 200, body: { text: 'Hotkey held note.' } });
 ku({ code: 'Space', ctrlKey: true }); // release after holding -> stop
-await sleep(80);
-check('hotkey release began finalizing', status().includes('Finalizing'), status());
-await sleep(700);
-hk2.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(500);
+await sleep(300);
 check('hotkey hold note saved + copied', clipboard.includes('Hotkey held note.'), JSON.stringify(clipboard));
 check('plain Space does nothing', (() => { kd({ code: 'Space' }); return doc.getElementById('recordBtn').textContent.includes('Start'); })());
 
-// ===== Scenario 8: engine selector — per-mode controls + persistence =====
-console.log('--- scenario 8: engine selector ---');
-doc.getElementById('engBatch').click();
-check('batch button active', doc.getElementById('engBatch').className.includes('active'));
-check('vad section hidden in batch mode', doc.getElementById('vadSection').style.display === 'none');
-check('batch opts visible in batch mode', doc.getElementById('batchOptsSection').style.display !== 'none');
-check('gate hint says gate is the recording', doc.getElementById('gateHint').textContent.includes('IS the recording'), doc.getElementById('gateHint').textContent);
-await sleep(400); // debounced settings save
-check('engine persisted to settings', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).engine === 'batch');
-doc.getElementById('engRealtime').click();
-check('vad section back in realtime mode', doc.getElementById('vadSection').style.display !== 'none');
-check('batch opts hidden in realtime mode', doc.getElementById('batchOptsSection').style.display === 'none');
-doc.getElementById('engBatch').click();
+// F13/F14 contract: F13 keydown starts, F14 keydown stops.
+fetchQueue.push({ status: 200, body: { text: 'F13 note.' } });
+doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' }));
+await sleep(80);
+check('F13 keydown starts recording', doc.getElementById('recordBtn').textContent.includes('Stop'));
+doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F14' }));
+await sleep(300);
+check('F14 keydown stops + delivers', clipboard.includes('F13 note.'), JSON.stringify(clipboard));
+doc.getElementById('freshBtn').click();
 
 // ===== Scenario 9: batch engine happy path =====
 console.log('--- scenario 9: batch happy path ---');
@@ -513,134 +377,9 @@ doc.getElementById('recordBtn').click(); // wrap up the queued session
 await sleep(300);
 check('queued session delivered too', clipboard.includes('Second.'), JSON.stringify(clipboard));
 
-// ===== Scenario 12: hybrid happy path — live feedback, refined clipboard =====
-console.log('--- scenario 12: hybrid happy path ---');
-doc.getElementById('engHybrid').click();
-doc.getElementById('freshBtn').click();
-const fCount12 = fetchCalls.length;
-fetchQueue.push({ delayMs: 400, status: 200, body: { text: 'Refined note text.' } });
-pump(2); // speaking as the key lands -> pre-roll
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s12 = sockets[sockets.length - 1];
-s12.open();
-await sleep(30);
-pump(6); // live speech (with pre-roll: 8 frames ≈ 0.7s, above the refine minimum)
-s12.msg({ message_type: 'partial_transcript', text: 'live partial words' });
-check('hybrid shows live partials', latest().includes('live partial words'), latest());
-s12.msg({ message_type: 'committed_transcript', text: 'Live committed words.' });
-doc.getElementById('recordBtn').click(); // stop -> tail (250ms) -> HYBRID FAST FINALIZE
-// Hybrid no longer blocks the batch refine on the realtime engine's finalize
-// (the old await-final + commit-quiet wait): sessionPcm is complete after the
-// tail, so the refine begins as soon as TAIL_MS elapses.
-await sleep(400); // tail done (250ms); refine in flight (fetch delayMs 400, resolves ~650ms after stop)
-check('refining status shown', status().includes('Refining via batch'), status());
-check('link pill refining', doc.getElementById('linkPill').textContent === 'refining…', doc.getElementById('linkPill').textContent);
-await sleep(450); // refine resolves (~650ms after stop) and delivers
-check('exactly one refine upload', fetchCalls.length === fCount12 + 1, fetchCalls.length - fCount12);
-const refineCall = fetchCalls[fetchCalls.length - 1];
-const refineFile = refineCall.form && refineCall.form.get('file');
-check('refine uploaded a wav file', refineFile && refineFile.name === 'recording.wav', refineFile && refineFile.name);
-check('clipboard holds the REFINED text', clipboard.includes('Refined note text.'), JSON.stringify(clipboard));
-check('clipboard does not hold the live text', !clipboard.includes('Live committed words.'), JSON.stringify(clipboard));
-check('box swapped to refined text', latest().includes('Refined note text.') && !latest().includes('Live committed words.'), latest());
-check('refined success status', status().includes('Refined transcript') && status().includes('Done!'), status());
-const hist12 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9'));
-check('history entry engine hybrid, live text kept for comparison',
-  hist12[0] && hist12[0].engine === 'hybrid' && typeof hist12[0].liveText === 'string' && hist12[0].liveText.includes('Live committed words.'),
-  hist12[0] && (hist12[0].engine + ' / ' + JSON.stringify(hist12[0].liveText)));
-check('link pill idle after refine', doc.getElementById('linkPill').textContent === 'link idle');
-
-// ===== Scenario 13: hybrid refine failure -> live text + audible warn =====
-console.log('--- scenario 13: hybrid refine failure ---');
-doc.getElementById('freshBtn').click();
-fetchQueue.push({ status: 500, body: { error: 'refine exploded' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s13 = sockets[sockets.length - 1];
-s13.open();
-await sleep(30);
-pump(8);
-s13.msg({ message_type: 'committed_transcript', text: 'Live survives.' });
-doc.getElementById('recordBtn').click();
-await sleep(700);
-s13.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(700);
-check('live text delivered when refine fails', clipboard.includes('Live survives.'), JSON.stringify(clipboard));
-check('warn status names the refine failure', statusCls().includes('warn') && status().includes('refine failed') && status().includes('refine exploded'), status());
-check('not reported as a clean Done', !status().includes('Done!'), status());
-
-// ===== Scenario 14: hybrid recovery — WS dies, batch refine still delivers =====
-console.log('--- scenario 14: hybrid WS-death recovery ---');
-doc.getElementById('freshBtn').click();
-fetchQueue.push({ status: 200, body: { text: 'Recovered full text.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s14 = sockets[sockets.length - 1];
-s14.open();
-await sleep(30);
-pump(8);
-s14.msg({ message_type: 'partial_transcript', text: 'doomed partial' });
-s14.serverClose(); // link dies mid-dictation — no user stop
-await sleep(700);
-check('refine ran despite the dead link', clipboard.includes('Recovered full text.'), JSON.stringify(clipboard));
-check('recovery framed as a failure to verify', statusCls().includes('err') && status().includes('recovered via batch'), status());
-
-// ===== Scenario 15: hybrid append parity =====
-console.log('--- scenario 15: hybrid append parity ---');
-doc.getElementById('freshBtn').click();
-doc.getElementById('appendWindow').value = '0'; // 0 = always append
-fetchQueue.push({ status: 200, body: { text: 'Part one.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s15a = sockets[sockets.length - 1];
-s15a.open();
-await sleep(30);
-pump(8);
-doc.getElementById('recordBtn').click();
-await sleep(700);
-s15a.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(700);
-check('first hybrid note delivered', clipboard.includes('Part one.'), JSON.stringify(clipboard));
-fetchQueue.push({ status: 200, body: { text: 'Part two.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s15b = sockets[sockets.length - 1];
-s15b.open();
-await sleep(30);
-pump(8);
-const f15 = s15b.sent.map((d) => JSON.parse(d));
-check('append session: first frame carries refined previous_text', f15.length >= 1 && typeof f15[0].previous_text === 'string' && f15[0].previous_text.endsWith('Part one.'), JSON.stringify(f15[0] && f15[0].previous_text));
-doc.getElementById('recordBtn').click();
-await sleep(700);
-s15b.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(700);
-check('refined splice keeps the note base', clipboard.includes('Part one.') && clipboard.includes('Part two.'), JSON.stringify(clipboard));
-
-// ===== Scenario 16: hybrid with zero live text — refine still delivers =====
-console.log('--- scenario 16: hybrid no live text ---');
-doc.getElementById('freshBtn').click();
-doc.getElementById('appendWindow').value = '1';
-await sleep(1300); // let the append window lapse so this note starts fresh
-fetchQueue.push({ status: 200, body: { text: 'Only batch heard this.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-const s16 = sockets[sockets.length - 1];
-s16.open();
-await sleep(30);
-pump(8); // audio flows but the server never sends a transcript
-doc.getElementById('recordBtn').click();
-await sleep(700);  // tail + commit
-await sleep(2700); // FINAL_WAIT deadline passes with no reply
-await sleep(300);  // refine resolves
-check('refine delivered text the live engine missed', clipboard.includes('Only batch heard this.'), JSON.stringify(clipboard));
-check('treated as a clean refined success', status().includes('Refined transcript') && status().includes('Done!'), status());
-
 // ===== Scenario 17: click-to-append — clicking the box arms a one-shot append =====
 console.log('--- scenario 17: click-to-append ---');
-doc.getElementById('engBatch').click();
-doc.getElementById('appendMode').click(); // back OFF — the shipped default
-check('append mode off again', !doc.getElementById('appendMode').checked);
+check('append mode off (the shipped default)', !doc.getElementById('appendMode').checked);
 doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Alpha.' } });
 doc.getElementById('recordBtn').click();
@@ -682,36 +421,28 @@ const presetSrc = html.match(/const KEYTERM_PRESETS\s*=\s*\((.*)\);/);
 check('preset definitions injected into the page', !!presetSrc);
 const PRESETS = JSON.parse(presetSrc[1]);
 const alwaysTerms = PRESETS.filter((p) => p.always).flatMap((p) => p.terms);
-const rtEligible = (t) => t.length <= 20 && t.split(' ').length <= 5;
-const rtAlways = alwaysTerms.filter(rtEligible);
 const optional = PRESETS.filter((p) => !p.always);
-check('ships an always-on list and at least one optional preset', rtAlways.length > 0 && optional.length > 0);
+check('ships an always-on list and at least one optional preset', alwaysTerms.length > 0 && optional.length > 0);
 const preset1 = optional[0];
-const p1Term = preset1.terms.find((t) => rtEligible(t) && !alwaysTerms.includes(t));
-check('optional preset has a realtime-eligible distinct term', typeof p1Term === 'string', p1Term);
+const p1Term = preset1.terms.find((t) => !alwaysTerms.includes(t));
+check('optional preset has a distinct term', typeof p1Term === 'string', p1Term);
 check('one checkbox per optional preset, none for always-on lists',
   doc.querySelectorAll('#presetRow input[data-preset]').length === optional.length,
   doc.querySelectorAll('#presetRow input[data-preset]').length);
 
-// Leg A (realtime, unchecked): always-on terms ride, preset terms do not,
-// custom terms lead the merged list.
-doc.getElementById('engRealtime').click();
+// Leg A (batch, unchecked): always-on terms ride, preset terms do not,
+// custom terms lead the merged list (carried on the upload form).
 doc.getElementById('freshBtn').click();
 doc.getElementById('keyterms').value = 'zebraterm';
+fetchQueue.push({ status: 200, body: { text: 'Preset leg A.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
-const s18a = sockets[sockets.length - 1];
-const ktA = JSON.parse(new URL(s18a.url).searchParams.get('keyterms_json'));
-check('custom term leads the merged list', ktA[0] === 'zebraterm', JSON.stringify(ktA[0]));
-check('always-on terms ride with presets unchecked', rtAlways.every((t) => ktA.includes(t)), ktA.length + ' terms');
-check('unchecked preset terms are not sent', !ktA.includes(p1Term));
-s18a.open();
-await sleep(30);
-s18a.msg({ message_type: 'committed_transcript', text: 'Preset leg A.' });
 doc.getElementById('recordBtn').click();
-await sleep(700);
-s18a.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(500);
+await sleep(300);
+const ktA = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
+check('custom term leads the merged list', ktA[0] === 'zebraterm', JSON.stringify(ktA[0]));
+check('always-on terms ride with presets unchecked', alwaysTerms.every((t) => ktA.includes(t)), ktA.length + ' terms');
+check('unchecked preset terms are not sent', !ktA.includes(p1Term));
 check('leg A delivered normally', clipboard.includes('Preset leg A.'), JSON.stringify(clipboard));
 
 // Check the first optional preset; the choice must persist in settings.
@@ -723,33 +454,25 @@ check('checked preset id persisted in settings (additive v9 field)',
   Array.isArray(s18Settings.presetIds) && s18Settings.presetIds.includes(preset1.id),
   JSON.stringify(s18Settings.presetIds));
 
-// Leg B (realtime, checked): preset terms ride; a custom dupe of a preset
-// term is sent exactly once; the realtime cap holds.
+// Leg B (batch, checked): preset terms ride; a custom dupe of a preset term
+// is sent exactly once.
 doc.getElementById('freshBtn').click();
 doc.getElementById('keyterms').value = 'zebraterm\n' + p1Term;
+fetchQueue.push({ status: 200, body: { text: 'Preset leg B.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
-const s18b = sockets[sockets.length - 1];
-const ktB = JSON.parse(new URL(s18b.url).searchParams.get('keyterms_json'));
-check('checked preset terms ride the realtime call',
-  preset1.terms.filter(rtEligible).slice(0, 5).every((t) => ktB.includes(t)), ktB.length + ' terms');
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const ktB = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
+check('checked preset terms ride the call',
+  preset1.terms.slice(0, 5).every((t) => ktB.includes(t)), ktB.length + ' terms');
 check('term duplicated between custom box and preset sent once',
   ktB.filter((t) => t.toLowerCase() === p1Term.toLowerCase()).length === 1);
-// Default transport is Soniox (large context budget) -> client sends the fuller
-// list (<=300, char-budget-guarded server-side); only ?rt=el uses the 50/20 cap.
-check('realtime keyterm cap respected (Soniox default, <=300)', ktB.length <= 300, ktB.length);
-s18b.open();
-await sleep(30);
-s18b.msg({ message_type: 'committed_transcript', text: 'Preset leg B.' });
-doc.getElementById('recordBtn').click();
-await sleep(700);
-s18b.msg({ message_type: 'committed_transcript', text: '' });
-await sleep(500);
+check('batch keyterm cap respected (<=1000)', ktB.length <= 1000, ktB.length);
 check('leg B delivered normally', clipboard.includes('Preset leg B.'), JSON.stringify(clipboard));
 
-// Leg C (batch, checked): the upload form carries the full preset list —
-// including terms too long for realtime — plus the always-on list.
-doc.getElementById('engBatch').click();
+// Leg C (batch, checked): the upload form carries the full preset list plus
+// the always-on list.
 doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Preset leg C.' } });
 doc.getElementById('recordBtn').click();
@@ -839,8 +562,16 @@ console.log('--- scenario 19: phone mic session ---');
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
-      win.fetch = (url, opts) => { fetchCalls19b.push({ url: String(url), opts }); return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}'), json: () => Promise.resolve({ text: 'Phone realtime.' }) }); };
-      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = (url, opts) => {
+        fetchCalls19b.push({ url: String(url), opts });
+        // The /deliver relay answers with a listener ack; the batch upload answers
+        // with a transcription.
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Phone batch."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks19b.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
@@ -858,31 +589,24 @@ console.log('--- scenario 19: phone mic session ---');
     joinBtn.click();
     await sleep(10);
 
-    // Switch to realtime and start recording
-    doc19b.getElementById('engRealtime').click();
+    // The joined phone dictates in BATCH: record -> upload -> deliverFinalText
+    // POSTs the authoritative final text to /api/session/ABC123/deliver.
     doc19b.getElementById('apiKey').value = 'test-key';
-    doc19b.getElementById('sonioxKey').value = 'test-skey';
     doc19b.getElementById('recordBtn').click();
-    await sleep(50);
+    await sleep(80);
+    // No realtime WS opens in batch mode (only the desktop-room sockets, if any).
+    check('joined phone opens no realtime transcribe WS', !socks19b.some((s) => s.url.includes('/api/transcribe')));
+    doc19b.getElementById('recordBtn').click(); // stop -> upload -> deliver
+    await sleep(300);
 
-    const transcribeSock = socks19b.find((s) => s.url.includes('/api/transcribe'));
-    check('phone WS URL includes session code', !!(transcribeSock && transcribeSock.url.includes('session=ABC123')));
-
-    if (transcribeSock) {
-      transcribeSock.open();
-      transcribeSock.msg({ message_type: 'session_started', config: {} });
-      // Use `text` field (ElevenLabs format); fires while recording so it seeds finalizedSegments
-      transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
-      // Stop recording; tail window runs for TAIL_MS (250ms)
-      doc19b.getElementById('recordBtn').click();
-      await sleep(700); // > TAIL_MS — beginCommitPhase now sends commit:true
-      // Server responds with a final committed transcript after the commit; this triggers
-      // the COMMIT_QUIET_MS (150ms) close path instead of the 2500ms deadline
-      transcribeSock.msg({ message_type: 'committed_transcript', text: 'Phone realtime.' });
-      await sleep(500); // > COMMIT_QUIET_MS — WS closes -> finalizeSession -> deliverFinalText
-      // After delivery, should have POSTed to /api/session/ABC123/deliver
-      const deliverCall = fetchCalls19b.find((c) => c.url.includes('/api/session/') && c.url.includes('/deliver'));
-      check('phone POSTs final text to session deliver endpoint', !!deliverCall);
+    // The authoritative final text is POSTed to the room's /deliver endpoint with
+    // the joined session code (this is how the desktop clipboard gets written).
+    const deliverCall = fetchCalls19b.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST');
+    check('joined phone POSTs final text to /api/session/ABC123/deliver', !!deliverCall, fetchCalls19b.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+    if (deliverCall) {
+      let body = {};
+      try { body = JSON.parse(deliverCall.opts.body); } catch (e) {}
+      check('the /deliver body carries the batch transcript', String(body.text || '').includes('Phone batch.'), JSON.stringify(body.text));
     }
   }
 }
@@ -1016,9 +740,9 @@ console.log('--- scenario 20: phone link resilience ---');
         if (String(url).includes('/deliver')) {
           return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":0}') });
         }
-        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"unused"}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Phone note."}') });
       };
-      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks20p.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
@@ -1028,21 +752,15 @@ console.log('--- scenario 20: phone link resilience ---');
   const doc20p = dom20p.window.document;
   const status20p = () => doc20p.getElementById('status').textContent;
 
+  // The joined phone dictates in BATCH and relays the authoritative final text.
   doc20p.getElementById('phoneJoinInput').value = 'ABC123';
   doc20p.getElementById('phoneJoinBtn').click();
-  doc20p.getElementById('engRealtime').click();
   doc20p.getElementById('apiKey').value = 'test-key';
-  doc20p.getElementById('sonioxKey').value = 'test-skey';
   doc20p.getElementById('recordBtn').click();
-  await sleep(50);
-  const phoneSock = socks20p.find((s) => s.url.includes('/api/transcribe'));
-  check('s20p: phone WS carries the session code', !!(phoneSock && phoneSock.url.includes('session=ABC123')));
-  phoneSock.open();
-  phoneSock.msg({ message_type: 'committed_transcript', text: 'Phone note.' });
-  doc20p.getElementById('recordBtn').click(); // stop -> tail -> commit
-  await sleep(700);
-  phoneSock.msg({ message_type: 'committed_transcript', text: '' });
-  await sleep(600); // quiet period -> finalize -> deliver -> relay ack
+  await sleep(80);
+  check('s20p: joined phone opens no realtime transcribe WS', !socks20p.some((s) => s.url.includes('/api/transcribe')));
+  doc20p.getElementById('recordBtn').click(); // stop -> upload -> deliver
+  await sleep(600); // upload -> finalize -> deliver -> relay ack
   const dCall = fetch20p.find((c) => c.url.includes('/deliver'));
   check('s20p: deliver POST sent', !!dCall);
   const dBody = dCall ? JSON.parse(dCall.opts.body) : {};
@@ -1167,6 +885,7 @@ console.log('--- scenario 22: phone link persistence ---');
 
   // ---- Phone: a persisted join rides the next dictation after a "reload"; Leave forgets it ----
   const socks22p = [];
+  const fetch22p = [];
   let w22p;
   const dom22p = new JSDOM(html, {
     runScripts: 'dangerously', url: 'https://dictation.test/',
@@ -1178,13 +897,19 @@ console.log('--- scenario 22: phone link persistence ---');
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
-      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
-      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = (url, opts) => {
+        fetch22p.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Rejoin batch."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks22p.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
       // The phone joined a desktop session before this "reload" (iOS PWA kill)
-      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'ABC123', engine: 'realtime' }));
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'ABC123', engine: 'batch' }));
     },
   });
   await sleep(100);
@@ -1194,13 +919,15 @@ console.log('--- scenario 22: phone link persistence ---');
   check('s22p: join badge restored at boot', doc22p.getElementById('phoneJoinBadge').style.display !== 'none');
   check('s22p: leave button shown for the restored join', doc22p.getElementById('phoneLeaveBtn').style.display !== 'none');
   doc22p.getElementById('apiKey').value = 'test-key';
-  doc22p.getElementById('sonioxKey').value = 'test-skey';
+  // The restored join rides the next BATCH dictation: the authoritative final
+  // text is relayed to the desktop via the /deliver POST carrying the code.
   doc22p.getElementById('recordBtn').click();
-  await sleep(50);
-  const rejoinedSock = socks22p.find((s) => s.url.includes('/api/transcribe'));
-  check('s22p: restored join rides the next dictation', !!(rejoinedSock && rejoinedSock.url.includes('session=ABC123')), rejoinedSock && rejoinedSock.url.split('?')[1]);
-  doc22p.getElementById('recordBtn').click();
-  await sleep(6000); // let the never-opened socket time out and finalize
+  await sleep(80);
+  check('s22p: joined phone opens no realtime transcribe WS', !socks22p.some((s) => s.url.includes('/api/transcribe')));
+  doc22p.getElementById('recordBtn').click(); // stop -> upload -> deliver
+  await sleep(400);
+  const rejoinDeliver = fetch22p.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST');
+  check('s22p: restored join rides the next dictation (relays to /deliver with the code)', !!rejoinDeliver, fetch22p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 
   doc22p.getElementById('phoneLeaveBtn').click();
   await sleep(20);
@@ -1381,6 +1108,7 @@ console.log('--- scenario 24: QR join ---');
 
   // ---- Phone: opening the scanned URL joins, persists, and cleans the address bar ----
   const socks23p = [];
+  const fetch23p = [];
   let w23p;
   const dom23p = new JSDOM(html, {
     runScripts: 'dangerously', url: 'https://dictation.test/?join=xyz234',
@@ -1392,12 +1120,18 @@ console.log('--- scenario 24: QR join ---');
       win.URL.revokeObjectURL = () => {};
       win.AudioContext = MockAudioCtx;
       win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
-      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
-      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = (url, opts) => {
+        fetch23p.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Scan batch."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
       const SockClass = class extends MockWS { constructor(url) { super(url); socks23p.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
-      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ engine: 'realtime' }));
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ engine: 'batch' }));
     },
   });
   await sleep(100);
@@ -1408,15 +1142,14 @@ console.log('--- scenario 24: QR join ---');
   check('s24p: join badge + leave shown after scan', doc23p.getElementById('phoneJoinBadge').style.display !== 'none' && doc23p.getElementById('phoneLeaveBtn').style.display !== 'none');
   check('s24p: join param cleaned from the address bar', !w23p.location.search.includes('join'), w23p.location.href);
   doc23p.getElementById('apiKey').value = 'test-key';
-  doc23p.getElementById('sonioxKey').value = 'test-skey';
+  // The scanned join rides the next BATCH dictation: relayed via the /deliver POST.
   doc23p.getElementById('recordBtn').click();
-  await sleep(50);
-  const scanSock = socks23p.find((s) => s.url.includes('/api/transcribe'));
-  check('s24p: scanned join rides the next dictation', !!(scanSock && scanSock.url.includes('session=XYZ234')));
-  // Drain: finalize the abandoned session now so its 5s connect timer cannot
-  // fire in the middle of a later scenario (finalizeSession clears it).
-  if (scanSock) scanSock.serverClose();
-  await sleep(50);
+  await sleep(80);
+  check('s24p: joined phone opens no realtime transcribe WS', !socks23p.some((s) => s.url.includes('/api/transcribe')));
+  doc23p.getElementById('recordBtn').click(); // stop -> upload -> deliver
+  await sleep(400);
+  const scanDeliver = fetch23p.find((c) => c.url.includes('/api/session/XYZ234/deliver') && c.opts && c.opts.method === 'POST');
+  check('s24p: scanned join rides the next dictation (relays to /deliver with the code)', !!scanDeliver, fetch23p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 }
 
 // ===== Scenario 25: big-button dictation layout =====
@@ -1429,7 +1162,7 @@ console.log('--- scenario 25: big-button layout ---');
     const state = {
       socks: [], fetches: [], vibes: [], win: null,
       deliverListeners: 1, deliverFail: false, deliverDelayMs: 0,
-      batchText: 'Big note.', batchDelayMs: 0,
+      batchText: 'Big note.', batchDelayMs: 0, batchFail: false,
       clipFail: false, // simulate iOS denying clipboard writes outside a user gesture
     };
     state.dom = new JSDOM(html, {
@@ -1454,8 +1187,8 @@ console.log('--- scenario 25: big-button layout ---');
             }), state.deliverDelayMs || 0));
           }
           return new Promise((resolve) => setTimeout(() => resolve({
-            ok: true, status: 200,
-            text: () => Promise.resolve(JSON.stringify({ text: state.batchText })),
+            ok: !state.batchFail, status: state.batchFail ? 500 : 200,
+            text: () => Promise.resolve(JSON.stringify(state.batchFail ? { error: 'upload exploded' } : { text: state.batchText })),
           }), state.batchDelayMs || 0));
         };
         win.MediaRecorder = class {
@@ -1717,31 +1450,22 @@ console.log('--- scenario 25: big-button layout ---');
   dB.getElementById('bigButtonMode').dispatchEvent(new B.win.Event('change', { bubbles: true }));
   check('s25b: back to "joined" restores the layout', dB.body.classList.contains('bigbtn'));
 
-  // realtime unexpected close: the finalize gap must render WORKING…, never a
-  // stale green DONE flash, before the red failure lands
-  dB.getElementById('engRealtime').click();
+  // batch upload failure on the big screen: the upload window must render
+  // WORKING…, never a stale green DONE flash, before the red failure lands.
+  B.batchFail = true;
+  B.batchDelayMs = 250; // hold the upload open so the busy window is observable
   pev(B.win, bigBtnB, 'pointerdown', 21); // quick tap toggles on
   pev(B.win, bigBtnB, 'pointerup', 21);
-  await sleep(150);
-  const rtSock = B.socks[B.socks.length - 1];
-  rtSock.open();
-  await sleep(30);
-  // Live realtime words must SHOW on the big screen while recording — the whole
-  // point of the realtime engine on mobile. (Regression: they only reached the
-  // collapsed, head-truncated peek strip, so the newest words scrolled off-screen
-  // and the strip looked frozen as the note grew.)
-  rtSock.msg({ message_type: 'partial_transcript', text: 'the patient is recovering well and' });
-  await sleep(20);
-  check('s25b: live realtime words show on the big screen while recording',
-    dB.getElementById('bigPeekText').textContent.includes('recovering well and'), dB.getElementById('bigPeekText').textContent);
-  check('s25b: peek enters live mode (wrapped, tail-pinned) during recording', peekB.classList.contains('live'));
-  rtSock.msg({ message_type: 'committed_transcript', text: 'Doomed note.' });
-  rtSock.serverClose(); // dies mid-dictation, no user stop
-  check('s25b: finalize gap renders WORKING, not a stale success', screenB() === 'busy', screenB());
-  await sleep(300);
-  check('s25b: unexpected close lands on the red screen', screenB() === 'fail', screenB());
-  check('s25b: partial still delivered on the unexpected close', (B.win._clip || '').includes('Doomed note.'), JSON.stringify(B.win._clip));
-  check('s25b: peek leaves live mode once recording ends', !peekB.classList.contains('live'));
+  await sleep(120);
+  pev(B.win, bigBtnB, 'pointerdown', 22); // tap off -> stop -> upload
+  pev(B.win, bigBtnB, 'pointerup', 22);
+  await sleep(100); // upload in flight (batchDelayMs not yet elapsed)
+  check('s25b: upload window renders WORKING, not a stale success', screenB() === 'busy', screenB());
+  await sleep(400); // failed upload lands
+  check('s25b: failed upload lands on the red screen', screenB() === 'fail', screenB());
+  check('s25b: no-text upload failure copies the sentinel', B.win._clip === '##DICTATION_FAILED##', JSON.stringify(B.win._clip));
+  B.batchFail = false;
+  B.batchDelayMs = 0;
 
   // ---- Leg C: the QR /?join= boot path lands in the big button ----
   const C = mkBigDom({ url: 'https://dictation.test/?join=btn789' });
@@ -1824,165 +1548,51 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25e: unjoined denied copy fail-beeps', JSON.stringify(E.vibes[E.vibes.length - 1]) === '[220,90,220]', JSON.stringify(E.vibes[E.vibes.length - 1]));
 }
 
-// ── Scenario 26: Deepgram Nova-3 realtime frame translation (Worker side) ──
-// Realtime streams to Deepgram Nova-3 on Workers AI; the Worker translates between
-// the client's frame vocabulary and Deepgram's protocol. Pure functions, so they
-// test without a browser. The translator is DEFENSIVE across the three plausible
-// on-wire shapes (Cloudflare doesn't publish nova-3's streaming envelope) and
-// surfaces an unrecognized frame loudly. Loud-failure is the floor: any error frame
-// must surface as a client {error}.
+// ===== Scenario 29: batch-only product (engine migration + capture feedback) =====
+console.log('--- scenario 29: batch-only product ---');
 {
-  const c2b = worker.novaClientToBackend;
-
-  // Audio chunk -> raw PCM bytes (base64-decoded into a Uint8Array).
-  const append = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'QUJD', commit: false, sample_rate: 16000 }));
-  check('s26: audio chunk -> decoded PCM bytes', append.length === 1 && append[0] instanceof Uint8Array && String.fromCharCode(...append[0]) === 'ABC', JSON.stringify([...(append[0]||[])]));
-
-  // Final flush (commit) -> ONLY CloseStream control JSON (Deepgram-on-Workers-AI
-  // rejects other control variants; CloseStream alone finalizes + ends the stream).
-  const commit = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: '', commit: true, sample_rate: 16000 }));
-  const commitTypes = commit.map((f) => { try { return JSON.parse(f).type; } catch { return f; } });
-  check('s26: commit -> CloseStream only', commit.length === 1 && commitTypes[0] === 'CloseStream', JSON.stringify(commitTypes));
-
-  // Audio + commit on the same frame -> bytes then the CloseStream control, in order.
-  const both = c2b(JSON.stringify({ message_type: 'input_audio_chunk', audio_base_64: 'WA==', commit: true }));
-  check('s26: audio+commit -> bytes then CloseStream', both.length === 2 && both[0] instanceof Uint8Array && JSON.parse(both[1]).type === 'CloseStream', JSON.stringify([both[0] instanceof Uint8Array, both[1]]));
-
-  // Non-audio / garbage frames are ignored, never forwarded.
-  check('s26: non-chunk frames are dropped', c2b(JSON.stringify({ message_type: 'something_else' })).length === 0);
-  check('s26: malformed JSON is dropped, not thrown', c2b('{not json').length === 0);
-
-  // Backend -> client: shape (A), native Deepgram streaming Results. The running
-  // partial reflects locked finalText + the current interim tail.
-  const mkResult = (transcript, isFinal, extra) => JSON.stringify(Object.assign({ type: 'Results', is_final: !!isFinal, channel: { alternatives: [{ transcript }] } }, extra || {}));
-  const toC = worker.makeNova3ToClient();
-  const first = toC(mkResult('How are', false)).map(JSON.parse);
-  check('s26: first Results emits session_started then partial', first[0].message_type === 'session_started' && first[1].message_type === 'partial_transcript' && first[1].text === 'How are', JSON.stringify(first));
-
-  // is_final locks a segment into finalText.
-  const r2 = toC(mkResult('How are you', true)).map(JSON.parse);
-  check('s26: is_final Results locks into finalText', r2[0].message_type === 'partial_transcript' && r2[0].text === 'How are you', r2[0].text);
-
-  // A following interim appends to the locked finalText (running view).
-  const r3 = toC(mkResult('doing', false)).map(JSON.parse);
-  check('s26: interim appends to locked final', r3[0].text === 'How are you doing', r3[0].text);
-
-  // is_final segments only ever update the running partial — committed is NOT
-  // emitted per-final (that append-duplicated into "hello hello world"); it comes
-  // once on Metadata. So another is_final just extends the partial.
-  const r4 = toC(mkResult('doing well', true)).map(JSON.parse);
-  check('s26: is_final extends partial, does NOT commit', r4[0].message_type === 'partial_transcript' && r4[0].text === 'How are you doing well' && !r4.some((f) => f.message_type === 'committed_transcript'), JSON.stringify(r4));
-
-  // Metadata (end of stream after CloseStream) -> the ONE committed_transcript with
-  // the full accumulated text. This is the single lock-in (no duplication).
-  const meta = toC(JSON.stringify({ type: 'Metadata', request_id: 'x' })).map(JSON.parse);
-  check('s26: Metadata -> single committed_transcript with full text', meta.length === 1 && meta[0].message_type === 'committed_transcript' && meta[0].text === 'How are you doing well', JSON.stringify(meta));
-
-  // Connected (handshake) / SpeechStarted / UtteranceEnd are benign lifecycle
-  // frames -> ignored, NOT surfaced as errors (a fresh translator so the first-frame
-  // session_started doesn't mask the assertion).
-  check('s26: SpeechStarted produces no client frame', toC(JSON.stringify({ type: 'SpeechStarted' })).length === 0);
-  const conn = worker.makeNova3ToClient()(JSON.stringify({ type: 'Connected', request_id: 'x', sequence_id: 0 })).map(JSON.parse);
-  check('s26: Connected handshake is ignored (only session_started, no error)', conn.length === 1 && conn[0].message_type === 'session_started' && !conn.some((f) => f.message_type === 'error'), JSON.stringify(conn));
-  const unknownF = worker.makeNova3ToClient()(JSON.stringify({ type: 'SomethingNew', foo: 1 })).map(JSON.parse);
-  check('s26: unknown frame is ignored, not a loud error', !unknownF.some((f) => f.message_type === 'error'), JSON.stringify(unknownF));
-
-  // Error-shaped frames -> loud {error}.
-  const e1 = worker.makeNova3ToClient()(JSON.stringify({ type: 'Error', description: 'bad audio' })).map(JSON.parse);
-  check('s26: type:Error -> loud error frame', e1.find((f) => f.message_type === 'error' && /bad audio/.test(f.error)), JSON.stringify(e1));
-  const e2 = worker.makeNova3ToClient()(JSON.stringify({ error: 'quota exceeded' })).map(JSON.parse);
-  check('s26: string error field -> loud error frame', e2.find((f) => f.message_type === 'error' && /quota exceeded/.test(f.error)), JSON.stringify(e2));
-
-  // Shape (B): batch-style envelope surfaces text as a running partial (committed
-  // still comes once via Metadata / the close backstop — no per-frame duplication).
-  const b1 = worker.makeNova3ToClient()(JSON.stringify({ results: { channels: [{ alternatives: [{ transcript: 'batch shape' }] }] } })).map(JSON.parse);
-  check('s26: batch-shape frame -> partial (text surfaced)', b1.find((f) => f.message_type === 'partial_transcript')?.text === 'batch shape', JSON.stringify(b1));
-
-  // Shape (C): Flux-style EndOfTurn extends the running partial.
-  const c1 = worker.makeNova3ToClient()(JSON.stringify({ event: 'EndOfTurn', transcript: 'turn shape' })).map(JSON.parse);
-  check('s26: flux-shape EndOfTurn -> partial (text surfaced)', c1.find((f) => f.message_type === 'partial_transcript')?.text === 'turn shape', JSON.stringify(c1));
-
-  // Unknown shape with no transcript -> ignored (no fabricated text, no fatal error).
-  const unk = worker.makeNova3ToClient()(JSON.stringify({ totally: 'unexpected', shape: 1 })).map(JSON.parse);
-  check('s26: unknown shape ignored (no transcript, no error)', !unk.some((f) => f.message_type === 'error' || f.message_type === 'partial_transcript' || f.message_type === 'committed_transcript'), JSON.stringify(unk));
-}
-
-// ── Scenario 27: AudioWorklet frame pump (mobile realtime fix) ──
-// Realtime/hybrid audio is pumped by an AudioWorklet (off the main thread, so it
-// can't be starved on phones into slow/sparse transcripts) with a ScriptProcessor
-// fallback. The bulk of the suite above runs the FALLBACK path (the harness's
-// MockAudioCtx exposes no audioWorklet); this scenario mocks the worklet so the
-// PRIMARY path is covered: the module loads, an AudioWorkletNode is created (not a
-// ScriptProcessor), and a frame posted on its port drives the same downsample →
-// PCM → stream chokepoint, sending a spec-shaped chunk on the realtime socket.
-console.log('--- scenario 27: AudioWorklet pump ---');
-{
-  let workletNode = null;
-  let addModuleCalls = 0;
-  let scriptProcessorCalls = 0;
-
-  class MockWorkletCtx extends MockAudioCtx {
-    constructor() {
-      super();
-      this.audioWorklet = { addModule: () => { addModuleCalls++; return Promise.resolve(); } };
-    }
-    createScriptProcessor() { scriptProcessorCalls++; return super.createScriptProcessor(); }
-  }
-  class MockAudioWorkletNode {
-    constructor(ctx, name) {
-      this.name = name;
-      this.port = { onmessage: null, postMessage() {} };
-      workletNode = this;
-    }
-    connect() {} disconnect() {}
-  }
-
-  const wsocks = [];
-  const dom27 = new JSDOM(html, {
+  const socks29 = [];
+  let w29;
+  const dom29 = new JSDOM(html, {
     runScripts: 'dangerously', url: 'https://dictation.test/',
     beforeParse(win) {
+      w29 = win;
       win.isSecureContext = true;
       win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
-      win.URL.createObjectURL = () => 'blob:worklet-mock';
+      win.URL.createObjectURL = () => 'blob:mock';
       win.URL.revokeObjectURL = () => {};
-      win.AudioContext = MockWorkletCtx;
-      win.AudioWorkletNode = MockAudioWorkletNode;
-      const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
-      const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
-      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(stream), addEventListener: () => {} };
-      win.MediaRecorder = class {
-        constructor() { this.state = 'inactive'; }
-        static isTypeSupported() { return false; }
-        start() { this.state = 'recording'; }
-        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
-      };
-      const SockClass = class extends MockWS { constructor(url) { super(url); wsocks.push(this); } };
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, muted: false, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Batch note."}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks29.push(this); } };
       SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
       win.WebSocket = SockClass;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ engine: 'hybrid' })); // a pre-existing hybrid user
     },
   });
   await sleep(100);
-  const d27 = dom27.window.document;
-  d27.getElementById('sonioxKey').value = 'test-skey';
-  d27.getElementById('engRealtime').click();
-  d27.getElementById('recordBtn').click();
-  await sleep(120);
+  const doc29 = dom29.window.document;
+  const settings29 = () => JSON.parse(w29.localStorage.getItem('scribe_v2_settings_v9'));
 
-  check('s27: the worklet module was loaded (addModule called)', addModuleCalls === 1, 'addModule=' + addModuleCalls);
-  check('s27: an AudioWorkletNode is the pump, not a ScriptProcessor', !!workletNode && scriptProcessorCalls === 0, 'node=' + !!workletNode + ' sp=' + scriptProcessorCalls);
-  check('s27: the pump wired a port.onmessage handler', typeof workletNode.port.onmessage === 'function');
+  // The engine selector is gone (batch-only); the dictation below proves the
+  // product behaves as batch regardless of the saved Hybrid engine.
+  check('s29: no engine selector in the DOM (batch-only)', !doc29.getElementById('engineSeg') && !doc29.getElementById('engRealtime'));
 
-  const sock27 = wsocks[wsocks.length - 1];
-  sock27.open();
-  await sleep(20);
-  const sentBefore = sock27.sent.length;
-  // A frame posted on the worklet port must flow through handleAudioFrame and be
-  // streamed as a spec-shaped input_audio_chunk (proof the off-thread pump feeds
-  // the same chokepoint the old onaudioprocess did).
-  workletNode.port.onmessage({ data: new dom27.window.Float32Array(4096).fill(0.05) });
-  await sleep(20);
-  const chunk = sock27.sent.slice(sentBefore).map((s) => JSON.parse(s)).find((m) => m.message_type === 'input_audio_chunk');
-  check('s27: a posted frame streams a spec-shaped audio chunk', !!chunk && typeof chunk.audio_base_64 === 'string' && chunk.audio_base_64.length > 0 && chunk.sample_rate === 16000, JSON.stringify(chunk));
+  doc29.getElementById('apiKey').value = 'test-key';
+  doc29.getElementById('recordBtn').click();
+  await sleep(140); // let the gate-meter loop tick and reveal the capture feedback
+  check('s29: recording shows the live capture feedback (waveform + timer)', doc29.getElementById('recFeedback').style.display !== 'none');
+  check('s29: no realtime WebSocket opens in batch mode', !socks29.some((s) => s.url.includes('/api/transcribe')));
+  doc29.getElementById('recordBtn').click(); // stop -> upload -> deliver
+  await sleep(140);
+  check('s29: capture feedback hides once recording ends', doc29.getElementById('recFeedback').style.display === 'none');
+  check('s29: batch text reaches the clipboard', (w29._clip || '').includes('Batch note'), w29._clip);
+  // The saved Hybrid engine migrated to Batch: the history entry is tagged batch
+  // and the persisted engine is batch.
+  const hist29 = JSON.parse(w29.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  check('s29: a saved Hybrid engine migrates to Batch (history tagged batch)', hist29[0] && hist29[0].engine === 'batch', hist29[0] && hist29[0].engine);
+  check('s29: the migrated engine persists as batch', settings29().engine === 'batch', JSON.stringify(settings29().engine));
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

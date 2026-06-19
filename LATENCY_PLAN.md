@@ -1,3 +1,7 @@
+> **🗄️ ARCHIVED (2026-06-19) — obsolete for the batch-only product.** This plan was about the post-speech finalize latency of the **Realtime/Hybrid** engines (the gap between the live words finishing and the clipboard landing). Those engines were **removed** — there is no live text to finalize anymore; batch's only post-speech latency is the upload + transcription itself (`BATCH_UPLOAD_TIMEOUT_MS`, already cut 30000→15000, plus the `[LATENCY]`-tagged `MediaRecorder.start(1000)` / `precomputedBatchKeyterms` / TLS pre-warm wins, which survived). Code references below (`refineAndDeliverHybrid`, `sonioxClientToBackend`, `?rt=el`, `/api/nova-probe`, the `rtDebugLog` overlay, the `.test/` corpus, line numbers) **no longer exist** in `worker.js`. Kept verbatim as part of the realtime resurrection archive — see `REALTIME_HANDOFF.md`. Go-forward batch latency/accuracy work starts from the batch facts in `CLAUDE.md`, not from here.
+
+---
+
 # Plan: kill the post-speech finalize latency (the delay AFTER the live text is done)
 
 > For a fresh session. Repo: `C:\elevenlabs-web-\worker.js` (single-file CF Worker).
@@ -29,7 +33,9 @@ Constants (worker.js ~1914-1937, **post-Step-1**): `TAIL_MS=250`, `FINAL_WAIT_MS
 
 ## Step 0 — confirm the mode + instrument the finalize timeline (do this FIRST)
 1. Ask/confirm which engine+mode the user runs when they feel the delay: **pure Realtime (Soniox)** vs **Hybrid**. The fix is different.
-2. Add `?debug=1` finalize-phase timestamps to the existing `rtDebugLog` overlay so the user's real session prints the actual budget: log at `stopRecording` (release), at the tail-timer fire, at commit send, at each `committed_transcript`, at `finalizeSession` entry, at refine start (hybrid), and at `deliverFinalText`. Then one real dictation shows exactly where the ms go (confirms the measurements above on his machine/mode).
+2. ✅ **DONE (2026-06-19).** `?debug=1` now prints, to the on-screen `rtDebugLog` overlay (DevTools-free), both:
+   - a **live audio-cadence heartbeat** (`[audio …] pump=worklet|scriptprocessor framesSent=… partials=… wsBuffered=…`, ~1/s while recording) — distinguishes a stalled **pump** (framesSent flatlines) from a stalled **engine** (framesSent climbs, partials don't), and a growing `wsBuffered` flags main-thread/network send backpressure (the ScriptProcessor-starvation tell); and
+   - a **finalize timeline** via `dbgPhase()` — `[phase …] … (+Nms since release)` at `stopRecording` (release), tail-timer fire, commit send, final committed arrival, `finalizeSession`, batch-refine POST start/return (hybrid), and `deliverFinalText`. One real dictation shows exactly where the post-release ms go. The pump kind is also tee'd to the overlay at session start (`[audio] AudioWorklet pump active` vs `!! … FALLBACK to ScriptProcessor pump`), so the live-stall root cause from Session 2 is visible without DevTools.
 
 ## Step 1 — pure realtime (Soniox): cut the client finalize constants  ✅ DONE (2026-06-19)
 Soniox finalizes in ~85 ms and the text is complete at release, so the conservative constants tuned for old engines are now pure overhead. **Landed:** `TAIL_MS` 600→250, `COMMIT_QUIET_MS` 350→150 in `worker.js`; flow-test timing updated (scenario 12 retimed for the shorter tail) + a trailing-partial anti-clip assertion added. The rationale and the anti-clipping caveat below stand as the record.

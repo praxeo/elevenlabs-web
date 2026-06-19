@@ -1,5 +1,32 @@
 # Realtime STT Investigation — Handoff
 
+> ## 🗄️ STATUS (2026-06-19): REALTIME + HYBRID **REMOVED** from the codebase — learnings archive
+>
+> The product is **batch-only** now (owner call: batch is "fast and amazingly accurate", realtime is expensive and not necessary; the *reassurance* realtime gave is now a free on-device **capture waveform** — see `CLAUDE.md`). The realtime/hybrid/direct-stream/Soniox code was **deleted** in the batch-only cleanup. **This document is preserved on purpose — the owner has NOT given up on realtime.** Everything below is the full investigation log; this banner is the executive summary + how to bring it back.
+>
+> ### The one thing that mattered (root cause, finally found)
+> **Our app was jittery while soniox.com's demo (same engine) was smooth — because of HOW we captured audio, not the network.** Our realtime used a raw-PCM **AudioWorklet pump** whose per-frame **downsample + WebSocket send ran on the MAIN THREAD**, so under live-render load they fired in bursts and Soniox received jittery audio. Soniox's own demo (and our **batch** path) capture with **`MediaRecorder`**, which runs **off the main thread**, and Soniox **auto-detects the webm container** (`audio_format:"auto"`). That off-thread vs main-thread difference is the whole story — it's also why **batch was always flawless** and realtime never was, and why removing the Worker proxy hop alone did *not* fix it.
+>
+> ### The approach that WORKED (rebuild from here)
+> 1. **Direct stream**: browser opens the WS **straight to Soniox** (`wss://stt-rt.soniox.com/transcribe-websocket`), authenticated by a **temporary API key** the Worker mints (`POST /api/soniox-token`, passphrase-gated, `single_use`/120 s/600 s). No Worker proxy hop on the audio path. The long-lived `SONIOX_API_KEY` never reaches the browser.
+> 2. **Off-thread capture**: feed Soniox a **`MediaRecorder` webm stream** (`audio_format:"auto"`), NOT a raw-PCM pump. This is the fix for the jitter.
+> 3. **Pre-mint** the temp key (at boot + after each dictation) so the mint round-trip is off the PTT-down start path.
+> 4. **Hybrid** (if revived): reuse the same off-thread webm as the batch-refine upload (compressed, ~8-10× smaller than the raw WAV, complete capture) instead of `buildWavBlob(sessionPcm)`.
+> 5. **Phone link + direct**: the joined phone opens a `SessionRoom` **`?role=pub` publisher** socket to mirror its translated frames to the desktop; the room synthesizes `phone_session_end` on publisher disconnect (crash resilience).
+> 6. **Soniox config** (PTT-tuned): `model:"stt-rt-v5"`, `enable_endpoint_detection:false` (PTT gives the end-of-audio = empty-string frame), `language_hints_strict:true`, medical `context.general` + full keyterms under the ~8000-char budget. Soniox finalizes **~73 ms** after the empty-string commit.
+>
+> ### Known OPEN issues when it was removed
+> - **iOS Safari**: `MediaRecorder` produces **mp4**, which is NOT in Soniox's auto-detect list (`aac, aiff, amr, asf, flac, mp3, ogg, wav, webm`) — so iOS fell back to the (jittery) raw-PCM pump. **iOS needs a separate capture path** (e.g. transcode, or a different container) before realtime is good on iPhone.
+> - First-word latency still ~1–1.5 s (mint + connect + first chunk); pre-minting helped, a kept-warm connection would help more.
+> - The live interim text inherently wobbles (streaming has no right-context) — that's why batch/hybrid existed; the live feed is feedback, never the deliverable.
+>
+> ### 🧬 RESURRECTION — the full implementation is in git
+> The realtime engine was built and refined across **PR #24** (commits `2cdff67` … `c7617e4`); `f93c620` retired it from the UI; the subsequent cleanup commit deleted the code. **To bring it back: cherry-pick / revert those commits, or rebuild from the 6 steps above.** Reference implementations to recover from history: the client `mintSonioxKey` / `buildSonioxDirectConfig` / `makeSonioxClientTranslator` / `startDirectRecorder`, the Worker `sonioxClientToBackend` / `makeSonioxToClient` / `handleSonioxToken` / `handleTranscribeRealtime`, and the `SessionRoom` publisher role. The detailed engine-evolution + ruled-out hypotheses are below.
+
+---
+
+## Realtime STT Investigation — original handoff (historical)
+
 > **Purpose:** restart context for getting **good live/interim realtime speech-to-text**
 > working in this medical dictation app **via Cloudflare** (Workers AI / AI Gateway).
 > Batch works great; realtime/hybrid is the goal that keeps slipping. This doc is the
@@ -9,7 +36,21 @@
 
 ## ✅ CURRENT STATE (2026-06-19) — read this first
 
-**Realtime default = Soniox `stt-rt-v5`.** This is an append-log: the Session 3 entry just below is current; everything from **"TL;DR"** downward (Nova-3 binding, the `sample_rate` hypothesis, the AI-Gateway transports) is the **historical investigation record**, kept for the root-cause trail — *not* the live engine. `?rt=el` = ElevenLabs Scribe v2 Realtime; `?rt=binding`/`flux`/`gw`/`dgw` = the relegated Deepgram fallbacks. Batch + the hybrid clipboard = ElevenLabs Scribe v2.
+**Realtime default = Soniox `stt-rt-v5`.** This is an append-log: the Session 4 entry directly below is current; the Session 3 entry and everything from **"TL;DR"** downward (Nova-3 binding, the `sample_rate` hypothesis, the AI-Gateway transports) is the **historical investigation record**, kept for the root-cause trail — *not* the live engine. `?rt=el` = ElevenLabs Scribe v2 Realtime; `?rt=binding`/`flux`/`gw`/`dgw` = the relegated Deepgram fallbacks. Batch + the hybrid clipboard = ElevenLabs Scribe v2.
+
+## 🚀 SESSION 4 (2026-06-19) — DIRECT stream (`?rt=direct`), matching soniox.com's demo
+
+**Root cause of "soniox.com is faster than our app" (user's key benchmark): our pipeline, not the engine.** The proxy path streams every ~85 ms frame **browser → Cloudflare Worker → Soniox** as **base64 JSON**, adding a network hop + per-frame main-thread encode/jitter that Soniox's streaming model is timing-sensitive to. Soniox's own demo uses **"direct stream"** (browser → Soniox over WS, temp-key auth, no intermediary) — their documented lowest-latency path.
+
+**Landed (opt-in `?rt=direct`, proxy stays the default until the user A/Bs it):**
+- **`POST /api/soniox-token`** (`handleSonioxToken`) — passphrase-gated; mints a Soniox temporary API key (`single_use`, 120 s expiry, 600 s max session). The long-lived `SONIOX_API_KEY` never reaches the browser.
+- **Client direct transport** — `mintSonioxKey` → open the WS straight to `wss://stt-rt.soniox.com/transcribe-websocket` → `buildSonioxDirectConfig` as the first frame → **binary PCM** frames (no base64) → `makeSonioxClientTranslator` on-device. `handleServerFrame(data, sess)` is the shared downstream path for both transports. **Mint failure falls back to the proxy** (loud-logged, never a dead mic). Audio captured during the mint await is folded back from the pre-roll ring so opening words aren't clipped.
+- **Phone link stays low-latency too** — a joined phone streams direct AND opens a `SessionRoom` **publisher** socket (`?role=pub`) to mirror its translated frames to the desktop; on publisher disconnect the room synthesizes `phone_session_end` (crash resilience, matching the proxy). The authoritative `/deliver` POST is unchanged.
+- Tests: `flow.test.mjs` scenario **28** (direct happy path: token mint, direct-to-Soniox WS, config-first, binary frames, token→partial + marker drop, empty-string commit, committed→clipboard, mint-failure→proxy fallback, joined publisher mirror) + scenario **21** publisher contract.
+
+**Open (NOT yet done — deliberately measured first):**
+- **Hybrid finalize compression.** The user found pure **batch is faster than hybrid** for the same dictation: hybrid uploads a ~1.6 MB uncompressed WAV (`buildWavBlob(sessionPcm)`) for the refine vs batch's ~200 KB webm. Fix = record an **ungated webm** for the refine, keeping the PCM/WAV as the recovery fallback. **Risk:** this changes the audio that becomes the chart text for ALL hybrid users (can't hide behind `?rt=direct`), and mocks can't verify real webm encoding/accuracy. **Confirm the upload is the bottleneck first** via the `?debug=1` `[phase] batch refine POST start/return` timeline, then implement with a bulletproof WAV fallback + real-device verification.
+- **Flip the default** to direct only after the user A/Bs `?rt=direct` on their real setup. Optional: pre-mint the temp key while the mic is warm to take the mint round-trip off the start path.
 
 **Latency ground truth — MEASURED on a real WS (do NOT re-derive; re-measure only if you swap the realtime engine, and don't confuse it with the ~0.75 s *first-word* latency):** after PTT release Soniox returns the committed transcript **~73 ms** later and closes the socket **~84 ms** later, and the full text is already on screen *before* release. So the engine is not the post-speech delay — the client constants were. We cut `TAIL_MS` 600→250 and `COMMIT_QUIET_MS` 350→150, and shortened the batch-upload path (`start(1000)` timeslice recorder, precomputed batch keyterms, TLS pre-warm, `BATCH_UPLOAD_TIMEOUT_MS` 30→15 s); the hybrid refine also no longer waits for the realtime finalize. Full breakdown + the remaining (product-level) hybrid-delivery decision live in **`LATENCY_PLAN.md`**.
 

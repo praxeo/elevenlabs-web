@@ -1918,6 +1918,12 @@ right lower quadrant"></textarea>
         (document.body || document.documentElement).appendChild(box);
       }
       box.textContent += line + "\\n";
+      // Bound the overlay: an ever-growing <pre> reflowed on EVERY partial makes
+      // ?debug=1 itself jank the main thread — worst in direct mode, where audio
+      // sends share that thread, so the diagnostic perturbs what it measures. Keep
+      // the last ~160 lines (cheap split is far less than reflowing 1000+ lines).
+      var dbgLines = box.textContent.split("\\n");
+      if (dbgLines.length > 160) box.textContent = dbgLines.slice(dbgLines.length - 160).join("\\n");
       box.scrollTop = box.scrollHeight;
     } catch (e) {}
   }
@@ -3099,13 +3105,17 @@ right lower quadrant"></textarea>
     const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
     const pcmBuffer = floatTo16BitPCM(downsampled);
     capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
-    const base64Audio = arrayBufferToBase64(pcmBuffer);
 
     if (ws.readyState === WebSocket.OPEN) {
       flushPendingChunks();
-      if (rtSendAudioB64(base64Audio)) dbgFramesSent++;
+      // Direct: ship the raw PCM ArrayBuffer (no base64 on the hot path). Proxy:
+      // base64 JSON through the chokepoint. base64 is only computed when needed.
+      const sent = directMode
+        ? rtSendAudioBinary(pcmBuffer)
+        : sendAudioChunk(arrayBufferToBase64(pcmBuffer), false);
+      if (sent) dbgFramesSent++;
     } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
-      pendingChunks.push(base64Audio);
+      pendingChunks.push(arrayBufferToBase64(pcmBuffer));
     }
     // Per-second cadence heartbeat (?debug=1). The decisive read: if framesSent
     // keeps climbing while partials stops rising, audio IS reaching the engine and
@@ -3245,6 +3255,17 @@ right lower quadrant"></textarea>
       return true;
     }
     return sendAudioChunk(b64, false);
+  }
+
+  // DIRECT live-frame fast path: send the raw PCM ArrayBuffer straight to Soniox.
+  // The per-frame path must NOT base64-encode (and rtSendAudioB64 must NOT decode
+  // it back) — that round-trip was pure main-thread work ~12x/sec and a real
+  // source of the "jittery" cadence. Used for live frames; the pre-roll/connecting
+  // buffer stays base64 and is decoded once on flush (not the hot path).
+  function rtSendAudioBinary(buf) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try { ws.send(buf); } catch (e) { return false; }
+    return true;
   }
 
   // Transport-aware end-of-audio commit. PROXY: {commit:true} empty chunk (the

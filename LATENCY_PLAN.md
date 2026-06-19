@@ -1,3 +1,7 @@
+> **🗄️ ARCHIVED (2026-06-19) — obsolete for the batch-only product.** This plan was about the post-speech finalize latency of the **Realtime/Hybrid** engines (the gap between the live words finishing and the clipboard landing). Those engines were **removed** — there is no live text to finalize anymore; batch's only post-speech latency is the upload + transcription itself (`BATCH_UPLOAD_TIMEOUT_MS`, already cut 30000→15000, plus the `[LATENCY]`-tagged `MediaRecorder.start(1000)` / `precomputedBatchKeyterms` / TLS pre-warm wins, which survived). Code references below (`refineAndDeliverHybrid`, `sonioxClientToBackend`, `?rt=el`, `/api/nova-probe`, the `rtDebugLog` overlay, the `.test/` corpus, line numbers) **no longer exist** in `worker.js`. Kept verbatim as part of the realtime resurrection archive — see `REALTIME_HANDOFF.md`. Go-forward batch latency/accuracy work starts from the batch facts in `CLAUDE.md`, not from here.
+
+---
+
 # Plan: kill the post-speech finalize latency (the delay AFTER the live text is done)
 
 > For a fresh session. Repo: `C:\elevenlabs-web-\worker.js` (single-file CF Worker).

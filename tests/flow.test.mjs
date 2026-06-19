@@ -1985,5 +1985,121 @@ console.log('--- scenario 27: AudioWorklet pump ---');
   check('s27: a posted frame streams a spec-shaped audio chunk', !!chunk && typeof chunk.audio_base_64 === 'string' && chunk.audio_base_64.length > 0 && chunk.sample_rate === 16000, JSON.stringify(chunk));
 }
 
+// ===== Scenario 28: DIRECT stream (browser -> Soniox via temp key) =====
+// The lowest-latency transport: ?rt=direct mints a Soniox temp key from the
+// Worker, opens the WS straight to Soniox, sends the config first, streams BINARY
+// PCM (no base64/JSON), translates tokens on-device, and ends with an
+// empty-string commit. A mint failure must fall back to the proxy (never a dead
+// mic). Solo session (no join) — joined sessions stay on the proxy for now.
+console.log('--- scenario 28: direct stream ---');
+{
+  // ---- Part A: direct happy path ----
+  const socks28 = [];
+  const fetchCalls28 = [];
+  let w28;
+  const mkStream = () => ({ getAudioTracks: () => [{ readyState: 'live', enabled: true, muted: false, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] });
+  const dom28 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?rt=direct',
+    beforeParse(win) {
+      w28 = win;
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mkStream()), addEventListener() {} };
+      win.fetch = (url, opts) => {
+        fetchCalls28.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/api/soniox-token')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"api_key":"tmp-key-123","expires_at":"soon"}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks28.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc28 = dom28.window.document;
+  const pump28 = (n = 3) => { for (let i = 0; i < n; i++) scriptNode.onaudioprocess({ inputBuffer: { getChannelData: () => new Float32Array(4096).fill(0.05) } }); };
+
+  doc28.getElementById('engRealtime').click();
+  doc28.getElementById('apiKey').value = 'test-key';
+  doc28.getElementById('sonioxKey').value = 'test-skey';
+  pump28(2); // speaking as the key lands -> pre-roll ring
+  doc28.getElementById('recordBtn').click();
+  await sleep(80); // let the async temp-key mint resolve, then the WS opens
+
+  check('s28: token minted via /api/soniox-token', fetchCalls28.some((c) => c.url.includes('/api/soniox-token')));
+  const dsock = socks28.find((s) => s.url.includes('stt-rt.soniox.com'));
+  check('s28: opens the WS straight to Soniox (no proxy hop)', !!dsock, dsock && dsock.url);
+
+  if (dsock) {
+    pump28(2); // buffered while connecting
+    check('s28: no frames sent while connecting', dsock.sent.length === 0);
+    dsock.open();
+    await sleep(20);
+    let cfg = null; try { cfg = JSON.parse(dsock.sent[0]); } catch (e) {}
+    check('s28: first frame is the Soniox config with the temp key', !!(cfg && cfg.api_key === 'tmp-key-123' && cfg.model === 'stt-rt-v5' && cfg.audio_format === 'pcm_s16le' && cfg.sample_rate === 16000), JSON.stringify(cfg && { k: cfg.api_key, m: cfg.model }));
+    check('s28: PTT config keeps endpoint detection OFF', cfg && cfg.enable_endpoint_detection === false);
+    pump28(3);
+    const audioFrames = dsock.sent.slice(1); // everything after the config frame
+    check('s28: audio streams as binary PCM, not base64 JSON', audioFrames.length > 0 && audioFrames.every((f) => typeof f !== 'string' && f && typeof f.byteLength === 'number'), 'frames=' + audioFrames.length + ' first=' + typeof audioFrames[0]);
+
+    // Soniox tokens -> on-device translation -> live display (markers dropped).
+    dsock.msg({ tokens: [{ text: 'Patient presents', is_final: false }, { text: '<end>', is_final: false }] });
+    await sleep(10);
+    const latest28 = doc28.getElementById('latest').textContent || '';
+    check('s28: Soniox tokens render as a live partial', latest28.includes('Patient presents'), latest28);
+    check('s28: control markers (<end>) are dropped', !latest28.includes('<end>'), latest28);
+
+    doc28.getElementById('recordBtn').click(); // stop -> tail -> commit
+    await sleep(700); // > TAIL_MS
+    check('s28: commit is an empty-string end-of-audio (binary protocol)', dsock.sent.includes(''), JSON.stringify(dsock.sent.filter((x) => typeof x === 'string')));
+
+    dsock.msg({ tokens: [{ text: 'Patient presents with chest pain.', is_final: true }], finished: true });
+    await sleep(400); // > COMMIT_QUIET_MS -> close -> finalize -> deliver
+    check('s28: committed text lands on the clipboard', (w28._clip || '').includes('Patient presents with chest pain'), w28._clip);
+  }
+
+  // ---- Part B: mint failure -> proxy fallback (never a dead mic) ----
+  const socks28b = [];
+  const fetchCalls28b = [];
+  const dom28b = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?rt=direct',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mkStream()), addEventListener() {} };
+      win.fetch = (url, opts) => {
+        fetchCalls28b.push({ url: String(url) });
+        if (String(url).includes('/api/soniox-token')) {
+          return Promise.resolve({ ok: false, status: 500, text: () => Promise.resolve('{"error":"SONIOX_API_KEY not set"}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks28b.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc28b = dom28b.window.document;
+  doc28b.getElementById('engRealtime').click();
+  doc28b.getElementById('apiKey').value = 'test-key';
+  doc28b.getElementById('sonioxKey').value = 'test-skey';
+  doc28b.getElementById('recordBtn').click();
+  await sleep(80);
+  const proxySock = socks28b.find((s) => s.url.includes('/api/transcribe'));
+  const directSock = socks28b.find((s) => s.url.includes('stt-rt.soniox.com'));
+  check('s28: mint failure falls back to the Worker proxy transport', !!proxySock && !directSock, 'proxy=' + !!proxySock + ' direct=' + !!directSock);
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

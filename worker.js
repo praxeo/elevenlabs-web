@@ -1857,6 +1857,14 @@ right lower quadrant"></textarea>
 
   // Realtime Variables
   let ws = null;
+  // DIRECT-stream transport: when on, the browser opens the realtime WS straight
+  // to Soniox (temp-key auth) with NO Worker proxy hop on the audio path — the
+  // lowest-latency path, matching soniox.com's own demo. directMode is decided
+  // per session at connect time; directKey holds the minted temp key; directXlate
+  // is the per-session Soniox->client-frame translator.
+  let directMode = false;
+  let directKey = "";
+  let directXlate = null;
   let finalizedSegments = [];
   let currentPartial = "";
   // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
@@ -2125,6 +2133,18 @@ right lower quadrant"></textarea>
       binary += String.fromCharCode(bytes[i]);
     }
     return window.btoa(binary);
+  }
+
+  // Inverse of arrayBufferToBase64 — used by the DIRECT-stream transport, which
+  // sends raw binary PCM frames to Soniox (no base64/JSON wrapper). The pre-roll
+  // and connecting-buffer (pendingChunks) are held as base64 for both transports;
+  // direct mode decodes each back to bytes at send time.
+  function base64ToArrayBuffer(b64) {
+    const binary = window.atob(b64);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
   }
 
   // Hybrid capture chokepoint: called exactly once per produced frame, at the
@@ -3049,7 +3069,7 @@ right lower quadrant"></textarea>
 
     if (ws.readyState === WebSocket.OPEN) {
       flushPendingChunks();
-      if (sendAudioChunk(base64Audio, false)) dbgFramesSent++;
+      if (rtSendAudioB64(base64Audio)) dbgFramesSent++;
     } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
       pendingChunks.push(base64Audio);
     }
@@ -3181,10 +3201,34 @@ right lower quadrant"></textarea>
     return true;
   }
 
+  // Transport-aware audio send. PROXY: base64 JSON frame through sendAudioChunk
+  // (the Worker translates). DIRECT: raw binary PCM straight to Soniox — no
+  // base64, no JSON, no main-thread encode jitter. Returns true on success.
+  function rtSendAudioB64(b64) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (directMode) {
+      try { ws.send(base64ToArrayBuffer(b64)); } catch (e) { return false; }
+      return true;
+    }
+    return sendAudioChunk(b64, false);
+  }
+
+  // Transport-aware end-of-audio commit. PROXY: {commit:true} empty chunk (the
+  // Worker turns it into Soniox's empty-string end-of-audio). DIRECT: send the
+  // empty string straight to Soniox.
+  function rtSendCommit() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    if (directMode) {
+      try { ws.send(""); } catch (e) { return false; }
+      return true;
+    }
+    return sendAudioChunk("", true);
+  }
+
   function flushPendingChunks() {
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     while (pendingChunks.length) {
-      if (!sendAudioChunk(pendingChunks[0], false)) break;
+      if (!rtSendAudioB64(pendingChunks[0])) break;
       pendingChunks.shift();
     }
   }
@@ -3203,6 +3247,161 @@ right lower quadrant"></textarea>
     }
     prerollFrames = [];
     return out;
+  }
+
+  // ───── DIRECT-stream transport (browser -> Soniox, no Worker proxy hop) ─────
+
+  var SONIOX_DIRECT_URL = "wss://stt-rt.soniox.com/transcribe-websocket";
+  var SONIOX_DIRECT_MODEL = "stt-rt-v5";
+
+  // Mint a short-lived Soniox temporary API key via the Worker (passphrase-gated).
+  // Returns the key string, or null on any failure (caller falls back to proxy).
+  async function mintSonioxKey() {
+    try {
+      var body = {};
+      if (SHARED_MODE) body.passphrase = passphraseEl.value.trim();
+      var ref = joinedSessionCode || phoneSessionCode || "";
+      if (ref) body.client_reference_id = ref;
+      var resp = await fetch("/api/soniox-token", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      var jd = null;
+      try { jd = JSON.parse(await resp.text()); } catch (e) {}
+      if (!resp.ok || !jd) {
+        rtDebugLog("[rt] token mint HTTP " + (resp && resp.status) + " " + ((jd && jd.error) || ""));
+        return null;
+      }
+      // The REST field name isn't pinned in the docs; accept the plausible ones.
+      var key = jd.api_key || jd.apiKey || jd.key || jd.temporary_api_key || jd.token || "";
+      if (!key) { rtDebugLog("[rt] token mint: no key in response"); return null; }
+      return key;
+    } catch (e) {
+      rtDebugLog("[rt] token mint threw: " + ((e && e.message) || e));
+      return null;
+    }
+  }
+
+  // Build the Soniox config (first WS frame) client-side — same shape the Worker
+  // sends on the proxy path: PTT-tuned (endpoint detection OFF), English-strict,
+  // medical general-context, and the full keyterm list trimmed to Soniox's
+  // ~8000-char context budget (custom > presets > always-on order preserved).
+  function buildSonioxDirectConfig(tempKey) {
+    var terms = effectiveKeyterms(49, 300);
+    var general = [
+      { key: "domain", value: "Healthcare" },
+      { key: "specialty", value: "Wound care and emergency medicine" },
+      { key: "setting", value: "Clinician dictation of a patient note" },
+      { key: "style", value: "Medical terminology, drug names, abbreviations" },
+    ];
+    var budget = 8000, picked = [];
+    for (var i = 0; i < terms.length; i++) {
+      var t = terms[i];
+      if (budget - (t.length + 1) < 0) break;
+      picked.push(t); budget -= t.length + 1;
+    }
+    return {
+      api_key: tempKey,
+      model: SONIOX_DIRECT_MODEL,
+      audio_format: "pcm_s16le",
+      sample_rate: 16000,
+      num_channels: 1,
+      language_hints: ["en"],
+      language_hints_strict: true,
+      enable_endpoint_detection: false,
+      context: picked.length ? { general: general, terms: picked } : { general: general },
+    };
+  }
+
+  // Client-side mirror of the Worker's makeSonioxToClient: turns each Soniox
+  // token response into the app frame vocabulary. Final tokens accumulate; the
+  // running partial is confirmed + provisional tail; committed lands on finished;
+  // <end>/<fin> markers drop; error_code -> loud error. Emits frame OBJECTS that
+  // feed the shared handleServerFrame (and the phone-link mirror).
+  function makeSonioxClientTranslator() {
+    var finalText = "";
+    var startedSent = false;
+    return function (raw) {
+      var m;
+      try { m = JSON.parse(raw); } catch (e) { return []; }
+      if (!m || typeof m !== "object") return [];
+      var out = [];
+      if (!startedSent) { startedSent = true; out.push({ message_type: "session_started", config: {} }); }
+      if (m.error_code) {
+        out.push({ message_type: "error", error: "Soniox " + String(m.error_code) + (m.error_message ? " - " + m.error_message : "") });
+        return out;
+      }
+      var newFinal = "", nonFinal = "";
+      if (Array.isArray(m.tokens)) {
+        for (var i = 0; i < m.tokens.length; i++) {
+          var tk = m.tokens[i];
+          if (!tk || typeof tk.text !== "string") continue;
+          var tt = tk.text.trim();
+          if (tt.length >= 2 && tt.charAt(0) === "<" && tt.charAt(tt.length - 1) === ">") continue; // drop <end>/<fin>
+          if (tk.is_final) newFinal += tk.text; else nonFinal += tk.text;
+        }
+      }
+      finalText += newFinal;
+      out.push({ message_type: "partial_transcript", text: finalText + nonFinal });
+      if (m.finished) out.push({ message_type: "committed_transcript", text: finalText });
+      return out;
+    };
+  }
+
+  // Shared downstream handler for one server frame in the app vocabulary. Both
+  // transports feed it: the PROXY path parses the Worker's JSON; the DIRECT path
+  // translates Soniox tokens client-side (makeSonioxClientTranslator) and feeds
+  // the resulting frame objects here. Keeping ONE handler means the live display,
+  // finalize/commit-quiet logic, and loud error path are identical on both paths.
+  function handleServerFrame(data, sess) {
+    if (!data || typeof data !== "object") return;
+    const m_type = data.message_type;
+    if (m_type === "session_started") {
+      // Nova-3: config.tier shows which config opened (medical/general/minimal).
+      const cfg = data.config || {};
+      const tier = typeof cfg.tier === "string" ? cfg.tier : "";
+      if (!stopping) {
+        setStatus("Listening — transcribing live…" + (tier ? " (" + tier + ")" : ""), "ok");
+      }
+    }
+    else if (m_type === "partial_transcript") {
+      partialCount++;
+      rtDebugLog("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text));
+      currentPartial = data.text;
+      updateLiveDisplay();
+    }
+    else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
+      partialCount++;
+      rtDebugLog("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text));
+      if (data.text && data.text.trim()) {
+        finalizedSegments.push(data.text);
+        currentPartial = "";
+        updateLiveDisplay();
+      }
+      if (stopPhase === "awaitFinal") {
+        // The final words arrived — close as soon as the server goes quiet
+        // instead of waiting out the whole deadline.
+        dbgPhase("final committed arrived; closing in " + COMMIT_QUIET_MS + "ms");
+        if (quietTimer) clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => {
+          quietTimer = null;
+          if (sess !== sessionSeq) return;
+          try { if (ws) ws.close(); } catch (e) {}
+          finalizeSession(false);
+        }, COMMIT_QUIET_MS);
+      }
+    }
+    else if (typeof data.error === "string" && data.error) {
+      // Covers the whole error-frame family: error, auth_error, quota_exceeded,
+      // rate_limited, commit_throttled, input_error, session_time_limit_exceeded,
+      // chunk_size_exceeded, … — any frame carrying an error string is loud.
+      const tag = (m_type && m_type !== "error") ? (m_type + ": ") : "";
+      lastWsError = tag + data.error;
+      console.error("Scribe error frame:", lastWsError);
+      setStatus("Transcription service error — " + lastWsError, "err");
+      failBeep();
+    }
   }
 
   async function startRecording() {
@@ -3337,40 +3536,60 @@ right lower quadrant"></textarea>
       return;
     }
 
-    // Establish Secure Proxy WebSocket Connection through the Cloudflare Worker
+    // Transport decision. ?rt=direct on the PAGE URL selects the DIRECT stream
+    // (browser -> Soniox via temp key, no Worker proxy hop). For now direct is
+    // SOLO-only: joined (phone-link) sessions stay on the proxy so the desktop
+    // keeps its Worker-mirrored live feedback until the room-mirror lands. Any
+    // direct setup failure falls back to the proxy transport — never a dead mic.
+    var pageRt = "";
+    try { pageRt = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
+    directMode = (pageRt === "direct") && !joinedSessionCode;
+    directXlate = null;
+    directKey = "";
+
+    if (directMode) {
+      setLinkPill("connecting");
+      // Mint a short-lived Soniox key. (Future optimization: pre-mint while the
+      // mic is warm so this round-trip is off the start path entirely.)
+      var minted = await mintSonioxKey();
+      if (mySession !== sessionSeq) return; // session superseded during the await
+      if (minted) {
+        directKey = minted;
+        // Audio captured DURING the mint await landed in the pre-roll ring (ws was
+        // null); fold it into pendingChunks so the opening words aren't clipped.
+        pendingChunks = pendingChunks.concat(buildPrerollChunks());
+      } else {
+        directMode = false; // loud-but-safe: fall back to the proven proxy path
+        rtDebugLog("[rt] direct mint failed -> proxy fallback");
+      }
+    }
+
     const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const params = new URLSearchParams();
-    // Realtime is Deepgram Nova-3 on Workers AI — no STT key travels from the
-    // browser. In shared mode the passphrase gates the Worker's AI binding.
-    if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
-    params.append("no_verbatim", String(noVerbatimEl.checked));
-    params.append("timestamps", timestampsEl.value);
-
-    // Keyterms bias the realtime engine (server-side). The default transport
-    // (Soniox) accepts a large context budget, so send the FULL preset list with
-    // the longer 49-char limit; only the ElevenLabs realtime transport (?rt=el)
-    // needs the 50-term/20-char cap (the Worker also re-caps EL to 50/20). Batch /
-    // hybrid-refine get the full list separately, so the clipboard always benefits.
-    var rtSel = "";
-    try { rtSel = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
-    var keyterms = (rtSel === "el" || rtSel === "scribe")
-      ? effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS)
-      : effectiveKeyterms(49, 300);
-    params.append("keyterms_json", JSON.stringify(keyterms));
-
-    if (joinedSessionCode) params.append("session", joinedSessionCode);
-
-    // Experimental realtime transport override: ?rt=flux|gw|dgw on the PAGE URL
-    // is forwarded to the Worker (absent/auto = the proven nova-3 binding, the
-    // default). Lets the operator live-test alternative transports that reach an
-    // honored sample_rate without any UI change; an unknown value is ignored.
-    try {
-      var pageRt = new URLSearchParams(window.location.search).get("rt");
+    var wsUrl;
+    if (directMode) {
+      wsUrl = SONIOX_DIRECT_URL;
+      directXlate = makeSonioxClientTranslator();
+    } else {
+      // Proxy path: connect through the Cloudflare Worker. No STT key travels
+      // from the browser; in shared mode the passphrase gates the Worker.
+      const params = new URLSearchParams();
+      if (SHARED_MODE) params.append("passphrase", passphraseEl.value.trim());
+      params.append("no_verbatim", String(noVerbatimEl.checked));
+      params.append("timestamps", timestampsEl.value);
+      // Keyterms bias the engine server-side. Soniox (default) takes a large
+      // context budget, so send the FULL preset list at the 49-char limit; only
+      // ?rt=el needs the 50/20 cap (the Worker also re-caps EL).
+      var keyterms = (pageRt === "el" || pageRt === "scribe")
+        ? effectiveKeyterms(REALTIME_KEYTERM_MAX_CHARS, REALTIME_KEYTERM_MAX_TERMS)
+        : effectiveKeyterms(49, 300);
+      params.append("keyterms_json", JSON.stringify(keyterms));
+      if (joinedSessionCode) params.append("session", joinedSessionCode);
+      // Experimental transport override (?rt=...) forwarded to the Worker; an
+      // unknown value is ignored (absent/auto = the default Soniox proxy).
       if (pageRt && /^(el|scribe|soniox|binding|nova|flux|gw|dgw|auto)$/.test(pageRt)) params.append("rt", pageRt);
-    } catch (e) {}
-
-    const wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
-    rtDebugLog("[rt " + Math.round(performance.now()) + "] connecting ws  engine=" + sessionEngine + " rt=" + ((typeof pageRt !== "undefined" && pageRt) ? pageRt : "auto"));
+      wsUrl = wsProtocol + "//" + window.location.host + "/api/transcribe?" + params.toString();
+    }
+    rtDebugLog("[rt " + Math.round(performance.now()) + "] connecting ws  engine=" + sessionEngine + " rt=" + (directMode ? "direct" : (pageRt || "auto")));
 
     try {
       ws = new WebSocket(wsUrl);
@@ -3382,6 +3601,7 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
+    if (directMode) { try { ws.binaryType = "arraybuffer"; } catch (e) {} }
 
     setLinkPill("connecting");
 
@@ -3400,8 +3620,13 @@ right lower quadrant"></textarea>
     ws.onopen = () => {
       if (mySession !== sessionSeq) return;
       wsOpenAt = Date.now();
-      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws OPEN");
+      rtDebugLog("[rt " + Math.round(performance.now()) + "] ws OPEN" + (directMode ? " (direct)" : ""));
       if (connectTimer) { clearTimeout(connectTimer); connectTimer = null; }
+      // DIRECT: the auth + audio-format + medical-context config rides the FIRST
+      // WS frame (Soniox's config-first protocol), then audio streams as binary.
+      if (directMode) {
+        try { ws.send(JSON.stringify(buildSonioxDirectConfig(directKey))); } catch (e) {}
+      }
       setLinkPill("live");
       flushPendingChunks();
       setStatus("Listening — transcribing live…", "ok");
@@ -3415,54 +3640,12 @@ right lower quadrant"></textarea>
     ws.onmessage = async (event) => {
       if (mySession !== sessionSeq) return;
       try {
-        const data = JSON.parse(event.data);
-        const m_type = data.message_type;
-
-        if (m_type === "session_started") {
-          // Nova-3: config.tier shows which config opened (medical/general/minimal).
-          const cfg = data.config || {};
-          const tier = typeof cfg.tier === "string" ? cfg.tier : "";
-          if (!stopping) {
-            setStatus("Listening — transcribing live…" + (tier ? " (" + tier + ")" : ""), "ok");
-          }
-        }
-        else if (m_type === "partial_transcript") {
-          partialCount++;
-          rtDebugLog("[rt " + (Math.round(performance.now())) + "] partial(" + (data.text || "").length + "): " + JSON.stringify(data.text));
-          currentPartial = data.text;
-          updateLiveDisplay();
-        }
-        else if (m_type === "committed_transcript" || m_type === "committed_transcript_with_timestamps") {
-          partialCount++;
-          rtDebugLog("[rt " + (Math.round(performance.now())) + "] COMMIT(" + (data.text || "").length + "): " + JSON.stringify(data.text));
-          if (data.text && data.text.trim()) {
-            finalizedSegments.push(data.text);
-            currentPartial = "";
-            updateLiveDisplay();
-          }
-          if (stopPhase === "awaitFinal") {
-            // The final words arrived — close as soon as the server goes quiet
-            // instead of waiting out the whole deadline.
-            dbgPhase("final committed arrived; closing in " + COMMIT_QUIET_MS + "ms");
-            if (quietTimer) clearTimeout(quietTimer);
-            quietTimer = setTimeout(() => {
-              quietTimer = null;
-              if (mySession !== sessionSeq) return;
-              try { if (ws) ws.close(); } catch (e) {}
-              finalizeSession(false);
-            }, COMMIT_QUIET_MS);
-          }
-        }
-        else if (typeof data.error === "string" && data.error) {
-          // Covers the whole error-frame family: error, auth_error,
-          // quota_exceeded, rate_limited, commit_throttled, input_error,
-          // session_time_limit_exceeded, chunk_size_exceeded, … — any frame
-          // carrying an error string takes the loud path.
-          const tag = (m_type && m_type !== "error") ? (m_type + ": ") : "";
-          lastWsError = tag + data.error;
-          console.error("Scribe error frame:", lastWsError);
-          setStatus("Transcription service error — " + lastWsError, "err");
-          failBeep();
+        if (directMode) {
+          // Soniox token frames -> app frames, on-device, then the shared handler.
+          var frames = directXlate ? directXlate(event.data) : [];
+          for (var fi = 0; fi < frames.length; fi++) handleServerFrame(frames[fi], mySession);
+        } else {
+          handleServerFrame(JSON.parse(event.data), mySession);
         }
       } catch (err) {
         console.error("Error processing message:", err);
@@ -3619,7 +3802,7 @@ right lower quadrant"></textarea>
         try {
           if (ws && ws.readyState === WebSocket.OPEN) {
             flushPendingChunks();
-            sendAudioChunk("", true); // graceful commit to the engine
+            rtSendCommit(); // graceful end-of-audio to the engine (binary "" in direct mode)
           }
         } catch (e) {}
         try { if (ws) ws.close(); } catch (e) {} // onclose re-enters finalize; sessionFinalized guards it
@@ -3636,8 +3819,9 @@ right lower quadrant"></textarea>
 
     if (ws && ws.readyState === WebSocket.OPEN) {
       flushPendingChunks();
-      // Final empty chunk with commit: true forces the last segment out
-      sendAudioChunk("", true);
+      // Final end-of-audio forces the last segment out (binary "" in direct mode,
+      // {commit:true} through the Worker in proxy mode)
+      rtSendCommit();
       dbgPhase("commit sent -> awaiting final committed (deadline " + FINAL_WAIT_MS + "ms)");
       if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
       finalDeadlineTimer = setTimeout(() => {

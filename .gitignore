@@ -6,6 +6,9 @@
 .wrangler/
 node_modules/
 
+# Claude Code harness scratch (agent worktrees, local agent state) — never commit.
+.claude/
+
 # jsdom is installed transiently for tests (npm install --no-save jsdom);
 # the app itself has zero dependencies and no build step.
 package.json

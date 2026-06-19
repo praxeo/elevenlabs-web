@@ -1109,6 +1109,29 @@ console.log('--- scenario 21: session room DO contract ---');
   const freshLatest = JSON.parse(await (await room.fetch(latestReq())).text());
   check('s21: /latest returns the held delivery with its id', freshLatest.delivery && freshLatest.delivery.delivery_id === 'do2' && freshLatest.delivery.text === 'DO note 2.' && typeof freshLatest.age_ms === 'number', JSON.stringify(freshLatest));
 
+  // Publisher role (the phone in DIRECT mode): pushes frames into the room, which
+  // broadcasts them to listeners and synthesizes phone_session_end on disconnect.
+  await room.fetch(wsReq()); // a fresh listener to observe the publisher
+  const listenerD = lastPair.server;
+  const beforePub = listenerD.sent.length;
+  const pubReq = { headers: { get: (h) => (h === 'Upgrade' ? 'websocket' : null) }, method: 'GET', url: 'https://room/api/session/ABC123?role=pub' };
+  await room.fetch(pubReq);
+  const publisher = lastPair.server;
+  const parsed = (arr) => arr.map((d) => { try { return JSON.parse(d); } catch { return {}; } });
+  publisher.handlers.message({ data: JSON.stringify({ message_type: 'partial_transcript', text: 'live words' }) });
+  check('s21: publisher frames are broadcast to listeners', parsed(listenerD.sent.slice(beforePub)).some((m) => m.text === 'live words'));
+  publisher.handlers.message({ data: JSON.stringify({ message_type: 'ping' }) });
+  check('s21: publisher ping gets a pong', parsed(publisher.sent).some((m) => m.message_type === 'pong'));
+  const pubDelivery = JSON.stringify({ message_type: 'phone_delivery', text: 'Pub note.', delivery_id: 'pub1' });
+  publisher.handlers.message({ data: pubDelivery });
+  check('s21: a publisher phone_delivery is retained for replay', room.lastDelivery.body === pubDelivery);
+  const beforeEnd = listenerD.sent.length;
+  publisher.handlers.close(); // phone drops / dictation ends
+  check('s21: publisher close emits phone_session_end to listeners', parsed(listenerD.sent.slice(beforeEnd)).some((m) => m.message_type === 'phone_session_end'));
+  const beforeDup = listenerD.sent.length;
+  publisher.handlers.error(); // close+error must not double-fire
+  check('s21: publisher end fires exactly once (close+error guarded)', listenerD.sent.length === beforeDup);
+
   globalThis.Response = RealResponse;
   delete globalThis.WebSocketPair;
 }
@@ -2099,6 +2122,56 @@ console.log('--- scenario 28: direct stream ---');
   const proxySock = socks28b.find((s) => s.url.includes('/api/transcribe'));
   const directSock = socks28b.find((s) => s.url.includes('stt-rt.soniox.com'));
   check('s28: mint failure falls back to the Worker proxy transport', !!proxySock && !directSock, 'proxy=' + !!proxySock + ' direct=' + !!directSock);
+
+  // ---- Part C: joined + direct -> streams to Soniox AND mirrors via a publisher ----
+  const socks28c = [];
+  const dom28c = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?rt=direct',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mkStream()), addEventListener() {} };
+      win.fetch = (url) => {
+        if (String(url).includes('/api/soniox-token')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"api_key":"tmp-c"}') });
+        if (String(url).includes('/deliver')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks28c.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc28c = dom28c.window.document;
+  doc28c.getElementById('phoneJoinInput').value = 'ABC123';
+  doc28c.getElementById('phoneJoinBtn').click();
+  await sleep(10);
+  doc28c.getElementById('engRealtime').click();
+  doc28c.getElementById('apiKey').value = 'test-key';
+  doc28c.getElementById('sonioxKey').value = 'test-skey';
+  doc28c.getElementById('recordBtn').click();
+  await sleep(80);
+  const dsockC = socks28c.find((s) => s.url.includes('stt-rt.soniox.com'));
+  const pubSock = socks28c.find((s) => s.url.includes('/api/session/ABC123') && s.url.includes('role=pub'));
+  check('s28: joined direct still streams straight to Soniox', !!dsockC, dsockC && dsockC.url);
+  check('s28: joined direct opens a room publisher socket', !!pubSock, pubSock && pubSock.url);
+  if (dsockC && pubSock) {
+    dsockC.open();
+    pubSock.open();
+    await sleep(10);
+    dsockC.msg({ tokens: [{ text: 'Mirror me', is_final: false }] });
+    await sleep(10);
+    check('s28: live partials are mirrored to the desktop via the publisher', pubSock.sent.some((d) => { try { return JSON.parse(d).text === 'Mirror me'; } catch { return false; } }), pubSock.sent.length + ' frames');
+    doc28c.getElementById('recordBtn').click(); // stop -> finalize
+    await sleep(700);
+    dsockC.msg({ tokens: [{ text: 'Mirror me now.', is_final: true }], finished: true });
+    await sleep(400);
+    check('s28: publisher socket closes at finalize (room then emits phone_session_end)', pubSock.closed === true);
+  }
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

@@ -22,6 +22,39 @@ export class SessionRoom {
     if (request.headers.get("Upgrade") === "websocket") {
       const [client, server] = Object.values(new WebSocketPair());
       server.accept();
+
+      // PUBLISHER role (the phone in DIRECT-stream mode): it streams straight to
+      // Soniox, so the Worker is no longer in the audio path to mirror transcripts
+      // — the phone pushes its translated frames here instead. Its messages are
+      // broadcast to listeners (and a phone_delivery is retained); on disconnect
+      // we synthesize phone_session_end so the desktop's fallback/grace fires
+      // exactly as it did when the Worker proxied the stream (crash resilience).
+      if (url.searchParams.get("role") === "pub") {
+        const broadcast = (message) => {
+          for (const [lid, lws] of this.listeners) {
+            try { lws.send(message); } catch { this.listeners.delete(lid); }
+          }
+        };
+        server.addEventListener("message", (event) => {
+          const message = typeof event.data === "string" ? event.data : "";
+          if (!message) return;
+          let mt = "";
+          try { mt = (JSON.parse(message) || {}).message_type || ""; } catch {}
+          if (mt === "ping") { try { server.send(JSON.stringify({ message_type: "pong" })); } catch {} return; }
+          if (mt === "phone_delivery") this.lastDelivery = { body: message, ts: Date.now() };
+          broadcast(message);
+        });
+        let ended = false;
+        const onEnd = () => {
+          if (ended) return;
+          ended = true;
+          broadcast(JSON.stringify({ message_type: "phone_session_end" }));
+        };
+        server.addEventListener("close", onEnd);
+        server.addEventListener("error", onEnd);
+        return new Response(null, { status: 101, webSocket: client });
+      }
+
       const id = crypto.randomUUID();
       this.listeners.set(id, server);
       server.addEventListener("close", () => this.listeners.delete(id));
@@ -1942,6 +1975,7 @@ right lower quadrant"></textarea>
   let lastDeliveryId    = "";   // desktop: dedupe replayed phone_delivery frames
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
+  let pubWs             = null; // phone (DIRECT mode): publisher socket mirroring live frames to the room
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
 
@@ -3349,6 +3383,30 @@ right lower quadrant"></textarea>
     };
   }
 
+  // ───── Phone-link mirror for DIRECT mode (joined phone -> desktop) ─────
+  // On the proxy path the Worker mirrors transcript frames into the room. In
+  // direct mode the Worker is out of the audio path, so the phone opens a
+  // PUBLISHER socket to the room and pushes its translated frames itself. The
+  // room broadcasts them to the desktop listener and, on this socket's close,
+  // synthesizes phone_session_end — so the desktop's grace/fallback fires exactly
+  // as before, including if the phone dies mid-dictation. The authoritative final
+  // text still travels the existing /deliver POST (deliverFinalText) — unchanged.
+  function openPhonePublisher() {
+    if (!joinedSessionCode) return;
+    closePhonePublisher();
+    try {
+      var proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      pubWs = new WebSocket(proto + "//" + window.location.host + "/api/session/" + joinedSessionCode + "?role=pub");
+    } catch (e) { pubWs = null; }
+  }
+  function publishToRoom(frame) {
+    if (!pubWs || pubWs.readyState !== WebSocket.OPEN) return;
+    try { pubWs.send(JSON.stringify(frame)); } catch (e) {}
+  }
+  function closePhonePublisher() {
+    if (pubWs) { try { pubWs.close(); } catch (e) {} pubWs = null; }
+  }
+
   // Shared downstream handler for one server frame in the app vocabulary. Both
   // transports feed it: the PROXY path parses the Worker's JSON; the DIRECT path
   // translates Soniox tokens client-side (makeSonioxClientTranslator) and feeds
@@ -3537,13 +3595,13 @@ right lower quadrant"></textarea>
     }
 
     // Transport decision. ?rt=direct on the PAGE URL selects the DIRECT stream
-    // (browser -> Soniox via temp key, no Worker proxy hop). For now direct is
-    // SOLO-only: joined (phone-link) sessions stay on the proxy so the desktop
-    // keeps its Worker-mirrored live feedback until the room-mirror lands. Any
-    // direct setup failure falls back to the proxy transport — never a dead mic.
+    // (browser -> Soniox via temp key, no Worker proxy hop) — for SOLO and for
+    // JOINED (phone-link) sessions alike: a joined phone streams direct AND opens
+    // a room publisher socket so the desktop keeps live feedback. Any direct setup
+    // failure falls back to the proxy transport — never a dead mic.
     var pageRt = "";
     try { pageRt = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
-    directMode = (pageRt === "direct") && !joinedSessionCode;
+    directMode = (pageRt === "direct");
     directXlate = null;
     directKey = "";
 
@@ -3558,6 +3616,9 @@ right lower quadrant"></textarea>
         // Audio captured DURING the mint await landed in the pre-roll ring (ws was
         // null); fold it into pendingChunks so the opening words aren't clipped.
         pendingChunks = pendingChunks.concat(buildPrerollChunks());
+        // Joined: mirror live frames to the desktop via a room publisher socket
+        // (the Worker no longer sees the stream to mirror it).
+        if (joinedSessionCode) openPhonePublisher();
       } else {
         directMode = false; // loud-but-safe: fall back to the proven proxy path
         rtDebugLog("[rt] direct mint failed -> proxy fallback");
@@ -3642,8 +3703,12 @@ right lower quadrant"></textarea>
       try {
         if (directMode) {
           // Soniox token frames -> app frames, on-device, then the shared handler.
+          // Joined: also mirror each frame to the desktop via the room publisher.
           var frames = directXlate ? directXlate(event.data) : [];
-          for (var fi = 0; fi < frames.length; fi++) handleServerFrame(frames[fi], mySession);
+          for (var fi = 0; fi < frames.length; fi++) {
+            handleServerFrame(frames[fi], mySession);
+            publishToRoom(frames[fi]);
+          }
         } else {
           handleServerFrame(JSON.parse(event.data), mySession);
         }
@@ -3842,6 +3907,10 @@ right lower quadrant"></textarea>
     sessionFinalized = true;
     dbgPhase("finalizeSession(unexpected=" + !!unexpected + ")");
     clearSessionTimers();
+    // Closing the publisher makes the room emit phone_session_end to the desktop
+    // (its grace timer then waits for the authoritative /deliver), matching the
+    // proxy path's per-dictation end signal. No-op when not a direct joined mic.
+    closePhonePublisher();
 
     // Set BEFORE the button/pill updates below: those trigger the big-screen
     // recalc, and with finishing already true it renders WORKING… through the

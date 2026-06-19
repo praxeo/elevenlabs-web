@@ -1911,6 +1911,13 @@ right lower quadrant"></textarea>
   let directRec = null;
   let directRecMime = "";
   let pendingMediaChunks = [];
+  // Pre-minted Soniox temp key: minting is an HTTP round-trip (browser -> Worker
+  // -> Soniox auth), and doing it inline at PTT-down adds that latency to EVERY
+  // dictation's first word. Mint ahead (at boot and after each direct dictation)
+  // so the start path just reuses a fresh key. single_use, so consumed once.
+  let directKeyCache = "";
+  let directKeyCacheAt = 0;
+  let directKeyMinting = false;
   let finalizedSegments = [];
   let currentPartial = "";
   // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
@@ -2067,7 +2074,8 @@ right lower quadrant"></textarea>
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
   const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
-  const DIRECT_REC_TIMESLICE_MS = 200; // ?rt=direct realtime: MediaRecorder chunk cadence (off-thread; smooth beats the raw pump's main-thread 85ms bursts)
+  const DIRECT_REC_TIMESLICE_MS = 100; // ?rt=direct realtime: MediaRecorder chunk cadence (off-thread; small for low live latency, big enough to avoid webm over-fragmentation)
+  const DIRECT_KEY_TTL_MS = 100000; // reuse a pre-minted temp key only if < ~100s old (120s server expiry, with headroom)
   const PUMP_FRAME_SAMPLES = 4096;  // pump frame size (≈85ms at 48kHz) — matched the old ScriptProcessor so all downstream byte counts hold
 
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
@@ -3359,6 +3367,21 @@ right lower quadrant"></textarea>
     }
   }
 
+  // Pre-mint a temp key ahead of the next dictation so the round-trip is off the
+  // start path. Best-effort, only on the direct transport; no-op if a fresh key is
+  // already cached or a mint is in flight.
+  async function prewarmDirectKey() {
+    var rtP = "";
+    try { rtP = (new URLSearchParams(window.location.search).get("rt") || "").toLowerCase(); } catch (e) {}
+    if (rtP !== "direct" || directKeyMinting) return;
+    if (directKeyCache && (Date.now() - directKeyCacheAt) < DIRECT_KEY_TTL_MS) return;
+    directKeyMinting = true;
+    try {
+      var k = await mintSonioxKey();
+      if (k) { directKeyCache = k; directKeyCacheAt = Date.now(); rtDebugLog("[rt] pre-minted direct key"); }
+    } finally { directKeyMinting = false; }
+  }
+
   // Build the Soniox config (first WS frame) client-side — same shape the Worker
   // sends on the proxy path: PTT-tuned (endpoint detection OFF), English-strict,
   // medical general-context, and the full keyterm list trimmed to Soniox's
@@ -3704,10 +3727,16 @@ right lower quadrant"></textarea>
 
     if (directMode) {
       setLinkPill("connecting");
-      // Mint a short-lived Soniox key. (Future optimization: pre-mint while the
-      // mic is warm so this round-trip is off the start path entirely.)
-      var minted = await mintSonioxKey();
-      if (mySession !== sessionSeq) return; // session superseded during the await
+      // Use a pre-minted key if one is fresh (no round-trip on the start path);
+      // otherwise mint inline. Either way kick off a pre-mint for the NEXT one.
+      var minted = "";
+      if (directKeyCache && (Date.now() - directKeyCacheAt) < DIRECT_KEY_TTL_MS) {
+        minted = directKeyCache; directKeyCache = ""; directKeyCacheAt = 0; // single-use: consume
+        rtDebugLog("[rt] using pre-minted direct key");
+      } else {
+        minted = await mintSonioxKey();
+        if (mySession !== sessionSeq) return; // session superseded during the await
+      }
       if (minted) {
         directKey = minted;
         // Audio source: a MediaRecorder webm feed (off-thread, like the demo) for
@@ -4212,6 +4241,7 @@ right lower quadrant"></textarea>
     releaseWakeLock(); // the screen may sleep again once the outcome is delivered
     const label = opts.label || "Live transcript";
     dbgPhase("deliverFinalText (" + (cleaned ? cleaned.length : 0) + " chars) — END of finalize timeline");
+    prewarmDirectKey(); // mint the next direct key now so the next PTT starts instantly (self-gates)
 
     if (!cleaned.trim()) {
       await writeSentinel();
@@ -5338,6 +5368,7 @@ right lower quadrant"></textarea>
   renderHistory();
   updateAppendChip();
   tryWarmOnLoad();
+  prewarmDirectKey(); // ?rt=direct: have a temp key ready so the FIRST dictation is instant too
 })();
 </script>
 </body>

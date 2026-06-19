@@ -1898,6 +1898,19 @@ right lower quadrant"></textarea>
   let directMode = false;
   let directKey = "";
   let directXlate = null;
+  // DIRECT realtime audio source. soniox.com's demo (and our batch path) capture
+  // with MediaRecorder — OFF the main thread — and Soniox auto-detects the webm
+  // container (audio_format:"auto"). Our raw-PCM AudioWorklet pump downsamples and
+  // sends each frame ON the main thread, which bursts under live-render load and
+  // makes Soniox jittery. So for ?rt=direct realtime we feed Soniox a MediaRecorder
+  // webm stream instead. directUsesRec is set per session (realtime + container
+  // support); a browser without webm/ogg MediaRecorder falls back to the raw-PCM
+  // direct path. directRec is the recorder; pendingMediaChunks buffers webm blobs
+  // captured before the WS opens.
+  let directUsesRec = false;
+  let directRec = null;
+  let directRecMime = "";
+  let pendingMediaChunks = [];
   let finalizedSegments = [];
   let currentPartial = "";
   // Diagnostic: ?debug=1 logs every realtime transcript frame (with a ms stamp)
@@ -2054,6 +2067,7 @@ right lower quadrant"></textarea>
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const PREROLL_MS         = 400;   // idle audio kept in memory and prepended at start (first-word rescue)
   const PREROLL_FRAME_CAP  = 12;    // hard cap on the pre-roll ring (~1s of frames)
+  const DIRECT_REC_TIMESLICE_MS = 200; // ?rt=direct realtime: MediaRecorder chunk cadence (off-thread; smooth beats the raw pump's main-thread 85ms bursts)
   const PUMP_FRAME_SAMPLES = 4096;  // pump frame size (≈85ms at 48kHz) — matched the old ScriptProcessor so all downstream byte counts hold
 
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
@@ -3102,20 +3116,27 @@ right lower quadrant"></textarea>
       return;
     }
 
-    const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
-    const pcmBuffer = floatTo16BitPCM(downsampled);
-    capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
+    // DIRECT + MediaRecorder feed: the recorder streams webm to Soniox OFF the
+    // main thread (the whole point — the raw-PCM pump's per-frame downsample/send
+    // ran here and bursted under render load, jittering Soniox). Do NO per-frame
+    // audio work; just keep the ?debug heartbeat. (Realtime-only path, so no
+    // capturePcm to maintain.)
+    if (!directUsesRec) {
+      const downsampled = downsampleBuffer(floatSamples, audioCtx.sampleRate, 16000);
+      const pcmBuffer = floatTo16BitPCM(downsampled);
+      capturePcm(pcmBuffer); // hybrid: keep the exact frame for the batch refine
 
-    if (ws.readyState === WebSocket.OPEN) {
-      flushPendingChunks();
-      // Direct: ship the raw PCM ArrayBuffer (no base64 on the hot path). Proxy:
-      // base64 JSON through the chokepoint. base64 is only computed when needed.
-      const sent = directMode
-        ? rtSendAudioBinary(pcmBuffer)
-        : sendAudioChunk(arrayBufferToBase64(pcmBuffer), false);
-      if (sent) dbgFramesSent++;
-    } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
-      pendingChunks.push(arrayBufferToBase64(pcmBuffer));
+      if (ws.readyState === WebSocket.OPEN) {
+        flushPendingChunks();
+        // Direct: ship the raw PCM ArrayBuffer (no base64 on the hot path). Proxy:
+        // base64 JSON through the chokepoint. base64 is only computed when needed.
+        const sent = directMode
+          ? rtSendAudioBinary(pcmBuffer)
+          : sendAudioChunk(arrayBufferToBase64(pcmBuffer), false);
+        if (sent) dbgFramesSent++;
+      } else if (ws.readyState === WebSocket.CONNECTING && pendingChunks.length < PENDING_CHUNK_CAP) {
+        pendingChunks.push(arrayBufferToBase64(pcmBuffer));
+      }
     }
     // Per-second cadence heartbeat (?debug=1). The decisive read: if framesSent
     // keeps climbing while partials stops rising, audio IS reaching the engine and
@@ -3356,17 +3377,25 @@ right lower quadrant"></textarea>
       if (budget - (t.length + 1) < 0) break;
       picked.push(t); budget -= t.length + 1;
     }
-    return {
+    var cfg = {
       api_key: tempKey,
       model: SONIOX_DIRECT_MODEL,
-      audio_format: "pcm_s16le",
-      sample_rate: 16000,
-      num_channels: 1,
       language_hints: ["en"],
       language_hints_strict: true,
       enable_endpoint_detection: false,
       context: picked.length ? { general: general, terms: picked } : { general: general },
     };
+    if (directUsesRec) {
+      // MediaRecorder feed: Soniox auto-detects the webm/ogg container from the
+      // stream header — no sample_rate/encoding needed (and the recorder is the
+      // native mic rate, not our downsample).
+      cfg.audio_format = "auto";
+    } else {
+      cfg.audio_format = "pcm_s16le";
+      cfg.sample_rate = 16000;
+      cfg.num_channels = 1;
+    }
+    return cfg;
   }
 
   // Client-side mirror of the Worker's makeSonioxToClient: turns each Soniox
@@ -3426,6 +3455,51 @@ right lower quadrant"></textarea>
   }
   function closePhonePublisher() {
     if (pubWs) { try { pubWs.close(); } catch (e) {} pubWs = null; }
+  }
+
+  // ───── DIRECT realtime: MediaRecorder feed (off-thread, like the demo) ─────
+  // A Soniox auto-detectable container (webm/ogg). iOS Safari yields neither
+  // (it records mp4, which Soniox's auto list excludes), so directFeedMime()
+  // returns "" there and the caller falls back to the raw-PCM pump.
+  function directFeedMime() {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return "";
+    var cands = ["audio/webm;codecs=opus", "audio/webm", "audio/ogg;codecs=opus", "audio/ogg"];
+    for (var i = 0; i < cands.length; i++) { if (MediaRecorder.isTypeSupported(cands[i])) return cands[i]; }
+    return "";
+  }
+  function startDirectRecorder() {
+    pendingMediaChunks = [];
+    try {
+      directRec = new MediaRecorder(stream, { mimeType: directRecMime, audioBitsPerSecond: 32000 });
+    } catch (e) {
+      directRec = null; directUsesRec = false;
+      rtDebugLog("[rt] direct recorder failed (" + ((e && e.message) || e) + ") -> raw-PCM fallback");
+      return;
+    }
+    directRec.ondataavailable = function (e) {
+      if (!e.data || e.data.size === 0) return;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(e.data); dbgFramesSent++; } catch (err) {}
+      } else if (pendingMediaChunks.length < 300) {
+        pendingMediaChunks.push(e.data);
+      }
+    };
+    try { directRec.start(DIRECT_REC_TIMESLICE_MS); }
+    catch (e) { directRec = null; directUsesRec = false; rtDebugLog("[rt] direct recorder start failed -> raw-PCM fallback"); }
+  }
+  function flushPendingMediaChunks() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    while (pendingMediaChunks.length) {
+      try { ws.send(pendingMediaChunks.shift()); } catch (e) { break; }
+    }
+  }
+  // Stop the recorder, then run cb AFTER its final chunk has been delivered
+  // (onstop fires after the last ondataavailable) — so end-of-audio is signaled
+  // only once Soniox has every byte.
+  function stopDirectRecorder(cb) {
+    if (!directRec || directRec.state === "inactive") { directRec = null; if (cb) cb(); return; }
+    directRec.onstop = function () { directRec = null; if (cb) cb(); };
+    try { directRec.stop(); } catch (e) { directRec = null; if (cb) cb(); }
   }
 
   // Shared downstream handler for one server frame in the app vocabulary. Both
@@ -3625,6 +3699,8 @@ right lower quadrant"></textarea>
     directMode = (pageRt === "direct");
     directXlate = null;
     directKey = "";
+    directUsesRec = false;
+    directRecMime = "";
 
     if (directMode) {
       setLinkPill("connecting");
@@ -3634,9 +3710,22 @@ right lower quadrant"></textarea>
       if (mySession !== sessionSeq) return; // session superseded during the await
       if (minted) {
         directKey = minted;
-        // Audio captured DURING the mint await landed in the pre-roll ring (ws was
-        // null); fold it into pendingChunks so the opening words aren't clipped.
-        pendingChunks = pendingChunks.concat(buildPrerollChunks());
+        // Audio source: a MediaRecorder webm feed (off-thread, like the demo) for
+        // REALTIME when the browser supports a Soniox auto-container; otherwise the
+        // raw-PCM pump (hybrid always keeps the pump — it needs capturePcm). The
+        // recorder path doesn't pre-roll (the demo doesn't either) and must not mix
+        // raw PCM into the webm stream, so its pendingChunks stays empty.
+        directRecMime = (sessionEngine === "realtime") ? directFeedMime() : "";
+        directUsesRec = !!directRecMime;
+        if (directUsesRec) {
+          pendingChunks = [];
+          startDirectRecorder(); // may clear directUsesRec on failure
+        }
+        if (!directUsesRec) {
+          // Raw-PCM direct path: fold the mint-await pre-roll back in so the
+          // opening words aren't clipped.
+          pendingChunks = pendingChunks.concat(buildPrerollChunks());
+        }
         // Joined: mirror live frames to the desktop via a room publisher socket
         // (the Worker no longer sees the stream to mirror it).
         if (joinedSessionCode) openPhonePublisher();
@@ -3710,7 +3799,10 @@ right lower quadrant"></textarea>
         try { ws.send(JSON.stringify(buildSonioxDirectConfig(directKey))); } catch (e) {}
       }
       setLinkPill("live");
-      flushPendingChunks();
+      // Recorder feed flushes buffered webm; raw-PCM paths flush base64 chunks.
+      // Never both — mixing raw PCM into the webm stream would corrupt it.
+      if (directUsesRec) flushPendingMediaChunks();
+      else flushPendingChunks();
       setStatus("Listening — transcribing live…", "ok");
       if (stopPhase === "awaitFinal") {
         // PTT was released while still connecting: buffered speech was just
@@ -3904,10 +3996,19 @@ right lower quadrant"></textarea>
     stopPhase = "awaitFinal";
 
     if (ws && ws.readyState === WebSocket.OPEN) {
-      flushPendingChunks();
-      // Final end-of-audio forces the last segment out (binary "" in direct mode,
-      // {commit:true} through the Worker in proxy mode)
-      rtSendCommit();
+      // Recorder feed: stop the recorder first so its final webm chunk flushes,
+      // THEN signal end-of-audio (no raw-PCM flush — it must not mix into webm).
+      // Raw-PCM paths: flush remaining chunks, then commit.
+      if (directUsesRec) {
+        // rtSendCommit/flush both no-op if the socket isn't OPEN, so a stale
+        // callback after a finalize is harmless — no session guard needed.
+        stopDirectRecorder(function () { flushPendingMediaChunks(); rtSendCommit(); });
+      } else {
+        flushPendingChunks();
+        // Final end-of-audio forces the last segment out (binary "" in direct mode,
+        // {commit:true} through the Worker in proxy mode)
+        rtSendCommit();
+      }
       dbgPhase("commit sent -> awaiting final committed (deadline " + FINAL_WAIT_MS + "ms)");
       if (finalDeadlineTimer) clearTimeout(finalDeadlineTimer);
       finalDeadlineTimer = setTimeout(() => {
@@ -3928,6 +4029,9 @@ right lower quadrant"></textarea>
     sessionFinalized = true;
     dbgPhase("finalizeSession(unexpected=" + !!unexpected + ")");
     clearSessionTimers();
+    // Stop the direct MediaRecorder if it's still running (an unexpected close
+    // bypasses beginCommitPhase). Idempotent — a no-op if already stopped.
+    stopDirectRecorder();
     // Closing the publisher makes the room emit phone_session_end to the desktop
     // (its grace timer then waits for the authoritative /deliver), matching the
     // proxy path's per-dictation end signal. No-op when not a direct joined mic.

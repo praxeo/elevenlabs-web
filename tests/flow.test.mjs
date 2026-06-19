@@ -2172,6 +2172,59 @@ console.log('--- scenario 28: direct stream ---');
     await sleep(400);
     check('s28: publisher socket closes at finalize (room then emits phone_session_end)', pubSock.closed === true);
   }
+
+  // ---- Part D: direct realtime feeds Soniox via MediaRecorder webm (off-thread) ----
+  // When the browser supports a Soniox auto-container, direct realtime captures
+  // with MediaRecorder (off the main thread, like soniox.com's demo + our batch)
+  // instead of the raw-PCM pump whose per-frame main-thread send caused jitter.
+  const socks28d = [];
+  const recs28d = [];
+  const dom28d = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/?rt=direct',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mkStream()), addEventListener() {} };
+      win.fetch = (url) => String(url).includes('/api/soniox-token')
+        ? Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"api_key":"tmp-d"}') })
+        : Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"x"}') });
+      win.MediaRecorder = class {
+        constructor(stream, opts) { this.state = 'inactive'; this.stream = stream; this.opts = opts || {}; recs28d.push(this); }
+        static isTypeSupported(t) { return /webm/.test(t); }
+        start(ts) { this.state = 'recording'; this.timeslice = ts; }
+        emit(sz) { if (this.ondataavailable) this.ondataavailable({ data: { size: sz || 120, type: this.opts.mimeType || 'audio/webm' } }); }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; this.emit(40); if (this.onstop) this.onstop(); }
+      };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks28d.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc28d = dom28d.window.document;
+  doc28d.getElementById('engRealtime').click();
+  doc28d.getElementById('apiKey').value = 'test-key';
+  doc28d.getElementById('sonioxKey').value = 'test-skey';
+  doc28d.getElementById('recordBtn').click();
+  await sleep(80);
+  const dsockD = socks28d.find((s) => s.url.includes('stt-rt.soniox.com'));
+  const directRecMock = recs28d.find((r) => r.stream && r.stream.getAudioTracks && r.state === 'recording');
+  check('s28: direct realtime uses a MediaRecorder feed when webm is supported', !!directRecMock, 'recorders=' + recs28d.length);
+  if (dsockD && directRecMock) {
+    dsockD.open();
+    await sleep(10);
+    let cfgD = null; try { cfgD = JSON.parse(dsockD.sent[0]); } catch (e) {}
+    check('s28: recorder feed declares audio_format:auto (Soniox container detect)', !!(cfgD && cfgD.audio_format === 'auto' && cfgD.sample_rate === undefined), JSON.stringify(cfgD && { f: cfgD.audio_format }));
+    directRecMock.emit(200); // an off-thread webm chunk
+    await sleep(5);
+    check('s28: webm chunks stream to Soniox (no per-frame main-thread PCM work)', dsockD.sent.slice(1).some((d) => d && d.size === 200), 'sent=' + dsockD.sent.length);
+    doc28d.getElementById('recordBtn').click(); // stop -> tail -> recorder stop -> commit
+    await sleep(700);
+    check('s28: recorder feed ends with an empty-string commit after the recorder stops', dsockD.sent.includes(''), JSON.stringify(dsockD.sent.filter((x) => typeof x === 'string')));
+  }
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

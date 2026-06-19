@@ -112,6 +112,16 @@ export default {
       return handleNovaProbe(request, env);
     }
 
+    // Direct-stream auth: mint a short-lived Soniox temporary API key so the
+    // browser can open the realtime WS straight to Soniox (no Worker proxy hop
+    // on the audio path) — the lowest-latency path, matching Soniox's own demo.
+    // The long-lived SONIOX_API_KEY never leaves the Worker; the temp key is
+    // single-use + short-lived + session-duration-capped, and minting is gated
+    // by the shared-mode passphrase exactly like the realtime/batch paths.
+    if (url.pathname === "/api/soniox-token") {
+      return handleSonioxToken(request, env);
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -414,6 +424,65 @@ export function makeSonioxToClient() {
     if (m.finished) out.push(JSON.stringify({ message_type: "committed_transcript", text: finalText }));
     return out;
   };
+}
+
+// Mint a Soniox temporary API key for direct browser streaming. POST (passphrase
+// in the JSON body in shared mode; same constant-time gate as everything else).
+// Returns Soniox's create-temporary-api-key response verbatim ({ api_key,
+// expires_at, ... }). Failures are loud (non-200 + error string) so the client
+// can fall back to the Worker-proxy transport instead of silently breaking.
+const SONIOX_TOKEN_URL = "https://api.soniox.com/v1/auth/temporary-api-key";
+async function handleSonioxToken(request, env) {
+  if (request.method !== "POST") {
+    return json({ error: "Expected POST" }, 405);
+  }
+  let body = {};
+  try { body = await request.json(); } catch { body = {}; }
+
+  // Shared-mode passphrase gate (constant-time), mirroring handleTranscribeRealtime.
+  const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+  if (serverPass) {
+    const given = String((body && body.passphrase) || "").trim();
+    if (!safeEqual(given, serverPass)) {
+      return json({ error: "Unauthorized passphrase" }, 401);
+    }
+  }
+
+  const sonioxKey = ((env && env.SONIOX_API_KEY) || "").trim();
+  if (!sonioxKey) {
+    return json({ error: "SONIOX_API_KEY not set — direct streaming unavailable" }, 500);
+  }
+
+  // single_use + short expiry + a per-stream duration cap bound a leaked/replayed
+  // key: it can open exactly one stream, only in the next ~2 min, for at most one
+  // long push-to-talk dictation. client_reference_id tags usage logs per session.
+  const ref = String((body && body.client_reference_id) || "").replace(/[^A-Za-z0-9_-]/g, "").slice(0, 64);
+  const payload = {
+    usage_type: "transcribe_websocket",
+    expires_in_seconds: 120,
+    single_use: true,
+    max_session_duration_seconds: 600,
+  };
+  if (ref) payload.client_reference_id = ref;
+
+  try {
+    const resp = await fetch(SONIOX_TOKEN_URL, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + sonioxKey, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const text = await resp.text();
+    if (!resp.ok) {
+      return json({ error: "Soniox token mint failed (" + resp.status + ") " + text.slice(0, 200) }, 502);
+    }
+    // Pass Soniox's JSON straight through (content-type already JSON).
+    return new Response(text, {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" },
+    });
+  } catch (e) {
+    return json({ error: "Soniox token mint threw: " + ((e && e.message) || String(e)).slice(0, 200) }, 502);
+  }
 }
 
 async function handleTranscribeRealtime(request, env) {

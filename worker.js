@@ -449,6 +449,22 @@ const INDEX_HTML = `<!doctype html>
     #pairStatus.ok { color: var(--ok); }
     #pairStatus.err { color: var(--danger); }
     #pairPhoneBtn { flex: 0 0 auto; }
+    /* Mic tips: a one-time, phone-first onboarding nudge for keeping OTHER
+       people's voices out of the notes (iOS Voice Isolation + close-mic +
+       push-to-talk discipline). Auto-shown once on the big-button surface,
+       reopenable from the top row / Options. Highest-leverage accuracy lever. */
+    #micTips { display: none; position: fixed; inset: 0; z-index: 60;
+      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+    #micTips.show { display: flex; }
+    #micTipsCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      padding: 22px; max-width: 380px; width: 100%; max-height: 86vh; overflow-y: auto; }
+    #micTipsTitle { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    #micTipsLede { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+    #micTipsCard .mt-h { font-size: 13px; color: var(--accent); font-weight: 600; margin: 14px 0 6px; }
+    #micTipsCard ol, #micTipsCard ul { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.55; }
+    #micTipsCard li { margin: 5px 0; }
+    #micTipsCard .mt-key { color: var(--text); font-weight: 600; }
+    #micTipsCard .mt-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
     .sliderval { color: var(--accent); font-size: 12px; }
     .legend { font-size: 11px; color: var(--muted); margin-top: 4px; }
     .legend .dr { color: var(--danger); }
@@ -724,6 +740,10 @@ const INDEX_HTML = `<!doctype html>
           <div class="hint" style="margin: 6px 0 4px;">
             Turns this device into a one-button dictation surface. Stored on this device only.
           </div>
+
+          <div class="row" style="margin-top: 10px;">
+            <button id="optionsMicTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips — keep other voices out</button>
+          </div>
         </div>
       </details>
 
@@ -819,6 +839,7 @@ right lower quadrant"></textarea>
   <div id="bigUi" data-screen="idle">
     <div id="bigTopRow">
       <span id="bigJoinedBadge"></span>
+      <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
       <button id="bigLeaveBtn">Leave</button>
       <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
     </div>
@@ -848,6 +869,45 @@ right lower quadrant"></textarea>
       <div class="row" style="justify-content: center; margin-top: 16px;">
         <button id="pairDoneBtn" class="primary">Done</button>
         <button id="pairEndBtn">End session</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Mic tips: a one-time onboarding nudge for keeping other people's voices
+       out of the notes. Auto-shows once on the phone (big-button) surface;
+       reopenable from the top row / Options. -->
+  <div id="micTips">
+    <div id="micTipsCard">
+      <div id="micTipsTitle">Keep other voices out of your notes</div>
+      <div id="micTipsLede">Dictation can pick up people talking near you. Two habits keep your notes clean:</div>
+
+      <div id="micTipsIos">
+        <div class="mt-h">On iPhone: turn on Voice Isolation — the single best fix</div>
+        <ol>
+          <li>Start a dictation (hold the button) so iPhone shows the mic control.</li>
+          <li>Swipe down from the top‑right corner to open Control Center.</li>
+          <li>Tap <span class="mt-key">Mic Mode</span> (it appears only while an app is using the mic).</li>
+          <li>Choose <span class="mt-key">Voice Isolation</span>.</li>
+        </ol>
+        <div class="mt-note">You set it once — it sticks for this app. iOS removes other voices before they ever reach the page.</div>
+      </div>
+
+      <div id="micTipsAndroid" style="display:none">
+        <div class="mt-h">On Android</div>
+        <ul>
+          <li>Turn on any <span class="mt-key">Voice Focus</span> / noise‑reduction option in your phone's mic or call settings.</li>
+        </ul>
+      </div>
+
+      <div class="mt-h">Always</div>
+      <ul>
+        <li>Hold the phone <span class="mt-key">close to your mouth</span>, like a walkie‑talkie — the closer your voice, the easier the room is to ignore.</li>
+        <li>Push‑to‑talk records <span class="mt-key">only while you hold</span> the button — let go the moment someone else speaks.</li>
+        <li>Face away from other conversations, or step somewhere quieter, when you can.</li>
+      </ul>
+
+      <div class="row" style="justify-content: center; margin-top: 16px;">
+        <button id="micTipsDoneBtn" class="primary">Got it</button>
       </div>
     </div>
   </div>
@@ -944,6 +1004,14 @@ right lower quadrant"></textarea>
   const pairDoneBtnEl    = document.getElementById("pairDoneBtn");
   const pairEndBtnEl     = document.getElementById("pairEndBtn");
 
+  // Mic-tips onboarding (keep other voices out)
+  const micTipsEl        = document.getElementById("micTips");
+  const micTipsIosEl     = document.getElementById("micTipsIos");
+  const micTipsAndroidEl = document.getElementById("micTipsAndroid");
+  const micTipsDoneBtnEl = document.getElementById("micTipsDoneBtn");
+  const bigTipsBtnEl     = document.getElementById("bigTipsBtn");
+  const optionsMicTipsBtnEl = document.getElementById("optionsMicTipsBtn");
+
   // Big-button dictation layout elements
   const bigUiEl          = document.getElementById("bigUi");
   const bigBtnEl         = document.getElementById("bigBtn");
@@ -1025,6 +1093,8 @@ right lower quadrant"></textarea>
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
   let phoneJoined       = false; // desktop: a phone has joined this session (phone_join ping / first delivery) — drives the pairing overlay/button
+  let micTipsSeen       = false; // per-device: the "keep other voices out" onboarding nudge has been dismissed
+  let micTipsAutoShown  = false; // session: the nudge has auto-shown once this load (re-show is guarded by micTipsSeen across loads)
 
   // Phone-side durable delivery queue (joined device): an undelivered relay is
   // persisted (pendingDeliveries) and retried — on link heal and at boot —
@@ -1532,6 +1602,8 @@ right lower quadrant"></textarea>
       // portable/per-device settings split planned in the roadmap): a phone
       // forced to "always" must not drag a desktop sharing its profile along.
       bigButtonMode:     bigButtonModeEl ? bigButtonModeEl.value : "joined",
+      // Per-device: the "keep other voices out" onboarding nudge was dismissed.
+      micTipsSeen:       micTipsSeen,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
@@ -1604,6 +1676,7 @@ right lower quadrant"></textarea>
         });
       }
       if (s.micGranted === true) micEverGranted = true;
+      if (s.micTipsSeen === true) micTipsSeen = true;
       if (bigButtonModeEl && (s.bigButtonMode === "joined" || s.bigButtonMode === "always" || s.bigButtonMode === "never")) {
         bigButtonModeEl.value = s.bigButtonMode;
       }
@@ -2721,6 +2794,42 @@ right lower quadrant"></textarea>
     } catch (e) {}
   }
 
+  /* ───── Mic tips: keep other voices out (onboarding nudge) ─────
+     iOS Voice Isolation is the single most effective lever against bystander
+     speech (it filters at the OS level), but it is manual and undetectable from
+     the web — so we surface it as a one-time tip, plus the universal close-mic
+     and push-to-talk-discipline habits. Shown once on the phone surface. */
+  function isLikelyIOS() {
+    try {
+      var ua = navigator.userAgent || "";
+      if (/iPad|iPhone|iPod/.test(ua)) return true;
+      // iPadOS 13+ reports as Mac — distinguish by touch support.
+      if (navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  function showMicTips() {
+    if (!micTipsEl) return;
+    var ios = isLikelyIOS();
+    if (micTipsIosEl)     micTipsIosEl.style.display     = ios ? "" : "none";
+    if (micTipsAndroidEl) micTipsAndroidEl.style.display = ios ? "none" : "";
+    micTipsEl.classList.add("show");
+  }
+
+  function closeMicTips() {
+    if (micTipsEl) micTipsEl.classList.remove("show");
+    if (!micTipsSeen) { micTipsSeen = true; saveSettingsNow(); } // a dismissal counts as seen — don't auto-nag again
+  }
+
+  // Auto-show once on the phone (big-button) surface, until dismissed.
+  function maybeAutoShowMicTips() {
+    if (micTipsSeen || micTipsAutoShown) return;
+    if (!bigButtonActive()) return; // the nudge is for the phone surface, not a plain desktop
+    micTipsAutoShown = true;
+    showMicTips();
+  }
+
   function setPhoneLinkUI(connected) {
     if (!phoneCodeBadgeEl || !phoneSessionCode) return;
     phoneCodeBadgeEl.textContent = connected ? phoneSessionCode : phoneSessionCode + " ⚠";
@@ -3201,6 +3310,7 @@ right lower quadrant"></textarea>
     }
     if (bigLeaveBtnEl) bigLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
     updateBigScreen();
+    maybeAutoShowMicTips(); // first time on the phone surface: nudge about other-voice rejection
   }
 
   function setBigSettingsVisible(show) {
@@ -3409,6 +3519,12 @@ right lower quadrant"></textarea>
   if (pairPhoneBtnEl) pairPhoneBtnEl.onclick = () => openPairOverlay();
   if (pairDoneBtnEl)  pairDoneBtnEl.onclick  = () => closePairOverlay();
   if (pairEndBtnEl)   pairEndBtnEl.onclick   = () => { stopPhoneSession(); closePairOverlay(); };
+
+  if (micTipsDoneBtnEl)    micTipsDoneBtnEl.onclick    = () => closeMicTips();
+  if (bigTipsBtnEl)        bigTipsBtnEl.onclick        = () => showMicTips();
+  if (optionsMicTipsBtnEl) optionsMicTipsBtnEl.onclick = () => showMicTips();
+  // Tapping the dark backdrop dismisses the tips (counts as seen).
+  if (micTipsEl) micTipsEl.addEventListener("click", (e) => { if (e.target === micTipsEl) closeMicTips(); });
 
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
     joinedSessionCode = "";

@@ -1886,6 +1886,72 @@ console.log('--- scenario 26: phone pairing overlay ---');
   check('s26p: joining POSTs a phone_join ping so the desktop overlay can close', !!joinPing, fetch26p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 }
 
+// ===== Scenario 27: mic-tips onboarding (keep other voices out) =====
+// A one-time, phone-first nudge: iOS Voice Isolation steps + close-mic / push-
+// to-talk discipline. Auto-shows once on the big-button surface, dismissal
+// persists (no re-nag), reopenable, and the iOS-vs-Android sections switch on UA.
+console.log('--- scenario 27: mic-tips onboarding ---');
+{
+  const mkTipsDom = (opts) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      if (opts && opts.ua) { try { Object.defineProperty(win.navigator, 'userAgent', { value: opts.ua, configurable: true }); } catch (e) {} }
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify((opts && opts.settings) || {}));
+    },
+  });
+  const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+  // iPhone, joined -> big-button -> the nudge auto-shows with the iOS steps
+  const dom27 = mkTipsDom({ ua: IPHONE_UA, settings: { joinedSessionCode: 'TIPS01' } });
+  await sleep(120);
+  const doc27 = dom27.window.document;
+  const tips27 = doc27.getElementById('micTips');
+  check('s27: big-button layout active for a joined phone', doc27.body.classList.contains('bigbtn'));
+  check('s27: mic-tips auto-shows on the phone surface', tips27.classList.contains('show'));
+  check('s27: iOS Voice Isolation steps shown on iPhone', doc27.getElementById('micTipsIos').style.display !== 'none');
+  check('s27: Android note hidden on iPhone', doc27.getElementById('micTipsAndroid').style.display === 'none');
+
+  doc27.getElementById('micTipsDoneBtn').click();
+  check('s27: "Got it" hides the nudge', !tips27.classList.contains('show'));
+  const settings27 = JSON.parse(dom27.window.localStorage.getItem('scribe_v2_settings_v9'));
+  check('s27: dismissal persists micTipsSeen (per-device)', settings27.micTipsSeen === true, JSON.stringify(settings27.micTipsSeen));
+
+  doc27.getElementById('bigTipsBtn').click();
+  check('s27: the "Mic tips" button reopens the nudge', tips27.classList.contains('show'));
+  // backdrop tap dismisses
+  tips27.dispatchEvent(new dom27.window.MouseEvent('click', { bubbles: true }));
+  check('s27: tapping the backdrop dismisses it', !tips27.classList.contains('show'));
+
+  // A dismissed nudge must NOT auto-show again on the next load
+  const dom27b = mkTipsDom({ ua: IPHONE_UA, settings: { joinedSessionCode: 'TIPS01', micTipsSeen: true } });
+  await sleep(120);
+  check('s27: a dismissed nudge does not auto-show again', !dom27b.window.document.getElementById('micTips').classList.contains('show'));
+
+  // A plain desktop (not joined, not big-button) must NOT auto-show the nudge
+  const dom27c = mkTipsDom({ settings: {} });
+  await sleep(120);
+  check('s27: no auto-show on a plain desktop', !dom27c.window.document.getElementById('micTips').classList.contains('show'));
+
+  // Non-iOS device: reopening shows the Android note, hides the iOS steps
+  const dom27d = mkTipsDom({ settings: { bigButtonMode: 'always', micTipsSeen: true } }); // big-button active, but seen -> no auto-show
+  await sleep(120);
+  const doc27d = dom27d.window.document;
+  doc27d.getElementById('bigTipsBtn').click();
+  check('s27: non-iOS hides the iOS steps', doc27d.getElementById('micTipsIos').style.display === 'none');
+  check('s27: non-iOS shows the Android note', doc27d.getElementById('micTipsAndroid').style.display !== 'none');
+}
+
 // ===== Scenario 29: batch-only product (engine migration + capture feedback) =====
 console.log('--- scenario 29: batch-only product ---');
 {

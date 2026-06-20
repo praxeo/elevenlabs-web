@@ -2746,8 +2746,7 @@ right lower quadrant"></textarea>
      first delivery as a fallback). */
   function updatePairButton() {
     if (!pairPhoneBtnEl) return;
-    pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓"
-      : phoneSessionCode ? "📱 Show pairing QR" : "📱 Pair a phone";
+    pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓" : "📱 Pair a phone";
   }
 
   function openPairOverlay() {

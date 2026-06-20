@@ -605,7 +605,7 @@ console.log('--- scenario 19: phone mic session ---');
 
     // The authoritative final text is POSTed to the room's /deliver endpoint with
     // the joined session code (this is how the desktop clipboard gets written).
-    const deliverCall = fetchCalls19b.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST');
+    const deliverCall = fetchCalls19b.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_delivery'));
     check('joined phone POSTs final text to /api/session/ABC123/deliver', !!deliverCall, fetchCalls19b.map((c) => c.url.replace('https://dictation.test', '')).join(','));
     if (deliverCall) {
       let body = {};
@@ -765,7 +765,7 @@ console.log('--- scenario 20: phone link resilience ---');
   check('s20p: joined phone opens no realtime transcribe WS', !socks20p.some((s) => s.url.includes('/api/transcribe')));
   doc20p.getElementById('recordBtn').click(); // stop -> upload -> deliver
   await sleep(600); // upload -> finalize -> deliver -> relay ack
-  const dCall = fetch20p.find((c) => c.url.includes('/deliver'));
+  const dCall = fetch20p.find((c) => c.url.includes('/deliver') && c.opts && String(c.opts.body).includes('phone_delivery'));
   check('s20p: deliver POST sent', !!dCall);
   const dBody = dCall ? JSON.parse(dCall.opts.body) : {};
   check('s20p: deliver carries text + delivery_id', dBody.text && dBody.text.includes('Phone note.') && typeof dBody.delivery_id === 'string' && dBody.delivery_id.length > 0, JSON.stringify(dBody.delivery_id));
@@ -821,18 +821,20 @@ console.log('--- scenario 20q: phone delivery queue ---');
   doc20q.getElementById('recordBtn').click(); // stop -> upload -> deliver (fails)
   await sleep(600);
 
-  const firstDeliver = fetch20q.find((c) => c.url.includes('/deliver'));
+  // Only the transcript deliveries — not the phone_join ping that joining fires.
+  const deliveries20q = () => fetch20q.filter((c) => c.url.includes('/deliver') && c.opts && String(c.opts.body).includes('phone_delivery'));
+  const firstDeliver = deliveries20q()[0];
   check('s20q: a /deliver POST was attempted', !!firstDeliver);
   const firstId = firstDeliver ? JSON.parse(firstDeliver.opts.body).delivery_id : '';
   check('s20q: a failed relay is loud', status20q().includes('FAILED') && status20q().includes('NOT'), status20q());
   check('s20q: the undelivered text is queued (durable in localStorage)', queue20q().length === 1 && queue20q()[0].text.includes('Queue note.'), JSON.stringify(queue20q()));
 
   // Heal the link: an online event drains the queue, re-POSTing the held item.
-  const deliverCount0 = fetch20q.filter((c) => c.url.includes('/deliver')).length;
+  const deliverCount0 = deliveries20q().length;
   deliverMode = 'ok';
   win20q.dispatchEvent(new win20q.Event('online'));
   await sleep(200);
-  const retries = fetch20q.filter((c) => c.url.includes('/deliver')).slice(deliverCount0);
+  const retries = deliveries20q().slice(deliverCount0);
   check('s20q: the heal triggers a retry POST', retries.length >= 1, retries.length + ' retries');
   check('s20q: the retry reuses the SAME delivery_id (so the desktop ring dedupes a double)', retries.length > 0 && JSON.parse(retries[0].opts.body).delivery_id === firstId, firstId);
   check('s20q: a delivered item clears the queue', queue20q().length === 0, JSON.stringify(queue20q()));
@@ -1094,7 +1096,7 @@ console.log('--- scenario 22: phone link persistence ---');
   check('s22p: joined phone opens no realtime transcribe WS', !socks22p.some((s) => s.url.includes('/api/transcribe')));
   doc22p.getElementById('recordBtn').click(); // stop -> upload -> deliver
   await sleep(400);
-  const rejoinDeliver = fetch22p.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST');
+  const rejoinDeliver = fetch22p.find((c) => c.url.includes('/api/session/ABC123/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_delivery'));
   check('s22p: restored join rides the next dictation (relays to /deliver with the code)', !!rejoinDeliver, fetch22p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 
   doc22p.getElementById('phoneLeaveBtn').click();
@@ -1316,7 +1318,7 @@ console.log('--- scenario 24: QR join ---');
   check('s24p: joined phone opens no realtime transcribe WS', !socks23p.some((s) => s.url.includes('/api/transcribe')));
   doc23p.getElementById('recordBtn').click(); // stop -> upload -> deliver
   await sleep(400);
-  const scanDeliver = fetch23p.find((c) => c.url.includes('/api/session/XYZ234/deliver') && c.opts && c.opts.method === 'POST');
+  const scanDeliver = fetch23p.find((c) => c.url.includes('/api/session/XYZ234/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_delivery'));
   check('s24p: scanned join rides the next dictation (relays to /deliver with the code)', !!scanDeliver, fetch23p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 }
 
@@ -1767,6 +1769,121 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25e2: a delivered relay is EXACTLY ONE done cue', outcomes(E2.vibes.slice(vE2c)).length === 1 && JSON.stringify(outcomes(E2.vibes.slice(vE2c))[0]) === '[40,60,40]', JSON.stringify(E2.vibes.slice(vE2c)));
   check('s25e2: the relay ack announced the desktop delivery', statusE2().includes('Delivered to the desktop'), statusE2());
+}
+
+// ===== Scenario 26: front-and-center phone pairing (QR overlay + join handshake) =====
+// The desktop's prominent "Pair a phone" button opens a big-QR overlay that
+// auto-closes when a phone joins (the phone_join ping relayed through the room),
+// with the first delivery as a fallback. The phone notifies the desktop on join.
+console.log('--- scenario 26: phone pairing overlay ---');
+{
+  // ---- Desktop: "Pair a phone" opens the overlay; phone_join closes it ----
+  const socks26 = [];
+  const dom26 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks26.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc26 = dom26.window.document;
+  const pairBtn = doc26.getElementById('pairPhoneBtn');
+  const overlay26 = doc26.getElementById('pairOverlay');
+  check('s26: a prominent "Pair a phone" button lives on the primary card (not buried in Options)', !!pairBtn && doc26.querySelector('section.card').contains(pairBtn), pairBtn ? pairBtn.textContent : 'missing');
+
+  pairBtn.click(); // start a session + open the overlay
+  await sleep(20);
+  const sock26 = socks26.find((s) => s.url.includes('/api/session/'));
+  check('s26: opening the overlay starts a phone session (listener socket)', !!sock26);
+  const code26 = sock26 ? sock26.url.split('/api/session/')[1] : '';
+  check('s26: the overlay is shown front-and-center', overlay26.classList.contains('show'));
+  check('s26: the overlay renders a QR svg', !!doc26.getElementById('pairQr').querySelector('svg'));
+  check('s26: the overlay shows the 6-char session code', doc26.getElementById('pairCode').textContent === code26 && code26.length === 6, doc26.getElementById('pairCode').textContent);
+  sock26.open();
+  await sleep(10);
+
+  // a phone_join handshake closes the overlay and flips the button to paired
+  sock26.msg({ message_type: 'phone_join' });
+  await sleep(20);
+  check('s26: a phone_join closes the overlay', !overlay26.classList.contains('show'));
+  check('s26: the button reflects the paired state', pairBtn.textContent.toLowerCase().includes('paired'), pairBtn.textContent);
+  check('s26: a join announces the pairing', doc26.getElementById('status').textContent.includes('paired'), doc26.getElementById('status').textContent);
+
+  // re-open then End session tears it all down
+  pairBtn.click();
+  await sleep(10);
+  check('s26: re-opening shows the overlay again', overlay26.classList.contains('show'));
+  doc26.getElementById('pairEndBtn').click();
+  await sleep(10);
+  check('s26: End session hides the overlay', !overlay26.classList.contains('show'));
+  check('s26: End session closes the room socket', sock26.closed);
+
+  // ---- Fallback: with no phone_join, the first delivery closes the overlay ----
+  const socks26b = [];
+  const dom26b = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks26b.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc26b = dom26b.window.document;
+  const overlay26b = doc26b.getElementById('pairOverlay');
+  doc26b.getElementById('pairPhoneBtn').click();
+  await sleep(20);
+  const sock26b = socks26b.find((s) => s.url.includes('/api/session/'));
+  sock26b.open();
+  await sleep(10);
+  check('s26b: overlay open, no join ping yet', overlay26b.classList.contains('show'));
+  sock26b.msg({ message_type: 'phone_delivery', text: 'First note.', delivery_id: 'pj1' });
+  await sleep(20);
+  check('s26b: the first delivery closes the overlay (join-ping fallback)', !overlay26b.classList.contains('show'));
+
+  // ---- Phone: joining POSTs a phone_join ping so the desktop overlay closes ----
+  const fetch26p = [];
+  const dom26p = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => { fetch26p.push({ url: String(url), opts: opts || {} }); return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') }); };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc26p = dom26p.window.document;
+  doc26p.getElementById('phoneJoinInput').value = 'PAIR99';
+  doc26p.getElementById('phoneJoinBtn').click();
+  await sleep(20);
+  const joinPing = fetch26p.find((c) => c.url.includes('/api/session/PAIR99/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_join'));
+  check('s26p: joining POSTs a phone_join ping so the desktop overlay can close', !!joinPing, fetch26p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 }
 
 // ===== Scenario 29: batch-only product (engine migration + capture feedback) =====

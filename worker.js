@@ -430,6 +430,25 @@ const INDEX_HTML = `<!doctype html>
     .pill.rec  { color: #fff; background: #b91c1c; border-color: #b91c1c; }
     .pill.fail { color: #fff; background: var(--danger); border-color: var(--danger); }
     .pill.warn { color: #0b0d10; background: var(--warn); border-color: var(--warn); }
+    /* Phone-pairing overlay: the desktop's front-and-center QR, shown on demand
+       from the compact "Pair a phone" button. Additive fixed overlay — the QR is
+       big only WHILE pairing, then closes the moment a phone joins, so the
+       primary card's tiny-window compactness rules are untouched. */
+    #pairOverlay { display: none; position: fixed; inset: 0; z-index: 50;
+      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+    #pairOverlay.show { display: flex; }
+    body.bigbtn #pairOverlay { display: none !important; } /* a joined phone never hosts pairing */
+    #pairCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      padding: 22px; max-width: 360px; width: 100%; text-align: center; }
+    #pairTitle { font-size: 18px; font-weight: 600; margin-bottom: 14px; }
+    #pairQr { display: inline-block; line-height: 0; background: #fff; padding: 10px; border-radius: 12px; }
+    #pairQr svg { width: min(64vmin, 280px); height: auto; display: block; }
+    #pairCode { font-family: monospace; font-size: 34px; letter-spacing: 8px; color: var(--accent); margin: 16px 0 4px; }
+    #pairInstr { font-size: 13px; color: var(--muted); line-height: 1.5; }
+    #pairStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
+    #pairStatus.ok { color: var(--ok); }
+    #pairStatus.err { color: var(--danger); }
+    #pairPhoneBtn { flex: 0 0 auto; }
     .sliderval { color: var(--accent); font-size: 12px; }
     .legend { font-size: 11px; color: var(--muted); margin-top: 4px; }
     .legend .dr { color: var(--danger); }
@@ -592,6 +611,10 @@ const INDEX_HTML = `<!doctype html>
       <div class="row" style="margin-top: 10px;">
         <button id="copyBtn">Copy latest</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+      </div>
+
+      <div class="row" style="margin-top: 8px;">
+        <button id="pairPhoneBtn" title="Show a QR to pair your phone as the microphone — dictated text lands on this computer's clipboard">📱 Pair a phone</button>
       </div>
     </section>
 
@@ -811,6 +834,23 @@ right lower quadrant"></textarea>
     </div>
   </div>
   <button id="bigReturnBtn">&#8592; Back to the button</button>
+
+  <!-- Phone-pairing overlay: the desktop's front-and-center QR. Shown on demand
+       from the compact "Pair a phone" button; auto-closes when a phone joins
+       (the phone_join handshake) or on the first delivery. -->
+  <div id="pairOverlay">
+    <div id="pairCard">
+      <div id="pairTitle">Scan to pair your phone</div>
+      <div id="pairQr"></div>
+      <div id="pairCode"></div>
+      <div id="pairInstr">Point your phone camera at the code — or open this page on your phone and type the code below. Your phone becomes the microphone; dictated text lands on THIS computer's clipboard.</div>
+      <div id="pairStatus"></div>
+      <div class="row" style="justify-content: center; margin-top: 16px;">
+        <button id="pairDoneBtn" class="primary">Done</button>
+        <button id="pairEndBtn">End session</button>
+      </div>
+    </div>
+  </div>
 </main>
 
 <script>
@@ -895,6 +935,15 @@ right lower quadrant"></textarea>
   const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
   const phoneLeaveBtnEl  = document.getElementById("phoneLeaveBtn");
 
+  // Front-and-center phone-pairing overlay elements
+  const pairPhoneBtnEl   = document.getElementById("pairPhoneBtn");
+  const pairOverlayEl    = document.getElementById("pairOverlay");
+  const pairQrEl         = document.getElementById("pairQr");
+  const pairCodeEl       = document.getElementById("pairCode");
+  const pairStatusEl     = document.getElementById("pairStatus");
+  const pairDoneBtnEl    = document.getElementById("pairDoneBtn");
+  const pairEndBtnEl     = document.getElementById("pairEndBtn");
+
   // Big-button dictation layout elements
   const bigUiEl          = document.getElementById("bigUi");
   const bigBtnEl         = document.getElementById("bigBtn");
@@ -975,6 +1024,7 @@ right lower quadrant"></textarea>
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
+  let phoneJoined       = false; // desktop: a phone has joined this session (phone_join ping / first delivery) — drives the pairing overlay/button
 
   // Phone-side durable delivery queue (joined device): an undelivered relay is
   // persisted (pendingDeliveries) and retried — on link heal and at boot —
@@ -2616,6 +2666,61 @@ right lower quadrant"></textarea>
     return code;
   }
 
+  /* ───── Front-and-center pairing overlay (desktop) ─────
+     A compact "Pair a phone" button on the primary card opens a big, centered
+     QR overlay — the desktop's prominent pairing surface. It auto-closes the
+     moment a phone joins (a phone_join ping relayed through the room, with the
+     first delivery as a fallback). */
+  function updatePairButton() {
+    if (!pairPhoneBtnEl) return;
+    pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓"
+      : phoneSessionCode ? "📱 Show pairing QR" : "📱 Pair a phone";
+  }
+
+  function openPairOverlay() {
+    if (!phoneSessionCode) startPhoneSession();
+    if (!phoneSessionCode) return; // session start failed (no room support)
+    var joinUrl = window.location.origin + "/?join=" + phoneSessionCode;
+    if (pairQrEl) renderQrSvg(joinUrl, pairQrEl);
+    if (pairCodeEl) pairCodeEl.textContent = phoneSessionCode;
+    if (pairStatusEl) {
+      pairStatusEl.textContent = phoneJoined ? "Phone paired — dictate away." : "Waiting for your phone to scan…";
+      pairStatusEl.className = phoneJoined ? "ok" : "";
+    }
+    if (pairOverlayEl) pairOverlayEl.classList.add("show");
+    updatePairButton();
+  }
+
+  function closePairOverlay() {
+    if (pairOverlayEl) pairOverlayEl.classList.remove("show");
+  }
+
+  // The desktop learns a phone joined (phone_join ping, or the first delivery as
+  // a fallback): close the QR overlay and reflect the paired state.
+  function onPhoneJoined() {
+    var wasJoined = phoneJoined;
+    phoneJoined = true;
+    closePairOverlay();
+    updatePairButton();
+    return wasJoined;
+  }
+
+  // Phone side: tell the desktop a phone has joined so its pairing QR overlay
+  // can close immediately (instead of waiting for the first dictation). Best-
+  // effort and fire-and-forget — relayed through the room to listeners, NOT
+  // buffered (only phone_delivery is). If no desktop is listening yet, the
+  // overlay simply closes on the first delivery instead.
+  function notifyDesktopOfJoin(code) {
+    if (!code) return;
+    try {
+      fetch("/api/session/" + code + "/deliver", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message_type: "phone_join" }),
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
   function setPhoneLinkUI(connected) {
     if (!phoneCodeBadgeEl || !phoneSessionCode) return;
     phoneCodeBadgeEl.textContent = connected ? phoneSessionCode : phoneSessionCode + " ⚠";
@@ -2628,6 +2733,7 @@ right lower quadrant"></textarea>
     phoneSessionCode   = generateSessionCode();
     remoteCommitted    = "";
     remoteHasDelivery  = false;
+    phoneJoined        = false;
     lastDeliveryId     = "";
     recentDeliveryIds  = [];
     pendingCopyText    = "";
@@ -2638,6 +2744,7 @@ right lower quadrant"></textarea>
     warmBeepCtx();
 
     beginPhoneSession("Phone session ready. Code: " + phoneSessionCode);
+    updatePairButton();
     saveSettingsNow(); // session survives a reload — see restorePhoneLink
   }
 
@@ -2679,6 +2786,7 @@ right lower quadrant"></textarea>
       joinedSessionCode = joinParam;
       saveSettingsNow();
       try { history.replaceState(null, "", window.location.pathname); } catch (e) {}
+      notifyDesktopOfJoin(joinParam); // a fresh QR scan: close the desktop's pairing overlay
       setStatus("Joined session " + joinParam + " (scanned). Start recording to send audio to the desktop.", "ok");
     }
     if (phoneSessionCode) {
@@ -2760,6 +2868,7 @@ right lower quadrant"></textarea>
     }
     remoteCommitted   = "";
     remoteHasDelivery = false;
+    phoneJoined       = false;
     pendingCopyText   = "";
     lastDeliveryId    = "";
     recentDeliveryIds = [];
@@ -2768,6 +2877,8 @@ right lower quadrant"></textarea>
     phoneStartBtnEl.style.display = "";
     if (phoneCodeHintEl) phoneCodeHintEl.style.display = "none";
     if (phoneQrEl) { phoneQrEl.style.display = "none"; phoneQrEl.innerHTML = ""; }
+    closePairOverlay();
+    updatePairButton();
     saveSettingsNow(); // forget the persisted session
     setStatus("Phone session ended.", "");
   }
@@ -2815,6 +2926,15 @@ right lower quadrant"></textarea>
 
     if (msg.message_type === "pong") return; // heartbeat reply; onmessage already timestamped it
 
+    if (msg.message_type === "phone_join") {
+      // The phone announced it joined — close the pairing QR overlay and show
+      // the paired state (don't re-announce on a repeat ping).
+      if (!onPhoneJoined()) {
+        setStatus("Phone paired ✓ — dictate on the phone; the text lands on this clipboard.", "ok");
+      }
+      return;
+    }
+
     if (msg.message_type === "session_started") {
       setStatus("Phone connected. Listening... (Code: " + phoneSessionCode + ")", "ok");
       return;
@@ -2840,6 +2960,9 @@ right lower quadrant"></textarea>
     }
 
     if (msg.message_type === "phone_delivery") {
+      // A delivery proves a phone is on the link — close the pairing overlay if
+      // the phone_join ping was missed (it is not buffered/replayed).
+      onPhoneJoined();
       // The room replays the last delivery to (re)connecting listeners so a
       // link drop cannot lose it; the phone's delivery queue can also re-POST a
       // held delivery. Dedupe against a RING of recent ids, not just the last
@@ -3279,9 +3402,14 @@ right lower quadrant"></textarea>
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
     if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
     saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
+    notifyDesktopOfJoin(code); // close the desktop's pairing QR overlay right away
     applyBigButtonUI(); // joining flips this device into the big-button layout
     setStatus("Joined session " + code + ". Start recording to send audio to the desktop.", "ok");
   };
+  if (pairPhoneBtnEl) pairPhoneBtnEl.onclick = () => openPairOverlay();
+  if (pairDoneBtnEl)  pairDoneBtnEl.onclick  = () => closePairOverlay();
+  if (pairEndBtnEl)   pairEndBtnEl.onclick   = () => { stopPhoneSession(); closePairOverlay(); };
+
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
     joinedSessionCode = "";
     // Abandon any deliveries queued for the code we left (they target that
@@ -3538,6 +3666,7 @@ right lower quadrant"></textarea>
   restoreLatestFromHistory();
   restorePhoneLink(); // resume/rejoin a persisted phone-link pairing
   applyBigButtonUI(); // after restorePhoneLink: a persisted/QR join boots straight into the big button
+  updatePairButton(); // reflect any resumed phone session on the "Pair a phone" button
   updateAuthUI();
   if (authSectionEl) authSectionEl.open = !hasAuth(); // collapsed once credentials exist
   renderHistory();

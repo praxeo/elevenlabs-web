@@ -168,8 +168,8 @@ For thin clients and locked-down desktops where the browser can't own a decent m
 
 **Pairing (once):**
 
-1. On the desktop, open **Options → Phone mic** → **Start phone session**. A 6-character code and a QR code appear.
-2. On the phone, **scan the QR** with the camera (or open the app, type the code, **Join**). That's it — the pairing persists on *both* sides across page reloads, app switches, and iOS killing the PWA, until you press **End session** (desktop) or **Leave** (phone).
+1. On the desktop, click **📱 Pair a phone** (front and center on the main card). A large **QR code** and 6-character code fill a centered overlay.
+2. On the phone, **scan the QR** with the camera (or open the app, type the code, **Join**). The overlay **closes itself the moment the phone joins** (a join handshake; the first dictation is a fallback). That's it — the pairing persists on *both* sides across page reloads, app switches, and iOS killing the PWA, until you press **End session** (desktop) or **Leave** (phone). (The same controls also live in **Options → Phone mic** for manual code entry.)
 
 **Dictating:** use the phone exactly as usual — any engine (hybrid recommended). Live text mirrors onto the desktop as you speak; when you release, the final text is delivered to the desktop, copied to its clipboard, and announced with the same success/failure beeps as a local dictation.
 

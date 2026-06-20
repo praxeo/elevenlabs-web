@@ -666,11 +666,6 @@ const INDEX_HTML = `<!doctype html>
         <summary>Options</summary>
         <div class="body">
           <label class="checkbox" style="margin-top: 4px;">
-            <input type="checkbox" id="noVerbatim" checked />
-            Remove filler words / false starts
-          </label>
-
-          <label class="checkbox">
             <input type="checkbox" id="autoCopy" checked />
             Auto‑copy transcript to clipboard
           </label>
@@ -685,21 +680,6 @@ const INDEX_HTML = `<!doctype html>
             <input id="appendWindow" type="number" min="0" max="600" step="5" value="45" style="flex: 0 0 80px;" />
             <span class="hint" style="flex: 0 0 auto;">seconds (0 = always append)</span>
           </div>
-
-          <label class="checkbox">
-            <input type="checkbox" id="stripNewlines" checked />
-            Strip newlines (collapse to spaces)
-          </label>
-
-          <label class="checkbox">
-            <input type="checkbox" id="stripEllipses" checked />
-            Remove ellipses (pauses become "…" otherwise)
-          </label>
-
-          <label class="checkbox">
-            <input type="checkbox" id="trailingSpace" checked />
-            Trailing space (for consecutive dictations)
-          </label>
 
           <label class="checkbox">
             <input type="checkbox" id="startBeep" checked />
@@ -945,14 +925,10 @@ right lower quadrant"></textarea>
   const keytermHintEl    = document.getElementById("keytermHint");
   const timestampsEl     = document.getElementById("timestamps");
   const tagEventsEl      = document.getElementById("tagEvents");
-  const noVerbatimEl     = document.getElementById("noVerbatim");
   const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
   const startBeepEl      = document.getElementById("startBeep");
-  const stripNewlinesEl  = document.getElementById("stripNewlines");
-  const stripEllipsesEl  = document.getElementById("stripEllipses");
-  const trailingSpaceEl  = document.getElementById("trailingSpace");
 
   const gateOpenEl       = document.getElementById("gateOpen");
   const gateCloseEl      = document.getElementById("gateClose");
@@ -1238,17 +1214,16 @@ right lower quadrant"></textarea>
 
   /* ───── Text processing ───── */
   function cleanTranscript(raw) {
+    // Newline-strip, ellipsis-strip, and trailing-space were once toggles but
+    // are now always on (the only sane defaults for paste-into-Cerner) — the
+    // checkboxes were removed. Downstream paste workflows depend on this shape.
     let t = raw;
-    if (stripEllipsesEl.checked) {
-      // Scribe renders dictation pauses as ellipses; strip both forms.
-      t = t.replace(/\\u2026/g, " ").replace(/\\.{3,}/g, " ");
-    }
-    if (stripNewlinesEl.checked) {
-      t = t.replace(/[\\r\\n]+/g, " ");
-    }
+    // Scribe renders dictation pauses as ellipses; strip both forms.
+    t = t.replace(/\\u2026/g, " ").replace(/\\.{3,}/g, " ");
+    t = t.replace(/[\\r\\n]+/g, " ");
     t = t.replace(/ +/g, " ").trim();
     t = t.replace(/ ([,.;:!?])/g, "$1");
-    if (trailingSpaceEl.checked && t.length > 0) t += " ";
+    if (t.length > 0) t += " ";
     return t;
   }
 
@@ -1570,15 +1545,11 @@ right lower quadrant"></textarea>
       presetIds:      Object.keys(presetInputs).filter((id) => presetInputs[id].checked),
       timestamps:     timestampsEl.value,
       tagEvents:      tagEventsEl.checked,
-      noVerbatim:     noVerbatimEl.checked,
       autoCopy:       autoCopyEl.checked,
       appendMode:     appendModeEl.checked,
       saveApiKey:     saveApiKeyEl.checked,
       noiseSuppress:  noiseSuppressEl.checked,
       startBeep:      startBeepEl.checked,
-      stripNewlines:  stripNewlinesEl.checked,
-      stripEllipses:  stripEllipsesEl.checked,
-      trailingSpace:  trailingSpaceEl.checked,
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
@@ -1636,15 +1607,11 @@ right lower quadrant"></textarea>
       }
       if (s.timestamps) timestampsEl.value = s.timestamps;
       if (typeof s.tagEvents     === "boolean") tagEventsEl.checked     = s.tagEvents;
-      if (typeof s.noVerbatim    === "boolean") noVerbatimEl.checked    = s.noVerbatim;
       if (typeof s.autoCopy      === "boolean") autoCopyEl.checked      = s.autoCopy;
       if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
       if (typeof s.saveApiKey    === "boolean") saveApiKeyEl.checked    = s.saveApiKey;
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
-      if (typeof s.stripNewlines === "boolean") stripNewlinesEl.checked = s.stripNewlines;
-      if (typeof s.stripEllipses === "boolean") stripEllipsesEl.checked = s.stripEllipses;
-      if (typeof s.trailingSpace === "boolean") trailingSpaceEl.checked = s.trailingSpace;
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
@@ -1820,7 +1787,7 @@ right lower quadrant"></textarea>
     form.append("file", blob, fileName);
     form.append("file_format", "other");
     form.append("timestamps_granularity", timestampsEl.value);
-    form.append("no_verbatim", String(noVerbatimEl.checked));
+    form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
     form.append("tag_audio_events", String(tagEventsEl.checked));
     form.append("keyterms_json", precomputedBatchKeyterms || JSON.stringify(
       effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
@@ -3643,8 +3610,7 @@ right lower quadrant"></textarea>
 
   for (const el of [
     apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
-    noVerbatimEl, autoCopyEl, appendModeEl, startBeepEl,
-    stripNewlinesEl, stripEllipsesEl, trailingSpaceEl,
+    autoCopyEl, appendModeEl, startBeepEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);

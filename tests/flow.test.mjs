@@ -227,6 +227,9 @@ await sleep(200);
 console.log('--- scenario 0: boot migration + defaults + restore ---');
 check('legacy access code surfaced as passphrase', doc.getElementById('passphrase').value === 'legacy-code', JSON.stringify(doc.getElementById('passphrase').value));
 check('append mode unchecked by default', !doc.getElementById('appendMode').checked);
+check('legacy clean-up options removed from the DOM (now permanently on)',
+  !doc.getElementById('noVerbatim') && !doc.getElementById('stripNewlines') && !doc.getElementById('stripEllipses') && !doc.getElementById('trailingSpace'),
+  [doc.getElementById('noVerbatim'), doc.getElementById('stripNewlines'), doc.getElementById('stripEllipses'), doc.getElementById('trailingSpace')].map(Boolean).join(','));
 check('latest transcript restored from history on boot', latest().includes('Restored note.'), latest());
 check('auth section open while credentials are missing', doc.getElementById('authSection').open === true);
 check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('enter'), doc.getElementById('authSummary').textContent);
@@ -341,6 +344,7 @@ check('upload form carries api key + keyterms + tag_audio_events + file',
   typeof upload.form.get('keyterms_json') === 'string' &&
   upload.form.get('tag_audio_events') === 'false' &&
   upload.form.get('file') !== null);
+check('no_verbatim is always sent true (the filler-words toggle was removed)', upload.form.get('no_verbatim') === 'true', upload.form.get('no_verbatim'));
 check('batch text displayed', latest().includes('Batch note dictated.'), latest());
 check('batch text on clipboard', clipboard.includes('Batch note dictated.'), JSON.stringify(clipboard));
 check('batch success status', status().includes('Done!'), status());

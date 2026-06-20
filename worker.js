@@ -1109,7 +1109,7 @@ right lower quadrant"></textarea>
   let gateTimer = null;
   let gateBuf = null;
   let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
-  let wakeLock = null;        // screen wake lock held per dictation: iOS auto-lock reclaims the mic
+  let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
   let gateIsOpen = false;
   let gateLastOpen = 0;
   let lastMeterPct = -1;
@@ -1834,6 +1834,7 @@ right lower quadrant"></textarea>
   // Unsupported/denied is fine — everything else still works.
   async function acquireWakeLock() {
     try {
+      if (wakeLock && !wakeLock.released) return; // already held — don't stack sentinels
       if (navigator.wakeLock && navigator.wakeLock.request) {
         wakeLock = await navigator.wakeLock.request("screen");
       }
@@ -1842,6 +1843,15 @@ right lower quadrant"></textarea>
   function releaseWakeLock() {
     try { if (wakeLock) wakeLock.release(); } catch (e) {}
     wakeLock = null;
+  }
+  // The screen wake lock is wanted whenever letting the screen sleep would cost
+  // us the mic: during a dictation, AND the whole time the phone sits on the
+  // big-button surface (between push-to-talk presses). Keeping the screen awake
+  // there is the load-bearing fix for "iOS keeps killing the mic" — iOS reclaims
+  // the audio session on auto-lock, so preventing the lock prevents the
+  // interruption, instead of only re-acquiring after the fact.
+  function wakeLockDesired() {
+    return recording || stopping || finishing || bigButtonActive();
   }
 
   function audioGraphHealthy() {
@@ -2072,14 +2082,17 @@ right lower quadrant"></textarea>
     if (recording || stopping) return;
     if (warmRetryTimer) { clearTimeout(warmRetryTimer); warmRetryTimer = null; }
     ensureAudio().catch(() => {
-      if (attempt >= 2) {
+      if (attempt >= 4) {
         if (micEverGranted) setStatus("Microphone did not re-engage after returning — tap Start and it will reconnect.", "warn");
         return;
       }
+      // iOS hand-back timing is variable (longer after a call/Siri/a long lock),
+      // so keep retrying on a widening backoff (~700ms..5s, ~14s total) before
+      // giving up — a single quick attempt left the mic cold until a manual press.
       warmRetryTimer = setTimeout(() => {
         warmRetryTimer = null;
         if (document.visibilityState === "visible") warmWithRetry(attempt + 1);
-      }, attempt === 0 ? 700 : 2000);
+      }, attempt === 0 ? 700 : Math.min(1500 * attempt, 5000));
     });
   }
 
@@ -2145,7 +2158,8 @@ right lower quadrant"></textarea>
 
     // Hold a screen wake lock for the dictation: iOS auto-lock reclaims the
     // microphone and suspends the page mid-upload/refine. Released by
-    // deliverFinalText — the single session exit.
+    // deliverFinalText — except on the phone's big-button surface, where it is
+    // kept across takes (wakeLockDesired) so the mic never goes cold mid-visit.
     acquireWakeLock();
 
     // New session bookkeeping; stale callbacks from a previous socket bail out
@@ -2361,7 +2375,10 @@ right lower quadrant"></textarea>
   //   unexpectedMsg — override for the unexpected status line
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
-    releaseWakeLock(); // the screen may sleep again once the outcome is delivered
+    // On a plain desktop the screen may sleep again once the outcome is
+    // delivered; on the phone's big-button surface we deliberately KEEP the lock
+    // so iOS doesn't auto-lock between takes and reclaim the mic (wakeLockDesired).
+    if (!bigButtonActive()) releaseWakeLock();
     const label = opts.label || "Transcript";
 
     if (!cleaned.trim()) {
@@ -3265,6 +3282,11 @@ right lower quadrant"></textarea>
   function applyBigButtonUI() {
     const active = bigButtonActive();
     document.body.classList.toggle("bigbtn", active);
+    // Keep the screen awake the whole time the phone sits on this surface so iOS
+    // auto-lock can't reclaim the mic between push-to-talk presses; drop it on
+    // leave unless a dictation is still mid-flight and wants it (wakeLockDesired).
+    if (active) acquireWakeLock();
+    else if (!wakeLockDesired()) releaseWakeLock();
     if (!active) {
       document.body.classList.remove("bigbtn-settings");
       bigPeekExpanded = false;
@@ -3698,22 +3720,23 @@ right lower quadrant"></textarea>
   window.addEventListener("pageshow", (e) => {
     if (e.persisted) releaseAudio();
     if (!recording && !stopping) tryWarmOnLoad();
+    if (wakeLockDesired()) acquireWakeLock(); // re-arm keep-awake on the phone surface after a bfcache restore
   });
 
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState !== "visible") return;
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
-    if (recording || stopping || finishing) {
-      acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides
-    } else {
-      tryWarmOnLoad();
-    }
+    if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
+    // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden.
+    // Mid-session we leave the live graph alone (the lock above is enough).
+    if (!recording && !stopping && !finishing) tryWarmOnLoad();
   });
 
   // Standalone PWAs (iOS home-screen installs) sometimes fire only focus —
   // not visibilitychange — when switching back from another app.
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
+    if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     if (!recording && !stopping && !audioGraphHealthy()) tryWarmOnLoad();
   });
 

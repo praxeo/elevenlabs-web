@@ -1349,6 +1349,12 @@ console.log('--- scenario 25: big-button layout ---');
         win.URL.revokeObjectURL = () => {};
         win.AudioContext = MockAudioCtx;
         win.navigator.vibrate = (p) => { state.vibes.push(p); return true; };
+        // Wake lock spy: track held state so the persistent keep-awake on the
+        // big-button surface (iOS mic-reclaim mitigation) can be asserted.
+        state.wakeAcquires = 0; state.wakeHeld = false; state.lastWake = null;
+        win.navigator.wakeLock = { request: () => { state.wakeAcquires++; state.wakeHeld = true; const s = { released: false, release() { this.released = true; state.wakeHeld = false; return Promise.resolve(); } }; state.lastWake = s; return Promise.resolve(s); } };
+        // The phone surface is visible; the visibilitychange re-warm/re-lock only runs when so.
+        Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
         const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
         const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
         win.navigator.mediaDevices = { getUserMedia: () => { track.readyState = 'live'; return Promise.resolve(stream); }, addEventListener: () => {} };
@@ -1773,6 +1779,37 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25e2: a delivered relay is EXACTLY ONE done cue', outcomes(E2.vibes.slice(vE2c)).length === 1 && JSON.stringify(outcomes(E2.vibes.slice(vE2c))[0]) === '[40,60,40]', JSON.stringify(E2.vibes.slice(vE2c)));
   check('s25e2: the relay ack announced the desktop delivery', statusE2().includes('Delivered to the desktop'), statusE2());
+
+  // ---- Leg F: persistent keep-awake on the phone surface. iOS reclaims the
+  // mic on screen auto-lock, so the big-button surface holds a screen wake lock
+  // the WHOLE time it is up — acquired on entry, NOT released after a delivery
+  // (unlike a plain desktop), re-acquired when the page returns from hidden
+  // (the OS drops it on hide), and released only on Leave. This is the fix for
+  // "iOS keeps killing the mic between takes". ----
+  const F = mkBigDom({ settings: { joinedSessionCode: 'AWAKE1' } });
+  await sleep(100);
+  const dF = F.dom.window.document;
+  const bigBtnF = dF.getElementById('bigBtn');
+  check('s25f: wake lock acquired on entering the phone surface', F.wakeHeld === true && F.wakeAcquires >= 1, F.wakeHeld + '/' + F.wakeAcquires);
+  dF.getElementById('apiKey').value = 'test-key';
+  dF.getElementById('sonioxKey').value = 'test-skey';
+  F.batchText = 'Awake note.';
+  pev(F.win, bigBtnF, 'pointerdown', 1);
+  await sleep(550);
+  pev(F.win, bigBtnF, 'pointerup', 1);
+  await sleep(400);
+  check('s25f: dictation delivered to the desktop', F.fetches.some((f) => f.url.includes('/deliver')), JSON.stringify(F.fetches.map((f) => f.url)));
+  check('s25f: wake lock STILL held after delivery (no cold mic between takes)', F.wakeHeld === true, F.wakeHeld);
+  // Simulate the OS auto-releasing the lock while the page was hidden, then
+  // returning to the foreground: the visibilitychange handler must re-acquire it.
+  F.lastWake.released = true; F.wakeHeld = false;
+  dF.dispatchEvent(new F.win.Event('visibilitychange'));
+  await sleep(40);
+  check('s25f: returning to the surface re-acquires the dropped lock', F.wakeHeld === true && F.lastWake.released === false, F.wakeHeld);
+  // Leave reverts the layout and drops the keep-awake.
+  dF.getElementById('bigLeaveBtn').click();
+  await sleep(40);
+  check('s25f: Leave releases the wake lock', F.wakeHeld === false && !dF.body.classList.contains('bigbtn'), F.wakeHeld + '/' + dF.body.className);
 }
 
 // ===== Scenario 26: front-and-center phone pairing (QR overlay + join handshake) =====

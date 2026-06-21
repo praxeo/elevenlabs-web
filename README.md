@@ -53,7 +53,7 @@ Dictate on your phone and the text lands on the desktop's clipboard. This is for
 
 **Pairing.** On the desktop, click **Pair a phone** to show a QR code and a 6-character code. Scan it with the phone, or type the code. The overlay closes once the phone joins. The pairing persists on both sides across reloads and app restarts until you end the session (desktop) or leave it (phone).
 
-**On the phone**, a joined device switches to a big-button layout: one large push-to-talk button with the same hold/tap behavior as the hotkey, the whole screen as a status indicator readable at arm's length, haptics that mirror the beeps, and the transcript collapsed to a strip. A per-device override (Options → Big-button layout) sets when this layout is used: when joined (the default), always, or never.
+**On the phone**, a joined device switches to a big-button layout: one large push-to-talk button with the same hold/tap behavior as the hotkey, the whole screen as a status indicator readable at arm's length, haptics that mirror the beeps, and the transcript collapsed to a strip. A per-device override (Options → Big-button layout) sets when this layout is used: when joined (the default), always, or never. While the phone is on this layout the screen is kept awake, because iOS reclaims the microphone when the screen locks — so the mic stays ready between dictations instead of going cold. If the phone does sleep or you switch apps, the mic re-engages on its own when you reopen or refocus the page.
 
 **Reliability.** Every layer of the link fails loudly by default:
 

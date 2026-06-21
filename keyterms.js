@@ -15,12 +15,11 @@ export const KEYTERM_PRESETS = [
     label: "Standard medical",
     always: true,
     terms: [
-      "Cerner", "FirstNet", "PowerChart",
-      "afebrile", "normocephalic", "auscultation",
+      "afebrile", "auscultation",
       "alert and oriented", "no acute distress",
       "paronychia", "melena", "hematochezia", "HEART score", "MVC",
-      "COPD", "nonspecific", "ascites", "syncopal", "CVA", "CABG",
-      "ureterolithiasis", "biliary colic", "ureteral colic",
+      "COPD", "nonspecific", "ascites", "syncopal", "CVA", "CABG", "pilonidal", "CT angio", "post-discharge clinic", "hematemesis", "epistaxis", "AAA", 
+      "ureterolithiasis", "biliary colic", "syncope", "syncopal", "UAB", "Kirklin", "UED", "ureteral colic",
     ],
   },
   {
@@ -112,7 +111,7 @@ export const KEYTERM_PRESETS = [
       "laceration", "avulsion",
       // High-mangle-rate ER drugs (generic + brand) — added 2026-06-17
       "ondansetron", "Zofran", "ketorolac", "Toradol",
-      "hydromorphone", "Dilaudid", "ceftriaxone", "Rocephin",
+      "hydromorphone", "Dilaudid", "ceftriaxone", "Rocephin", "TNKase", "thrombolytics", "Eliquis", "Xarelto", "GLP-1 agonist", "Mounjaro", "Ozempic",
       "piperacillin-tazobactam", "Zosyn", "vancomycin",
       "enoxaparin", "Lovenox", "tranexamic acid", "TXA",
       "metoprolol", "diltiazem", "Cardizem", "labetalol",

@@ -1109,6 +1109,12 @@ right lower quadrant"></textarea>
   let gateTimer = null;
   let gateBuf = null;
   let micEverGranted = false; // getUserMedia has succeeded this session (iOS has no Permissions API for the mic)
+  // iOS leaves a track that died while the PWA was backgrounded looking alive
+  // (readyState "live", muted false, no "ended" event), so audioGraphHealthy()
+  // trusts a corpse and ensureAudio() reuses a dead graph on resume — the mic
+  // looks engaged but records silence. Any backgrounding sets this; ensureAudio
+  // then forces a full rebuild (a fresh getUserMedia track is genuinely live).
+  let audioSuspect = false;
   let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
   let gateIsOpen = false;
   let gateLastOpen = 0;
@@ -1868,7 +1874,11 @@ right lower quadrant"></textarea>
   }
 
   async function ensureAudio() {
-    if (audioGraphHealthy()) {
+    // After ANY backgrounding the existing graph is suspect on iOS: the track can
+    // be dead while still reporting readyState "live"/unmuted, so the reuse fast
+    // path below would hand back a corpse that records silence. Skip it and force
+    // a full rebuild — a fresh getUserMedia track is genuinely live.
+    if (!audioSuspect && audioGraphHealthy()) {
       if (audioCtx.state === "suspended") {
         try { await audioCtx.resume(); } catch (e) {}
       }
@@ -1880,6 +1890,7 @@ right lower quadrant"></textarea>
     }
 
     releaseAudio();
+    audioSuspect = false; // cleared by the rebuild we are about to do
 
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -1928,6 +1939,21 @@ right lower quadrant"></textarea>
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) {}
     }
+    // Instant detection of a mid-dictation interruption: iOS fires statechange
+    // when Siri / a call / another app takes the audio session ("suspended" or
+    // "interrupted"). The 30ms watchdog catches it too, but the event fires even
+    // when the gate timer is being throttled. Alarm only while recording and
+    // after a short start-up grace; never auto-clear — fail loud, redictate.
+    audioCtx.onstatechange = () => {
+      if (recording && !stopping && !micAlarmFired &&
+          audioCtx && audioCtx.state !== "running" &&
+          Date.now() - recStartedAt > 200) {
+        micAlarmFired = true;
+        setMicPill("fail");
+        micAlarmBeep();
+        setStatus("⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate.", "err");
+      }
+    };
     // Diagnostic (one-time): surface the true hardware sample rate so a stealth
     // hardware-rate surprise is never invisible.
     if (!window.__srLogged) {
@@ -2031,11 +2057,19 @@ right lower quadrant"></textarea>
         if (!micAlarmFired) {
           const flatline = nowMs - recStartedAt > 2500 && maxRmsSeen < FLATLINE_RMS;
           const mutedLong = mutedSince && nowMs - mutedSince > 1500;
-          if (trackDead || mutedLong || flatline) {
+          // A suspended/interrupted AudioContext mid-dictation freezes the
+          // analyser at its last buffer (the spec says it returns the same
+          // data), so the flatline check above goes blind on stale non-zero
+          // peaks. Treat a non-running context as its own alarm, after a short
+          // start-up grace so a momentary start blip cannot false-fire.
+          const ctxDead = audioCtx && audioCtx.state !== "running" && nowMs - recStartedAt > 200;
+          if (trackDead || mutedLong || flatline || ctxDead) {
             micAlarmFired = true;
             setMicPill("fail");
             micAlarmBeep();
-            setStatus("⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.", "err");
+            setStatus(ctxDead
+              ? "⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate."
+              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.", "err");
           }
         }
       }
@@ -3715,6 +3749,11 @@ right lower quadrant"></textarea>
     try { releaseAudio(); } catch (e) {}
   });
 
+  // pagehide fires on iOS PWA suspend/app-switch even when visibilitychange and
+  // beforeunload don't — it is also a backgrounding, so the audio graph must be
+  // treated as suspect (and rebuilt) on return. See ensureAudio / audioSuspect.
+  window.addEventListener("pagehide", () => { audioSuspect = true; });
+
   // Re-engage the mic when the app comes back: bfcache restores and slept
   // tabs can leave a dead MediaStream behind that looks alive.
   window.addEventListener("pageshow", (e) => {
@@ -3724,11 +3763,19 @@ right lower quadrant"></textarea>
   });
 
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState !== "visible") return;
+    if (document.visibilityState !== "visible") {
+      // Backgrounding: iOS can silently kill the mic track while it keeps
+      // reporting "live"/unmuted. Mark the graph suspect so the next
+      // ensureAudio() rebuilds from a fresh getUserMedia instead of reusing a
+      // corpse that records silence (the resume silent-capture bug).
+      audioSuspect = true;
+      return;
+    }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
-    // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden.
-    // Mid-session we leave the live graph alone (the lock above is enough).
+    // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
+    // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
+    // leave the live graph alone (the lock above is enough).
     if (!recording && !stopping && !finishing) tryWarmOnLoad();
   });
 
@@ -3737,7 +3784,7 @@ right lower quadrant"></textarea>
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
-    if (!recording && !stopping && !audioGraphHealthy()) tryWarmOnLoad();
+    if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });
 
   // The link healing is the cue to retry: drain the phone delivery queue the

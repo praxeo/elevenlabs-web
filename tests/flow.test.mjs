@@ -141,12 +141,13 @@ let activeWakeLock = null;
 // upload fails the scenario loudly instead of hanging.
 const fetchQueue = [];
 const fetchCalls = [];
+const mainCtxInstances = []; // only the MAIN DOM's AudioContexts (the app's live one is last)
 
 const dom = new JSDOM(html, {
   runScripts: 'dangerously',
   url: 'https://dictation.test/',
   beforeParse(window) {
-    window.AudioContext = MockAudioCtx;
+    window.AudioContext = class extends MockAudioCtx { constructor() { super(); mainCtxInstances.push(this); } };
     window.WebSocket = MockWS;
     window.MediaRecorder = class {
       constructor(stream, opts) { this.state = 'inactive'; this.stream = stream; this.opts = opts; }
@@ -1227,6 +1228,70 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
   await sleep(150);
   check('s23d: persisted grant re-warms the mic at boot after a PWA relaunch', gum23d === 1, gum23d);
 }
+
+// ===== Scenario 23r: resume silent-capture bug =====
+// The critical real-world failure: joined PWA, resume the session, press the big
+// button, the mic LOOKS engaged but records nothing. Root cause: iOS leaves a
+// track that died while backgrounded reporting readyState "live"/unmuted, so
+// audioGraphHealthy() trusts a corpse and ensureAudio() reuses a dead graph.
+// Fix: any backgrounding marks the graph suspect -> ensureAudio rebuilds.
+console.log('--- scenario 23r: resume forces a mic rebuild + interruption alarm ---');
+
+// Baseline: with NO backgrounding, a healthy graph is reused (no re-acquire).
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Reuse note.' } });
+micTrack.readyState = 'live'; micTrack.muted = false;
+const gumReuseBefore = gumCalls;
+doc.getElementById('recordBtn').click();
+await sleep(60);
+check('s23r: a healthy graph (no backgrounding) is reused — no re-acquire', gumCalls === gumReuseBefore, gumCalls - gumReuseBefore);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s23r: the reused-graph dictation delivers', clipboard.includes('Reuse note.'), JSON.stringify(clipboard));
+
+// Background the PWA (pagehide on iOS): the track still reports "live"/unmuted
+// (the iOS corpse), but the next press MUST rebuild rather than record silence.
+w.dispatchEvent(new w.Event('pagehide'));
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Resumed note.' } });
+micTrack.readyState = 'live'; micTrack.muted = false; // looks alive — the bug condition
+const gumResumeBefore = gumCalls;
+doc.getElementById('recordBtn').click();
+await sleep(60);
+check('s23r: a backgrounded graph is REBUILT despite looking healthy (the resume bug fix)', gumCalls === gumResumeBefore + 1, gumCalls - gumResumeBefore);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s23r: dictation works after the forced rebuild', clipboard.includes('Resumed note.'), JSON.stringify(clipboard));
+
+// visibilitychange -> hidden also marks the graph suspect.
+Object.defineProperty(doc, 'visibilityState', { value: 'hidden', configurable: true });
+doc.dispatchEvent(new w.Event('visibilitychange'));
+Object.defineProperty(doc, 'visibilityState', { value: 'visible', configurable: true });
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Hidden note.' } });
+const gumHiddenBefore = gumCalls;
+doc.getElementById('recordBtn').click();
+await sleep(60);
+check('s23r: visibilitychange->hidden also forces a rebuild', gumCalls === gumHiddenBefore + 1, gumCalls - gumHiddenBefore);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+
+// A mid-dictation AudioContext interruption (Siri/call/another app) must fire
+// the alarm even though the frozen analyser keeps reading "speech" (micRms high,
+// so the RMS-flatline check can never fire — only the state check catches it).
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Interrupted note.' } });
+micRms = 0.05; // real "speech" level so only the AudioContext-state check can alarm
+doc.getElementById('recordBtn').click();
+micTrack.readyState = 'live'; micTrack.muted = false; // a healthy live track (rebuild hands one back)
+await sleep(250); // past the 200ms start-up grace; no alarm yet (track live, rms high)
+const ctxR = mainCtxInstances[mainCtxInstances.length - 1];
+ctxR.state = 'interrupted'; // the audio session is taken over mid-dictation
+await sleep(120); // several 30ms watchdog ticks
+check('s23r: a mid-dictation AudioContext interruption fires the mic alarm', /AUDIO INTERRUPTED/i.test(status()) && statusCls().includes('err'), status());
+ctxR.state = 'running'; // release; finish the session so later state is clean
+doc.getElementById('recordBtn').click();
+await sleep(300);
 
 // ===== Scenario 24: QR join =====
 console.log('--- scenario 24: QR join ---');

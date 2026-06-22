@@ -64,7 +64,7 @@ Dictate on your phone and the text lands on the desktop's clipboard. This is for
 - If the desktop tab is not focused when text arrives, the copy is held and retried on refocus.
 - `hotkey.ahk` can poll `GET /latest` and write the clipboard with no browser focus required (set `PHONE_POLL_URL` and `PHONE_CODE` at the top of the script).
 
-**Keeping other voices out.** A one-time **Mic tips** card (reopen it from the big-button bar or Options) covers the most effective fixes: on iPhone, Control Center → Mic Mode → Voice Isolation removes other voices at the OS level; on any phone, hold it close and release the button when someone else is talking. The session code is the link's only credential, and the QR is generated on the page rather than by an external service.
+**Keeping other voices out.** Three layers, because no single one is enough. (1) Hold the mic **close** — the biggest lever; a close voice drowns out the room. (2) **iOS Voice Isolation** (Control Center → Mic Mode) strips background *noise* at the OS level — but another person's voice is speech, so it can survive both that and browser noise suppression. (3) So the app also **filters out other speakers automatically** (on by default, in Advanced): when a second voice is loud enough to be transcribed, it keeps only the main speaker and shows a status note about what it removed. The one-time **Mic tips** card (reopen it from the big-button bar or Options) walks through the first two. The session code is the link's only credential, and the QR is generated on the page rather than by an external service.
 
 ## Settings
 

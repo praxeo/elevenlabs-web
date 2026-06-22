@@ -201,13 +201,28 @@ async function handleTranscribeBatch(request, env) {
     form.append("file_format", String(incoming.get("file_format") || "other"));
 
     form.append("language_code", "en");
-    form.append("diarize", "false");
-    form.append("num_speakers", "1");
+
+    // Diarization (keep-primary-speaker) is the lever against bystander voices
+    // the mic picks up: noise suppression / iOS Voice Isolation strip *noise*,
+    // but another person's speech is speech and survives both. When the client
+    // asks for it, let Scribe label speakers (don't force num_speakers=1) and
+    // return word-level data so the client can keep only the primary speaker.
+    // The client does the filtering (the Worker stays a thin proxy); we just
+    // shape the request so the per-word speaker_id is present.
+    const diarize = incoming.get("diarize") === "true";
+    if (diarize) {
+      form.append("diarize", "true");
+    } else {
+      form.append("diarize", "false");
+      form.append("num_speakers", "1");
+    }
     form.append("temperature", "0");
 
+    // Word-granular timestamps guarantee the words[] array (with speaker_id)
+    // the client needs to drop other speakers; otherwise honor the client's ask.
     form.append(
       "timestamps_granularity",
-      String(incoming.get("timestamps_granularity") || "none")
+      diarize ? "word" : String(incoming.get("timestamps_granularity") || "none")
     );
 
     const noVerbatim = incoming.get("no_verbatim") !== "false";
@@ -768,6 +783,11 @@ right lower quadrant"></textarea>
             Browser noise suppression <span class="hint">(on by default; turn off to A/B if a close, quiet mic transcribes better)</span>
           </label>
 
+          <label class="checkbox">
+            <input type="checkbox" id="diarize" checked />
+            Filter out other speakers <span class="hint">(on by default; keeps only the main voice — removes bystander speech the mic picks up. Noise suppression can't: another person's voice is speech. A status note reports anything removed.)</span>
+          </label>
+
           <div id="batchOptsSection">
             <label class="checkbox">
               <input type="checkbox" id="tagEvents" />
@@ -783,9 +803,10 @@ right lower quadrant"></textarea>
           </div>
 
           <h3>How do these settings work?</h3>
-          <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. Use the Scribe filters to reject background speech.</p>
+          <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. With a close mic, raising the open threshold rejects quieter, more distant voices before they're ever recorded.</p>
           <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
           <p><strong>Click filter</strong>: higher values stop brief clicks/rustling being read as speech.</p>
+          <p><strong>Filter out other speakers</strong>: when a second person's voice is loud enough to clear the gate, the speaker filter is the only thing that can drop it — the gate can't tell two equally-loud voices apart. It keeps the main (most-spoken) voice and reports what it removed. Pair it with a close mic for the best result.</p>
         </div>
       </details>
 
@@ -881,10 +902,12 @@ right lower quadrant"></textarea>
 
       <div class="mt-h">Always</div>
       <ul>
-        <li>Hold the phone <span class="mt-key">close to your mouth</span>, like a walkie‑talkie — the closer your voice, the easier the room is to ignore.</li>
+        <li>Hold the phone <span class="mt-key">close to your mouth</span>, like a walkie‑talkie — this is the single biggest fix. The closer your voice, the more it drowns out the room, and the harder a distant talker is to pick up.</li>
         <li>Push‑to‑talk records <span class="mt-key">only while you hold</span> the button — let go the moment someone else speaks.</li>
         <li>Face away from other conversations, or step somewhere quieter, when you can.</li>
       </ul>
+
+      <div class="mt-note">Voice Isolation and noise suppression remove background <em>noise</em> — fans, hums, clicks — but another person's voice is speech, so it can slip through even with them on. That's why a close mic matters. As a backstop this app also <span class="mt-key">automatically filters out other speakers</span> (keeps only the main voice) and tells you when it removed something — leave it on (Advanced) unless you have a reason not to.</div>
 
       <div class="row" style="justify-content: center; margin-top: 16px;">
         <button id="micTipsDoneBtn" class="primary">Got it</button>
@@ -928,6 +951,7 @@ right lower quadrant"></textarea>
   const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
+  const diarizeEl        = document.getElementById("diarize");
   const startBeepEl      = document.getElementById("startBeep");
 
   const gateOpenEl       = document.getElementById("gateOpen");
@@ -1555,6 +1579,7 @@ right lower quadrant"></textarea>
       appendMode:     appendModeEl.checked,
       saveApiKey:     saveApiKeyEl.checked,
       noiseSuppress:  noiseSuppressEl.checked,
+      diarize:        diarizeEl.checked, // per-device: keep-primary-speaker filter (on by default)
       startBeep:      startBeepEl.checked,
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
@@ -1617,6 +1642,7 @@ right lower quadrant"></textarea>
       if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
       if (typeof s.saveApiKey    === "boolean") saveApiKeyEl.checked    = s.saveApiKey;
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
+      if (typeof s.diarize       === "boolean") diarizeEl.checked       = s.diarize; // default stays ON (checked in HTML) when unset
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
@@ -1784,6 +1810,44 @@ right lower quadrant"></textarea>
     await clipboardWrite(DICTATION_SENTINEL);
   }
 
+  // Keep-primary-speaker: when diarization is on, Scribe returns a words[] array
+  // with a speaker_id per token. Background voices the mic picked up land as a
+  // SECOND speaker — drop them and keep only the dominant (most-words) speaker.
+  // Returns null when there is nothing to filter (a single speaker, or no
+  // labels), so the caller falls back to the unfiltered text — never silently
+  // empties a note. removedWords lets finalize surface what was dropped.
+  function keepPrimarySpeaker(words) {
+    if (!Array.isArray(words) || !words.length) return null;
+    var counts = {};
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      if (w && w.type === "word" && w.speaker_id != null) {
+        counts[w.speaker_id] = (counts[w.speaker_id] || 0) + 1;
+      }
+    }
+    var ids = Object.keys(counts);
+    if (ids.length <= 1) return null; // single (or unlabeled) speaker: nothing to drop
+    var dominant = ids[0];
+    for (var j = 1; j < ids.length; j++) {
+      if (counts[ids[j]] > counts[dominant]) dominant = ids[j];
+    }
+    var kept = [];
+    var removed = 0;
+    for (var k = 0; k < words.length; k++) {
+      var t = words[k];
+      if (!t) continue;
+      var sid = t.speaker_id;
+      // Keep the dominant speaker's tokens plus any unlabeled spacing; drop the
+      // other speakers. cleanTranscript collapses the join spacing downstream.
+      if (sid == null || String(sid) === String(dominant)) {
+        if (t.text) kept.push(t.text);
+      } else if (t.type === "word") {
+        removed++;
+      }
+    }
+    return { text: kept.join(" "), removedWords: removed, speakers: ids.length };
+  }
+
   /* ───── Batch transcription call (pure batch mode + hybrid refine) ───── */
   async function batchTranscribe(blob, fileName, timeoutMs) {
     const form = new FormData();
@@ -1795,6 +1859,7 @@ right lower quadrant"></textarea>
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
     form.append("tag_audio_events", String(tagEventsEl.checked));
+    form.append("diarize", String(diarizeEl.checked)); // keep-primary-speaker: drop bystander voices the mic caught
     form.append("keyterms_json", precomputedBatchKeyterms || JSON.stringify(
       effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
     )); // [LATENCY] reuse the snapshot taken at session start; fall back if absent
@@ -1819,7 +1884,16 @@ right lower quadrant"></textarea>
                     raw || "transcription request failed";
         return { ok: false, text: "", error: String(msg) };
       }
-      return { ok: true, text: String(data.text || data.transcript || ""), error: "" };
+      var text = String(data.text || data.transcript || "");
+      var removedWords = 0;
+      // Keep only the primary speaker when diarization is on. A failure to find a
+      // second speaker (or any words[]) leaves the full text untouched — the
+      // filter can only ever REMOVE bystander speech, never empty a clean note.
+      if (diarizeEl.checked && Array.isArray(data.words) && data.words.length) {
+        var prim = keepPrimarySpeaker(data.words);
+        if (prim && prim.text.trim()) { text = prim.text; removedWords = prim.removedWords; }
+      }
+      return { ok: true, text: text, error: "", removedWords: removedWords };
     } catch (err) {
       const aborted = err && err.name === "AbortError";
       return {
@@ -2399,7 +2473,13 @@ right lower quadrant"></textarea>
       return;
     }
 
-    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected, label: "Transcript" });
+    // Surface diarization removals as a (non-beeping) status note: the clinician
+    // must be able to see that speech was dropped, in case the primary-speaker
+    // pick was wrong (the delivered text is still the cleaner, primary-only one).
+    var note = r.removedWords
+      ? "Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers."
+      : "";
+    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected, label: "Transcript", note: note });
   }
 
   // The single delivery exit: exactly one clipboard outcome and one beep per
@@ -2455,13 +2535,14 @@ right lower quadrant"></textarea>
     const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
     const cleanOutcome = !opts.unexpected && !micAlarmFired;
     let announceRelayOutcome = relayCarries && cleanOutcome;
+    const noteSuffix = opts.note ? " " + opts.note : ""; // diarization "removed N words" note (no beep)
 
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
       if (announceRelayOutcome) {
-        setStatus(copied
+        setStatus((copied
           ? "Transcript copied here and sent to the desktop — confirming delivery…"
-          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)", "warn");
+          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)") + noteSuffix, "warn");
       } else if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
         failBeep();
@@ -2472,17 +2553,17 @@ right lower quadrant"></textarea>
         setStatus("⚠ Mic signal dropped during this dictation — verify the text before pasting!", "err");
         failBeep();
       } else {
-        setStatus(label + " saved & copied. Done!", "ok");
+        setStatus(label + " saved & copied. Done!" + noteSuffix, "ok");
         doneBeep();
       }
     } else {
       if (announceRelayOutcome) {
-        setStatus("Transcript sent to the desktop — confirming delivery…", "warn");
+        setStatus("Transcript sent to the desktop — confirming delivery…" + noteSuffix, "warn");
       } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
       } else {
-        setStatus(label + " saved.", "ok");
+        setStatus(label + " saved." + noteSuffix, "ok");
         doneBeep();
       }
     }
@@ -3666,7 +3747,7 @@ right lower quadrant"></textarea>
 
   for (const el of [
     apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
-    autoCopyEl, appendModeEl, startBeepEl,
+    autoCopyEl, appendModeEl, startBeepEl, diarizeEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);

@@ -68,6 +68,12 @@
 // (scenario 0, asserted right after boot: legacy access-code migration shim,
 //  batch default engine, append-mode off by default, latest transcript
 //  restored from history, and the auth section's open/collapse behavior)
+//  29. batch-only product: saved Hybrid->Batch migration, no engine selector,
+//      live capture feedback shows/hides, batch text reaches the clipboard
+//  30. diarization keep-primary-speaker: default-on toggle sends diarize=true, a
+//      two-speaker words[] drops the bystander with a no-beep "removed N words"
+//      status note, a single speaker is a no-op, and toggling off sends
+//      diarize=false + skips client filtering + persists per-device
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -2104,6 +2110,72 @@ console.log('--- scenario 29: batch-only product ---');
   check('s29: a saved Hybrid engine migrates to Batch (history tagged batch)', hist29[0] && hist29[0].engine === 'batch', hist29[0] && hist29[0].engine);
   check('s29: the migrated engine persists as batch', settings29().engine === 'batch', JSON.stringify(settings29().engine));
 }
+
+// ===== Scenario 30: diarization — keep-primary-speaker filters bystander voices =====
+// Background voices the mic catches land as a SECOND Scribe speaker. With the
+// (default-on, per-device) "Filter out other speakers" toggle, the client keeps
+// only the dominant speaker, surfaces a no-beep status note about what it
+// removed, and never empties a clean single-speaker note. Toggling it off sends
+// diarize=false and delivers the full text unfiltered.
+console.log('--- scenario 30: diarization keep-primary-speaker ---');
+doc.getElementById('apiKey').value = 'test-key';
+doc.getElementById('freshBtn').click();
+check('s30: diarize toggle defaults ON (per-device)', doc.getElementById('diarize').checked === true);
+
+// Leg A: two speakers — the bystander's words are dropped, a note reports it.
+const wordsTwo = [
+  { text: 'Patient', type: 'word', speaker_id: 'speaker_0' },
+  { text: 'is',      type: 'word', speaker_id: 'speaker_0' },
+  { text: 'stable',  type: 'word', speaker_id: 'speaker_0' },
+  { text: 'hey',     type: 'word', speaker_id: 'speaker_1' },
+  { text: 'grab',    type: 'word', speaker_id: 'speaker_1' },
+  { text: 'lunch',   type: 'word', speaker_id: 'speaker_1' },
+  { text: 'today',   type: 'word', speaker_id: 'speaker_0' },
+];
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable hey grab lunch today', words: wordsTwo } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const upA = fetchCalls[fetchCalls.length - 1];
+check('s30: upload carries diarize=true when the toggle is on', upA.form.get('diarize') === 'true', upA.form.get('diarize'));
+check('s30: primary speaker kept on the clipboard', clipboard.includes('Patient is stable today'), JSON.stringify(clipboard));
+check('s30: bystander speaker dropped from the clipboard', !clipboard.includes('lunch'), JSON.stringify(clipboard));
+check('s30: a status note reports what was removed (no beep)', status().includes('Filtered out 3 words from other speakers'), status());
+check('s30: removal is still a success outcome (Done!)', status().includes('Done!'), status());
+
+// Leg B: a single speaker is a no-op — the full text survives, no note.
+doc.getElementById('freshBtn').click();
+const wordsOne = [
+  { text: 'Solo', type: 'word', speaker_id: 'speaker_0' },
+  { text: 'note', type: 'word', speaker_id: 'speaker_0' },
+  { text: 'here', type: 'word', speaker_id: 'speaker_0' },
+];
+fetchQueue.push({ status: 200, body: { text: 'Solo note here', words: wordsOne } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: single-speaker note delivered intact', clipboard.includes('Solo note here'), JSON.stringify(clipboard));
+check('s30: single speaker => no removal note', !status().includes('Filtered out'), status());
+
+// Leg C: toggle OFF — diarize=false sent, and the client never filters even if
+// the server were to return a multi-speaker words[] (the guard is client-side).
+doc.getElementById('freshBtn').click();
+doc.getElementById('diarize').checked = false;
+doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable hey grab lunch today', words: wordsTwo } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const upC = fetchCalls[fetchCalls.length - 1];
+check('s30: upload carries diarize=false when the toggle is off', upC.form.get('diarize') === 'false', upC.form.get('diarize'));
+check('s30: toggle off => no client-side filtering (full text delivered)', clipboard.includes('lunch'), JSON.stringify(clipboard));
+check('s30: toggle off => no removal note', !status().includes('Filtered out'), status());
+check('s30: diarize=false persisted (per-device)', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).diarize === false, w.localStorage.getItem('scribe_v2_settings_v9'));
+doc.getElementById('diarize').checked = true; // restore default for any later reuse
+doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

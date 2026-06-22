@@ -694,10 +694,8 @@ const INDEX_HTML = `<!doctype html>
             Append consecutive recordings (don't clear)
           </label>
 
-          <div class="row" id="appendWindowRow" style="margin: 4px 0 0 24px; align-items: center;">
-            <span class="hint" style="flex: 0 0 auto;">…only if started within</span>
-            <input id="appendWindow" type="number" min="0" max="600" step="5" value="45" style="flex: 0 0 80px;" />
-            <span class="hint" style="flex: 0 0 auto;">seconds (0 = always append)</span>
+          <div class="row" style="margin: 2px 0 0 24px;">
+            <span class="hint">When on, every dictation adds to the note until you turn this off or clear the box. Off = each dictation starts fresh. (Use “➕ Append next” to append just once.)</span>
           </div>
 
           <label class="checkbox">
@@ -975,7 +973,6 @@ right lower quadrant"></textarea>
   const recTimerEl       = document.getElementById("recTimer");
   const recStateEl       = document.getElementById("recState");
 
-  const appendWindowEl   = document.getElementById("appendWindow");
   const appendChipEl     = document.getElementById("appendChip");
   const micPillEl        = document.getElementById("micPill");
   const linkPillEl       = document.getElementById("linkPill");
@@ -1077,7 +1074,6 @@ right lower quadrant"></textarea>
   let maxRmsSeen = 0;
   let micAlarmFired = false;
   let mutedSince = 0;
-  let lastFinalizeAt = 0;
   let connectTimer = null;
   let tailTimer = null;
   let finalDeadlineTimer = null;
@@ -1351,20 +1347,8 @@ right lower quadrant"></textarea>
       return;
     }
     appendChipEl.style.display = "";
-    const w = Number(appendWindowEl.value) || 0;
-    if (w > 0 && lastFinalizeAt) {
-      const remain = Math.ceil((lastFinalizeAt + w * 1000 - Date.now()) / 1000);
-      if (remain <= 0) {
-        appendChipEl.textContent = "next dictation starts fresh";
-        appendChipEl.className = "pill";
-      } else {
-        appendChipEl.textContent = "next dictation appends (" + remain + "s)";
-        appendChipEl.className = "pill ok";
-      }
-    } else {
-      appendChipEl.textContent = "next dictation appends";
-      appendChipEl.className = "pill ok";
-    }
+    appendChipEl.textContent = "next dictation appends";
+    appendChipEl.className = "pill ok";
   }
 
   /* ───── Engine UI (batch-only) ───── */
@@ -1620,7 +1604,6 @@ right lower quadrant"></textarea>
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
-      appendWindow:   appendWindowEl.value,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
       keytermsOpen:   Boolean(keytermsSectionEl && keytermsSectionEl.open),
@@ -1683,7 +1666,6 @@ right lower quadrant"></textarea>
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
-      if (s.appendWindow !== undefined) appendWindowEl.value = s.appendWindow;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
       if (typeof s.keytermsOpen === "boolean" && keytermsSectionEl) keytermsSectionEl.open = s.keytermsOpen;
@@ -1751,16 +1733,13 @@ right lower quadrant"></textarea>
   }
 
   // Boot restore: show the most recent saved transcript instead of an empty
-  // box, and adopt its finalize time so the append window keeps working
-  // across reloads. The restored note clears like any other when the next
+  // box across reloads. The restored note clears like any other when the next
   // session starts fresh, and click-to-append can extend it.
   function restoreLatestFromHistory() {
     const items = getHistory();
     if (!items.length || !items[0].text || !items[0].text.trim()) return;
     finalizedSegments = [items[0].text.trim()];
     currentPartial = "";
-    const t = Date.parse(items[0].createdAt || "");
-    if (!isNaN(t)) lastFinalizeAt = t;
     updateLiveDisplay();
   }
 
@@ -2379,17 +2358,13 @@ right lower quadrant"></textarea>
     clearSessionTimers();
 
     // Continue the current text when armed by clicking the transcript box
-    // (one-shot, beats the window), or when append mode is on AND the
-    // previous dictation finished recently enough (the append window).
+    // (one-shot), or when append mode is on. Otherwise start fresh. The
+    // decision is explicit — no time window — so the same action always
+    // gives the same result (append vs. fresh is never clock-dependent).
     if (appendArmed) {
       appendArmed = false; // consumed by this session
     } else if (!appendModeEl.checked) {
       finalizedSegments = [];
-    } else {
-      const w = Number(appendWindowEl.value) || 0;
-      if (w > 0 && lastFinalizeAt && Date.now() - lastFinalizeAt > w * 1000) {
-        finalizedSegments = [];
-      }
     }
     currentPartial = "";
     updateLiveDisplay();
@@ -2509,8 +2484,6 @@ right lower quadrant"></textarea>
       lastAudioUrl = URL.createObjectURL(blob);
       audioPreviewEl.src = lastAudioUrl;
     }
-
-    lastFinalizeAt = Date.now();
 
     await finishBatchSession(unexpected);
   }
@@ -3826,7 +3799,6 @@ right lower quadrant"></textarea>
   });
 
   appendModeEl.addEventListener("change", updateAppendChip);
-  appendWindowEl.addEventListener("input", () => { saveSettings(); updateAppendChip(); });
   if (advancedEl) advancedEl.addEventListener("toggle", saveSettings);
   if (optionsSectionEl) optionsSectionEl.addEventListener("toggle", saveSettings);
   if (keytermsSectionEl) keytermsSectionEl.addEventListener("toggle", saveSettings);

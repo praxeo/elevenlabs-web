@@ -9,7 +9,7 @@
 //   1. happy path: buffer-while-connecting, tail streaming, commit, await-final
 //   2. unexpected mid-dictation disconnect (must fail loudly, keep partial text)
 //   3. dead-mic flatline alarm + empty-session sentinel
-//   4. append-window expiry drops stale text
+//   4. append mode appends consecutive recordings (no time window)
 //   5. connect timeout fails loudly with sentinel
 //   6. PTT pressed during finalization queues a new session
 //   7. configurable hotkey: tap toggles, hold is push-to-talk
@@ -247,10 +247,10 @@ doc.getElementById('apiKey').dispatchEvent(new w.Event('change', { bubbles: true
 check('auth section collapses once a key is entered', doc.getElementById('authSection').open === false);
 check('auth summary shows the key is set', doc.getElementById('authSummary').textContent.includes('✓'), doc.getElementById('authSummary').textContent);
 
-// Turn append mode on for the append-window scenario (scenario 4); scenario 17
+// Turn append mode on for the append scenario (scenario 4); scenario 17
 // covers the append-off default.
 doc.getElementById('appendMode').click();
-check('append mode toggled on for the append-window scenario', doc.getElementById('appendMode').checked);
+check('append mode toggled on for the append scenario', doc.getElementById('appendMode').checked);
 doc.getElementById('freshBtn').click(); // clear the restored note so the next scenario starts fresh
 
 // ===== Scenario 3 (batch): dead mic flatline alarm =====
@@ -272,22 +272,23 @@ check('dead-mic finalize -> sentinel', clipboard === '##DICTATION_FAILED##', JSO
 check('no-speech status mentions mic', status().includes('microphone never produced a signal'), status());
 micRms = 0.05;
 
-// ===== Scenario 4 (batch): append window expiry starts fresh =====
-console.log('--- scenario 4: batch append window expiry ---');
-doc.getElementById('appendWindow').value = '1'; // 1 second window
+// ===== Scenario 4 (batch): append mode appends consecutive recordings =====
+// No time window anymore: with append mode on, the second dictation always
+// extends the first regardless of how much time passed between them.
+console.log('--- scenario 4: batch append mode (no time window) ---');
 fetchQueue.push({ status: 200, body: { text: 'First note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(80);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 check('first note saved', latest().includes('First note.'), latest());
-await sleep(1300); // exceed the 1s append window
+await sleep(1300); // a long pause must NOT change the outcome (no window)
 fetchQueue.push({ status: 200, body: { text: 'Second note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(80);
 doc.getElementById('recordBtn').click();
 await sleep(300);
-check('window expired -> old text dropped', !latest().includes('First note.') && latest().includes('Second note.'), latest());
+check('append mode keeps both notes after a long pause', latest().includes('First note.') && latest().includes('Second note.'), latest());
 doc.getElementById('appendMode').click(); // back to default (off) for the remaining scenarios
 doc.getElementById('freshBtn').click();
 

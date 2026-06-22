@@ -11,7 +11,8 @@ Status: alpha, in production use. Priorities, in order: (1) never lose a dictati
 - **Push-to-talk.** The default hotkey is Ctrl+Space: tap to start and stop, or hold to talk and release to stop (holds longer than ~400 ms). F13/F14 also start and stop, for the AutoHotkey relay (`hotkey.ahk` maps CapsLock to F13/F14). On release, the recording uploads and the transcript is copied.
 - **Live capture feedback.** While recording you see a moving waveform, a "Hearing you" indicator, and a timer. This runs on-device from the audio analyser — there is no streaming transcription and nothing leaves the machine. It only confirms the microphone is capturing.
 - **The noise gate decides what is transcribed.** Audio runs microphone → high-pass → noise gate → recorder, and the post-gate recording is exactly what gets uploaded. Gate tuning therefore affects the transcript, not just a preview (see [Tuning](#tuning)).
-- **One note per dictation by default.** Click the transcript box to append the next dictation onto the current note, or turn on append mode to chain dictations within a time window (default 45 s). The most recent transcript is restored on reload, and the clipboard always holds the current note.
+- **One note per dictation by default.** Hit **➕ Append next** to add the next dictation onto the current note, or turn on append mode to chain dictations within a time window (default 45 s). The most recent transcript is restored on reload, and the clipboard always holds the current note.
+- **Edit any transcript by hand.** Click into the dictation box and type to correct the current note (between dictations) — your edits flow through to the clipboard, to Copy latest, and to anything you append next. Past transcripts in History have an **Edit** button (Save / Cancel) so you can fix an older note in place; edited entries are marked "edited".
 
 ### Audio cues
 

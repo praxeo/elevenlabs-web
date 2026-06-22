@@ -404,15 +404,16 @@ await sleep(300);
 check('base note delivered', clipboard.includes('Alpha.'), JSON.stringify(clipboard));
 check('chip hidden with append mode off', doc.getElementById('appendChip').style.display === 'none');
 
-doc.getElementById('latest').click(); // arm: next dictation appends
-check('box click arms the append chip',
+doc.getElementById('appendToggleBtn').click(); // arm: next dictation appends
+check('Append-next button arms the append chip',
   doc.getElementById('appendChip').style.display !== 'none' &&
   doc.getElementById('appendChip').textContent.includes('append'),
   doc.getElementById('appendChip').textContent);
 check('box highlighted while armed', doc.getElementById('latest').className.includes('armed'));
-doc.getElementById('latest').click(); // second click cancels
+check('Append-next button shows the active state', doc.getElementById('appendToggleBtn').className.includes('active'));
+doc.getElementById('appendToggleBtn').click(); // second click cancels
 check('second click disarms', doc.getElementById('appendChip').style.display === 'none');
-doc.getElementById('latest').click(); // re-arm for the real run
+doc.getElementById('appendToggleBtn').click(); // re-arm for the real run
 
 fetchQueue.push({ status: 200, body: { text: 'Beta.' } });
 doc.getElementById('recordBtn').click();
@@ -427,6 +428,65 @@ await sleep(120);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 check('arm is one-shot: the following dictation starts fresh', clipboard.includes('Gamma.') && !clipboard.includes('Beta.'), JSON.stringify(clipboard));
+
+// ===== Scenario 31: editing the dictation boxes (active box + history) =====
+console.log('--- scenario 31: editing dictation boxes ---');
+// Land a clean note so there is something to edit.
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Patinet stbl.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+const latestBox = doc.getElementById('latest');
+check('s31: active box is editable while idle', latestBox.getAttribute('contenteditable') === 'true', latestBox.getAttribute('contenteditable'));
+
+// Hand-edit the active box and fire the input event jsdom needs.
+latestBox.textContent = 'Patient stable today.';
+latestBox.dispatchEvent(new w.Event('input', { bubbles: true }));
+await sleep(20);
+clipboard = '';
+doc.getElementById('copyBtn').click();
+await sleep(40);
+check('s31: edited active-box text is what Copy latest copies', clipboard.includes('Patient stable today.'), JSON.stringify(clipboard));
+
+// An appended dictation must splice onto the EDITED base, not the original.
+doc.getElementById('appendToggleBtn').click();
+fetchQueue.push({ status: 200, body: { text: 'Plan unchanged.' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s31: append builds on the edited base', clipboard.includes('Patient stable today.') && clipboard.includes('Plan unchanged.') && !clipboard.includes('Patinet stbl.'), JSON.stringify(clipboard));
+
+// The box locks (non-editable) during a session so live/finalize own its text.
+fetchQueue.push({ status: 200, body: { text: 'Locked note.' } });
+doc.getElementById('recordBtn').click();
+await sleep(60);
+check('s31: active box is NOT editable mid-session', latestBox.getAttribute('contenteditable') === 'false', latestBox.getAttribute('contenteditable'));
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s31: active box is editable again after delivery', latestBox.getAttribute('contenteditable') === 'true', latestBox.getAttribute('contenteditable'));
+
+// History editing: open the list, edit the newest entry in place, save it.
+if (doc.getElementById('history').style.display === 'none') doc.getElementById('toggleHistoryBtn').click();
+check('s31: history list is visible', doc.getElementById('history').style.display !== 'none');
+const firstItem = doc.querySelector('.history-item');
+check('s31: history renders items', !!firstItem);
+const itemText = firstItem.querySelector('.history-text');
+const editBtn = Array.from(firstItem.querySelectorAll('button')).find((b) => b.textContent === 'Edit');
+check('s31: history item has an Edit button', !!editBtn);
+editBtn.click();
+check('s31: editing makes the history text editable', itemText.getAttribute('contenteditable') === 'true');
+itemText.textContent = 'Locked note, corrected.';
+const saveBtn = Array.from(firstItem.querySelectorAll('button')).find((b) => b.textContent === 'Save');
+saveBtn.click();
+await sleep(20);
+const savedHist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+check('s31: edited history text persisted to storage', savedHist[0] && savedHist[0].text === 'Locked note, corrected.', JSON.stringify(savedHist[0]));
+check('s31: edited history entry is stamped editedAt', !!(savedHist[0] && savedHist[0].editedAt));
+const reItem = doc.querySelector('.history-item');
+check('s31: re-rendered history shows an "edited" marker', reItem.querySelector('.history-meta').textContent.includes('edited'), reItem.querySelector('.history-meta').textContent);
 
 // ===== Scenario 18: keyterm presets — injected lists, merge, dedupe, persistence =====
 console.log('--- scenario 18: keyterm presets ---');

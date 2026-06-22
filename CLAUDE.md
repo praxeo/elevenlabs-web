@@ -77,7 +77,7 @@ idle
 - Any unexpected failure ⇒ `finalizeSession(true)` / `deliverFinalText({unexpected:true})` ⇒ red status + fail beep + sentinel-if-no-text.
 - A 30 ms watchdog (inside the gate meter loop) fires the mic alarm on dead/muted track or RMS flatline (< `FLATLINE_RMS` after 2.5 s) — works in batch (no WS dependency).
 - F13 during finalization or delivery sets `pendingStart`; `maybePendingStart()` starts the next session after `deliverFinalText` — via a cancellable `pendingStartTimer` (60 ms; **1.5 s after a failure outcome** so the red screen/status is seen before the next REC paints over it). On the phone-link path the queued start additionally waits for the relay ack (`relayDeliveryToDesktop(...).finally(maybePendingStart)`, deadline `RELAY_TIMEOUT_MS`). **A queued start dies when the press that queued it ends without a tap**: a hold released during the finalize/queued window, a cancelled pointer, or F14 calls `cancelQueuedStart()` — the deferred `startRecording` must never open a mic nobody is holding. `finishing` stays true through the delivery's status/beep branches (cleared just before the relay/queue tail), so the big-screen derivation shows WORKING… across the awaits instead of a stale state.
-- **Click-to-append**: clicking the populated transcript box while idle toggles `appendArmed` — a one-shot "append the next dictation" that beats the append-mode checkbox (off by default) and the window; consumed at session start, cleared whenever the box empties, ignored mid-session and while text is selected. The chip + box border surface the armed state.
+- **Append-next + box editing**: the **"➕ Append next"** button (`toggleAppendArm`) arms `appendArmed` — a one-shot "append the next dictation" that beats the append-mode checkbox (off by default) and the window; consumed at session start, cleared whenever the box empties, ignored mid-session. The chip + box border + the button's `active` state surface it. (The big-peek expanded text still forwards taps to `toggleAppendArm`, the one place the arm rules live.) **The transcript box itself is now hand-editable** (`#latest` is `contenteditable` while idle — `refreshLatestEditable()` derives editability from session state so the live/finalize path owns the text mid-session): typing rewrites `latestText`/`finalizedSegments` (no `cleanTranscript` mid-type — delivery still cleans), so Copy/Append/delivery all use the edited text, and a `paste` handler (`plainTextPaste`) forces plain text. **History entries are editable too**: each `renderHistory` row has Edit/Save/Cancel — Save writes back via `setHistory` keyed by `createdAt` and stamps an additive `editedAt` (surfaced as "· edited" in the meta); independent of the live box. (Scenario 31.)
 - **Boot restore**: `restoreLatestFromHistory()` puts the newest history entry into the box and adopts its `createdAt` as `lastFinalizeAt`, so the note stays visible across reloads and the append window keeps counting from the real finish time.
 - Mic re-engagement: `audioGraphHealthy()` checks the actual `MediaStreamTrack.readyState` **and `muted`** (iOS interruptions — lock screen, Siri, calls — leave the track "live" but permanently muted), not just variable presence; rebuilt on start and on `pageshow` / `visibilitychange` / `focus` (standalone PWAs can fire only focus on app switch) / `devicechange`, and an idle track that stays muted > 1.2 s self-heals. bfcache restores leave dead streams that *look* alive. **The resume silent-capture bug** (the worst real-world failure: joined PWA, resume the session, the mic *looks* engaged but records nothing): iOS leaves a track that died while the PWA was backgrounded reporting `readyState:"live"`/unmuted with **no `ended` event**, so `audioGraphHealthy()` trusts a corpse and `ensureAudio()` reuses a dead graph. Fix: **any backgrounding** (`pagehide` and `visibilitychange`→hidden) sets `audioSuspect`, which makes `ensureAudio()` **skip the healthy-reuse fast path and force a fresh `getUserMedia`** (a fresh track is genuinely live; the flag is cleared on rebuild); the foreground handlers also re-warm on `audioSuspect`, so the rebuild usually happens proactively and the press stays fast. **AudioContext-state alarm**: a suspended/`interrupted` context mid-dictation freezes the `AnalyserNode` (it returns the *same stale buffer*), so the RMS-flatline watchdog goes blind on stale non-zero peaks — the watchdog therefore also alarms on `audioCtx.state !== "running"` (after a >200 ms start-up grace, recording-only) and an `audioCtx.onstatechange` listener fires the same loud alarm; a mid-dictation interruption is **never auto-recovered** (fail loud, redictate). iOS Safari has no Permissions API entry for the mic, so `tryWarmOnLoad` falls back to `micEverGranted` — **persisted as the additive `micGranted` settings field**, so a killed-and-relaunched PWA re-warms at boot instead of staying cold. Re-warms go through `warmWithRetry` (widening backoff ~700 ms → 5 s, ~5 attempts): iOS hands the audio session back late after foregrounding (longer after a call/Siri/a long lock), so the first `getUserMedia` can fail and succeed moments later; after the retries it gives up with a visible warn status. **Screen wake lock — `wakeLockDesired()` decides:** held from session start to `deliverFinalText` so iOS auto-lock cannot reclaim the mic mid-dictation or suspend the page mid-upload, AND held the **whole time the phone sits on the big-button surface** (`bigButtonActive()`) — acquired in `applyBigButtonUI`, *not* released after a delivery there, re-acquired on `pageshow`/`visibilitychange`/`focus` (the OS drops the lock on hide), released only on Leave. This is the load-bearing fix for "iOS keeps killing the mic between takes": keeping the screen awake prevents the auto-lock interruption instead of only re-warming after it. `acquireWakeLock()` is idempotent (won't stack sentinels). On a plain desktop the lifecycle is unchanged (released at `deliverFinalText`).
 
@@ -129,8 +129,8 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation — batch-only product, 18 scenario groups
-# (numbered 0,3,4,7,9,10,11,17,18,19,20,21,22,23,24,25,29,30; the gaps are the
+# Full session-flow simulation — batch-only product, 19 scenario groups
+# (numbered 0,3,4,7,9,10,11,17,18,19,20,21,22,23,24,25,29,30,31; the gaps are the
 # deleted realtime/hybrid/translator/pump/direct scenarios — numbering kept so
 # git history lines up):
 #  0  boot shim: legacy access-code->passphrase migration, defaults, history
@@ -142,7 +142,7 @@ node --check /tmp/served.js
 #     upload, history tagged engine "batch", link pill returns to idle
 # 10  batch upload failure -> sentinel + LINK FAIL
 # 11  PTT queued during a slow batch upload (finalize-gap busy)
-# 17  click-to-append one-shot
+# 17  append-next one-shot (the "➕ Append next" button arms/disarms)
 # 18  keyterm presets: injected lists, custom>checked>always merge, dedupe,
 #     persistence
 # 19  phone mic session: phone dictates batch, /api/session/<code>/deliver POST
@@ -179,6 +179,9 @@ node --check /tmp/served.js
 #     a no-beep "removed N words" status note, a single speaker is a no-op (full
 #     text, no note), toggle off sends diarize=false + skips client filtering +
 #     persists per-device
+# 31  editing the dictation boxes: the active box (#latest) is contenteditable
+#     while idle and locks during a session; hand-edits feed Copy/Append/delivery;
+#     history rows have Edit/Save/Cancel that persist (editedAt + "edited" marker)
 npm install --no-save jsdom jsqr
 node tests/flow.test.mjs
 ```

@@ -407,12 +407,15 @@ const INDEX_HTML = `<!doctype html>
       background: var(--panel2); border: 1px solid var(--line);
       border-radius: 12px; padding: 14px;
     }
-    .big:not(:empty) { cursor: pointer; }
+    .big[contenteditable="true"] { cursor: text; }
+    .big[contenteditable="true"]:focus { outline: none; border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .big.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .hint { color: var(--muted); font-size: 13px; }
     .history-item { border-top: 1px solid var(--line); padding: 12px 0; }
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .history-text { white-space: pre-wrap; font-size: 14px; }
+    .history-text[contenteditable="true"] { outline: none; border: 1px solid var(--accent); border-radius: 8px; padding: 6px; background: var(--panel2); }
+    button.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .checkbox {
       display: flex; gap: 8px; align-items: center;
       color: var(--muted); font-size: 13px; margin-top: 10px;
@@ -637,10 +640,11 @@ const INDEX_HTML = `<!doctype html>
       </div>
 
       <label>Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
-      <div id="latest" class="big" title="Click to append the next dictation to this text; click again to cancel"></div>
+      <div id="latest" class="big" title="Click to edit this text directly. Use 'Append next' to add the next dictation to this note."></div>
 
       <div class="row" style="margin-top: 10px;">
         <button id="copyBtn">Copy latest</button>
+        <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
       </div>
 
@@ -934,6 +938,7 @@ right lower quadrant"></textarea>
   const recordBtn        = document.getElementById("recordBtn");
   const clearBtn         = document.getElementById("clearBtn");
   const copyBtn          = document.getElementById("copyBtn");
+  const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
   const downloadBtn      = document.getElementById("downloadBtn");
   const downloadAudioBtn = document.getElementById("downloadAudioBtn");
@@ -1265,6 +1270,33 @@ right lower quadrant"></textarea>
     updateBigPeek();
   }
 
+  // The transcript box is hand-editable only while idle — during a session the
+  // live/finalize paths own its text (updateLiveDisplay) and an editable box
+  // would fight the cursor. Derive editability from session state; never flip it
+  // mid-edit (setAttribute to the same value would be a no-op anyway).
+  function refreshLatestEditable() {
+    if (!latestEl) return;
+    const want = (!recording && !stopping && !finishing) ? "true" : "false";
+    if (latestEl.getAttribute("contenteditable") !== want) latestEl.setAttribute("contenteditable", want);
+  }
+
+  // contenteditable accepts rich HTML on paste; force plain text so a pasted
+  // snippet can't smuggle markup into a note that gets copied into a chart.
+  function plainTextPaste(e) {
+    e.preventDefault();
+    let t = "";
+    try { t = (e.clipboardData || window.clipboardData).getData("text/plain"); } catch (_) {}
+    try { document.execCommand("insertText", false, t); }
+    catch (_) {
+      // Fallback for environments without execCommand: append at the end.
+      const el = e.target;
+      if (el && typeof el.textContent === "string") {
+        el.textContent += t;
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+    }
+  }
+
   function setStatus(msg, cls) {
     statusEl.className = "status " + (cls || "");
     statusEl.textContent = msg;
@@ -1298,6 +1330,10 @@ right lower quadrant"></textarea>
     const hasText = Boolean(latestText && latestText.trim());
     if (!hasText) appendArmed = false; // nothing left to append to
     latestEl.classList.toggle("armed", appendArmed && !recording);
+    if (appendToggleBtn) {
+      appendToggleBtn.classList.toggle("active", appendArmed && !recording);
+      appendToggleBtn.disabled = !hasText || recording || stopping || finishing;
+    }
     updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
     if (!hasText || recording) {
       appendChipEl.style.display = "none";
@@ -1755,11 +1791,13 @@ right lower quadrant"></textarea>
       const meta = document.createElement("div");
       meta.className = "history-meta";
       meta.textContent = new Date(item.createdAt).toLocaleString() +
-        (item.engine ? " · " + item.engine : "");
+        (item.engine ? " · " + item.engine : "") +
+        (item.editedAt ? " · edited" : "");
 
       const text = document.createElement("div");
       text.className = "history-text";
       text.textContent = item.text;
+      text.addEventListener("paste", plainTextPaste);
 
       const row = document.createElement("div");
       row.className = "row";
@@ -1767,9 +1805,54 @@ right lower quadrant"></textarea>
 
       const copy = document.createElement("button");
       copy.textContent = "Copy";
-      copy.onclick = () => copyText(item.text);
+      // Copy the current (possibly mid-edit) text, not a stale snapshot.
+      copy.onclick = () => copyText(text.textContent);
 
-      row.append(copy);
+      const edit = document.createElement("button");
+      edit.textContent = "Edit";
+
+      const save = document.createElement("button");
+      save.textContent = "Save";
+      save.style.display = "none";
+
+      const cancel = document.createElement("button");
+      cancel.textContent = "Cancel";
+      cancel.style.display = "none";
+
+      // Editing a past transcript in place — explicit Save writes it back to
+      // storage (keyed by createdAt so a re-render between open and save can't
+      // hit the wrong row), Cancel restores the pre-edit text. Independent of
+      // the live box; failures stay loud (Save only persists, never clipboards).
+      let original = item.text;
+      function enterEdit() {
+        original = text.textContent;
+        text.setAttribute("contenteditable", "true");
+        edit.style.display = "none";
+        save.style.display = "";
+        cancel.style.display = "";
+        text.focus();
+      }
+      edit.onclick = enterEdit;
+      cancel.onclick = () => {
+        text.textContent = original;
+        text.setAttribute("contenteditable", "false");
+        edit.style.display = "";
+        save.style.display = "none";
+        cancel.style.display = "none";
+      };
+      save.onclick = () => {
+        const newText = text.textContent;
+        const all = getHistory();
+        const i = all.findIndex((it) => it.createdAt === item.createdAt);
+        if (i >= 0) {
+          all[i].text = newText;
+          all[i].editedAt = new Date().toISOString();
+          setHistory(all); // re-renders the list (replacing this DOM), back to read-only
+          setStatus("Saved edit to the transcript.", "ok");
+        }
+      };
+
+      row.append(copy, edit, save, cancel);
       div.append(meta, text, row);
       historyEl.append(div);
     }
@@ -2359,6 +2442,7 @@ right lower quadrant"></textarea>
 
     recording = true;
     stopping = false;
+    refreshLatestEditable(); // lock the box: the live/finalize path owns its text now
     recordBtn.textContent = "Stop recording";
     recordBtn.classList.add("danger");
     setMicPill("rec");
@@ -2379,6 +2463,7 @@ right lower quadrant"></textarea>
     }
     userStopped = true;
     stopping = true;
+    refreshLatestEditable(); // keep the box locked through the upload phase
 
     // No tail/commit phases: stopping the recorder flushes the last chunk,
     // and its onstop handler drives the finalize/upload.
@@ -2569,6 +2654,7 @@ right lower quadrant"></textarea>
     }
 
     finishing = false;
+    refreshLatestEditable(); // back to idle: the box is hand-editable again
     updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
     updateAppendChip();
 
@@ -3542,9 +3628,9 @@ right lower quadrant"></textarea>
   });
   if (bigPeekTextEl) bigPeekTextEl.addEventListener("click", () => {
     if (!bigPeekExpanded) { bigPeekExpanded = true; updateBigPeek(); return; }
-    // Expanded: tapping the text is click-to-append. Forward to the shared
-    // transcript-box handler so the one-shot arm rules live in exactly one place.
-    latestEl.click();
+    // Expanded: tapping the text arms append. Call the shared arm helper so the
+    // one-shot rules live in exactly one place (the box click now edits, not arms).
+    toggleAppendArm();
   });
 
   if (bigLeaveBtnEl) bigLeaveBtnEl.onclick = () => { if (phoneLeaveBtnEl) phoneLeaveBtnEl.click(); };
@@ -3643,22 +3729,35 @@ right lower quadrant"></textarea>
     setStatus("Left the desktop session — dictations stay on this device now.", "ok");
   };
 
-  // Click the transcript box to append the next dictation onto it — one-shot,
-  // works regardless of the append-mode checkbox; click again to cancel.
-  // Ignored while a session is active and when text is being selected.
-  latestEl.addEventListener("click", () => {
+  // "Append next" arms a one-shot: the next dictation is added onto the current
+  // note instead of starting fresh — beats the append-mode checkbox/window; tap
+  // again to cancel. (Clicking the box itself now places the edit cursor, so
+  // arming lives on its own button, not the box.) Ignored while a session runs.
+  function toggleAppendArm() {
     if (recording || stopping || finishing) return;
     if (!latestText || !latestText.trim()) return;
-    try {
-      const sel = window.getSelection && window.getSelection();
-      if (sel && String(sel)) return; // selecting text to copy, not arming
-    } catch (e) {}
     appendArmed = !appendArmed;
     updateAppendChip();
     setStatus(appendArmed
-      ? "Next dictation will append to this text (click the box again to cancel)."
+      ? "Next dictation will append to this text (tap 'Append next' again to cancel)."
       : "Next dictation starts fresh.", "");
+  }
+  if (appendToggleBtn) appendToggleBtn.onclick = toggleAppendArm;
+
+  // The transcript box is hand-editable while idle (contenteditable, toggled by
+  // refreshLatestEditable). Typing rewrites the in-memory note so Copy/Append/
+  // delivery all use the edited text; collapse to one segment so a later append
+  // splices cleanly onto it. Skip cleanTranscript here — it would fight the
+  // cursor (trailing space, collapsing) mid-type; delivery still cleans output.
+  latestEl.addEventListener("input", () => {
+    if (recording || stopping || finishing) return; // not editable then; guard anyway
+    latestText = latestEl.textContent;
+    finalizedSegments = latestText.trim() ? [latestText] : [];
+    if (!latestText.trim()) appendArmed = false;
+    updateAppendChip(); // mirrors text + armed state into the big peek too
   });
+  latestEl.addEventListener("paste", plainTextPaste);
+  refreshLatestEditable();
 
   hotkeyBtn.onclick = () => {
     capturingHotkey = !capturingHotkey;

@@ -410,6 +410,12 @@ const INDEX_HTML = `<!doctype html>
     .big[contenteditable="true"] { cursor: text; }
     .big[contenteditable="true"]:focus { outline: none; border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .big.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .lastdict {
+      margin-top: 12px; background: var(--panel2);
+      border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    }
+    .lastdict-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .lastdict-text { white-space: pre-wrap; font-size: 14px; max-height: 96px; overflow: auto; }
     .hint { color: var(--muted); font-size: 13px; }
     .history-item { border-top: 1px solid var(--line); padding: 12px 0; }
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
@@ -643,9 +649,21 @@ const INDEX_HTML = `<!doctype html>
       <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
       <div class="row" style="margin-top: 10px;">
-        <button id="copyBtn">Copy latest</button>
+        <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy latest</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+      </div>
+
+      <!-- "Last dictation" slot: the most recently filed note. The box above is
+           the ACTIVE note; copying it (or starting a new dictation) files it here.
+           Hidden until there's something filed (keeps the compact card compact). -->
+      <div id="lastDictation" class="lastdict" style="display:none;">
+        <div class="lastdict-label">Last dictation</div>
+        <div id="lastDictationText" class="lastdict-text"></div>
+        <div class="row" style="margin-top: 8px;">
+          <button id="lastCopyBtn" title="Copy this filed note to the clipboard (leaves the box alone)">Copy</button>
+          <button id="lastAppendBtn" title="Bring this note back into the box and arm append so the next dictation continues it">➕ Append to this</button>
+        </div>
       </div>
 
       <div class="row" style="margin-top: 8px;">
@@ -938,6 +956,10 @@ right lower quadrant"></textarea>
   const copyBtn          = document.getElementById("copyBtn");
   const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
+  const lastDictationEl     = document.getElementById("lastDictation");
+  const lastDictationTextEl = document.getElementById("lastDictationText");
+  const lastCopyBtn         = document.getElementById("lastCopyBtn");
+  const lastAppendBtn       = document.getElementById("lastAppendBtn");
   const downloadBtn      = document.getElementById("downloadBtn");
   const downloadAudioBtn = document.getElementById("downloadAudioBtn");
   const toggleHistoryBtn = document.getElementById("toggleHistoryBtn");
@@ -1039,6 +1061,10 @@ right lower quadrant"></textarea>
 
   let finalizedSegments = [];
   let currentPartial = "";
+  // The "Last dictation" slot: the most recently FILED note (the active box note
+  // moves here when you Copy latest, clear the box, or start a fresh dictation).
+  // In-memory only — re-derived from history at boot (restoreLatestFromHistory).
+  let archivedText = "";
   // Diagnostic: ?debug=1 logs phone-link listener frames to the console AND an
   // on-screen overlay (foolproof when DevTools is filtered or unavailable). Off
   // by default; purely additive.
@@ -1264,6 +1290,45 @@ right lower quadrant"></textarea>
     latestText = cleaned;
     latestEl.textContent = cleaned;
     updateBigPeek();
+    renderLastDictation();
+  }
+
+  // The "Last dictation" slot. The active box note moves here when it's filed
+  // (Copy latest / Clear box / starting a fresh dictation); the slot is just a
+  // read-only view of the last filed note with its own Copy + "Append to this".
+  // Hidden when empty or mid-session so the compact card stays compact.
+  function renderLastDictation() {
+    if (!lastDictationEl) return;
+    const t = (archivedText || "").trim();
+    if (!t || recording || stopping || finishing) {
+      lastDictationEl.style.display = "none";
+      return;
+    }
+    lastDictationEl.style.display = "";
+    if (lastDictationTextEl) lastDictationTextEl.textContent = t;
+    // "Append to this" pulls the slot note back into the box, so it only makes
+    // sense when the box is empty — otherwise it would clobber the active note
+    // (use the box's own "Append next" then). Disable it while the box has text.
+    if (lastAppendBtn) lastAppendBtn.disabled = Boolean(latestText && latestText.trim());
+  }
+
+  // File the given text into the slot (no-op for empty text, so filing an
+  // already-empty box never wipes the slot). The note is already in history;
+  // the slot is just the most-recent filed note surfaced next to the box.
+  function fileToSlot(text) {
+    if (text && text.trim()) {
+      archivedText = text.trim();
+      renderLastDictation();
+    }
+  }
+
+  // Clear the active note box (Copy latest / Clear box / fresh-start all use it).
+  function clearBox() {
+    finalizedSegments = [];
+    currentPartial = "";
+    latestText = "";
+    if (latestEl) latestEl.textContent = "";
+    appendArmed = false;
   }
 
   // The transcript box is hand-editable only while idle — during a session the
@@ -1325,6 +1390,7 @@ right lower quadrant"></textarea>
   function updateAppendChip() {
     const hasText = Boolean(latestText && latestText.trim());
     if (!hasText) appendArmed = false; // nothing left to append to
+    renderLastDictation(); // mirror session/box state into the slot (hide on rec, button enable)
     latestEl.classList.toggle("armed", appendArmed && !recording);
     if (appendToggleBtn) {
       appendToggleBtn.classList.toggle("active", appendArmed && !recording);
@@ -1740,6 +1806,9 @@ right lower quadrant"></textarea>
     if (!items.length || !items[0].text || !items[0].text.trim()) return;
     finalizedSegments = [items[0].text.trim()];
     currentPartial = "";
+    // The box shows the newest note, so the slot shows the one before it (so the
+    // "Last dictation" view is consistent across reloads, not just in-session).
+    if (items[1] && items[1].text && items[1].text.trim()) archivedText = items[1].text.trim();
     updateLiveDisplay();
   }
 
@@ -2364,6 +2433,9 @@ right lower quadrant"></textarea>
     if (appendArmed) {
       appendArmed = false; // consumed by this session
     } else if (!appendModeEl.checked) {
+      // Starting fresh files the note being replaced into the "Last dictation"
+      // slot (it stays visible there + in history) before the box is cleared.
+      fileToSlot(finalizedSegments.join(" "));
       finalizedSegments = [];
     }
     currentPartial = "";
@@ -3641,21 +3713,59 @@ right lower quadrant"></textarea>
     latestEl.textContent = "";
     finalizedSegments = []; // Fixed: Make sure screen buffer is cleared alongside history
     currentPartial = "";
+    archivedText = ""; // the slot mirrors history — wiping history empties it too
     renderHistory();
     updateAppendChip();
     setStatus("History cleared.");
   };
 
   freshBtn.onclick = () => {
-    finalizedSegments = [];
-    currentPartial = "";
-    latestText = "";
-    latestEl.textContent = "";
+    // Clearing the box files the note into the "Last dictation" slot first, so
+    // it stays visible (and one tap of "Append to this" can bring it back).
+    fileToSlot(latestText);
+    clearBox();
+    updateLiveDisplay();
     updateAppendChip();
-    setStatus("Dictation box cleared — the next dictation starts a new note (history kept).", "ok");
+    setStatus("Dictation box cleared — the next dictation starts a new note (it's in 'Last dictation' and history).", "ok");
   };
 
-  copyBtn.onclick = () => { if (latestText) copyText(latestText); };
+  // Copy latest = copy AND file it: the note goes to the clipboard, then moves
+  // to the "Last dictation" slot and the box clears, ready for a fresh note. A
+  // failed copy keeps the box (the loud copyText status stands) so nothing is
+  // lost before the deliverable actually landed.
+  copyBtn.onclick = async () => {
+    if (!latestText || !latestText.trim()) return;
+    const text = latestText;
+    const ok = await copyText(text);
+    if (!ok) return;
+    fileToSlot(text);
+    clearBox();
+    updateLiveDisplay();
+    updateAppendChip();
+    setStatus("Copied — filed below as 'Last dictation'. The box is ready for a new note.", "ok");
+  };
+
+  // Slot "Copy": copy the filed note straight to the clipboard, leaving the box
+  // (and the slot) untouched — a re-grab of an older note, not a state change.
+  if (lastCopyBtn) lastCopyBtn.onclick = () => { if (archivedText) copyText(archivedText); };
+
+  // Slot "Append to this": bring the filed note back into the box and arm a
+  // one-shot append so the next dictation continues it. Only valid when the box
+  // is empty (renderLastDictation disables it otherwise) — append targets what's
+  // in the box, and we must never clobber a different active note.
+  if (lastAppendBtn) lastAppendBtn.onclick = () => {
+    if (recording || stopping || finishing) return;
+    const t = (archivedText || "").trim();
+    if (!t) return;
+    if (latestText && latestText.trim()) return; // box busy — guard (button is also disabled)
+    finalizedSegments = [t];
+    currentPartial = "";
+    archivedText = ""; // it's the active note now, not the archived one
+    appendArmed = true;
+    updateLiveDisplay();
+    updateAppendChip();
+    setStatus("Loaded the last dictation into the box — the next dictation will append to it.", "ok");
+  };
 
   if (phoneStartBtnEl) phoneStartBtnEl.onclick = () => startPhoneSession();
   if (phoneStopBtnEl)  phoneStopBtnEl.onclick  = () => stopPhoneSession();

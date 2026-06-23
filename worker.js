@@ -473,6 +473,15 @@ const INDEX_HTML = `<!doctype html>
     #pairStatus.ok { color: var(--ok); }
     #pairStatus.err { color: var(--danger); }
     #pairPhoneBtn { flex: 0 0 auto; }
+    /* Desktop indicator that the paired phone is actively dictating. */
+    #phoneRecBadge.rec { color: var(--danger); }
+    #phoneRecBadge.xcribe { color: var(--muted); }
+    #phoneRecBadge .recdot {
+      display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+      background: var(--danger); animation: phoneRecPulse 1s ease-in-out infinite;
+    }
+    #phoneRecBadge.xcribe .recdot { background: var(--muted); animation: none; }
+    @keyframes phoneRecPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
     /* Mic tips: a one-time, phone-first onboarding nudge for keeping OTHER
        people's voices out of the notes (iOS Voice Isolation + close-mic +
        push-to-talk discipline). Auto-shown once on the big-button surface,
@@ -666,8 +675,12 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="row" style="margin-top: 8px;">
+      <div class="row" style="margin-top: 8px; align-items: center; gap: 8px;">
         <button id="pairPhoneBtn" title="Show a QR to pair your phone as the microphone — dictated text lands on this computer's clipboard">📱 Pair a phone</button>
+        <!-- Live indicator: lights up when the paired phone starts dictating, so
+             the desktop user knows audio is being captured before the text lands.
+             Hidden until a phone_recording ping arrives (relayed, not buffered). -->
+        <span id="phoneRecBadge" style="display:none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600;"></span>
       </div>
     </section>
 
@@ -1018,6 +1031,7 @@ right lower quadrant"></textarea>
   const phoneJoinBtnEl   = document.getElementById("phoneJoinBtn");
   const phoneJoinBadgeEl = document.getElementById("phoneJoinBadge");
   const phoneLeaveBtnEl  = document.getElementById("phoneLeaveBtn");
+  const phoneRecBadgeEl  = document.getElementById("phoneRecBadge");
 
   // Front-and-center phone-pairing overlay elements
   const pairPhoneBtnEl   = document.getElementById("pairPhoneBtn");
@@ -1120,6 +1134,7 @@ right lower quadrant"></textarea>
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
   let phoneJoined       = false; // desktop: a phone has joined this session (phone_join ping / first delivery) — drives the pairing overlay/button
+  let phoneRecTimer     = null;  // desktop: safety auto-clear for the "phone is recording/transcribing" indicator (in case a stop/delivery ping is missed)
   let micTipsSeen       = false; // per-device: the "keep other voices out" onboarding nudge has been dismissed
   let micTipsAutoShown  = false; // session: the nudge has auto-shown once this load (re-show is guarded by micTipsSeen across loads)
 
@@ -2488,6 +2503,7 @@ right lower quadrant"></textarea>
     updateAppendChip();
     setStatus("Recording — release to upload for transcription…", "ok");
     startBeep();
+    notifyDesktopRecording("start"); // joined phone: light the desktop's "recording" indicator (no-op if unpaired)
 
     if (stopRequested) {
       stopRequested = false;
@@ -2536,6 +2552,7 @@ right lower quadrant"></textarea>
     if (micAlarmFired) setMicPill("fail");
     else setMicPill(audioGraphHealthy() ? "ready" : "off");
     if (!unexpected) setLinkPill("idle");
+    notifyDesktopRecording("stop"); // joined phone: flip the desktop indicator to "transcribing" while the upload runs (no-op if unpaired)
 
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       try { mediaRecorder.stop(); } catch (e) {}
@@ -3015,6 +3032,52 @@ right lower quadrant"></textarea>
     } catch (e) {}
   }
 
+  // Phone side: tell the desktop the phone has started/stopped capturing, so the
+  // desktop can show a live "phone is recording" indicator before any text
+  // lands. Like phone_join, this is best-effort, fire-and-forget, and relayed to
+  // listeners but NOT buffered (only phone_delivery is) — a missed ping just
+  // means the desktop misses the cue, never a lost dictation. Gated on a join so
+  // an unpaired device never POSTs. state: "start" | "stop".
+  function notifyDesktopRecording(state) {
+    if (!joinedSessionCode) return;
+    try {
+      fetch("/api/session/" + joinedSessionCode + "/deliver", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message_type: "phone_recording", state: state }),
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  // Desktop side: reflect the paired phone's capture state. "recording" while
+  // the phone holds the button, "transcribing" after release (upload in flight),
+  // "off" once the delivery lands. A safety timer auto-clears it if a stop/
+  // delivery ping is missed (the indicator is a cue, never load-bearing). Only
+  // the desktop (a paired-but-not-joined device) shows it.
+  function setPhoneRecIndicator(state) {
+    if (phoneRecTimer) { clearTimeout(phoneRecTimer); phoneRecTimer = null; }
+    if (!phoneRecBadgeEl) return;
+    if (joinedSessionCode || state === "off" || !state) {
+      phoneRecBadgeEl.style.display = "none";
+      phoneRecBadgeEl.textContent = "";
+      phoneRecBadgeEl.className = "";
+      return;
+    }
+    var label = state === "transcribing" ? "Phone finished — transcribing…" : "Phone is recording…";
+    phoneRecBadgeEl.className = state === "transcribing" ? "xcribe" : "rec";
+    phoneRecBadgeEl.innerHTML = "";
+    var dot = document.createElement("span");
+    dot.className = "recdot";
+    phoneRecBadgeEl.appendChild(dot);
+    phoneRecBadgeEl.appendChild(document.createTextNode(" " + label));
+    phoneRecBadgeEl.style.display = "inline-flex";
+    // Auto-clear: a long-but-bounded window for recording (a missed "stop" must
+    // not leave the dot pulsing forever); a tight one for transcribing (the
+    // batch upload deadline plus margin) so a missed delivery clears it too.
+    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + 8000) : 600000;
+    phoneRecTimer = setTimeout(function () { setPhoneRecIndicator("off"); }, ttl);
+  }
+
   /* ───── Mic tips: keep other voices out (onboarding nudge) ─────
      iOS Voice Isolation is the single most effective lever against bystander
      speech (it filters at the OS level), but it is manual and undetectable from
@@ -3202,6 +3265,7 @@ right lower quadrant"></textarea>
     pendingCopyText   = "";
     lastDeliveryId    = "";
     recentDeliveryIds = [];
+    setPhoneRecIndicator("off"); // tear down the live "phone is recording" cue
     phoneCodeBadgeEl.style.display = "none";
     phoneStopBtnEl.style.display = "none";
     phoneStartBtnEl.style.display = "";
@@ -3265,6 +3329,21 @@ right lower quadrant"></textarea>
       return;
     }
 
+    if (msg.message_type === "phone_recording") {
+      // The paired phone started/stopped capturing — surface a live indicator so
+      // the desktop user knows audio is flowing before the text arrives. A
+      // delivery proves a phone is on the link, same as phone_join.
+      onPhoneJoined();
+      if (msg.state === "stop") {
+        setPhoneRecIndicator("transcribing");
+        setStatus("📱 Phone finished — transcribing… (Code: " + phoneSessionCode + ")", "warn");
+      } else {
+        setPhoneRecIndicator("recording");
+        setStatus("📱 Phone is recording — the text lands here on release. (Code: " + phoneSessionCode + ")", "ok");
+      }
+      return;
+    }
+
     if (msg.message_type === "session_started") {
       setStatus("Phone connected. Listening... (Code: " + phoneSessionCode + ")", "ok");
       return;
@@ -3293,6 +3372,7 @@ right lower quadrant"></textarea>
       // A delivery proves a phone is on the link — close the pairing overlay if
       // the phone_join ping was missed (it is not buffered/replayed).
       onPhoneJoined();
+      setPhoneRecIndicator("off"); // the dictation landed — drop the recording/transcribing cue
       // The room replays the last delivery to (re)connecting listeners so a
       // link drop cannot lose it; the phone's delivery queue can also re-POST a
       // held delivery. Dedupe against a RING of recent ids, not just the last

@@ -46,7 +46,7 @@ Start/done beeps are optional (Options). Failure and warn alarms always play, an
 
 ## Phone link
 
-For setups where the desktop can't get a good mic. On the desktop, **Pair a phone** shows a QR + 6-char code (QR generated on-page, never an external service — the code is the only credential). The phone joins, switches to a **big-button layout** (one push-to-talk button, whole-screen status, haptics mirroring the beeps), and dictates in batch; the final text POSTs to the desktop, which writes the clipboard. Pairing survives reloads and app restarts on both sides until End session (desktop) / Leave (phone). The resilience machinery (heartbeat, reconnect, delivery queue, dedupe, focus-retry, and the AHK `/latest` poller for focus-free pasting) is detailed in `CLAUDE.md`.
+For setups where the desktop can't get a good mic. On the desktop, **Pair a phone** shows a QR + 6-char code (QR generated on-page, never an external service — the code is the only credential). The phone joins, switches to a **big-button layout** (one push-to-talk button, whole-screen status, haptics mirroring the beeps), and dictates in batch; the final text POSTs to the desktop, which writes the clipboard. While the phone is dictating, the desktop shows a live **"📱 Phone is recording…"** indicator (a pulsing dot that flips to "transcribing…" on release and clears when the text lands) so I know audio is flowing before the note arrives — it's a relayed, fire-and-forget cue, never load-bearing. Pairing survives reloads and app restarts on both sides until End session (desktop) / Leave (phone). The resilience machinery (heartbeat, reconnect, delivery queue, dedupe, focus-retry, and the AHK `/latest` poller for focus-free pasting) is detailed in `CLAUDE.md`.
 
 ## Keyterms
 

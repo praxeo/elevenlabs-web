@@ -2127,6 +2127,104 @@ console.log('--- scenario 26: phone pairing overlay ---');
   check('s26p: joining POSTs a phone_join ping so the desktop overlay can close', !!joinPing, fetch26p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
 }
 
+// ===== Scenario 26r: desktop "phone is recording" indicator =====
+// A paired phone fires a relayed-but-unbuffered phone_recording ping on capture
+// start/stop; the desktop reflects it as a live indicator (recording ->
+// transcribing -> cleared on delivery). The phone POSTs the ping only when
+// joined.
+console.log('--- scenario 26r: phone-recording indicator ---');
+{
+  // ---- Desktop: phone_recording start/stop drives the badge; delivery clears it ----
+  const socks26r = [];
+  const dom26r = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks26r.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc26r = dom26r.window.document;
+  const badge26r = doc26r.getElementById('phoneRecBadge');
+  const status26r = () => doc26r.getElementById('status').textContent;
+  check('s26r: the indicator lives on the primary card and starts hidden', !!badge26r && doc26r.querySelector('section.card').contains(badge26r) && badge26r.style.display === 'none', badge26r ? badge26r.style.display : 'missing');
+
+  doc26r.getElementById('pairPhoneBtn').click(); // start a session + listener socket
+  await sleep(20);
+  const sock26r = socks26r.find((s) => s.url.includes('/api/session/'));
+  sock26r.open();
+  await sleep(10);
+
+  sock26r.msg({ message_type: 'phone_recording', state: 'start' });
+  await sleep(10);
+  check('s26r: a phone_recording start shows the recording indicator', badge26r.style.display !== 'none' && badge26r.className === 'rec' && badge26r.textContent.toLowerCase().includes('recording'), badge26r.textContent + ' / ' + badge26r.className);
+  check('s26r: a recording start is announced on the status line', status26r().toLowerCase().includes('recording'), status26r());
+
+  sock26r.msg({ message_type: 'phone_recording', state: 'stop' });
+  await sleep(10);
+  check('s26r: a phone_recording stop flips to the transcribing state', badge26r.style.display !== 'none' && badge26r.className === 'xcribe' && badge26r.textContent.toLowerCase().includes('transcrib'), badge26r.textContent + ' / ' + badge26r.className);
+
+  sock26r.msg({ message_type: 'phone_delivery', text: 'Indicator note.', delivery_id: 'ri1' });
+  await sleep(20);
+  check('s26r: the delivery clears the indicator', badge26r.style.display === 'none', badge26r.style.display);
+  check('s26r: the delivered text reaches the clipboard', (dom26r.window._clip || '').includes('Indicator note.'), dom26r.window._clip);
+
+  // A recording start that arrives before any join still pairs (acts like phone_join).
+  sock26r.msg({ message_type: 'phone_recording', state: 'start' });
+  await sleep(10);
+  check('s26r: a recording ping proves a phone is on the link (pairs the button)', doc26r.getElementById('pairPhoneBtn').textContent.toLowerCase().includes('paired'), doc26r.getElementById('pairPhoneBtn').textContent);
+
+  // Ending the session tears the indicator down.
+  doc26r.getElementById('phoneStopBtn') && doc26r.getElementById('phoneStopBtn').click();
+  await sleep(10);
+  check('s26r: ending the session hides the indicator', badge26r.style.display === 'none', badge26r.style.display);
+
+  // ---- Phone: recording POSTs phone_recording start (only when joined) ----
+  const fetch26rp = [];
+  const dom26rp = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch26rp.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/deliver')) return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"Phone note."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new win.Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc26rp = dom26rp.window.document;
+  doc26rp.getElementById('phoneJoinInput').value = 'RECIND';
+  doc26rp.getElementById('phoneJoinBtn').click();
+  doc26rp.getElementById('apiKey').value = 'test-key';
+  doc26rp.getElementById('recordBtn').click(); // start recording
+  await sleep(80);
+  const recStartPing = fetch26rp.find((c) => c.url.includes('/api/session/RECIND/deliver') && c.opts && String(c.opts.body).includes('phone_recording') && String(c.opts.body).includes('"start"'));
+  check('s26rp: a joined phone POSTs a phone_recording start ping on capture', !!recStartPing, fetch26rp.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+  doc26rp.getElementById('recordBtn').click(); // stop -> upload
+  await sleep(600);
+  const recStopPing = fetch26rp.find((c) => c.url.includes('/api/session/RECIND/deliver') && c.opts && String(c.opts.body).includes('phone_recording') && String(c.opts.body).includes('"stop"'));
+  check('s26rp: the joined phone POSTs a phone_recording stop ping when capture ends', !!recStopPing);
+}
+
 // ===== Scenario 27: mic-tips onboarding (keep other voices out) =====
 // A one-time, phone-first nudge: iOS Voice Isolation steps + close-mic / push-
 // to-talk discipline. Auto-shows once on the big-button surface, dismissal

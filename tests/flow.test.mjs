@@ -414,6 +414,18 @@ check('box highlighted while armed', doc.getElementById('latest').className.incl
 check('Append-next button shows the active state', doc.getElementById('appendToggleBtn').className.includes('active'));
 doc.getElementById('appendToggleBtn').click(); // second click cancels
 check('second click disarms', doc.getElementById('appendChip').style.display === 'none');
+
+// Clicking into the box arms append too (focus handler), so the box lighting up
+// and "next dictation appends" are the same gesture.
+doc.getElementById('latest').dispatchEvent(new w.Event('focus', { bubbles: false }));
+check('focusing the box arms append',
+  doc.getElementById('appendChip').style.display !== 'none' &&
+  doc.getElementById('latest').className.includes('armed') &&
+  doc.getElementById('appendToggleBtn').className.includes('active'),
+  doc.getElementById('appendChip').textContent);
+doc.getElementById('appendToggleBtn').click(); // disarm to reset state
+check('box focus-arm can be cancelled by the button', doc.getElementById('appendChip').style.display === 'none');
+
 doc.getElementById('appendToggleBtn').click(); // re-arm for the real run
 
 fetchQueue.push({ status: 200, body: { text: 'Beta.' } });

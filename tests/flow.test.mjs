@@ -462,9 +462,16 @@ clipboard = '';
 doc.getElementById('copyBtn').click();
 await sleep(40);
 check('s31: edited active-box text is what Copy latest copies', clipboard.includes('Patient stable today.'), JSON.stringify(clipboard));
+// Copy latest also FILES the note (Option B): the box clears and the slot shows it.
+check('s31: Copy latest clears the box', !doc.getElementById('latest').textContent.trim(), JSON.stringify(doc.getElementById('latest').textContent));
+check('s31: Copy latest fills the Last dictation slot',
+  doc.getElementById('lastDictation').style.display !== 'none' && doc.getElementById('lastDictationText').textContent.includes('Patient stable today.'),
+  doc.getElementById('lastDictationText').textContent);
 
-// An appended dictation must splice onto the EDITED base, not the original.
-doc.getElementById('appendToggleBtn').click();
+// Bring the filed note back via the slot's "Append to this", then append onto
+// it: the dictation must splice onto the EDITED base, not the original typo.
+doc.getElementById('lastAppendBtn').click();
+check('s31: "Append to this" reloads the filed note into the box', doc.getElementById('latest').textContent.includes('Patient stable today.'), doc.getElementById('latest').textContent);
 fetchQueue.push({ status: 200, body: { text: 'Plan unchanged.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -500,6 +507,43 @@ check('s31: edited history text persisted to storage', savedHist[0] && savedHist
 check('s31: edited history entry is stamped editedAt', !!(savedHist[0] && savedHist[0].editedAt));
 const reItem = doc.querySelector('.history-item');
 check('s31: re-rendered history shows an "edited" marker', reItem.querySelector('.history-meta').textContent.includes('edited'), reItem.querySelector('.history-meta').textContent);
+
+// ===== Scenario 32: Last-dictation slot + Copy-files-and-readies (Option B) =====
+// The active box holds the current note; finishing it (Copy latest, Clear box,
+// or starting a fresh dictation) FILES it into the "Last dictation" slot and
+// readies the box for a new note. The slot has its own Copy + "Append to this".
+console.log('--- scenario 32: last-dictation slot ---');
+doc.getElementById('freshBtn').click(); // clean slate
+fetchQueue.push({ status: 200, body: { text: 'Note one.' } });
+doc.getElementById('recordBtn').click(); await sleep(120);
+doc.getElementById('recordBtn').click(); await sleep(300);
+check('s32: note one is in the active box', doc.getElementById('latest').textContent.includes('Note one.'), doc.getElementById('latest').textContent);
+
+// Starting a NEW (fresh) dictation files the previous note into the slot.
+fetchQueue.push({ status: 200, body: { text: 'Note two.' } });
+doc.getElementById('recordBtn').click(); await sleep(120);
+doc.getElementById('recordBtn').click(); await sleep(300);
+check('s32: fresh start files the previous note to the slot', doc.getElementById('lastDictationText').textContent.includes('Note one.'), doc.getElementById('lastDictationText').textContent);
+check('s32: box now holds the new note only', doc.getElementById('latest').textContent.includes('Note two.') && !doc.getElementById('latest').textContent.includes('Note one.'), doc.getElementById('latest').textContent);
+
+// Slot "Copy" grabs the filed note without disturbing the box.
+clipboard = '';
+doc.getElementById('lastCopyBtn').click();
+await sleep(40);
+check('s32: slot Copy copies the filed note', clipboard.includes('Note one.'), JSON.stringify(clipboard));
+check('s32: slot Copy leaves the box alone', doc.getElementById('latest').textContent.includes('Note two.'), doc.getElementById('latest').textContent);
+
+// The slot hides during a recording (the box owns the screen mid-session).
+fetchQueue.push({ status: 200, body: { text: 'Note three.' } });
+doc.getElementById('recordBtn').click();
+await sleep(60);
+check('s32: slot is hidden mid-session', doc.getElementById('lastDictation').style.display === 'none', doc.getElementById('lastDictation').style.display);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+
+// Clearing history empties the slot too (the slot mirrors the saved note).
+doc.getElementById('clearBtn').click();
+check('s32: clearing history empties the slot', doc.getElementById('lastDictation').style.display === 'none', doc.getElementById('lastDictation').style.display);
 
 // ===== Scenario 18: keyterm presets — injected lists, merge, dedupe, persistence =====
 console.log('--- scenario 18: keyterm presets ---');

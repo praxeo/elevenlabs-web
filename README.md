@@ -12,8 +12,8 @@ Hold a key, speak, release. The audio uploads to ElevenLabs Scribe v2 (batch) an
 - **The noise gate decides what's transcribed.** mic → high-pass → gate → recorder, and the post-gate recording is exactly what's uploaded — so gate tuning changes the transcript, not just a preview.
 - **Live capture feedback.** A waveform, a "Hearing you" light, and a timer while recording, all on-device from the analyser. Nothing streams; it just proves the mic is live. (This is the reassurance realtime used to give, for free.)
 - **One note per dictation.** ➕ Append next adds the next dictation onto the current note (a one-shot); append mode keeps chaining until I turn it off or clear the box. Always explicit — no hidden timer.
-- **Copy files the note.** "Copy latest" copies the note *and* readies a fresh box: the note drops into the **Last dictation** slot right below (with its own Copy + "➕ Append to this"). Starting a new dictation or "Clear dictation box" files it the same way. The box holds the note until then, so it stays editable/appendable until I'm done with it.
-- **Editable boxes.** The active box is hand-editable between dictations; History rows have Edit/Save/Cancel. Edits flow through to Copy, Append, and delivery.
+- **Copy files the note.** "Copy & clear" copies the note *and* readies a fresh box: the note drops into the **Last dictation** slot right below (with its own Copy + "➕ Append to this"). Starting a new dictation or "Clear dictation box" files it the same way. The box holds the note until then, so it stays editable/appendable until I'm done with it.
+- **Everything is editable in place.** The active box, the Last dictation slot, and every History row are all directly hand-editable — click to place the caret and type. Edits persist on blur (history stamps "· edited"; Esc reverts a history row), and flow through to Copy, Append, and delivery.
 
 ### Audio cues — meant to be used without watching the screen
 

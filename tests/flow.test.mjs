@@ -488,25 +488,23 @@ doc.getElementById('recordBtn').click();
 await sleep(300);
 check('s31: active box is editable again after delivery', latestBox.getAttribute('contenteditable') === 'true', latestBox.getAttribute('contenteditable'));
 
-// History editing: open the list, edit the newest entry in place, save it.
+// History editing: open the list, click into the newest entry, edit it in place.
+// Rows are directly contenteditable now (click-to-place-caret); edits persist on
+// blur (no Edit/Save buttons).
 if (doc.getElementById('history').style.display === 'none') doc.getElementById('toggleHistoryBtn').click();
 check('s31: history list is visible', doc.getElementById('history').style.display !== 'none');
 const firstItem = doc.querySelector('.history-item');
 check('s31: history renders items', !!firstItem);
 const itemText = firstItem.querySelector('.history-text');
-const editBtn = Array.from(firstItem.querySelectorAll('button')).find((b) => b.textContent === 'Edit');
-check('s31: history item has an Edit button', !!editBtn);
-editBtn.click();
-check('s31: editing makes the history text editable', itemText.getAttribute('contenteditable') === 'true');
+check('s31: history text is directly editable (contenteditable)', itemText.getAttribute('contenteditable') === 'true', itemText.getAttribute('contenteditable'));
+itemText.dispatchEvent(new w.Event('focus', { bubbles: true }));
 itemText.textContent = 'Locked note, corrected.';
-const saveBtn = Array.from(firstItem.querySelectorAll('button')).find((b) => b.textContent === 'Save');
-saveBtn.click();
+itemText.dispatchEvent(new w.Event('blur', { bubbles: true })); // persist on blur
 await sleep(20);
 const savedHist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
 check('s31: edited history text persisted to storage', savedHist[0] && savedHist[0].text === 'Locked note, corrected.', JSON.stringify(savedHist[0]));
 check('s31: edited history entry is stamped editedAt', !!(savedHist[0] && savedHist[0].editedAt));
-const reItem = doc.querySelector('.history-item');
-check('s31: re-rendered history shows an "edited" marker', reItem.querySelector('.history-meta').textContent.includes('edited'), reItem.querySelector('.history-meta').textContent);
+check('s31: the "edited" marker shows in place', firstItem.querySelector('.history-meta').textContent.includes('edited'), firstItem.querySelector('.history-meta').textContent);
 
 // ===== Scenario 32: Last-dictation slot + Copy-files-and-readies (Option B) =====
 // The active box holds the current note; finishing it (Copy latest, Clear box,
@@ -532,6 +530,20 @@ doc.getElementById('lastCopyBtn').click();
 await sleep(40);
 check('s32: slot Copy copies the filed note', clipboard.includes('Note one.'), JSON.stringify(clipboard));
 check('s32: slot Copy leaves the box alone', doc.getElementById('latest').textContent.includes('Note two.'), doc.getElementById('latest').textContent);
+
+// The slot text is hand-editable too: place the caret, edit, and the change
+// persists on blur to its history entry (stamped editedAt).
+const slotText = doc.getElementById('lastDictationText');
+check('s32: slot text is directly editable (contenteditable)', slotText.getAttribute('contenteditable') === 'true', slotText.getAttribute('contenteditable'));
+slotText.focus();
+slotText.textContent = 'Note one corrected.';
+slotText.dispatchEvent(new w.Event('input', { bubbles: true }));
+slotText.blur();
+await sleep(20);
+const histAfterSlotEdit = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+check('s32: editing the slot persists to its history entry',
+  histAfterSlotEdit.some((it) => it.text === 'Note one corrected.' && it.editedAt),
+  JSON.stringify(histAfterSlotEdit.map((it) => it.text)));
 
 // The slot hides during a recording (the box owns the screen mid-session).
 fetchQueue.push({ status: 200, body: { text: 'Note three.' } });

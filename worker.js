@@ -640,7 +640,7 @@ const INDEX_HTML = `<!doctype html>
       </div>
 
       <label>Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
-      <div id="latest" class="big" title="Click to edit this text directly. Use 'Append next' to add the next dictation to this note."></div>
+      <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
       <div class="row" style="margin-top: 10px;">
         <button id="copyBtn">Copy latest</button>
@@ -3703,9 +3703,9 @@ right lower quadrant"></textarea>
   };
 
   // "Append next" arms a one-shot: the next dictation is added onto the current
-  // note instead of starting fresh — beats the append-mode checkbox/window; tap
-  // again to cancel. (Clicking the box itself now places the edit cursor, so
-  // arming lives on its own button, not the box.) Ignored while a session runs.
+  // note instead of starting fresh — independent of the append-mode checkbox;
+  // tap again to cancel. (Clicking into the box arms this too via its focus
+  // handler; this button is the explicit toggle/cancel.) Ignored mid-session.
   function toggleAppendArm() {
     if (recording || stopping || finishing) return;
     if (!latestText || !latestText.trim()) return;
@@ -3730,6 +3730,21 @@ right lower quadrant"></textarea>
     updateAppendChip(); // mirrors text + armed state into the big peek too
   });
   latestEl.addEventListener("paste", plainTextPaste);
+
+  // Clicking into the box also arms a one-shot append: the next dictation adds
+  // onto this note instead of starting fresh. The box already lights up on
+  // :focus with the same accent glow as the .armed state, so click-to-edit and
+  // click-to-append are now one gesture. The click places the caret normally
+  // (no select-all — a stray keystroke must never wipe the note). Guarded to
+  // idle + non-empty, mirroring toggleAppendArm; tap "Append next" to cancel.
+  latestEl.addEventListener("focus", function () {
+    if (recording || stopping || finishing) return;
+    if (!latestText || !latestText.trim()) return;
+    if (appendArmed) return;
+    appendArmed = true;
+    updateAppendChip();
+    setStatus("Next dictation will append to this text (tap 'Append next' to cancel).", "");
+  });
   refreshLatestEditable();
 
   hotkeyBtn.onclick = () => {

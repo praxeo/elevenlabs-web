@@ -649,7 +649,7 @@ const INDEX_HTML = `<!doctype html>
       <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
       <div class="row" style="margin-top: 10px;">
-        <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy latest</button>
+        <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
       </div>
@@ -1299,13 +1299,20 @@ right lower quadrant"></textarea>
   // Hidden when empty or mid-session so the compact card stays compact.
   function renderLastDictation() {
     if (!lastDictationEl) return;
+    // The slot text is hand-editable while idle (contenteditable + persist on
+    // blur, see the slot handlers) — so while it's being edited, keep it shown
+    // and never rewrite textContent (that would collapse the caret).
+    const editing = lastDictationTextEl && document.activeElement === lastDictationTextEl;
     const t = (archivedText || "").trim();
-    if (!t || recording || stopping || finishing) {
+    if ((!t && !editing) || recording || stopping || finishing) {
       lastDictationEl.style.display = "none";
       return;
     }
     lastDictationEl.style.display = "";
-    if (lastDictationTextEl) lastDictationTextEl.textContent = t;
+    if (lastDictationTextEl) {
+      lastDictationTextEl.setAttribute("contenteditable", "true");
+      if (!editing) lastDictationTextEl.textContent = t;
+    }
     // "Append to this" pulls the slot note back into the box, so it only makes
     // sense when the box is empty — otherwise it would clobber the active note
     // (use the box's own "Append next" then). Disable it while the box has text.
@@ -1842,10 +1849,39 @@ right lower quadrant"></textarea>
         (item.engine ? " · " + item.engine : "") +
         (item.editedAt ? " · edited" : "");
 
+      // Past transcripts are hand-editable in place — like the active box and
+      // the "Last dictation" slot: the text is contenteditable, so a click lands
+      // the caret and you just type. Edits persist on blur, keyed by createdAt
+      // (a re-render can't hit the wrong row) and stamped editedAt ("· edited").
+      // Escape reverts to the pre-edit text. Plain-text paste, no clipboard side
+      // effects (persist never copies). A no-op edit (unchanged text) is skipped.
       const text = document.createElement("div");
       text.className = "history-text";
+      text.setAttribute("contenteditable", "true");
       text.textContent = item.text;
       text.addEventListener("paste", plainTextPaste);
+
+      let original = item.text;
+      text.addEventListener("focus", () => { original = text.textContent; });
+      text.addEventListener("keydown", (e) => {
+        if (e.key === "Escape") { text.textContent = original; text.blur(); }
+      });
+      text.addEventListener("blur", () => {
+        const newText = text.textContent;
+        if (newText === original) return;
+        const all = getHistory();
+        const i = all.findIndex((it) => it.createdAt === item.createdAt);
+        if (i < 0) return;
+        all[i].text = newText;
+        all[i].editedAt = new Date().toISOString();
+        // Persist directly (not setHistory) so the live re-render can't tear down
+        // this row mid-interaction; reflect the "edited" marker in place instead.
+        localStorage.setItem(STORE_KEY, JSON.stringify(all.slice(0, 100)));
+        meta.textContent = new Date(item.createdAt).toLocaleString() +
+          (item.engine ? " · " + item.engine : "") + " · edited";
+        original = newText;
+        setStatus("Saved edit to the transcript.", "ok");
+      });
 
       const row = document.createElement("div");
       row.className = "row";
@@ -1856,51 +1892,7 @@ right lower quadrant"></textarea>
       // Copy the current (possibly mid-edit) text, not a stale snapshot.
       copy.onclick = () => copyText(text.textContent);
 
-      const edit = document.createElement("button");
-      edit.textContent = "Edit";
-
-      const save = document.createElement("button");
-      save.textContent = "Save";
-      save.style.display = "none";
-
-      const cancel = document.createElement("button");
-      cancel.textContent = "Cancel";
-      cancel.style.display = "none";
-
-      // Editing a past transcript in place — explicit Save writes it back to
-      // storage (keyed by createdAt so a re-render between open and save can't
-      // hit the wrong row), Cancel restores the pre-edit text. Independent of
-      // the live box; failures stay loud (Save only persists, never clipboards).
-      let original = item.text;
-      function enterEdit() {
-        original = text.textContent;
-        text.setAttribute("contenteditable", "true");
-        edit.style.display = "none";
-        save.style.display = "";
-        cancel.style.display = "";
-        text.focus();
-      }
-      edit.onclick = enterEdit;
-      cancel.onclick = () => {
-        text.textContent = original;
-        text.setAttribute("contenteditable", "false");
-        edit.style.display = "";
-        save.style.display = "none";
-        cancel.style.display = "none";
-      };
-      save.onclick = () => {
-        const newText = text.textContent;
-        const all = getHistory();
-        const i = all.findIndex((it) => it.createdAt === item.createdAt);
-        if (i >= 0) {
-          all[i].text = newText;
-          all[i].editedAt = new Date().toISOString();
-          setHistory(all); // re-renders the list (replacing this DOM), back to read-only
-          setStatus("Saved edit to the transcript.", "ok");
-        }
-      };
-
-      row.append(copy, edit, save, cancel);
+      row.append(copy);
       div.append(meta, text, row);
       historyEl.append(div);
     }
@@ -1932,7 +1924,7 @@ right lower quadrant"></textarea>
   async function copyText(text) {
     const ok = await clipboardWrite(text);
     setStatus(ok ? "Copied to clipboard."
-                 : "Clipboard copy failed — keep this tab focused, then click 'Copy latest'.",
+                 : "Clipboard copy failed — keep this tab focused, then click 'Copy & clear'.",
               ok ? "ok" : "err");
     return ok;
   }
@@ -2672,9 +2664,9 @@ right lower quadrant"></textarea>
       if (announceRelayOutcome) {
         setStatus((copied
           ? "Transcript copied here and sent to the desktop — confirming delivery…"
-          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy latest' if you need it here)") + noteSuffix, "warn");
+          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy & clear' if you need it here)") + noteSuffix, "warn");
       } else if (!copied) {
-        setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy latest'.", "err");
+        setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy & clear'.", "err");
         failBeep();
       } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — PARTIAL transcript copied. Verify it before pasting!", "err");
@@ -3745,9 +3737,37 @@ right lower quadrant"></textarea>
     setStatus("Copied — filed below as 'Last dictation'. The box is ready for a new note.", "ok");
   };
 
+  // The "Last dictation" slot text is hand-editable too (like the active box and
+  // history rows): the caret lands where you click, edits keep archivedText live
+  // (so the slot's Copy/Append use the edited text), and on blur the edit is
+  // persisted back to its history entry (matched by the pre-edit text, stamped
+  // editedAt). A blanked slot never wipes the saved note. Plain-text paste.
+  var slotEditBase = "";
+  function persistSlotEdit() {
+    if (!lastDictationTextEl) return;
+    const newText = (lastDictationTextEl.textContent || "").trim();
+    archivedText = lastDictationTextEl.textContent;
+    if (!newText || newText === (slotEditBase || "").trim()) return;
+    const all = getHistory();
+    const i = all.findIndex(function (it) { return (it.text || "").trim() === (slotEditBase || "").trim(); });
+    if (i >= 0) {
+      all[i].text = lastDictationTextEl.textContent;
+      all[i].editedAt = new Date().toISOString();
+      setHistory(all); // persist + re-render the list (the slot DOM is separate)
+      setStatus("Saved edit to the last dictation.", "ok");
+    }
+    slotEditBase = newText;
+  }
+  if (lastDictationTextEl) {
+    lastDictationTextEl.addEventListener("focus", function () { slotEditBase = (archivedText || "").trim(); });
+    lastDictationTextEl.addEventListener("input", function () { archivedText = lastDictationTextEl.textContent; });
+    lastDictationTextEl.addEventListener("blur", persistSlotEdit);
+    lastDictationTextEl.addEventListener("paste", plainTextPaste);
+  }
+
   // Slot "Copy": copy the filed note straight to the clipboard, leaving the box
   // (and the slot) untouched — a re-grab of an older note, not a state change.
-  if (lastCopyBtn) lastCopyBtn.onclick = () => { if (archivedText) copyText(archivedText); };
+  if (lastCopyBtn) lastCopyBtn.onclick = () => { if (archivedText && archivedText.trim()) copyText(archivedText); };
 
   // Slot "Append to this": bring the filed note back into the box and arm a
   // one-shot append so the next dictation continues it. Only valid when the box

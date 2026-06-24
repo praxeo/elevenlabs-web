@@ -194,7 +194,9 @@ node --check /tmp/served.js
 # 31  editing the dictation surfaces: the active box (#latest) is contenteditable
 #     while idle and locks during a session; hand-edits feed Copy/Append/delivery;
 #     history rows are directly contenteditable (click-to-edit, persist on blur,
-#     editedAt + "edited" marker — no Edit/Save buttons)
+#     editedAt + "edited" marker — no Edit/Save buttons); history paginates to the
+#     newest HISTORY_PAGE (10) with a "Show N more"/"Show fewer" control (the top
+#     toggle still shows the full count)
 # 32  last-dictation slot (Option B): Copy & clear copies AND files the note into
 #     the #lastDictation slot + clears the box; a fresh start files the replaced
 #     note too; the slot's Copy re-grabs it, "Append to this" reloads it + arms

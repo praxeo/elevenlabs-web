@@ -1124,6 +1124,7 @@ right lower quadrant"></textarea>
   let maxRmsSeen = 0;
   let micAlarmFired = false;
   let mutedSince = 0;
+  let ctxNotRunningSince = 0; // ms the AudioContext has been non-"running" mid-dictation; debounces the interruption alarm so a transient iOS blip doesn't fail a healthy take
   let connectTimer = null;
   let tailTimer = null;
   let finalDeadlineTimer = null;
@@ -1215,6 +1216,7 @@ right lower quadrant"></textarea>
 
   const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
+  const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
 
@@ -2094,6 +2096,22 @@ right lower quadrant"></textarea>
       if (wakeLock && !wakeLock.released) return; // already held — don't stack sentinels
       if (navigator.wakeLock && navigator.wakeLock.request) {
         wakeLock = await navigator.wakeLock.request("screen");
+        // iOS drops the lock on its own (not only on hide — low-power mode, system
+        // events), and nothing else re-arms it until the next focus/visibility
+        // event, so the screen sleeps and reclaims the mic BETWEEN takes on the
+        // big-button surface. Re-acquire on release while the surface is still up
+        // and visible. Gated on bigButtonActive (not wakeLockDesired) so an
+        // intentional desktop release at deliverFinalText — fired while finishing
+        // is still true — is not immediately undone.
+        if (wakeLock && wakeLock.addEventListener) {
+          wakeLock.addEventListener("release", function () {
+            if (bigButtonActive() && document.visibilityState === "visible") {
+              setTimeout(function () {
+                if (bigButtonActive() && document.visibilityState === "visible") acquireWakeLock();
+              }, 400);
+            }
+          });
+        }
       }
     } catch (e) {}
   }
@@ -2122,6 +2140,20 @@ right lower quadrant"></textarea>
     // permanently muted — that is a dead mic, rebuild from scratch.
     if (track.muted) return false;
     return true;
+  }
+
+  // Fire the mid-dictation interruption alarm IFF the AudioContext is still
+  // non-running and has been for longer than the grace — the deferred re-check
+  // armed by onstatechange. Loud and never auto-cleared (a real interruption
+  // dropped audio); a blip that already recovered to "running" is a no-op.
+  function maybeAlarmCtxInterrupted() {
+    if (!recording || stopping || micAlarmFired) return;
+    if (!audioCtx || audioCtx.state === "running") return;
+    if (!ctxNotRunningSince || Date.now() - ctxNotRunningSince <= CTX_INTERRUPT_GRACE_MS) return;
+    micAlarmFired = true;
+    setMicPill("fail");
+    micAlarmBeep();
+    setStatus("⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate.", "err");
   }
 
   async function ensureAudio() {
@@ -2190,20 +2222,20 @@ right lower quadrant"></textarea>
     if (audioCtx.state === "suspended") {
       try { await audioCtx.resume(); } catch (e) {}
     }
-    // Instant detection of a mid-dictation interruption: iOS fires statechange
-    // when Siri / a call / another app takes the audio session ("suspended" or
-    // "interrupted"). The 30ms watchdog catches it too, but the event fires even
-    // when the gate timer is being throttled. Alarm only while recording and
-    // after a short start-up grace; never auto-clear — fail loud, redictate.
+    // Detect a mid-dictation interruption: iOS fires statechange when Siri / a
+    // call / another app takes the audio session ("suspended" or "interrupted").
+    // The 30ms watchdog catches it too, but the event fires even when the gate
+    // timer is being throttled. DON'T alarm on the first transition — iOS emits
+    // spurious interrupted->running blips that drop no audio, and instant-firing
+    // turned those into failed dictations (the mic-stability regression). Stamp
+    // the start of the non-running window and only alarm if it persists past the
+    // grace (re-checked here AND by the watchdog); never auto-clear a real one.
     audioCtx.onstatechange = () => {
-      if (recording && !stopping && !micAlarmFired &&
-          audioCtx && audioCtx.state !== "running" &&
-          Date.now() - recStartedAt > 200) {
-        micAlarmFired = true;
-        setMicPill("fail");
-        micAlarmBeep();
-        setStatus("⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate.", "err");
-      }
+      if (!audioCtx) return;
+      if (audioCtx.state === "running") { ctxNotRunningSince = 0; return; }
+      if (!recording || stopping || micAlarmFired || Date.now() - recStartedAt <= 200) return;
+      if (!ctxNotRunningSince) ctxNotRunningSince = Date.now();
+      setTimeout(maybeAlarmCtxInterrupted, CTX_INTERRUPT_GRACE_MS + 30);
     };
     // Diagnostic (one-time): surface the true hardware sample rate so a stealth
     // hardware-rate surprise is never invisible.
@@ -2305,15 +2337,23 @@ right lower quadrant"></textarea>
           mutedSince = 0;
         }
 
+        // A suspended/interrupted AudioContext mid-dictation freezes the
+        // analyser at its last buffer (the spec says it returns the same data),
+        // so the flatline check below goes blind on stale non-zero peaks. Track
+        // how long the context has been non-running so a SUSTAINED interruption
+        // still alarms, while a transient iOS blip that snaps back to "running"
+        // within the grace does not kill a healthy take.
+        if (audioCtx && audioCtx.state !== "running") {
+          if (!ctxNotRunningSince) ctxNotRunningSince = nowMs;
+        } else {
+          ctxNotRunningSince = 0;
+        }
+
         if (!micAlarmFired) {
           const flatline = nowMs - recStartedAt > 2500 && maxRmsSeen < FLATLINE_RMS;
           const mutedLong = mutedSince && nowMs - mutedSince > 1500;
-          // A suspended/interrupted AudioContext mid-dictation freezes the
-          // analyser at its last buffer (the spec says it returns the same
-          // data), so the flatline check above goes blind on stale non-zero
-          // peaks. Treat a non-running context as its own alarm, after a short
-          // start-up grace so a momentary start blip cannot false-fire.
-          const ctxDead = audioCtx && audioCtx.state !== "running" && nowMs - recStartedAt > 200;
+          const ctxDead = ctxNotRunningSince && nowMs - ctxNotRunningSince > CTX_INTERRUPT_GRACE_MS &&
+                          nowMs - recStartedAt > 200;
           if (trackDead || mutedLong || flatline || ctxDead) {
             micAlarmFired = true;
             setMicPill("fail");
@@ -2424,19 +2464,35 @@ right lower quadrant"></textarea>
 
     saveSettingsNow();
 
-    try {
-      await ensureAudio();
-      if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
-      if (!audioCtx || audioCtx.state !== "running") {
-        await writeSentinel();
-        setStatus("Audio not running. Click page once, then try again.", "err");
-        failBeep();
-        return;
+    // The press path must survive iOS's late audio-session hand-back. After a
+    // backgrounding, audioSuspect forces a fresh getUserMedia, and on the FIRST
+    // press back in the app that getUserMedia can fail and then succeed moments
+    // later — without a retry here that press died with "Microphone unavailable"
+    // (the "mic won't engage after returning" regression). Retry briefly; a real
+    // permission denial fails fast (retrying won't change it).
+    let audioErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await ensureAudio();
+        audioErr = null;
+        break;
+      } catch (e) {
+        audioErr = e;
+        if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) break;
+        if (attempt < 2) await new Promise(function (r) { setTimeout(r, 350); });
       }
-    } catch (e) {
+    }
+    if (audioErr) {
       await writeSentinel();
       setMicPill("fail");
-      setStatus("Microphone unavailable: " + (e && e.message ? e.message : e), "err");
+      setStatus("Microphone unavailable: " + (audioErr && audioErr.message ? audioErr.message : audioErr), "err");
+      failBeep();
+      return;
+    }
+    if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
+    if (!audioCtx || audioCtx.state !== "running") {
+      await writeSentinel();
+      setStatus("Audio not running. Click page once, then try again.", "err");
       failBeep();
       return;
     }
@@ -2470,6 +2526,7 @@ right lower quadrant"></textarea>
     maxRmsSeen = 0;
     micAlarmFired = false;
     mutedSince = 0;
+    ctxNotRunningSince = 0;
     clearSessionTimers();
 
     // Continue the current text when armed by clicking the transcript box
@@ -3294,6 +3351,26 @@ right lower quadrant"></textarea>
       phoneReconnectTimer = null;
       if (phoneSessionCode && !phoneSessionWs) connectPhoneSessionWs();
     }, phoneReconnectDelayMs);
+  }
+
+  // Desktop returning to the foreground: the listener socket commonly dies while
+  // the tab is backgrounded (browsers freeze background tabs and throttle the
+  // heartbeat timer; NAT idle-timeouts kill the socket without firing onclose),
+  // so a phone delivery sent meanwhile never arrived and the reconnect backoff
+  // timer was itself frozen. Reconnect/verify the link the instant the clinician
+  // looks at the desktop instead of waiting up to a throttled heartbeat tick —
+  // the room replays the buffered delivery on reconnect, so the note lands. This
+  // only NARROWS the loss window (it never force-closes a healthy socket: an open
+  // one is just pinged; phoneHeartbeat's own pong-timeout decides if it's a
+  // zombie). No-op on the phone (it has joinedSessionCode, not phoneSessionCode).
+  function reconnectPhoneLinkIfNeeded() {
+    if (!phoneSessionCode) return;
+    var ws = phoneSessionWs;
+    if (ws && ws.readyState === 1) { phoneHeartbeat(); return; } // open — verify, don't churn
+    if (ws && ws.readyState === 0) return;                       // already connecting
+    if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
+    phoneReconnectDelayMs = 0;
+    if (!phoneSessionWs) connectPhoneSessionWs();
   }
 
   function stopPhoneSession() {
@@ -4213,6 +4290,7 @@ right lower quadrant"></textarea>
       return;
     }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
+    reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden, so deliveries land
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
@@ -4224,6 +4302,7 @@ right lower quadrant"></textarea>
   // not visibilitychange — when switching back from another app.
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
+    reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });

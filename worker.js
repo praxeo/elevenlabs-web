@@ -415,7 +415,14 @@ const INDEX_HTML = `<!doctype html>
       border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
     }
     .lastdict-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
-    .lastdict-text { white-space: pre-wrap; font-size: 14px; max-height: 96px; overflow: auto; }
+    .lastdict-text { white-space: pre-wrap; font-size: 14px; max-height: 96px; overflow: auto; caret-color: var(--accent); }
+    /* While editing the slot, lift the height cap so the caret is never clipped
+       by the overflow container (the "invisible caret on a new line" bug) and
+       show the same accent edit ring as the active box (inset shadow = no reflow). */
+    .lastdict-text[contenteditable="true"]:focus {
+      outline: none; max-height: none; overflow: visible;
+      box-shadow: inset 0 0 0 1px var(--accent); border-radius: 8px;
+    }
     .hint { color: var(--muted); font-size: 13px; }
     .history-item { border-top: 1px solid var(--line); padding: 12px 0; }
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
@@ -685,7 +692,16 @@ const INDEX_HTML = `<!doctype html>
     </section>
 
     <section class="card">
-      <details class="help" id="authSection" style="margin-top: 0;">
+      <!-- Saved transcripts live at the TOP of this card for quick access to
+           past dictations (moved up from the bottom). Collapsed by default; the
+           persisted historyVisible toggle keeps the compact footprint. -->
+      <div class="row">
+        <button id="toggleHistoryBtn">Show saved transcripts</button>
+        <button id="clearBtn">Clear history</button>
+      </div>
+      <div id="history" style="display:none;"></div>
+
+      <details class="help" id="authSection">
         <summary id="authSummary">Access</summary>
         <div class="body">
           <div id="passphraseRow" style="display:none">
@@ -854,12 +870,6 @@ right lower quadrant"></textarea>
           </div>
         </div>
       </details>
-
-      <div class="row" style="margin-top: 14px;">
-        <button id="toggleHistoryBtn">Show saved transcripts</button>
-        <button id="clearBtn">Clear history</button>
-      </div>
-      <div id="history" style="display:none;"></div>
 
       <div class="hint" style="margin-top: 14px;">
         English‑only, Scribe v2. Mic stays warm between dictations for instant start.
@@ -1319,7 +1329,10 @@ right lower quadrant"></textarea>
     // and never rewrite textContent (that would collapse the caret).
     const editing = lastDictationTextEl && document.activeElement === lastDictationTextEl;
     const t = (archivedText || "").trim();
-    if ((!t && !editing) || recording || stopping || finishing) {
+    // Always available for edits/append — it no longer disappears mid-session.
+    // Only hidden when there is genuinely nothing filed (and not being edited),
+    // so an empty box never clutters the compact card.
+    if (!t && !editing) {
       lastDictationEl.style.display = "none";
       return;
     }
@@ -1329,9 +1342,10 @@ right lower quadrant"></textarea>
       if (!editing) lastDictationTextEl.textContent = t;
     }
     // "Append to this" pulls the slot note back into the box, so it only makes
-    // sense when the box is empty — otherwise it would clobber the active note
-    // (use the box's own "Append next" then). Disable it while the box has text.
-    if (lastAppendBtn) lastAppendBtn.disabled = Boolean(latestText && latestText.trim());
+    // sense when the box is empty and we're idle — otherwise it would clobber the
+    // active note (use the box's own "Append next" then) or fight a live session.
+    if (lastAppendBtn) lastAppendBtn.disabled =
+      recording || stopping || finishing || Boolean(latestText && latestText.trim());
   }
 
   // File the given text into the slot (no-op for empty text, so filing an
@@ -2437,7 +2451,15 @@ right lower quadrant"></textarea>
     // (one-shot), or when append mode is on. Otherwise start fresh. The
     // decision is explicit — no time window — so the same action always
     // gives the same result (append vs. fresh is never clock-dependent).
-    if (appendArmed) {
+    if (joinedSessionCode) {
+      // Joined to a desktop: THIS device is only the microphone — the desktop
+      // owns the note and its append mode (see deliverRemoteText). Always deliver
+      // a single dictation; accumulating here too would double-append on the
+      // desktop (silent wrong text on a chart). A solo big-button device (not
+      // joined) still appends locally via the branches below.
+      appendArmed = false;
+      finalizedSegments = [];
+    } else if (appendArmed) {
       appendArmed = false; // consumed by this session
     } else if (!appendModeEl.checked) {
       // Starting fresh files the note being replaced into the "Last dictation"
@@ -3280,23 +3302,36 @@ right lower quadrant"></textarea>
   // Deliver text that arrived from the phone to this desktop's clipboard.
   // degraded = live-text fallback (the authoritative delivery never came).
   function deliverRemoteText(text, degraded) {
-    latestText = text;
-    latestEl.textContent = text;
-    addHistory(text, { language_code: "en", engine: "remote" });
+    // The desktop OWNS the note when a phone is the mic, so it honors THIS
+    // device's append mode / one-shot box-click arm: a phone dictation extends
+    // the current note instead of replacing it — mirroring single-desktop
+    // append, which the user expects to apply no matter which mic dictated. The
+    // joined phone delivers single segments (see startRecording) and the caller
+    // dedupes by delivery_id BEFORE us, so a replayed/retried delivery can never
+    // double-append. A one-shot arm is consumed here.
+    var base = (latestText || "").trim();
+    var wantAppend = Boolean(base) && (appendModeEl.checked || appendArmed);
+    appendArmed = false;
+    var combined = wantAppend ? cleanTranscript(base + " " + text) : text;
+    latestText = combined;
+    latestEl.textContent = combined;
+    finalizedSegments = combined.trim() ? [combined] : []; // keep the box model in sync for further edits/append
+    updateAppendChip(); // refresh the armed pill now the one-shot arm is consumed
+    addHistory(combined, { language_code: "en", engine: "remote" });
     if (!autoCopyEl.checked) {
       if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript saved, not copied. Verify it!", "warn"); warnBeep(); }
-      else          { setStatus("Phone transcript received.", "ok"); doneBeep(); }
+      else          { setStatus(wantAppend ? "Phone transcript appended." : "Phone transcript received.", "ok"); doneBeep(); }
       return;
     }
-    copyText(text).then(function(ok) {
+    copyText(combined).then(function(ok) {
       if (ok) {
         pendingCopyText = "";
         if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript copied instead (less accurate). Verify it!", "warn"); warnBeep(); }
-        else          { setStatus("Phone transcript copied. Done!", "ok"); doneBeep(); }
+        else          { setStatus(wantAppend ? "Phone transcript appended & copied. Done!" : "Phone transcript copied. Done!", "ok"); doneBeep(); }
       } else {
         // Clipboard writes need document focus, and this tab is usually behind
         // Citrix/Cerner when a delivery lands. Hold the text; retry on refocus.
-        pendingCopyText = text;
+        pendingCopyText = combined;
         setStatus("⚠ Phone transcript received but clipboard copy FAILED — click this window and it will copy itself. Do NOT paste before that!", "err");
         failBeep();
       }
@@ -3918,6 +3953,9 @@ right lower quadrant"></textarea>
   // handler; this button is the explicit toggle/cancel.) Ignored mid-session.
   function toggleAppendArm() {
     if (recording || stopping || finishing) return;
+    // Joined to a desktop: append is the DESKTOP's job (this device is only the
+    // mic — see startRecording/deliverRemoteText), so arming here would mislead.
+    if (joinedSessionCode) return;
     if (!latestText || !latestText.trim()) return;
     appendArmed = !appendArmed;
     updateAppendChip();
@@ -3949,6 +3987,7 @@ right lower quadrant"></textarea>
   // idle + non-empty, mirroring toggleAppendArm; tap "Append next" to cancel.
   latestEl.addEventListener("focus", function () {
     if (recording || stopping || finishing) return;
+    if (joinedSessionCode) return; // joined: append is the desktop's job; still editable, just don't arm
     if (!latestText || !latestText.trim()) return;
     if (appendArmed) return;
     appendArmed = true;

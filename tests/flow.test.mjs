@@ -545,11 +545,14 @@ check('s32: editing the slot persists to its history entry',
   histAfterSlotEdit.some((it) => it.text === 'Note one corrected.' && it.editedAt),
   JSON.stringify(histAfterSlotEdit.map((it) => it.text)));
 
-// The slot hides during a recording (the box owns the screen mid-session).
+// The slot now STAYS visible (and editable) mid-session — it no longer
+// disappears when a recording starts; the just-filed note shows in it. The
+// "Append to this" button is disabled mid-session (it loads into the box).
 fetchQueue.push({ status: 200, body: { text: 'Note three.' } });
 doc.getElementById('recordBtn').click();
 await sleep(60);
-check('s32: slot is hidden mid-session', doc.getElementById('lastDictation').style.display === 'none', doc.getElementById('lastDictation').style.display);
+check('s32: slot stays visible mid-session', doc.getElementById('lastDictation').style.display !== 'none', doc.getElementById('lastDictation').style.display);
+check('s32: "Append to this" is disabled mid-session', doc.getElementById('lastAppendBtn').disabled === true, String(doc.getElementById('lastAppendBtn').disabled));
 doc.getElementById('recordBtn').click();
 await sleep(300);
 
@@ -860,6 +863,30 @@ console.log('--- scenario 20: phone link resilience ---');
   sockB.msg({ message_type: 'phone_delivery', text: 'Authoritative note.', delivery_id: 'd4' });
   await sleep(10500);
   check('s20: delivery cancels the grace fallback', (w20._clip || '').includes('Authoritative note.') && !(w20._clip || '').includes('Stale live.'), JSON.stringify(w20._clip));
+
+  // Desktop OWNS append in the phone-link flow: with THIS device's append mode
+  // on, an incoming phone delivery EXTENDS the current note instead of replacing
+  // it (mirrors single-desktop append) — this is the fix for "append works on
+  // the desktop but the phone mic doesn't respect it". The dedupe ring still
+  // guards replays so a retried delivery can never double-append onto a chart.
+  doc20.getElementById('appendMode').click();
+  check('s20: append mode on for the desktop-append check', doc20.getElementById('appendMode').checked);
+  w20._clip = '';
+  sockB.msg({ message_type: 'phone_delivery', text: 'Plus one.', delivery_id: 'd5' });
+  await sleep(40);
+  check('s20: phone delivery appends onto the desktop note (append mode on)', (w20._clip || '').includes('Authoritative note.') && (w20._clip || '').includes('Plus one.'), JSON.stringify(w20._clip));
+  check('s20: the append outcome is announced', status20().includes('appended'), status20());
+  // A replay of an already-seen id must NOT append again (no double-paste).
+  w20._clip = 'UNTOUCHED2';
+  sockB.msg({ message_type: 'phone_delivery', text: 'Plus one.', delivery_id: 'd5' });
+  await sleep(40);
+  check('s20: replayed append delivery deduped (no double-append)', w20._clip === 'UNTOUCHED2', JSON.stringify(w20._clip));
+  // Append mode back off => the next delivery replaces again (single segment).
+  doc20.getElementById('appendMode').click();
+  w20._clip = '';
+  sockB.msg({ message_type: 'phone_delivery', text: 'Fresh replace.', delivery_id: 'd6' });
+  await sleep(40);
+  check('s20: append mode off => delivery replaces', (w20._clip || '').includes('Fresh replace.') && !(w20._clip || '').includes('Plus one.'), JSON.stringify(w20._clip));
 
   // End session: everything closes and stays closed (no reconnect loop)
   doc20.getElementById('phoneStopBtn').click();
@@ -1673,20 +1700,23 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25b: owning finger release stops + delivers', (B.win._clip || '').includes('Multi note.'), JSON.stringify(B.win._clip));
 
-  // peek strip: collapsed mirror, tap to expand, click-to-append from expanded
+  // peek strip: collapsed mirror, tap to expand. Append is the DESKTOP's job in
+  // the phone-link flow (this device is only a mic), so click-to-append is a
+  // no-op while joined and a dictation delivers a SINGLE segment — never a
+  // locally-accumulated note, which would double-append on the desktop.
   const peekB = dB.getElementById('bigPeek');
   check('s25b: peek strip mirrors the latest transcript', dB.getElementById('bigPeekText').textContent.includes('Multi note.'), dB.getElementById('bigPeekText').textContent);
   check('s25b: peek starts collapsed', !peekB.classList.contains('expanded'));
   dB.getElementById('bigPeekBar').click();
   check('s25b: tapping the bar expands the peek', peekB.classList.contains('expanded'));
-  dB.getElementById('bigPeekText').click(); // click-to-append via the shared handler
-  check('s25b: expanded text click arms click-to-append', dB.getElementById('appendChip').style.display !== 'none' && peekB.classList.contains('armed'), dB.getElementById('appendChip').textContent);
-  B.batchText = 'Appended.';
+  dB.getElementById('bigPeekText').click(); // arming is suppressed while joined
+  check('s25b: click-to-append is a no-op while joined (desktop owns append)', dB.getElementById('appendChip').style.display === 'none' && !peekB.classList.contains('armed'), dB.getElementById('appendChip').style.display);
+  B.batchText = 'Single seg.';
   pev(B.win, bigBtnB, 'pointerdown', 7);
   await sleep(550);
   pev(B.win, bigBtnB, 'pointerup', 7);
   await sleep(400);
-  check('s25b: armed dictation appended onto the note', (B.win._clip || '').includes('Multi note.') && (B.win._clip || '').includes('Appended.'), JSON.stringify(B.win._clip));
+  check('s25b: a joined dictation delivers a single segment (no local accumulation)', (B.win._clip || '').includes('Single seg.') && !(B.win._clip || '').includes('Multi note.'), JSON.stringify(B.win._clip));
 
   // relay outcome is part of the screen: a zero-listener ack reddens it even
   // though the local delivery already succeeded (and beeped done)

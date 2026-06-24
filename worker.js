@@ -2655,6 +2655,17 @@ right lower quadrant"></textarea>
     recordBtn.classList.remove("danger");
     if (micAlarmFired) setMicPill("fail");
     else setMicPill(audioGraphHealthy() ? "ready" : "off");
+    // Phone big-button surface: the audio graph is RETAINED between takes (for a
+    // fast next push-to-talk), but iOS can silently kill the mic track in the idle
+    // gap while it keeps reporting readyState "live"/unmuted — audioGraphHealthy()
+    // trusts the corpse and the NEXT take records pure silence (the MIC FAIL / "no
+    // audio signal detected" flatline in the field). The wake lock tries to prevent
+    // the reclaim, but is not sufficient on its own (iOS reclaims the session even
+    // with the screen awake), so mark the retained graph suspect here: the next
+    // ensureAudio() then rebuilds from a fresh getUserMedia (genuinely live), and
+    // the press-path retry covers iOS's late audio-session hand-back. Desktop reuse
+    // is left fast — it does not suffer the iOS corpse-mic gap between takes.
+    if (bigButtonActive()) audioSuspect = true;
     if (!unexpected) setLinkPill("idle");
     notifyDesktopRecording("stop"); // joined phone: flip the desktop indicator to "transcribing" while the upload runs (no-op if unpaired)
 

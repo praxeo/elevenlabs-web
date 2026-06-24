@@ -1615,7 +1615,8 @@ console.log('--- scenario 25: big-button layout ---');
         Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
         const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
         const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
-        win.navigator.mediaDevices = { getUserMedia: () => { track.readyState = 'live'; return Promise.resolve(stream); }, addEventListener: () => {} };
+        state.gum = 0;
+        win.navigator.mediaDevices = { getUserMedia: () => { state.gum++; track.readyState = 'live'; return Promise.resolve(stream); }, addEventListener: () => {} };
         win.fetch = (url, fOpts) => {
           state.fetches.push({ url: String(url), opts: fOpts || {} });
           if (String(url).includes('/deliver')) {
@@ -1698,9 +1699,16 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25b: success turns the screen green', screenB() === 'ok', screenB());
   check('s25b: done haptic fired (the done pattern, not just any vibe)', JSON.stringify(B.vibes[B.vibes.length - 1]) === '[40,60,40]', JSON.stringify(B.vibes.slice(vibesAtStart)));
 
-  // tap = toggle: a quick press keeps recording, the next tap stops
+  // Corpse-mic guard: on the big-button surface the audio graph is retained
+  // between takes, but iOS can silently kill the mic track in the idle gap (it
+  // still reports "live"), so the next take would record pure silence (the field
+  // MIC FAIL). Finalize marks the graph suspect, so the NEXT take rebuilds from a
+  // fresh getUserMedia instead of reusing the (possibly dead) track.
+  const gumBeforeNextTake = B.gum;
   B.batchText = 'Tap note.';
   pev(B.win, bigBtnB, 'pointerdown', 2);
+  await sleep(20);
+  check('s25b: a take after a finalize rebuilds the mic graph (corpse-mic guard)', B.gum === gumBeforeNextTake + 1, (B.gum - gumBeforeNextTake) + ' getUserMedia calls');
   await sleep(80);
   pev(B.win, bigBtnB, 'pointerup', 2); // released under the tap threshold
   await sleep(200);

@@ -506,6 +506,22 @@ check('s31: edited history text persisted to storage', savedHist[0] && savedHist
 check('s31: edited history entry is stamped editedAt', !!(savedHist[0] && savedHist[0].editedAt));
 check('s31: the "edited" marker shows in place', firstItem.querySelector('.history-meta').textContent.includes('edited'), firstItem.querySelector('.history-meta').textContent);
 
+// Pagination: the list shows only the newest 10 by default (so it doesn't take
+// over the expanded desktop view), with a "Show N more" control. The top toggle
+// still reflects the FULL count.
+const totalHist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]').length;
+check('s31: enough history to exercise pagination (>10)', totalHist > 10, String(totalHist));
+check('s31: only the newest 10 rows render by default', doc.querySelectorAll('.history-item').length === 10, String(doc.querySelectorAll('.history-item').length));
+check('s31: the toggle still shows the full count', doc.getElementById('toggleHistoryBtn').textContent.includes('(' + totalHist + ')'), doc.getElementById('toggleHistoryBtn').textContent);
+const moreBtn = doc.getElementById('historyMoreBtn');
+check('s31: a "Show N more" control is present', !!moreBtn && moreBtn.textContent === 'Show ' + (totalHist - 10) + ' more', moreBtn ? moreBtn.textContent : 'none');
+moreBtn.click();
+check('s31: "Show more" reveals every row', doc.querySelectorAll('.history-item').length === totalHist, String(doc.querySelectorAll('.history-item').length));
+const fewerBtn = doc.getElementById('historyMoreBtn');
+check('s31: expanded offers "Show fewer"', !!fewerBtn && fewerBtn.textContent.includes('Show fewer'), fewerBtn ? fewerBtn.textContent : 'none');
+fewerBtn.click();
+check('s31: "Show fewer" collapses back to 10', doc.querySelectorAll('.history-item').length === 10, String(doc.querySelectorAll('.history-item').length));
+
 // ===== Scenario 32: Last-dictation slot + Copy-files-and-readies (Option B) =====
 // The active box holds the current note; finishing it (Copy latest, Clear box,
 // or starting a fresh dictation) FILES it into the "Last dictation" slot and

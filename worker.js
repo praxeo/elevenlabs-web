@@ -1197,6 +1197,8 @@ right lower quadrant"></textarea>
   let lastMeterPct = -1;
 
   let historyVisible = false;
+  let historyExpanded = false; // session-only: false = show the last HISTORY_PAGE, true = show all
+  const HISTORY_PAGE = 10;     // newest-N shown by default so the list stays compact
   let appendArmed = false; // one-shot: clicking the transcript box arms "append the next dictation"
 
   // Engine: batch-only. sessionEngine is snapshotted at session start.
@@ -1868,7 +1870,11 @@ right lower quadrant"></textarea>
       return;
     }
 
-    for (const item of items) {
+    // Show only the newest HISTORY_PAGE by default — the full list takes too much
+    // room in the expanded desktop view; the "Show N more" control below reveals
+    // the rest. Editing/persistence keys off createdAt, so a sliced view is safe.
+    const limit = historyExpanded ? items.length : HISTORY_PAGE;
+    for (const item of items.slice(0, limit)) {
       const div = document.createElement("div");
       div.className = "history-item";
 
@@ -1924,6 +1930,25 @@ right lower quadrant"></textarea>
       row.append(copy);
       div.append(meta, text, row);
       historyEl.append(div);
+    }
+
+    // "Show N more" / "Show fewer" — only when there's more than one page. The
+    // toggle button up top still shows the FULL count; this just paginates the list.
+    if (items.length > HISTORY_PAGE) {
+      const moreRow = document.createElement("div");
+      moreRow.className = "row";
+      moreRow.style.marginTop = "10px";
+      const moreBtn = document.createElement("button");
+      moreBtn.id = "historyMoreBtn";
+      if (historyExpanded) {
+        moreBtn.textContent = "Show fewer (last " + HISTORY_PAGE + ")";
+        moreBtn.onclick = () => { historyExpanded = false; renderHistory(); };
+      } else {
+        moreBtn.textContent = "Show " + (items.length - HISTORY_PAGE) + " more";
+        moreBtn.onclick = () => { historyExpanded = true; renderHistory(); };
+      }
+      moreRow.append(moreBtn);
+      historyEl.append(moreRow);
     }
   }
 

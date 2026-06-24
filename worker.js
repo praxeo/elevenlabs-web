@@ -581,6 +581,7 @@ const INDEX_HTML = `<!doctype html>
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
     }
     #bigHint { font-size: 12px; color: var(--muted); }
+    #bigSendBtn { flex: 0 0 auto; width: 100%; background: #0c4a6e; border-color: #0369a1; font-weight: 600; }
     #bigStatus {
       font-size: 14px; color: var(--text); text-align: center;
       min-height: 18px; max-height: 18vh; overflow: auto; white-space: pre-wrap;
@@ -668,6 +669,9 @@ const INDEX_HTML = `<!doctype html>
         <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
         <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+        <!-- Manual override (joined only): push the current box text to the
+             desktop clipboard without re-dictating. Hidden unless joined. -->
+        <button id="sendDesktopBtn" title="Send the current transcript to the paired desktop's clipboard (no re-dictation needed)" style="display:none;">⤴ Send to desktop</button>
       </div>
 
       <!-- "Last dictation" slot: the most recently filed note. The box above is
@@ -897,6 +901,12 @@ right lower quadrant"></textarea>
       <div id="bigPeekBar">Latest transcript — tap to expand</div>
       <div id="bigPeekText"></div>
     </div>
+    <!-- Manual override: push whatever is in the box to the desktop clipboard
+         WITHOUT re-dictating (e.g. the auto-delivery didn't land, or the note
+         was hand-edited). Goes through the same acked/deduped relay as a normal
+         delivery; the desktop owns append. Shown only when joined + idle + there
+         is text to send. -->
+    <button id="bigSendBtn" title="Send the current transcript to the desktop clipboard (no re-dictation needed)" style="display:none;">⤴ Send to desktop</button>
   </div>
   <button id="bigReturnBtn">&#8592; Back to the button</button>
 
@@ -979,6 +989,7 @@ right lower quadrant"></textarea>
   const copyBtn          = document.getElementById("copyBtn");
   const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
+  const sendDesktopBtn   = document.getElementById("sendDesktopBtn");
   const lastDictationEl     = document.getElementById("lastDictation");
   const lastDictationTextEl = document.getElementById("lastDictationText");
   const lastCopyBtn         = document.getElementById("lastCopyBtn");
@@ -1072,6 +1083,7 @@ right lower quadrant"></textarea>
   const bigPeekEl        = document.getElementById("bigPeek");
   const bigPeekBarEl     = document.getElementById("bigPeekBar");
   const bigPeekTextEl    = document.getElementById("bigPeekText");
+  const bigSendBtnEl     = document.getElementById("bigSendBtn");
   const bigButtonModeEl  = document.getElementById("bigButtonMode");
 
   let mediaRecorder = null;
@@ -1320,6 +1332,7 @@ right lower quadrant"></textarea>
     latestEl.textContent = cleaned;
     updateBigPeek();
     renderLastDictation();
+    refreshSendDesktop();
   }
 
   // The "Last dictation" slot. The active box note moves here when it's filed
@@ -3829,6 +3842,7 @@ right lower quadrant"></textarea>
         ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
         : "Latest transcript — tap to expand";
     if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
+    refreshSendDesktop(); // recording/idle + text changes flip the send button
   }
 
   // Press/release handling. Pointer capture plus the cancel/lost/document
@@ -3953,6 +3967,38 @@ right lower quadrant"></textarea>
   // to the "Last dictation" slot and the box clears, ready for a fresh note. A
   // failed copy keeps the box (the loud copyText status stands) so nothing is
   // lost before the deliverable actually landed.
+  // Manual override: push the current box text to the desktop clipboard without
+  // re-dictating. Only meaningful while joined (the desktop is the receiver) and
+  // idle (a mid-session send would collide with the dictation's own outcome
+  // cue). Goes through the SAME relay as a dictation delivery — enqueued with a
+  // fresh delivery_id, acked, replayed, deduped — so the desktop owns append and
+  // a replay can never double-copy. relayDeliveryToDesktop announces the single
+  // loud outcome (done on a listener ack, warn on zero-listeners, fail on a dead
+  // POST); the text stays in the box so it can be re-sent or edited.
+  function canSendToDesktop() {
+    return Boolean(joinedSessionCode) && !recording && !stopping && !finishing &&
+      Boolean(latestText && latestText.trim());
+  }
+  function sendToDesktop() {
+    if (!canSendToDesktop()) return;
+    const text = cleanTranscript(latestText);
+    if (!text.trim()) return; // cleanTranscript stripped it to nothing — nothing to deliver
+    setStatus("Sending the transcript to the desktop…", "");
+    relayDeliveryToDesktop(text, true);
+  }
+  // Show the "Send to desktop" buttons only when a manual send is valid. The
+  // primary-card button covers a joined device left in the normal layout
+  // (bigButtonMode "never"); the big-button button is the one a joined phone
+  // actually sees. Called from updateLiveDisplay (text/session changes) and the
+  // big-button refresh paths.
+  function refreshSendDesktop() {
+    const show = canSendToDesktop();
+    if (sendDesktopBtn) sendDesktopBtn.style.display = show ? "" : "none";
+    if (bigSendBtnEl) bigSendBtnEl.style.display = show ? "" : "none";
+  }
+  if (sendDesktopBtn) sendDesktopBtn.onclick = sendToDesktop;
+  if (bigSendBtnEl)   bigSendBtnEl.onclick   = sendToDesktop;
+
   copyBtn.onclick = async () => {
     if (!latestText || !latestText.trim()) return;
     const text = latestText;

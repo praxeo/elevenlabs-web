@@ -2358,9 +2358,27 @@ right lower quadrant"></textarea>
             micAlarmFired = true;
             setMicPill("fail");
             micAlarmBeep();
-            setStatus(ctxDead
+            // A fresh, OS-"live" track that delivers pure silence (mic indicator
+            // lit, zero RMS) is the iOS WebKit silent-capture wall — most often a
+            // Bluetooth/HFP route (AirPods/car mic) or a sample-rate mismatch that
+            // leaves the Web Audio graph silent even though capture is "on". Append
+            // the real audio-graph state so the failure is a precise bug report
+            // (device label + sample rates) instead of a guess. Failure-only, so
+            // the noise is acceptable; the clinician already screenshots these.
+            var diag = "";
+            try {
+              var ts = (track && track.getSettings) ? track.getSettings() : {};
+              diag = "  [ctx:" + (audioCtx ? audioCtx.state : "none") +
+                     " ctxSR:" + (audioCtx ? audioCtx.sampleRate : "?") +
+                     " micSR:" + (ts.sampleRate || "?") +
+                     " rs:" + (track ? track.readyState : "none") +
+                     " mute:" + (track ? track.muted : "?") +
+                     " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
+                     " peak:" + maxRmsSeen.toFixed(5) + "]";
+            } catch (e) {}
+            setStatus((ctxDead
               ? "⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate."
-              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.", "err");
+              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.") + diag, "err");
           }
         }
       }

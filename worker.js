@@ -833,6 +833,11 @@ right lower quadrant"></textarea>
           </label>
 
           <label class="checkbox">
+            <input type="checkbox" id="echoCancel" checked />
+            Echo cancellation <span class="hint">(on by default. Turn OFF if the mic captures silence on iPhone — iOS runs echo cancellation through the voice‑processing unit, which can go silent after a call/Siri/lock; off uses the plain mic path.)</span>
+          </label>
+
+          <label class="checkbox">
             <input type="checkbox" id="diarize" checked />
             Filter out other speakers <span class="hint">(on by default; keeps only the main voice — removes bystander speech the mic picks up. Noise suppression can't: another person's voice is speech. A status note reports anything removed.)</span>
           </label>
@@ -999,6 +1004,7 @@ right lower quadrant"></textarea>
   const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
+  const echoCancelEl     = document.getElementById("echoCancel");
   const diarizeEl        = document.getElementById("diarize");
   const startBeepEl      = document.getElementById("startBeep");
 
@@ -1705,6 +1711,7 @@ right lower quadrant"></textarea>
       appendMode:     appendModeEl.checked,
       saveApiKey:     saveApiKeyEl.checked,
       noiseSuppress:  noiseSuppressEl.checked,
+      echoCancel:     echoCancelEl.checked,
       diarize:        diarizeEl.checked, // per-device: keep-primary-speaker filter (on by default)
       startBeep:      startBeepEl.checked,
       gateOpen:       gateOpenEl.value,
@@ -1767,6 +1774,7 @@ right lower quadrant"></textarea>
       if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
       if (typeof s.saveApiKey    === "boolean") saveApiKeyEl.checked    = s.saveApiKey;
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
+      if (typeof s.echoCancel === "boolean") echoCancelEl.checked = s.echoCancel;
       if (typeof s.diarize       === "boolean") diarizeEl.checked       = s.diarize; // default stays ON (checked in HTML) when unset
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
@@ -2178,7 +2186,7 @@ right lower quadrant"></textarea>
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
-        echoCancellation: true,
+        echoCancellation: echoCancelEl.checked,
         noiseSuppression: noiseSuppressEl.checked,
         autoGainControl: false,
         sampleRate: 48000,
@@ -2374,6 +2382,7 @@ right lower quadrant"></textarea>
                      " rs:" + (track ? track.readyState : "none") +
                      " mute:" + (track ? track.muted : "?") +
                      " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
+                     " ec:" + (echoCancelEl.checked ? "on" : "off") +
                      " peak:" + maxRmsSeen.toFixed(5) + "]";
             } catch (e) {}
             setStatus((ctxDead
@@ -4189,6 +4198,14 @@ right lower quadrant"></textarea>
   keytermsEl.addEventListener("input", updateKeytermHint);
 
   noiseSuppressEl.addEventListener("change", () => {
+    releaseAudio();
+    tryWarmOnLoad();
+  });
+
+  // Echo cancellation flips the iOS capture path (voice-processing unit vs plain
+  // mic), so the graph must be rebuilt for the new constraint to take effect.
+  echoCancelEl.addEventListener("change", () => {
+    saveSettings();
     releaseAudio();
     tryWarmOnLoad();
   });

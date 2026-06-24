@@ -774,6 +774,84 @@ console.log('--- scenario 19: phone mic session ---');
   }
 }
 
+// ===== Scenario 19s: manual "Send to desktop" override =====
+// A joined phone can push the CURRENT box text to the desktop clipboard WITHOUT
+// re-dictating (the auto-delivery didn't land, or the note was hand-edited).
+// The button is hidden unless joined + idle + there is text; the send goes
+// through the same acked /deliver relay as a dictation delivery.
+console.log('--- scenario 19s: manual send-to-desktop override ---');
+{
+  const socks19s = [];
+  const fetch19s = [];
+  const dom19s = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = (url, opts) => {
+        fetch19s.push({ url: String(url), opts });
+        if (String(url).includes('/deliver')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        }
+        return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":"unused."}') });
+      };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socks19s.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const doc = dom19s.window.document;
+  const sendBtn = doc.getElementById('sendDesktopBtn');
+  const bigSendBtn = doc.getElementById('bigSendBtn');
+  check('s19s: sendDesktopBtn exists', !!sendBtn);
+  check('s19s: bigSendBtn exists', !!bigSendBtn);
+
+  // Not joined + no text: the manual-send buttons stay hidden.
+  check('s19s: send button hidden when not joined', sendBtn.style.display === 'none', JSON.stringify(sendBtn.style.display));
+
+  // Join a desktop session.
+  doc.getElementById('phoneJoinInput').value = 'SND123';
+  doc.getElementById('phoneJoinBtn').click();
+  await sleep(20);
+
+  // Joined but the box is empty — still hidden (nothing to send).
+  check('s19s: send button hidden while box empty', sendBtn.style.display === 'none', JSON.stringify(sendBtn.style.display));
+
+  // Hand-type into the idle box (mirrors editing a note to push manually).
+  const latestEl = doc.getElementById('latest');
+  latestEl.textContent = 'Manual override note.';
+  latestEl.dispatchEvent(new dom19s.window.Event('input', { bubbles: true }));
+  await sleep(20);
+  check('s19s: send button shows once joined + box has text', sendBtn.style.display === '' && bigSendBtn.style.display === '', JSON.stringify([sendBtn.style.display, bigSendBtn.style.display]));
+
+  // Push it manually — no recording happens.
+  bigSendBtn.click();
+  await sleep(60);
+  check('s19s: manual send opened no recorder/transcribe upload', !fetch19s.some((c) => c.url.includes('/api/transcribe')));
+  const sndDeliver = fetch19s.find((c) => c.url.includes('/api/session/SND123/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_delivery'));
+  check('s19s: manual send POSTs the box text to /deliver with the code', !!sndDeliver, fetch19s.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+  if (sndDeliver) {
+    let body = {};
+    try { body = JSON.parse(sndDeliver.opts.body); } catch (e) {}
+    check('s19s: the manual /deliver body carries the box text', String(body.text || '').includes('Manual override note.'), JSON.stringify(body.text));
+    check('s19s: the manual delivery is stamped with a delivery_id', !!body.delivery_id, JSON.stringify(body.delivery_id));
+  }
+
+  // The text stays in the box (re-sendable / editable) — not cleared.
+  check('s19s: box keeps the text after a manual send', (doc.getElementById('latest').textContent || '').includes('Manual override note.'));
+
+  // Leaving the session hides the buttons again even with text present.
+  doc.getElementById('phoneLeaveBtn').click();
+  await sleep(20);
+  check('s19s: send button hidden again after Leave', sendBtn.style.display === 'none', JSON.stringify(sendBtn.style.display));
+}
+
 // ===== Scenario 20: phone link resilience =====
 console.log('--- scenario 20: phone link resilience ---');
 {

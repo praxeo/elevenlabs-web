@@ -825,6 +825,15 @@ right lower quadrant"></textarea>
           <label for="highpass">High‑pass filter <span class="sliderval" id="highpassVal"></span></label>
           <input id="highpass" type="range" min="0" max="200" step="5" value="85" />
 
+          <label for="micGain">Mic input gain <span class="sliderval" id="micGainVal"></span></label>
+          <input id="micGain" type="range" min="1" max="20" step="0.5" value="1" />
+          <div class="hint">Boost a quiet mic. If you see <b>peak:0.0000…</b> on a MIC FAIL while you ARE speaking, raise this (and lower the gate open threshold to match). 1× = no boost.</div>
+
+          <label class="checkbox" style="margin-top: 8px;">
+            <input type="checkbox" id="autoGain" />
+            Auto gain control <span class="hint">(off by default. Turn on to let the browser auto‑boost a quiet mic — easier than the slider, but can pump on a close mic.)</span>
+          </label>
+
           <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
 
           <label class="checkbox">
@@ -1014,6 +1023,9 @@ right lower quadrant"></textarea>
   const gateCloseValEl   = document.getElementById("gateCloseVal");
   const highpassEl       = document.getElementById("highpass");
   const highpassValEl    = document.getElementById("highpassVal");
+  const micGainEl        = document.getElementById("micGain");
+  const micGainValEl     = document.getElementById("micGainVal");
+  const autoGainEl       = document.getElementById("autoGain");
 
   const meterBar         = document.getElementById("meterBar");
   const openMark         = document.getElementById("openMark");
@@ -1185,6 +1197,7 @@ right lower quadrant"></textarea>
   // Persistent audio nodes
   let stream = null;
   let audioCtx = null;
+  let micGainNode = null;
   let hpFilter = null;
   let analyserNode = null;
   let gateNode = null;
@@ -1613,6 +1626,7 @@ right lower quadrant"></textarea>
     gateCloseValEl.textContent = "(" + Number(gateCloseEl.value).toFixed(3) + ")";
     highpassValEl.textContent  =
       Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
+    if (micGainValEl) micGainValEl.textContent = "(" + Number(micGainEl.value).toFixed(1) + "×)";
 
     openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
     closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
@@ -1717,6 +1731,8 @@ right lower quadrant"></textarea>
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
       highpass:       highpassEl.value,
+      micGain:        micGainEl.value,
+      autoGain:       autoGainEl.checked,
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
       keytermsOpen:   Boolean(keytermsSectionEl && keytermsSectionEl.open),
@@ -1780,6 +1796,8 @@ right lower quadrant"></textarea>
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
+      if (s.micGain   !== undefined) micGainEl.value   = s.micGain;
+      if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
       if (typeof s.keytermsOpen === "boolean" && keytermsSectionEl) keytermsSectionEl.open = s.keytermsOpen;
@@ -2153,6 +2171,8 @@ right lower quadrant"></textarea>
              " mute:" + (track ? track.muted : "?") +
              " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
              " ec:" + (echoCancelEl.checked ? "on" : "off") +
+             " agc:" + (autoGainEl.checked ? "on" : "off") +
+             " gain:" + Number(micGainEl.value).toFixed(1) + "x" +
              " peak:" + maxRmsSeen.toFixed(5) + "]";
     } catch (e) { return ""; }
   }
@@ -2208,7 +2228,7 @@ right lower quadrant"></textarea>
         channelCount: 1,
         echoCancellation: echoCancelEl.checked,
         noiseSuppression: noiseSuppressEl.checked,
-        autoGainControl: false,
+        autoGainControl: autoGainEl.checked,
         sampleRate: 48000,
       },
     });
@@ -2277,6 +2297,14 @@ right lower quadrant"></textarea>
 
     const source = audioCtx.createMediaStreamSource(stream);
 
+    // Makeup gain right at the head of the graph, BEFORE the analyser/gate, so a
+    // quiet mic is boosted for the recording AND for the meter/gate/watchdog
+    // alike. Placed pre-analyser deliberately: it lifts a low-but-real signal
+    // above the flatline threshold + the gate, while a truly DEAD mic (zero
+    // samples) stays zero (gain × 0 = 0) — so it never masks a dead mic.
+    micGainNode = audioCtx.createGain();
+    micGainNode.gain.value = Number(micGainEl.value) || 1;
+
     hpFilter = audioCtx.createBiquadFilter();
     hpFilter.type = "highpass";
     hpFilter.frequency.value = Number(highpassEl.value) || 0;
@@ -2290,7 +2318,8 @@ right lower quadrant"></textarea>
 
     destNode = audioCtx.createMediaStreamDestination();
 
-    source.connect(hpFilter);
+    source.connect(micGainNode);
+    micGainNode.connect(hpFilter);
     hpFilter.connect(analyserNode);
 
     // BATCH CAPTURE: the post-gate audio is what MediaRecorder records and uploads.
@@ -2401,7 +2430,7 @@ right lower quadrant"></textarea>
     if (gateTimer) { clearInterval(gateTimer); gateTimer = null; }
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
-    stream = null; audioCtx = null; hpFilter = null; analyserNode = null;
+    stream = null; audioCtx = null; micGainNode = null; hpFilter = null; analyserNode = null;
     gateNode = null; destNode = null; gateBuf = null; gateIsOpen = false;
     lastMeterPct = -1;
     meterBar.style.width = "0%";
@@ -4195,6 +4224,18 @@ right lower quadrant"></textarea>
     if (hpFilter) hpFilter.frequency.value = Number(highpassEl.value) || 0;
     updateGateLabels();
     saveSettings();
+  });
+  // Makeup gain updates the live node immediately (no rebuild) so the meter
+  // responds while tuning; AGC is a capture constraint, so it rebuilds the graph.
+  micGainEl.addEventListener("input", () => {
+    if (micGainNode) micGainNode.gain.value = Number(micGainEl.value) || 1;
+    updateGateLabels();
+    saveSettings();
+  });
+  autoGainEl.addEventListener("change", () => {
+    saveSettings();
+    releaseAudio();
+    tryWarmOnLoad();
   });
 
   // Dynamic Scribe event listeners

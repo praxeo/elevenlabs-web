@@ -1457,6 +1457,9 @@ await sleep(300);
 // A mid-dictation AudioContext interruption (Siri/call/another app) must fire
 // the alarm even though the frozen analyser keeps reading "speech" (micRms high,
 // so the RMS-flatline check can never fire — only the state check catches it).
+// BUT it must DEBOUNCE: iOS emits spurious interrupted->running blips that drop
+// no audio, and the old instant-fire turned those into failed dictations (the
+// mic-stability regression). Only a SUSTAINED interruption (> the grace) alarms.
 doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Interrupted note.' } });
 micRms = 0.05; // real "speech" level so only the AudioContext-state check can alarm
@@ -1464,9 +1467,16 @@ doc.getElementById('recordBtn').click();
 micTrack.readyState = 'live'; micTrack.muted = false; // a healthy live track (rebuild hands one back)
 await sleep(250); // past the 200ms start-up grace; no alarm yet (track live, rms high)
 const ctxR = mainCtxInstances[mainCtxInstances.length - 1];
+// A transient blip shorter than the grace must NOT fail a healthy take.
+ctxR.state = 'interrupted';
+await sleep(150); // < CTX_INTERRUPT_GRACE_MS (400ms)
+ctxR.state = 'running'; // snaps back before the grace elapses
+await sleep(120);
+check('s23r: a transient AudioContext blip does NOT alarm (regression fix)', !/AUDIO INTERRUPTED/i.test(status()), status());
+// A sustained interruption (audio actually lost, analyser frozen) still alarms.
 ctxR.state = 'interrupted'; // the audio session is taken over mid-dictation
-await sleep(120); // several 30ms watchdog ticks
-check('s23r: a mid-dictation AudioContext interruption fires the mic alarm', /AUDIO INTERRUPTED/i.test(status()) && statusCls().includes('err'), status());
+await sleep(500); // > the grace; several 30ms watchdog ticks
+check('s23r: a sustained AudioContext interruption fires the mic alarm', /AUDIO INTERRUPTED/i.test(status()) && statusCls().includes('err'), status());
 ctxR.state = 'running'; // release; finish the session so later state is clean
 doc.getElementById('recordBtn').click();
 await sleep(300);

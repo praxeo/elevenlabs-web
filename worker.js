@@ -2096,6 +2096,22 @@ right lower quadrant"></textarea>
       if (wakeLock && !wakeLock.released) return; // already held — don't stack sentinels
       if (navigator.wakeLock && navigator.wakeLock.request) {
         wakeLock = await navigator.wakeLock.request("screen");
+        // iOS drops the lock on its own (not only on hide — low-power mode, system
+        // events), and nothing else re-arms it until the next focus/visibility
+        // event, so the screen sleeps and reclaims the mic BETWEEN takes on the
+        // big-button surface. Re-acquire on release while the surface is still up
+        // and visible. Gated on bigButtonActive (not wakeLockDesired) so an
+        // intentional desktop release at deliverFinalText — fired while finishing
+        // is still true — is not immediately undone.
+        if (wakeLock && wakeLock.addEventListener) {
+          wakeLock.addEventListener("release", function () {
+            if (bigButtonActive() && document.visibilityState === "visible") {
+              setTimeout(function () {
+                if (bigButtonActive() && document.visibilityState === "visible") acquireWakeLock();
+              }, 400);
+            }
+          });
+        }
       }
     } catch (e) {}
   }
@@ -2448,19 +2464,35 @@ right lower quadrant"></textarea>
 
     saveSettingsNow();
 
-    try {
-      await ensureAudio();
-      if (audioCtx && audioCtx.state === "suspended") await audioCtx.resume();
-      if (!audioCtx || audioCtx.state !== "running") {
-        await writeSentinel();
-        setStatus("Audio not running. Click page once, then try again.", "err");
-        failBeep();
-        return;
+    // The press path must survive iOS's late audio-session hand-back. After a
+    // backgrounding, audioSuspect forces a fresh getUserMedia, and on the FIRST
+    // press back in the app that getUserMedia can fail and then succeed moments
+    // later — without a retry here that press died with "Microphone unavailable"
+    // (the "mic won't engage after returning" regression). Retry briefly; a real
+    // permission denial fails fast (retrying won't change it).
+    let audioErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await ensureAudio();
+        audioErr = null;
+        break;
+      } catch (e) {
+        audioErr = e;
+        if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) break;
+        if (attempt < 2) await new Promise(function (r) { setTimeout(r, 350); });
       }
-    } catch (e) {
+    }
+    if (audioErr) {
       await writeSentinel();
       setMicPill("fail");
-      setStatus("Microphone unavailable: " + (e && e.message ? e.message : e), "err");
+      setStatus("Microphone unavailable: " + (audioErr && audioErr.message ? audioErr.message : audioErr), "err");
+      failBeep();
+      return;
+    }
+    if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
+    if (!audioCtx || audioCtx.state !== "running") {
+      await writeSentinel();
+      setStatus("Audio not running. Click page once, then try again.", "err");
       failBeep();
       return;
     }
@@ -3319,6 +3351,26 @@ right lower quadrant"></textarea>
       phoneReconnectTimer = null;
       if (phoneSessionCode && !phoneSessionWs) connectPhoneSessionWs();
     }, phoneReconnectDelayMs);
+  }
+
+  // Desktop returning to the foreground: the listener socket commonly dies while
+  // the tab is backgrounded (browsers freeze background tabs and throttle the
+  // heartbeat timer; NAT idle-timeouts kill the socket without firing onclose),
+  // so a phone delivery sent meanwhile never arrived and the reconnect backoff
+  // timer was itself frozen. Reconnect/verify the link the instant the clinician
+  // looks at the desktop instead of waiting up to a throttled heartbeat tick —
+  // the room replays the buffered delivery on reconnect, so the note lands. This
+  // only NARROWS the loss window (it never force-closes a healthy socket: an open
+  // one is just pinged; phoneHeartbeat's own pong-timeout decides if it's a
+  // zombie). No-op on the phone (it has joinedSessionCode, not phoneSessionCode).
+  function reconnectPhoneLinkIfNeeded() {
+    if (!phoneSessionCode) return;
+    var ws = phoneSessionWs;
+    if (ws && ws.readyState === 1) { phoneHeartbeat(); return; } // open — verify, don't churn
+    if (ws && ws.readyState === 0) return;                       // already connecting
+    if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
+    phoneReconnectDelayMs = 0;
+    if (!phoneSessionWs) connectPhoneSessionWs();
   }
 
   function stopPhoneSession() {
@@ -4238,6 +4290,7 @@ right lower quadrant"></textarea>
       return;
     }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
+    reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden, so deliveries land
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
@@ -4249,6 +4302,7 @@ right lower quadrant"></textarea>
   // not visibilitychange — when switching back from another app.
   window.addEventListener("focus", () => {
     backgroundFlush(); // retry any queued phone deliveries on app-switch return
+    reconnectPhoneLinkIfNeeded(); // desktop: revive a listener socket that died while hidden
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });

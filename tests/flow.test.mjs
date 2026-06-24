@@ -836,10 +836,15 @@ console.log('--- scenario 20: phone link resilience ---');
   await sleep(30);
   check('s20: drop is loud', status20().includes('reconnecting'), status20());
   check('s20: badge flags the dead link', badge20().textContent.includes('⚠'), badge20().textContent);
-  await sleep(1300); // first reconnect backoff is 1s
+  // Returning the desktop to the foreground reconnects the listener IMMEDIATELY
+  // (the room then replays the buffered delivery) instead of waiting out the
+  // throttled backoff timer — the fix for "deliveries don't land after the
+  // desktop was backgrounded". No 1s wait needed.
+  w20.dispatchEvent(new w20.Event('focus'));
+  await sleep(40);
   const sessSocks20 = socks20.filter((s) => s.url.includes('/api/session/'));
   const sockB = sessSocks20[1];
-  check('s20: reconnected to the same room', !!sockB && sockB.url.includes(code20), sessSocks20.length + ' session sockets');
+  check('s20: foreground reconnects the listener at once (no backoff wait)', !!sockB && sockB.url.includes(code20), sessSocks20.length + ' session sockets');
   sockB.open();
   await sleep(10);
   check('s20: badge recovers once reconnected', !badge20().textContent.includes('⚠'), badge20().textContent);

@@ -2137,6 +2137,26 @@ right lower quadrant"></textarea>
     return recording || stopping || finishing || bigButtonActive();
   }
 
+  // Compact audio-graph state for a silent-capture failure — turns a MIC FAIL /
+  // no-speech outcome into a precise bug report (Bluetooth/HFP route, sample-rate
+  // mismatch, or the iOS voice-processing / session-silence wall) instead of a
+  // generic message. Reads off the (possibly retained) graph; try/catch since
+  // getSettings/label may be absent.
+  function micDiag() {
+    try {
+      var track = stream && stream.getAudioTracks ? stream.getAudioTracks()[0] : null;
+      var ts = (track && track.getSettings) ? track.getSettings() : {};
+      return "  [ctx:" + (audioCtx ? audioCtx.state : "none") +
+             " ctxSR:" + (audioCtx ? audioCtx.sampleRate : "?") +
+             " micSR:" + (ts.sampleRate || "?") +
+             " rs:" + (track ? track.readyState : "none") +
+             " mute:" + (track ? track.muted : "?") +
+             " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
+             " ec:" + (echoCancelEl.checked ? "on" : "off") +
+             " peak:" + maxRmsSeen.toFixed(5) + "]";
+    } catch (e) { return ""; }
+  }
+
   function audioGraphHealthy() {
     // A stale graph (e.g. restored from bfcache, device unplugged, tab slept)
     // can leave all variables set while the track is silently dead. Validate
@@ -2366,28 +2386,9 @@ right lower quadrant"></textarea>
             micAlarmFired = true;
             setMicPill("fail");
             micAlarmBeep();
-            // A fresh, OS-"live" track that delivers pure silence (mic indicator
-            // lit, zero RMS) is the iOS WebKit silent-capture wall — most often a
-            // Bluetooth/HFP route (AirPods/car mic) or a sample-rate mismatch that
-            // leaves the Web Audio graph silent even though capture is "on". Append
-            // the real audio-graph state so the failure is a precise bug report
-            // (device label + sample rates) instead of a guess. Failure-only, so
-            // the noise is acceptable; the clinician already screenshots these.
-            var diag = "";
-            try {
-              var ts = (track && track.getSettings) ? track.getSettings() : {};
-              diag = "  [ctx:" + (audioCtx ? audioCtx.state : "none") +
-                     " ctxSR:" + (audioCtx ? audioCtx.sampleRate : "?") +
-                     " micSR:" + (ts.sampleRate || "?") +
-                     " rs:" + (track ? track.readyState : "none") +
-                     " mute:" + (track ? track.muted : "?") +
-                     " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
-                     " ec:" + (echoCancelEl.checked ? "on" : "off") +
-                     " peak:" + maxRmsSeen.toFixed(5) + "]";
-            } catch (e) {}
             setStatus((ctxDead
               ? "⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate."
-              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.") + diag, "err");
+              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.") + micDiag(), "err");
           }
         }
       }
@@ -2781,12 +2782,15 @@ right lower quadrant"></textarea>
       if (opts.unexpected) {
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
       } else if (micAlarmFired) {
-        setStatus("No speech detected — the microphone never produced a signal. Check the mic.", "err");
+        setStatus("No speech detected — the microphone never produced a signal. Check the mic." + micDiag(), "err");
       } else {
         // The sentinel is on the clipboard and the fail beep plays — this IS
         // a failure outcome and must read as one everywhere (incl. the
         // big-button screen), even when the cause is just an accidental tap.
-        setStatus("No speech detected — nothing transcribed; sentinel copied.", "err");
+        // The diagnostic carries the audio-graph state (incl. ec:on|off + peak)
+        // so a silent take that finalizes via the quick-release no-speech path
+        // — never tripping the held-take watchdog — still reports why.
+        setStatus("No speech detected — nothing transcribed; sentinel copied." + micDiag(), "err");
       }
       failBeep();
       finishing = false;

@@ -1234,6 +1234,10 @@ right lower quadrant"></textarea>
   // looks engaged but records silence. Any backgrounding sets this; ensureAudio
   // then forces a full rebuild (a fresh getUserMedia track is genuinely live).
   let audioSuspect = false;
+  // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild). A reused
+  // graph is the iOS corpse-mic risk (track reports "live"/unmuted but delivers
+  // silence after a no-event session reclaim); the press-path probe guards it.
+  let audioReused = false;
   let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
   let gateIsOpen = false;
   let gateLastOpen = 0;
@@ -1272,6 +1276,11 @@ right lower quadrant"></textarea>
   const IOS_AUDIO_SEED_VERSION = 1;     // bump to re-push a corrected seed to un-tuned installs (additive, no _v9 bump)
   const IOS_SEED_MIC_GAIN      = 3;     // makeup gain x — deterministic + observable (gain:Nx in micDiag), unlike AGC
   const IOS_SEED_GATE_OPEN     = 0.018; // gate open threshold — well above gateClose 0.008
+  // Press-path corpse-mic probe (phone surface): one analyser frame on the REUSED
+  // mic below this RMS (a live mic always has a tiny floor; an iOS corpse delivers
+  // exact zeros) forces a fresh-getUserMedia rebuild so the take lands on a live
+  // mic. See probeMicLive.
+  const MIC_PROBE_DEAD_RMS  = 0.00001;
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -2482,6 +2491,33 @@ right lower quadrant"></textarea>
     return true;
   }
 
+  // Press-path corpse-mic catch (phone surface). After a NO-EVENT iOS session
+  // reclaim (Low Power Mode, an idle gap) the mic track keeps reporting
+  // "live"/unmuted but delivers pure silence (peak:0.00000) — audioGraphHealthy()
+  // trusts it and ensureAudio() REUSES it, so the take records nothing. When the
+  // graph was reused (a fresh rebuild is already genuinely live), read the
+  // analyser ONCE before capture: it continuously reflects the live mic (the
+  // AudioContext processes audio even while idle), so a single frame tells a
+  // corpse (exact zeros) from a live mic (always a tiny nonzero floor) with NO
+  // delay to the press — only a detected corpse pays the rebuild. Forcing ONE
+  // fresh getUserMedia lands the user's words on a live mic. Fully defensive: it
+  // can only ever ADD a rebuild, never block or break the press — a mic still
+  // dead after the rebuild then fails loud via the watchdog / the "MIC PRODUCED
+  // NO SIGNAL" finalize path, never silently.
+  async function probeMicLive() {
+    try {
+      if (!bigButtonActive() || !analyserNode || !gateBuf) return;
+      analyserNode.getFloatTimeDomainData(gateBuf);
+      var sum = 0;
+      for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
+      var rms = Math.sqrt(sum / gateBuf.length);
+      if (rms >= MIC_PROBE_DEAD_RMS) return; // a live floor is present — healthy, proceed with no delay
+      audioSuspect = true; // force ensureAudio to skip the healthy-reuse fast path
+      releaseAudio();
+      await ensureAudio();
+    } catch (e) { /* best-effort: a probe failure must never block the press */ }
+  }
+
   // Fire the mid-dictation interruption alarm IFF the AudioContext is still
   // non-running and has been for longer than the grace — the deferred re-check
   // armed by onstatechange. Loud and never auto-cleared (a real interruption
@@ -2507,6 +2543,7 @@ right lower quadrant"></textarea>
       }
       if (audioCtx.state === "running") {
         setMicPill(recording ? "rec" : "ready");
+        audioReused = true; // healthy-reuse fast path — the press-path probe verifies the mic isn't a corpse
         return true;
       }
       // Context exists but will not run — fall through and rebuild from scratch.
@@ -2514,6 +2551,7 @@ right lower quadrant"></textarea>
 
     releaseAudio();
     audioSuspect = false; // cleared by the rebuild we are about to do
+    audioReused = false;  // a fresh getUserMedia below is genuinely live — no probe needed
 
     stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -2838,6 +2876,13 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
+    // Phone corpse-mic catch: a REUSED graph can be an iOS corpse (looks live,
+    // delivers silence) after a no-event reclaim, so the take would record pure
+    // silence. Probe the analyser before capture and rebuild if it reads flat
+    // zero. Only when the graph was reused (a fresh rebuild is already live) and
+    // only on the big-button surface, so a normal press pays nothing; the probe
+    // is fully best-effort and can never break the press.
+    if (audioReused && bigButtonActive()) await probeMicLive();
     if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
     if (!audioCtx || audioCtx.state !== "running") {
       await writeSentinel();
@@ -3048,19 +3093,24 @@ right lower quadrant"></textarea>
       ? new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" })
       : null;
 
-    // Classify a low-but-real mic level: speech whose peak sat in the dead-band
-    // ABOVE the flatline floor (so the dead-mic alarm did not and cannot fire)
-    // but BELOW the load-bearing gate (so it never cleared it and recorded
-    // near-empty). The empty outcomes below then fail LOUDLY with the cause
-    // ("VERY LOW MIC LEVEL") instead of a generic "no speech" that reads like a
-    // capture bug. Strictly disjoint from the flatline alarm via >= FLATLINE_RMS.
+    // Classify the empty outcomes by the captured peak so the loud failure names
+    // the real cause instead of a generic "no speech":
+    //   noSignal — peak essentially ZERO (< FLATLINE_RMS): the mic delivered
+    //     silence. On a held take the 2.5 s watchdog already alarmed; on a SHORT
+    //     press it slips past the watchdog, so name it here ("MIC PRODUCED NO
+    //     SIGNAL") rather than blaming the clinician for not speaking — this is
+    //     the iOS corpse-mic capture (peak:0.00000 in the field).
+    //   lowLevel — peak in the dead-band [FLATLINE_RMS, gateOpen): real but too
+    //     quiet to clear the gate ("VERY LOW MIC LEVEL").
+    // Both gated on !micAlarmFired so a fired watchdog keeps its own message.
+    var noSignal = !unexpected && !micAlarmFired && maxRmsSeen < FLATLINE_RMS;
     var lowLevel = !unexpected && !micAlarmFired &&
                    maxRmsSeen >= FLATLINE_RMS &&
                    maxRmsSeen < Number(gateOpenEl.value || 0.03);
 
     if (!blob || blob.size < 1024) {
       // Gate never opened / instant tap: nothing worth uploading.
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal });
       return;
     }
 
@@ -3088,7 +3138,7 @@ right lower quadrant"></textarea>
     updateLiveDisplay();
 
     if (!r.text || !r.text.trim()) {
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal });
       return;
     }
 
@@ -3132,6 +3182,15 @@ right lower quadrant"></textarea>
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic." + recordMicFailure("no-speech-mic-alarm"), "err");
+      } else if (opts.noSignal) {
+        // The mic delivered essentially ZERO signal (peak < FLATLINE_RMS) but the
+        // press was too short to trip the 2.5 s flatline watchdog — the iOS
+        // silent-capture / corpse-mic failure on a quick tap. That is a DEAD
+        // CAPTURE, not "no speech": name the mic so a clinician who DID speak
+        // isn't told they didn't. (On the big-button surface finalizeSession
+        // marked the graph suspect, so the next take rebuilds from a fresh
+        // getUserMedia; the press-path probe catches it before capture too.)
+        setStatus("MIC PRODUCED NO SIGNAL — the mic delivered silence, not your voice. Redictate; if it repeats, relaunch the app or toggle Echo cancellation in Options." + recordMicFailure("no-speech-zero-capture"), "err");
       } else if (opts.lowLevel) {
         // The voice was real but too quiet to clear the load-bearing gate: it
         // sat in the dead-band ABOVE the flatline floor (so the dead-mic alarm

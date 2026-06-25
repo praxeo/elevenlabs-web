@@ -1239,6 +1239,13 @@ right lower quadrant"></textarea>
   let gateLastOpen = 0;
   let lastMeterPct = -1;
 
+  // iOS quiet-mic level seed bookkeeping (additive _v9, per-device — see
+  // seedIosAudioDefaults). audioSeedVersion = the seed already applied (one-shot
+  // per version); audioUserTuned = the user moved a mic-level slider, so the
+  // seed must never overwrite a hand-tuned device.
+  let audioSeedVersion = 0;
+  let audioUserTuned   = false;
+
   let historyVisible = false;
   let historyExpanded = false; // session-only: false = show the last HISTORY_PAGE, true = show all
   const HISTORY_PAGE = 10;     // newest-N shown by default so the list stays compact
@@ -1257,6 +1264,14 @@ right lower quadrant"></textarea>
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
   const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
+  // One-shot iOS quiet-mic level seed (see seedIosAudioDefaults). A quiet iPhone
+  // mic records below the load-bearing gate and lands in the silent dead-band;
+  // these seed a MODEST makeup gain + a slightly lower gate so a normal voice
+  // clears it WITHOUT anyone opening Advanced. The gain cap stays well under the
+  // ~4x dead-mic-mask boundary, and the gate stays clear of gateClose (0.008).
+  const IOS_AUDIO_SEED_VERSION = 1;     // bump to re-push a corrected seed to un-tuned installs (additive, no _v9 bump)
+  const IOS_SEED_MIC_GAIN      = 3;     // makeup gain x — deterministic + observable (gain:Nx in micDiag), unlike AGC
+  const IOS_SEED_GATE_OPEN     = 0.018; // gate open threshold — well above gateClose 0.008
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -1786,6 +1801,8 @@ right lower quadrant"></textarea>
       highpass:       highpassEl.value,
       micGain:        micGainEl.value,
       autoGain:       autoGainEl.checked,
+      audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
+      audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
       optionsOpen:    Boolean(optionsSectionEl && optionsSectionEl.open),
       keytermsOpen:   Boolean(keytermsSectionEl && keytermsSectionEl.open),
@@ -1851,6 +1868,8 @@ right lower quadrant"></textarea>
       if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
       if (s.micGain   !== undefined) micGainEl.value   = s.micGain;
       if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
+      if (typeof s.audioSeedVersion === "number")  audioSeedVersion = s.audioSeedVersion;
+      if (typeof s.audioUserTuned   === "boolean") audioUserTuned   = s.audioUserTuned;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
       if (typeof s.optionsOpen === "boolean" && optionsSectionEl) optionsSectionEl.open = s.optionsOpen;
       if (typeof s.keytermsOpen === "boolean" && keytermsSectionEl) keytermsSectionEl.open = s.keytermsOpen;
@@ -3029,9 +3048,19 @@ right lower quadrant"></textarea>
       ? new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" })
       : null;
 
+    // Classify a low-but-real mic level: speech whose peak sat in the dead-band
+    // ABOVE the flatline floor (so the dead-mic alarm did not and cannot fire)
+    // but BELOW the load-bearing gate (so it never cleared it and recorded
+    // near-empty). The empty outcomes below then fail LOUDLY with the cause
+    // ("VERY LOW MIC LEVEL") instead of a generic "no speech" that reads like a
+    // capture bug. Strictly disjoint from the flatline alarm via >= FLATLINE_RMS.
+    var lowLevel = !unexpected && !micAlarmFired &&
+                   maxRmsSeen >= FLATLINE_RMS &&
+                   maxRmsSeen < Number(gateOpenEl.value || 0.03);
+
     if (!blob || blob.size < 1024) {
       // Gate never opened / instant tap: nothing worth uploading.
-      await deliverFinalText("", { unexpected: unexpected });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel });
       return;
     }
 
@@ -3059,7 +3088,7 @@ right lower quadrant"></textarea>
     updateLiveDisplay();
 
     if (!r.text || !r.text.trim()) {
-      await deliverFinalText("", { unexpected: unexpected });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel });
       return;
     }
 
@@ -3103,6 +3132,15 @@ right lower quadrant"></textarea>
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic." + recordMicFailure("no-speech-mic-alarm"), "err");
+      } else if (opts.lowLevel) {
+        // The voice was real but too quiet to clear the load-bearing gate: it
+        // sat in the dead-band ABOVE the flatline floor (so the dead-mic alarm
+        // did not and cannot fire) but BELOW the gate, so it recorded near-empty.
+        // Name the cause and the lever instead of the generic "no speech" below
+        // (which reads as a capture failure and sent us chasing the mic
+        // lifecycle, not the gain). Same sentinel + fail beep as any empty take;
+        // logged to the micfail ring under its own tag for field root-causing.
+        setStatus("VERY LOW MIC LEVEL — your voice was too quiet to record. Move the mic closer, or raise Mic gain in Options." + recordMicFailure("no-speech-low-level"), "err");
       } else {
         // The sentinel is on the clipboard and the fail beep plays — this IS
         // a failure outcome and must read as one everywhere (incl. the
@@ -3564,6 +3602,27 @@ right lower quadrant"></textarea>
       if (navigator.platform === "MacIntel" && (navigator.maxTouchPoints || 0) > 1) return true;
     } catch (e) {}
     return false;
+  }
+
+  // One-shot iOS level seed (the foolproof piece): a quiet iPhone mic records
+  // below the load-bearing gate and lands in the silent dead-band (see
+  // finishBatchSession), so a colleague who never opens Advanced gets near-empty
+  // notes. Seed a MODEST makeup gain + a slightly lower gate so a normal voice
+  // clears the gate out of the box. Deterministic + observable (gain:Nx in
+  // micDiag) and a dead mic still reads 0 (gain x 0 = 0) — unlike browser AGC,
+  // which is opaque and can mask a dying mic / pump the gate open / boost a
+  // bystander into the kept speaker. Strictly additive + versioned (NO _v9
+  // bump): runs once per IOS_AUDIO_SEED_VERSION, never on a hand-tuned device,
+  // and (gated on isLikelyIOS) never touches desktop. Pass 1 stays the loud
+  // backstop for any residual under-gain.
+  function seedIosAudioDefaults() {
+    if (!isLikelyIOS()) return;                          // iOS-only: the root cause + VPIO story are iPhone-specific
+    if (audioUserTuned) return;                          // respect a deliberately tuned device
+    if (audioSeedVersion >= IOS_AUDIO_SEED_VERSION) return; // one-shot per version
+    micGainEl.value = String(IOS_SEED_MIC_GAIN);
+    if (Number(gateOpenEl.value) > IOS_SEED_GATE_OPEN) gateOpenEl.value = String(IOS_SEED_GATE_OPEN);
+    audioSeedVersion = IOS_AUDIO_SEED_VERSION;
+    saveSettingsNow();
   }
 
   function showMicTips() {
@@ -4531,6 +4590,7 @@ right lower quadrant"></textarea>
   };
 
   gateOpenEl.addEventListener("input", () => {
+    audioUserTuned = true; // hand-tuned: the iOS level seed must never overwrite this
     enforceGateOrder("open"); updateGateLabels(); saveSettings();
   });
   gateCloseEl.addEventListener("input", () => {
@@ -4544,11 +4604,13 @@ right lower quadrant"></textarea>
   // Makeup gain updates the live node immediately (no rebuild) so the meter
   // responds while tuning; AGC is a capture constraint, so it rebuilds the graph.
   micGainEl.addEventListener("input", () => {
+    audioUserTuned = true; // hand-tuned: the iOS level seed must never overwrite this
     if (micGainNode) micGainNode.gain.value = Number(micGainEl.value) || 1;
     updateGateLabels();
     saveSettings();
   });
   autoGainEl.addEventListener("change", () => {
+    audioUserTuned = true; // a deliberate AGC choice counts as hand-tuned — the seed must not stack makeup gain on top
     saveSettings();
     releaseAudio();
     tryWarmOnLoad();
@@ -4737,6 +4799,7 @@ right lower quadrant"></textarea>
 
   renderPresetRow(); // must precede loadSettings, which re-checks persisted presets
   loadSettings();
+  seedIosAudioDefaults(); // after loadSettings (respect a hand-tuned device), before updateGateLabels/tryWarmOnLoad so the seeded gain+gate are reflected and built
   applyEngineUI();
   updateGateLabels();
   updateKeytermHint();

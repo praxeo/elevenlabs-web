@@ -280,6 +280,29 @@ check('dead-mic finalize -> sentinel', clipboard === '##DICTATION_FAILED##', JSO
 check('no-speech status mentions mic', status().includes('microphone never produced a signal'), status());
 micRms = 0.05;
 
+// ===== Scenario 3b (batch): LOW MIC LEVEL fails LOUD (not silently) =====
+// A real-but-quiet voice whose peak sits in the dead-band ABOVE the flatline
+// floor (0.0008) but BELOW the gate (0.030) records near-empty WITHOUT tripping
+// the dead-mic alarm. Pass 1 reclassifies that empty outcome as a specific
+// "VERY LOW MIC LEVEL" failure (still sentinel + fail beep, exactly one
+// delivery) so low gain can never masquerade as a silent capture bug. Strictly
+// disjoint from the flatline alarm (which owns maxRmsSeen < FLATLINE_RMS).
+console.log('--- scenario 3b: low-mic-level loud failure ---');
+doc.getElementById('freshBtn').click();
+micRms = 0.015; // dead-band: > FLATLINE_RMS 0.0008, < gateOpen 0.030
+doc.getElementById('recordBtn').click();
+await sleep(200); // let the gate-meter loop record the dead-band peak (no flatline: peak > 0.0008)
+check('s3b: no flatline alarm fires in the dead-band', !status().includes('MIC NOT CAPTURING'), status());
+clipboard = ''; // isolate this take's clipboard outcome from scenario 3's sentinel
+fetchQueue.push({ status: 200, body: { text: '' } });
+doc.getElementById('recordBtn').click(); // stop -> upload empty -> low-level classification
+await sleep(300);
+check('s3b: low level fails LOUD naming the cause + lever', status().includes('VERY LOW MIC LEVEL'), status());
+check('s3b: low level still copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+check('s3b: not misreported as a dead mic', !status().includes('microphone never produced a signal'), status());
+micRms = 0.05;
+doc.getElementById('freshBtn').click();
+
 // ===== Scenario 4 (batch): append mode appends consecutive recordings =====
 // No time window anymore: with append mode on, the second dictation always
 // extends the first regardless of how much time passed between them.
@@ -2727,6 +2750,64 @@ console.log('--- scenario 32j: dictation journal crash recovery ---');
   check('s32j: no banner when there is nothing to recover', reboot2.dom.window.document.getElementById('journalRecover').style.display === 'none');
   clean.dom.window.close();
   reboot2.dom.window.close();
+}
+
+// ===== Scenario 33: iOS quiet-mic level seed (foolproof out-of-the-box gain) =====
+// A quiet iPhone mic records below the load-bearing gate (the silent dead-band).
+// An additive, iOS-gated, ONE-SHOT seed raises a MODEST makeup gain + lowers the
+// gate so a normal voice clears it without anyone opening Advanced — never on a
+// hand-tuned device, never on desktop, versioned (no _v9 bump), and the gain cap
+// stays at/below the dead-mic-mask boundary so a dead mic still reads 0.
+console.log('--- scenario 33: iOS quiet-mic level seed ---');
+{
+  const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+  const DESKTOP_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
+  const mkSeedDom = (opts) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      if (opts && opts.ua) { try { Object.defineProperty(win.navigator, 'userAgent', { value: opts.ua, configurable: true }); } catch (e) {} }
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify((opts && opts.settings) || {}));
+    },
+  });
+
+  // (a) fresh iPhone, no saved audio fields -> seeded exactly once
+  const d33a = mkSeedDom({ ua: IPHONE_UA, settings: {} });
+  await sleep(120);
+  const doc33a = d33a.window.document;
+  check('s33: fresh iPhone seeds a modest makeup gain (3x)', doc33a.getElementById('micGain').value === '3', doc33a.getElementById('micGain').value);
+  check('s33: seeded gain stays at/below the dead-mic-mask boundary (<=4x)', Number(doc33a.getElementById('micGain').value) <= 4, doc33a.getElementById('micGain').value);
+  check('s33: fresh iPhone lowers the gate so a normal voice clears it (0.018)', doc33a.getElementById('gateOpen').value === '0.018', doc33a.getElementById('gateOpen').value);
+  check('s33: seeded gate stays above gateClose 0.008', Number(doc33a.getElementById('gateOpen').value) > Number(doc33a.getElementById('gateClose').value), doc33a.getElementById('gateOpen').value + ' vs ' + doc33a.getElementById('gateClose').value);
+  const s33a = JSON.parse(d33a.window.localStorage.getItem('scribe_v2_settings_v9'));
+  check('s33: the seed version is stamped (one-shot)', s33a.audioSeedVersion === 1, JSON.stringify(s33a.audioSeedVersion));
+
+  // (b) already seeded at the current version -> NOT re-seeded (the saved value wins)
+  const d33b = mkSeedDom({ ua: IPHONE_UA, settings: { audioSeedVersion: 1, micGain: '2' } });
+  await sleep(120);
+  check('s33: an already-seeded phone is not re-seeded', d33b.window.document.getElementById('micGain').value === '2', d33b.window.document.getElementById('micGain').value);
+
+  // (c) hand-tuned device -> the seed must never overwrite it
+  const d33c = mkSeedDom({ ua: IPHONE_UA, settings: { audioUserTuned: true } });
+  await sleep(120);
+  check('s33: a hand-tuned iPhone is left alone (gain unchanged)', d33c.window.document.getElementById('micGain').value === '1', d33c.window.document.getElementById('micGain').value);
+  check('s33: a hand-tuned iPhone is left alone (gate unchanged)', d33c.window.document.getElementById('gateOpen').value === '0.030', d33c.window.document.getElementById('gateOpen').value);
+
+  // (d) desktop UA -> never seeded (the iOS gate excludes it)
+  const d33d = mkSeedDom({ ua: DESKTOP_UA, settings: {} });
+  await sleep(120);
+  check('s33: desktop is never seeded (gain unchanged)', d33d.window.document.getElementById('micGain').value === '1', d33d.window.document.getElementById('micGain').value);
+  check('s33: desktop is never seeded (gate unchanged)', d33d.window.document.getElementById('gateOpen').value === '0.030', d33d.window.document.getElementById('gateOpen').value);
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

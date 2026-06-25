@@ -303,6 +303,28 @@ check('s3b: not misreported as a dead mic', !status().includes('microphone never
 micRms = 0.05;
 doc.getElementById('freshBtn').click();
 
+// ===== Scenario 3c (batch): a TRUE-ZERO capture fails as "MIC PRODUCED NO SIGNAL" =====
+// A dead / iOS-corpse mic delivers literal silence (peak 0). On a HELD take the
+// 2.5s watchdog names it; on a SHORT press it slips past the watchdog and used to
+// read as the mild generic "No speech detected" — blaming the clinician for not
+// speaking. It now fails LOUD naming the mic (peak < FLATLINE_RMS), distinct from
+// the dead-band "VERY LOW MIC LEVEL" (peak in [FLATLINE_RMS, gateOpen)).
+console.log('--- scenario 3c: true-zero capture loud failure ---');
+doc.getElementById('freshBtn').click();
+micRms = 0.0; // true zero — the mic delivers nothing
+doc.getElementById('recordBtn').click();
+await sleep(200); // SHORT hold: under the 2.5s flatline watchdog, so it must classify at finalize
+check('s3c: no flatline alarm on a short zero take', !status().includes('MIC NOT CAPTURING'), status());
+clipboard = ''; // isolate this take's clipboard outcome
+fetchQueue.push({ status: 200, body: { text: '' } });
+doc.getElementById('recordBtn').click(); // stop -> upload empty -> zero-capture classification
+await sleep(300);
+check('s3c: a true-zero capture fails LOUD naming the mic', status().includes('MIC PRODUCED NO SIGNAL'), status());
+check('s3c: true-zero capture copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+check('s3c: not blamed on the clinician ("no speech")', !status().includes('No speech detected'), status());
+micRms = 0.05;
+doc.getElementById('freshBtn').click();
+
 // ===== Scenario 4 (batch): append mode appends consecutive recordings =====
 // No time window anymore: with append mode on, the second dictation always
 // extends the first regardless of how much time passed between them.
@@ -2808,6 +2830,65 @@ console.log('--- scenario 33: iOS quiet-mic level seed ---');
   await sleep(120);
   check('s33: desktop is never seeded (gain unchanged)', d33d.window.document.getElementById('micGain').value === '1', d33d.window.document.getElementById('micGain').value);
   check('s33: desktop is never seeded (gate unchanged)', d33d.window.document.getElementById('gateOpen').value === '0.030', d33d.window.document.getElementById('gateOpen').value);
+}
+
+// ===== Scenario 23p: phone corpse-mic probe (press-path mic health check) =====
+// On the big-button surface a REUSED audio graph can be an iOS corpse (track
+// reports "live"/unmuted but delivers pure silence after a no-event reclaim).
+// Before capture the press reads the analyser ONCE; a flat-zero read forces a
+// fresh getUserMedia so the user's words land on a live mic. A healthy mic always
+// shows a floor, so it pays nothing. micGranted -> the graph warms at boot
+// (audioSuspect false), so the FIRST press REUSES it (the corpse-risk path).
+console.log('--- scenario 23p: phone corpse-mic probe ---');
+{
+  const mkProbeDom = (onGum) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => { onGum(); return Promise.resolve({ getAudioTracks: () => [{ readyState: 'live', muted: false, enabled: true, stop() {}, addEventListener() {} }], getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }] }); }, addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"text":""}') }); // empty transcript -> the loud no-signal finalize
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3; win.WebSocket = Sock;
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true, bigButtonMode: 'always' }));
+    },
+  });
+
+  // (a) corpse mic (analyser flat zero) -> the probe forces a pre-capture rebuild,
+  //     and a still-dead mic then fails LOUD (never silently records nothing).
+  let gumA = 0;
+  const domA = mkProbeDom(() => { gumA++; });
+  await sleep(140); // boot: micGranted warms the graph once (audioSuspect cleared)
+  const docA = domA.window.document;
+  docA.getElementById('apiKey').value = 'test-key';
+  micRms = 0.0; // corpse: the analyser reads exact zeros
+  const gumA0 = gumA;
+  docA.getElementById('recordBtn').click(); // start -> reuse -> probe reads zero -> rebuild
+  await sleep(120);
+  check('s23p: a corpse mic on the phone forces a pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
+  docA.getElementById('recordBtn').click(); // stop -> upload empty -> still zero -> loud failure
+  await sleep(300);
+  check('s23p: a still-dead mic then fails LOUD (MIC PRODUCED NO SIGNAL)', docA.getElementById('status').textContent.includes('MIC PRODUCED NO SIGNAL'), docA.getElementById('status').textContent);
+  check('s23p: the corpse take copies the sentinel', domA.window._clip === '##DICTATION_FAILED##', JSON.stringify(domA.window._clip));
+
+  // (b) a healthy mic always shows a floor -> the probe is a no-op (NO extra
+  //     getUserMedia), so a normal press pays nothing.
+  let gumB = 0;
+  const domB = mkProbeDom(() => { gumB++; });
+  await sleep(140);
+  const docB = domB.window.document;
+  docB.getElementById('apiKey').value = 'test-key';
+  micRms = 0.05; // a live floor is present
+  const gumB0 = gumB;
+  docB.getElementById('recordBtn').click(); // start -> reuse -> probe reads a floor -> NO rebuild
+  await sleep(120);
+  check('s23p: a healthy phone mic does NOT trigger a probe rebuild', gumB === gumB0, 'gum delta ' + (gumB - gumB0));
+  docB.getElementById('recordBtn').click(); // clean up the take
+  await sleep(200);
+  micRms = 0.05;
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

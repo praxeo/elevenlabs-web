@@ -76,8 +76,9 @@ The gate puts a gap between my voice and the room and only lets my voice through
 | Background still transcribed | Open too low — raise red |
 | Gate flickers open and closed | Gap too narrow — raise red, lower yellow |
 | Nothing records | Both above your voice — lower both |
+| iPhone records near-empty / "VERY LOW MIC LEVEL" | Low gain: a quiet mic sits below the gate. iOS auto-seeds a modest **Mic gain** (3×) + lower gate on first launch; otherwise raise **Mic gain** and lower red yourself |
 
-A close, low-gain mic does more than the sliders can. Constants at the top of the client script: `BATCH_UPLOAD_TIMEOUT_MS` (15000), `FLATLINE_RMS` (0.0008, the dead-mic threshold), `HOTKEY_TAP_MS` (400, tap-vs-hold); the phone-link timings are in `CLAUDE.md`.
+A close, low-gain mic does more than the sliders can — and on **iPhone** the app now seeds a modest makeup gain + lower gate automatically on first launch (one-shot, never over a hand-tuned device, never on desktop), because a quiet iPhone mic otherwise records in the *silent dead-band* below the gate. Any residual under-gain now fails **loudly** as "VERY LOW MIC LEVEL" (with the cause + lever) instead of a generic no-speech error. Constants at the top of the client script: `BATCH_UPLOAD_TIMEOUT_MS` (15000), `FLATLINE_RMS` (0.0008, the dead-mic threshold), `IOS_SEED_MIC_GAIN` (3) / `IOS_SEED_GATE_OPEN` (0.018) / `IOS_AUDIO_SEED_VERSION`, `HOTKEY_TAP_MS` (400, tap-vs-hold); the phone-link timings are in `CLAUDE.md`.
 
 ## Roadmap
 

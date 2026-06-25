@@ -1,8 +1,9 @@
 // Session-flow simulation for the embedded client app.
 //
 // Run from the repo root:
-//   npm install --no-save jsdom jsqr
+//   npm install --no-save jsdom jsqr fake-indexeddb
 //   node tests/flow.test.mjs
+// (install all three in ONE command — npm --no-save prunes other --no-save pkgs)
 //
 // Renders the page through the real Worker fetch handler, boots it in jsdom
 // with mocked WebSocket / fetch / audio graph / clipboard, and drives:
@@ -80,6 +81,7 @@
 
 import { JSDOM } from 'jsdom';
 import jsQR from 'jsqr';
+import { IDBFactory } from 'fake-indexeddb';
 import { dirname, join } from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -139,6 +141,7 @@ const mockStream = { getAudioTracks: () => [micTrack], getTracks: () => [micTrac
 
 let clipboard = '';
 let gumCalls = 0;        // getUserMedia acquisitions (mic re-engagement paths)
+let lastGumConstraints = null; // the constraints object of the most recent getUserMedia
 let wakeLockCalls = 0;   // wake lock acquisitions
 let activeWakeLock = null;
 
@@ -193,7 +196,12 @@ const dom = new JSDOM(html, {
       });
     };
     Object.defineProperty(window.navigator, 'mediaDevices', {
-      value: { getUserMedia: () => { gumCalls++; return Promise.resolve(mockStream); }, addEventListener() {} },
+      // A fresh getUserMedia always yields a LIVE track (the real API does), so a
+      // re-acquisition after releaseAudio (e.g. the big-button corpse-mic guard)
+      // revives the singleton track instead of handing back a stale "ended" one.
+      // The constraints are captured so a rebuild's echoCancellation/autoGainControl
+      // can be asserted (scenario 31m).
+      value: { getUserMedia: (c) => { gumCalls++; lastGumConstraints = c; micTrack.readyState = 'live'; return Promise.resolve(mockStream); }, addEventListener() {} },
       configurable: true,
     });
     Object.defineProperty(window.navigator, 'wakeLock', {
@@ -2408,45 +2416,96 @@ console.log('--- scenario 29: batch-only product ---');
 }
 
 // ===== Scenario 30: diarization — keep-primary-speaker filters bystander voices =====
-// Background voices the mic catches land as a SECOND Scribe speaker. With the
-// (default-on, per-device) "Filter out other speakers" toggle, the client keeps
-// only the dominant speaker, surfaces a no-beep status note about what it
-// removed, and never empties a clean single-speaker note. Toggling it off sends
-// diarize=false and delivers the full text unfiltered.
+// Background voices the mic catches land as a SECOND Scribe speaker. The
+// (default-on, per-device) "Filter out other speakers" toggle keeps only the
+// dominant speaker — but ONLY on the phone / big-button surface (a plain desktop
+// keeps the proven single-speaker config), ONLY when one speaker clearly
+// dominates (the minority guard), and a LARGE removal is a degraded warn (not a
+// clean Done!) with the unfiltered text stashed in history for recovery.
 console.log('--- scenario 30: diarization keep-primary-speaker ---');
 doc.getElementById('apiKey').value = 'test-key';
 doc.getElementById('freshBtn').click();
 check('s30: diarize toggle defaults ON (per-device)', doc.getElementById('diarize').checked === true);
+const mkWords = (spec) => spec.flatMap(([sid, ...ws]) => ws.map((t) => ({ text: t, type: 'word', speaker_id: sid })));
+const hist0 = () => JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]')[0] || {};
 
-// Leg A: two speakers — the bystander's words are dropped, a note reports it.
-const wordsTwo = [
-  { text: 'Patient', type: 'word', speaker_id: 'speaker_0' },
-  { text: 'is',      type: 'word', speaker_id: 'speaker_0' },
-  { text: 'stable',  type: 'word', speaker_id: 'speaker_0' },
-  { text: 'hey',     type: 'word', speaker_id: 'speaker_1' },
-  { text: 'grab',    type: 'word', speaker_id: 'speaker_1' },
-  { text: 'lunch',   type: 'word', speaker_id: 'speaker_1' },
-  { text: 'today',   type: 'word', speaker_id: 'speaker_0' },
-];
+// Leg 0: DESKTOP surface (default, not joined) — even with the toggle ON,
+// diarization is SUPPRESSED: diarize=false is sent and the full text is
+// delivered. The desktop keeps the proven single-speaker path.
+const wordsTwo = mkWords([['speaker_0', 'Patient', 'is', 'stable'], ['speaker_1', 'hey', 'grab', 'lunch'], ['speaker_0', 'today']]);
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable hey grab lunch today', words: wordsTwo } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click();
 await sleep(300);
+const up0 = fetchCalls[fetchCalls.length - 1];
+check('s30: desktop surface SUPPRESSES diarization (diarize=false even with toggle on)', up0.form.get('diarize') === 'false', up0.form.get('diarize'));
+check('s30: desktop surface delivers the full unfiltered text', clipboard.includes('lunch'), JSON.stringify(clipboard));
+
+// Switch to the phone / big-button surface so diarization actually applies.
+doc.getElementById('bigButtonMode').value = 'always';
+doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubbles: true }));
+
+// Leg A: a CLEAR minority bystander (1 of 9 words) — small removal, clean Done!.
+doc.getElementById('freshBtn').click();
+const wordsA = mkWords([['speaker_0', 'Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'], ['speaker_1', 'okay']]);
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
 const upA = fetchCalls[fetchCalls.length - 1];
-check('s30: upload carries diarize=true when the toggle is on', upA.form.get('diarize') === 'true', upA.form.get('diarize'));
-check('s30: primary speaker kept on the clipboard', clipboard.includes('Patient is stable today'), JSON.stringify(clipboard));
-check('s30: bystander speaker dropped from the clipboard', !clipboard.includes('lunch'), JSON.stringify(clipboard));
-check('s30: a status note reports what was removed (no beep)', status().includes('Filtered out 3 words from other speakers'), status());
-check('s30: removal is still a success outcome (Done!)', status().includes('Done!'), status());
+check('s30: phone surface sends diarize=true', upA.form.get('diarize') === 'true', upA.form.get('diarize'));
+check('s30: primary speaker kept on the clipboard', clipboard.includes('Patient is stable and resting comfortably this morning'), JSON.stringify(clipboard));
+check('s30: clear-minority bystander dropped', !clipboard.includes('okay'), JSON.stringify(clipboard));
+check('s30: small removal stays a clean success (Done!)', status().includes('Done!') && statusCls().includes('ok'), status());
+check('s30: small removal reports the count', status().includes('Filtered out 1 word from other speakers'), status());
+
+// Leg A2: a LARGE removal (3 of 9 words) — degraded WARN, not Done!, and the
+// unfiltered transcript is stashed in history for recovery.
+doc.getElementById('freshBtn').click();
+const wordsBig = mkWords([['speaker_0', 'Assessment', 'and', 'plan', 'continue', 'current', 'medications'], ['speaker_1', 'did', 'you', 'eat']]);
+fetchQueue.push({ status: 200, body: { text: 'Assessment and plan continue current medications did you eat', words: wordsBig } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: large removal kept the dominant speaker', clipboard.includes('Assessment and plan continue current medications'), JSON.stringify(clipboard));
+check('s30: large removal dropped the minority speaker', !clipboard.includes('did you eat'), JSON.stringify(clipboard));
+check('s30: large removal is a degraded WARN (not Done!)', statusCls().includes('warn') && !status().includes('Done!'), status() + ' / ' + statusCls());
+check('s30: large removal status says VERIFY', status().includes('VERIFY'), status());
+check('s30: unfiltered transcript stashed in history for recovery', (hist0().unfiltered || '').includes('did you eat'), JSON.stringify(hist0()));
+
+// Leg guard: NO clear majority (4 vs 3 = 57%, below the 60% min share) — the
+// filter keeps EVERYTHING rather than risk dropping the clinician (or acting on
+// Scribe over-diarizing one continuous voice).
+doc.getElementById('freshBtn').click();
+const wordsEven = mkWords([['speaker_0', 'the', 'patient', 'reports', 'mild'], ['speaker_1', 'pain', 'since', 'yesterday']]);
+fetchQueue.push({ status: 200, body: { text: 'the patient reports mild pain since yesterday', words: wordsEven } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: minority guard keeps BOTH speakers when none dominates', clipboard.includes('patient reports mild') && clipboard.includes('pain since yesterday'), JSON.stringify(clipboard));
+check('s30: minority guard => no removal note, clean Done!', !status().includes('Filtered out') && status().includes('Done!'), status());
+
+// Leg inverted: a talkative BYSTANDER out-talks the clinician (6 vs 2). The
+// most-words heuristic keeps the wrong speaker — but the safety net makes it
+// LOUD (degraded warn) and recoverable (unfiltered in history), never a silent
+// confident Done!.
+doc.getElementById('freshBtn').click();
+const wordsInv = mkWords([['speaker_1', 'so', 'anyway', 'i', 'told', 'her', 'that'], ['speaker_0', 'chest', 'pain']]);
+fetchQueue.push({ status: 200, body: { text: 'so anyway i told her that chest pain', words: wordsInv } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: inverted dominance is a degraded WARN, never a confident Done!', statusCls().includes('warn') && !status().includes('Done!'), status() + ' / ' + statusCls());
+check('s30: inverted dominance keeps the clinician words recoverable in history', (hist0().unfiltered || '').includes('chest pain'), JSON.stringify(hist0()));
 
 // Leg B: a single speaker is a no-op — the full text survives, no note.
 doc.getElementById('freshBtn').click();
-const wordsOne = [
-  { text: 'Solo', type: 'word', speaker_id: 'speaker_0' },
-  { text: 'note', type: 'word', speaker_id: 'speaker_0' },
-  { text: 'here', type: 'word', speaker_id: 'speaker_0' },
-];
+const wordsOne = mkWords([['speaker_0', 'Solo', 'note', 'here']]);
 fetchQueue.push({ status: 200, body: { text: 'Solo note here', words: wordsOne } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -2472,6 +2531,203 @@ check('s30: toggle off => no removal note', !status().includes('Filtered out'), 
 check('s30: diarize=false persisted (per-device)', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).diarize === false, w.localStorage.getItem('scribe_v2_settings_v9'));
 doc.getElementById('diarize').checked = true; // restore default for any later reuse
 doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
+doc.getElementById('bigButtonMode').value = 'joined'; // leave the surface as it was
+doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubbles: true }));
+
+// ===== Scenario 31m: mic capture levers + silent-capture telemetry =====
+// The per-device echo-cancellation / makeup-gain / auto-gain levers that the
+// silent-capture commits added (#39/#42) had no coverage. Assert their defaults,
+// that toggling the capture constraints rebuilds the graph (and rides into
+// getUserMedia), that makeup gain updates live without a rebuild, that the
+// levers persist + reload, the failure log is captured — and the CENTRAL #42
+// safety invariant: makeup gain (pre-analyser) can NEVER mask a dead mic.
+console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
+{
+  doc.getElementById('freshBtn').click();
+  const ec = doc.getElementById('echoCancel');
+  const ag = doc.getElementById('autoGain');
+  const mg = doc.getElementById('micGain');
+
+  check('s31m: echo cancellation defaults ON', ec.checked === true);
+  check('s31m: makeup gain defaults to 1x', mg.value === '1', mg.value);
+  check('s31m: auto gain control defaults OFF', ag.checked === false);
+  check('s31m: Copy button is labelled "Copy & clear"', doc.getElementById('copyBtn').textContent.includes('Copy & clear'), doc.getElementById('copyBtn').textContent);
+
+  // Echo cancellation is a capture constraint -> toggling it rebuilds the graph.
+  let g0 = gumCalls;
+  ec.checked = false; ec.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('s31m: toggling echo cancellation rebuilds the audio graph', gumCalls > g0, gumCalls + ' vs ' + g0);
+  check('s31m: rebuild carries echoCancellation:false into getUserMedia', !!(lastGumConstraints && lastGumConstraints.audio && lastGumConstraints.audio.echoCancellation === false), JSON.stringify(lastGumConstraints && lastGumConstraints.audio));
+  ec.checked = true; ec.dispatchEvent(new w.Event('change')); await sleep(200);
+
+  // Auto gain control rebuilds too.
+  g0 = gumCalls;
+  ag.checked = true; ag.dispatchEvent(new w.Event('change'));
+  await sleep(200);
+  check('s31m: toggling auto gain rebuilds the audio graph', gumCalls > g0, gumCalls + ' vs ' + g0);
+  check('s31m: rebuild carries autoGainControl:true into getUserMedia', !!(lastGumConstraints && lastGumConstraints.audio.autoGainControl === true), JSON.stringify(lastGumConstraints && lastGumConstraints.audio));
+  ag.checked = false; ag.dispatchEvent(new w.Event('change')); await sleep(200);
+
+  // Makeup gain is a live node, NOT a capture constraint -> no rebuild.
+  g0 = gumCalls;
+  mg.value = '8'; mg.dispatchEvent(new w.Event('input'));
+  await sleep(60);
+  check('s31m: makeup gain updates live without a graph rebuild', gumCalls === g0, gumCalls + ' vs ' + g0);
+  await sleep(300); // let the debounced save flush
+  const saved = JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9'));
+  check('s31m: levers persist (echoCancel on, autoGain off, micGain 8)', saved.echoCancel === true && saved.autoGain === false && saved.micGain === '8', JSON.stringify({ ec: saved.echoCancel, ag: saved.autoGain, mg: saved.micGain }));
+
+  // CRITICAL invariant (#42): makeup gain sits BEFORE the analyser, so gain × 0
+  // = 0 — a high gain must NEVER lift a dead mic's silence above the flatline
+  // watchdog. A 15x flatline still alarms and copies the sentinel.
+  mg.value = '15'; mg.dispatchEvent(new w.Event('input'));
+  doc.getElementById('freshBtn').click();
+  micRms = 0.0; // dead mic
+  doc.getElementById('recordBtn').click();
+  await sleep(2900);
+  check('s31m: high makeup gain does NOT mask a dead mic (alarm still fires)', status().includes('MIC NOT CAPTURING'), status());
+  check('s31m: dead-mic diagnostic shows the gain that was set', status().includes('gain:15.0x'), status());
+  fetchQueue.push({ status: 200, body: { text: '' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s31m: dead mic at high gain still copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+  const flog = JSON.parse(w.localStorage.getItem('scribe_v2_micfail_v9') || '[]');
+  check('s31m: the silent-capture failure was logged with the audio-graph state',
+    flog.some((e) => /no-capture-flatline|no-speech-mic-alarm/.test(e.reason) && (e.diag || '').includes('gain:15.0x')),
+    JSON.stringify(flog.slice(0, 2)));
+  micRms = 0.05; mg.value = '1'; mg.dispatchEvent(new w.Event('input'));
+
+  // micDiag on the QUICK-RELEASE no-speech path (#41): a short tap that never
+  // trips the 2.5s flatline watchdog still surfaces + logs the audio-graph state.
+  doc.getElementById('freshBtn').click();
+  fetchQueue.push({ status: 200, body: { text: '' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(80);
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s31m: quick-release no-speech copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+  check('s31m: quick-release no-speech surfaces the audio-graph diagnostic', status().includes('ec:') && status().includes('gain:') && status().includes('peak:'), status());
+  const flog2 = JSON.parse(w.localStorage.getItem('scribe_v2_micfail_v9') || '[]');
+  check('s31m: quick-release no-speech logged with its reason', !!(flog2[0] && flog2[0].reason === 'no-speech-quick-release'), JSON.stringify(flog2[0]));
+
+  // Reload round-trip: a fresh boot reads the persisted levers via loadSettings.
+  const rDom = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{}') });
+      const t = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+      const st = { getAudioTracks: () => [t], getTracks: () => [t] };
+      Object.defineProperty(win.navigator, 'mediaDevices', { value: { getUserMedia: () => Promise.resolve(st), addEventListener() {} }, configurable: true });
+      Object.defineProperty(win.navigator, 'permissions', { value: { query: () => Promise.resolve({ state: 'granted' }) }, configurable: true });
+      Object.defineProperty(win.navigator, 'clipboard', { value: { writeText() { return Promise.resolve(); } }, configurable: true });
+      Object.defineProperty(win, 'isSecureContext', { value: true, configurable: true });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, echoCancel: false, micGain: '9', autoGain: true }));
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (reload):', e.message); failures++; });
+    },
+  });
+  await sleep(150);
+  const rd = rDom.window.document;
+  check('s31m: reload restores echoCancel=false via loadSettings', rd.getElementById('echoCancel').checked === false);
+  check('s31m: reload restores micGain=9 via loadSettings', rd.getElementById('micGain').value === '9', rd.getElementById('micGain').value);
+  check('s31m: reload restores autoGain=true via loadSettings', rd.getElementById('autoGain').checked === true);
+}
+
+// ===== Scenario 32j: dictation journal (crash-safe audio recovery) =====
+// The roadmap's #1 reliability gap: a device that captures audio but dies before
+// upload+delivery used to silently lose that take. The journal mirrors each
+// chunk to IndexedDB during recording; the next boot finds an un-finalized take
+// and offers a loud recovery (re-upload + deliver). A normal finish clears it.
+console.log('--- scenario 32j: dictation journal crash recovery ---');
+{
+  // One device's persistent IndexedDB, SHARED across the "crash" and the "reboot"
+  // so the journal survives the simulated process death.
+  const sharedIDB = new IDBFactory();
+  const mkJDom = (opts) => {
+    const st = { fetches: [], batchText: 'Recovered words.', batchFail: false, win: null };
+    st.dom = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        st.win = win;
+        win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+        win.indexedDB = sharedIDB;
+        // MediaRecorder that mirrors start(1000): emit chunks on a short interval
+        // so chunks actually land in the journal during "recording".
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; this._iv = null; }
+          static isTypeSupported() { return false; }
+          start() { this.state = 'recording'; this._iv = win.setInterval(() => { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); }, 40); }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this._iv) { win.clearInterval(this._iv); this._iv = null; } if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+        };
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.fetch = (url) => { st.fetches.push(String(url)); return new Promise((resolve) => setTimeout(() => resolve({ ok: !st.batchFail, status: st.batchFail ? 500 : 200, text: () => Promise.resolve(JSON.stringify(st.batchFail ? { error: 'x' } : { text: st.batchText })) }), 5)); };
+        const t = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+        const stream = { getAudioTracks: () => [t], getTracks: () => [t] };
+        Object.defineProperty(win.navigator, 'mediaDevices', { value: { getUserMedia: () => Promise.resolve(stream), addEventListener() {} }, configurable: true });
+        Object.defineProperty(win.navigator, 'permissions', { value: { query: () => Promise.resolve({ state: 'granted' }) }, configurable: true });
+        Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (x) => { win._clip = x; return Promise.resolve(); } }, configurable: true });
+        Object.defineProperty(win, 'isSecureContext', { value: true, configurable: true });
+        if (opts && opts.settings) win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(opts.settings));
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (32j):', e.message); failures++; });
+      },
+    });
+    return st;
+  };
+  const orphanRecordingCount = () => new Promise((resolve) => {
+    const req = sharedIDB.open('scribe_v2_journal', 1);
+    req.onsuccess = () => { const db = req.result; const g = db.transaction('sessions', 'readonly').objectStore('sessions').getAll(); g.onsuccess = () => { db.close(); resolve((g.result || []).filter((s) => s.state === 'recording').length); }; g.onerror = () => { db.close(); resolve(-1); }; };
+    req.onerror = () => resolve(-1);
+  });
+
+  // ---- crash: capture audio, never finalize ----
+  const crash = mkJDom({ settings: { saveApiKey: true } });
+  await sleep(150);
+  const cd = crash.dom.window.document;
+  cd.getElementById('apiKey').value = 'k';
+  cd.getElementById('recordBtn').click(); // start -> chunks mirror to the journal on the interval
+  await sleep(220);                        // ~5 chunks journaled
+  crash.dom.window.close();                // simulate the page dying before stop/finalize
+  check('s32j: an interrupted take left an orphan in the journal', (await orphanRecordingCount()) >= 1, await orphanRecordingCount());
+
+  // ---- reboot: same device IndexedDB, boot finds + offers recovery ----
+  const reboot = mkJDom({ settings: { saveApiKey: true } });
+  reboot.batchText = 'Recovered dictation text.';
+  await sleep(300); // boot + restoreJournal (async)
+  const rd = reboot.dom.window.document;
+  check('s32j: reboot surfaces the recovery banner', rd.getElementById('journalRecover').style.display !== 'none', rd.getElementById('journalRecover').style.display);
+  check('s32j: recovery banner names it as interrupted', rd.getElementById('journalRecoverMsg').textContent.includes('interrupted'), rd.getElementById('journalRecoverMsg').textContent);
+  rd.getElementById('apiKey').value = 'k';
+  rd.getElementById('journalRecoverBtn').click(); // recover -> re-upload -> deliver locally
+  await sleep(350);
+  check('s32j: recovered audio is re-uploaded for transcription', reboot.fetches.some((u) => u.includes('/api/transcribe')), reboot.fetches.join(','));
+  check('s32j: recovered text lands on the clipboard', (reboot.win._clip || '').includes('Recovered dictation text.'), JSON.stringify(reboot.win._clip));
+  check('s32j: recovered note is in the box', rd.getElementById('latest').textContent.includes('Recovered dictation text.'), rd.getElementById('latest').textContent);
+  check('s32j: recovery banner hidden after success', rd.getElementById('journalRecover').style.display === 'none');
+  check('s32j: journal cleared after successful recovery', (await orphanRecordingCount()) === 0, await orphanRecordingCount());
+  reboot.dom.window.close();
+
+  // ---- happy path: a normally finished take leaves NO orphan ----
+  const clean = mkJDom({ settings: { saveApiKey: true } });
+  clean.batchText = 'Clean take.';
+  await sleep(250);
+  const cld = clean.dom.window.document;
+  cld.getElementById('apiKey').value = 'k';
+  cld.getElementById('recordBtn').click();
+  await sleep(150);
+  cld.getElementById('recordBtn').click(); // stop -> upload -> deliver -> journalFinish clears it
+  await sleep(350);
+  check('s32j: a normally finished take leaves no orphan', (await orphanRecordingCount()) === 0, await orphanRecordingCount());
+
+  // ---- discard path: a fresh boot with the clean DB shows no banner ----
+  const reboot2 = mkJDom({ settings: { saveApiKey: true } });
+  await sleep(300);
+  check('s32j: no banner when there is nothing to recover', reboot2.dom.window.document.getElementById('journalRecover').style.display === 'none');
+  clean.dom.window.close();
+  reboot2.dom.window.close();
+}
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

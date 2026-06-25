@@ -34,7 +34,7 @@ Start/done beeps are optional (Options). Failure and warn alarms always play, an
 - **The gate earns its keep.** It's the capture path *and* it drives the waveform feedback and the dead-mic watchdog — one analyser, three jobs.
 - **Phone link durability.** The phone dictates and the text lands on the desktop clipboard. The delivery is queued on the phone (persisted, retried on reconnect and at boot), acked by listener count, replayed by the room, and deduped by id — so a dropped link, or a phone that dies after transcribing, recovers instead of losing the note.
 - **Keeping the phone screen awake.** The real fix for "iOS keeps killing the mic between takes" was to *prevent* the interruption (hold the wake lock while the phone is on the big-button surface), not just recover after it.
-- **Diarization keep-primary-speaker.** Drops a bystander voice the mic caught and reports how many words it removed. It can only ever remove a second voice, never empty a clean note. On by default.
+- **Diarization keep-primary-speaker.** Drops a bystander voice the mic caught and reports how many words it removed. On by default, but only on the phone / big-button surface (where bystanders are the real risk) — a plain desktop keeps the proven single-speaker config. It only filters when one voice clearly dominates (so it never deletes my own words on an even split), a big cut warns and saves the unfiltered version to history, and it can never empty a clean note.
 
 ## What hasn't worked (and the lessons)
 
@@ -83,7 +83,7 @@ A close, low-gain mic does more than the sliders can. Constants at the top of th
 
 In priority order — #1 is the standing rule, never lose a dictation:
 
-1. **Durability.** A dictation journal: persist the captured audio to IndexedDB during recording and recover after a crash, plus a local failure log. (The phone-side delivery queue is done; the in-flight *audio* gap is what's left.)
+1. **Durability — done.** The dictation journal landed: each recorded chunk is mirrored to IndexedDB during capture, and a take that the app died on (crash / kill / OOM before upload) is recovered on the next boot — a loud banner re-transcribes the saved audio and copies it. Plus the silent-capture failure log (`scribe_v2_micfail_v9`) now records the audio-graph state on every MIC FAIL / no-speech for later diagnosis. With the phone-side delivery queue (post-transcription) this closes both loss legs. *Next:* a UI to browse/replay the failure log and recovered audio.
 2. **Settings portability.** Sync the portable settings across devices while keeping per-device tuning local — export/import or passphrase-keyed server-side profiles.
 3. **Phone UI.** The big-button layout is done; surfacing the capture waveform on the big screen is the open gap, then a larger live readout and swipe gestures.
 

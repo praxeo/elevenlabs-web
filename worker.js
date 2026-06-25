@@ -661,6 +661,17 @@ const INDEX_HTML = `<!doctype html>
         until the beep, then switch windows and Ctrl+V.
       </div>
 
+      <!-- Crash-recovery banner: shown only when the dictation journal finds a
+           take that captured audio but never finished (the app died mid-dictation
+           before upload). Hidden otherwise, so the compact card stays compact. -->
+      <div id="journalRecover" class="status err" style="display:none; margin-top:8px;">
+        <div id="journalRecoverMsg"></div>
+        <div class="row" style="margin-top: 8px;">
+          <button id="journalRecoverBtn" class="primary" title="Transcribe the interrupted recording and copy it">Recover the interrupted dictation</button>
+          <button id="journalDiscardBtn" title="Discard the interrupted recording (it cannot be recovered later)">Discard</button>
+        </div>
+      </div>
+
       <label>Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
       <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
@@ -848,7 +859,7 @@ right lower quadrant"></textarea>
 
           <label class="checkbox">
             <input type="checkbox" id="diarize" checked />
-            Filter out other speakers <span class="hint">(on by default; keeps only the main voice — removes bystander speech the mic picks up. Noise suppression can't: another person's voice is speech. A status note reports anything removed.)</span>
+            Filter out other speakers <span class="hint">(on by default, but applies only on the phone / big-button surface — a plain desktop keeps the proven single-speaker config. Keeps only the dominant voice when it clearly dominates; a big cut warns + saves the unfiltered version to history. Noise suppression can't do this — another person's voice is speech.)</span>
           </label>
 
           <div id="batchOptsSection">
@@ -1092,6 +1103,12 @@ right lower quadrant"></textarea>
   const bigPeekTextEl    = document.getElementById("bigPeekText");
   const bigButtonModeEl  = document.getElementById("bigButtonMode");
 
+  // Crash-recovery (dictation journal) banner
+  const journalRecoverEl    = document.getElementById("journalRecover");
+  const journalRecoverMsgEl = document.getElementById("journalRecoverMsg");
+  const journalRecoverBtn   = document.getElementById("journalRecoverBtn");
+  const journalDiscardBtn   = document.getElementById("journalDiscardBtn");
+
   let mediaRecorder = null;
   let chunks = [];
   let recording = false;
@@ -1107,6 +1124,12 @@ right lower quadrant"></textarea>
   // moves here when you Copy latest, clear the box, or start a fresh dictation).
   // In-memory only — re-derived from history at boot (restoreLatestFromHistory).
   let archivedText = "";
+  // The createdAt of the history entry the slot mirrors, so a slot edit persists
+  // back to THAT row by id — never by text (identical-text rows would collide and
+  // the wrong stored dictation could be overwritten). null = no stable link
+  // (e.g. the box was hand-edited before filing), in which case a slot edit is
+  // slot-only and never touches history.
+  let archivedCreatedAt = null;
   // Diagnostic: ?debug=1 logs phone-link listener frames to the console AND an
   // on-screen overlay (foolproof when DevTools is filtered or unavailable). Off
   // by default; purely additive.
@@ -1237,6 +1260,16 @@ right lower quadrant"></textarea>
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
+  // Diarization keep-primary-speaker safety. The filter can DELETE real words, so
+  // it must fail toward keeping the clinician's speech in (missing text in a chart
+  // is the worst outcome). It only drops a speaker when ONE clearly dominates
+  // (≥ MIN_SHARE of labeled words) — a roughly-even split (two real speakers, or
+  // Scribe over-diarizing one continuous voice) keeps EVERYTHING. A removal above
+  // WARN_SHARE is treated as degraded: warn beep + "verify" status + the
+  // unfiltered transcript stashed in history for recovery.
+  const DIARIZE_PRIMARY_MIN_SHARE = 0.6;  // dominant speaker must hold ≥60% of words to filter at all
+  const DIARIZE_WARN_SHARE        = 0.15; // dropping ≥15% of words is degraded, not a clean "Done!"
+
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline fails faster on a hung request (was 30s)
 
   // Phone link (desktop listener <-> session room)
@@ -1267,6 +1300,12 @@ right lower quadrant"></textarea>
   // The pre-merge batch app stored the shared access code under this key;
   // read it as a fallback so those users keep their saved code.
   const LEGACY_ACCESS_CODE_KEY = "scribe_v2_access_code_v9";
+  // Per-device capturable failure log: the micDiag() audio-graph state at each
+  // silent-capture failure, so the affected device's root cause (HFP route /
+  // sample-rate / voice-processing unit) can be pinned down instead of guessed
+  // lever-by-lever. Additive, never wiped by a settings change. Bounded ring.
+  const MICFAIL_LOG_KEY        = "scribe_v2_micfail_v9";
+  const MICFAIL_LOG_MAX        = 10;
 
   /* ───── Audio cues ─────
      Beeps prefer the persistent (already running) AudioContext: a fresh
@@ -1377,6 +1416,13 @@ right lower quadrant"></textarea>
   function fileToSlot(text) {
     if (text && text.trim()) {
       archivedText = text.trim();
+      // Link the slot to a specific history row so a later slot edit targets it
+      // by createdAt, not by text. The filed note is the active box note = the
+      // most recent delivery, so it matches history[0] unless the box was
+      // hand-edited after delivery — in which case there is no clean link and a
+      // slot edit stays slot-only (safer than overwriting the wrong row).
+      var h = getHistory();
+      archivedCreatedAt = (h[0] && (h[0].text || "").trim() === archivedText) ? h[0].createdAt : null;
       renderLastDictation();
     }
   }
@@ -1455,8 +1501,15 @@ right lower quadrant"></textarea>
       appendToggleBtn.classList.toggle("active", appendArmed && !recording);
       appendToggleBtn.disabled = !hasText || recording || stopping || finishing;
     }
+    // Box-clearing buttons are unsafe during a session and the in-flight upload
+    // (finishing): the delivery re-files from sessionBaseText, so a clear now
+    // would reappear. Disable them in that window (the onclick handlers also
+    // guard the path) — mirrors the appendToggleBtn guard above.
+    const busy = recording || stopping || finishing;
+    if (copyBtn)  copyBtn.disabled  = !hasText || busy;
+    if (freshBtn) freshBtn.disabled = busy;
     updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
-    if (!hasText || recording) {
+    if (!hasText || busy) {
       appendChipEl.style.display = "none";
       return;
     }
@@ -1859,9 +1912,186 @@ right lower quadrant"></textarea>
       if (meta.language_code !== undefined) entry.language_code = meta.language_code;
       if (meta.engine) entry.engine = meta.engine;
       if (meta.liveText) entry.liveText = meta.liveText; // hybrid: the realtime rendering, kept for comparison
+      if (meta.unfiltered) entry.unfiltered = meta.unfiltered; // diarization: the pre-filter text, for recovering wrongly dropped speech
+      if (meta.recovered) entry.recovered = true; // came back via the crash-recovery journal
     }
     items.unshift(entry);
     setHistory(items);
+  }
+
+  /* ───── Dictation journal (crash-safe audio recovery) ─────
+     The one remaining SILENT loss window: a device that captures audio but dies
+     (crash / OS kill / OOM) BEFORE upload+delivery finishes loses that take — its
+     audio lives only in MediaRecorder's in-memory chunks[]. The journal mirrors
+     each chunk to IndexedDB DURING recording and recovers an un-finalized take on
+     the next boot. PURELY ADDITIVE and best-effort: every op is try/caught and
+     no-ops if IndexedDB is missing or fails, so a journal problem never touches
+     the live capture/upload path — it can only ever NARROW the loss window. */
+  const JOURNAL_DB_NAME   = "scribe_v2_journal";
+  const JOURNAL_MAX_CHUNKS = 600; // soft cap (~10 min @ 1s timeslice) — bound the write cost; the in-memory path is unaffected past this
+  let journalDb = null;
+  let journalDisabled = (typeof indexedDB === "undefined");
+  let journalSessionId = null;   // id of the in-flight take's journal record (null = not journaling)
+  let journalChunkCount = 0;
+  let pendingRecovery = null;    // { session, blob } awaiting the user's Recover/Discard
+
+  function journalOpen() {
+    if (journalDisabled) return Promise.resolve(null);
+    if (journalDb) return Promise.resolve(journalDb);
+    return new Promise(function (resolve) {
+      let req;
+      try { req = indexedDB.open(JOURNAL_DB_NAME, 1); }
+      catch (e) { journalDisabled = true; return resolve(null); }
+      req.onupgradeneeded = function () {
+        const db = req.result;
+        if (!db.objectStoreNames.contains("sessions")) db.createObjectStore("sessions", { keyPath: "id" });
+        if (!db.objectStoreNames.contains("chunks")) {
+          const cs = db.createObjectStore("chunks", { keyPath: "k", autoIncrement: true });
+          cs.createIndex("sid", "sid", { unique: false });
+        }
+      };
+      req.onsuccess = function () { journalDb = req.result; resolve(journalDb); };
+      req.onerror = function () { journalDisabled = true; resolve(null); };
+    });
+  }
+  function jTxDone(tx) { return new Promise(function (res) { tx.oncomplete = function () { res(true); }; tx.onerror = function () { res(false); }; tx.onabort = function () { res(false); }; }); }
+  function jReq(r) { return new Promise(function (res) { r.onsuccess = function () { res(r.result); }; r.onerror = function () { res(undefined); }; }); }
+
+  // Begin journaling a take (fire-and-forget from the record path so it never
+  // adds latency). journalSessionId arms journalAppend once the metadata lands.
+  async function journalStart(mimeType) {
+    journalSessionId = null;
+    journalChunkCount = 0;
+    if (journalDisabled) return;
+    try {
+      const db = await journalOpen();
+      if (!db) return;
+      const id = "j" + Date.now() + "-" + sessionSeq;
+      const tx = db.transaction("sessions", "readwrite");
+      tx.objectStore("sessions").put({
+        id: id, createdAt: new Date().toISOString(),
+        mimeType: mimeType || "audio/webm",
+        joined: Boolean(joinedSessionCode),
+        base: sessionBaseText || "",
+        state: "recording",
+      });
+      if (await jTxDone(tx)) journalSessionId = id;
+    } catch (e) { journalSessionId = null; }
+  }
+
+  // Mirror one recorded chunk (best-effort, non-blocking). Stored as an
+  // ArrayBuffer, not a Blob: ArrayBuffers persist reliably across browsers
+  // (iOS Safari has a history of Blob-in-IndexedDB bugs — and iOS is the target).
+  async function journalAppend(blob) {
+    if (journalDisabled || !journalSessionId || !blob || !blob.arrayBuffer) return;
+    if (journalChunkCount >= JOURNAL_MAX_CHUNKS) return;
+    const sid = journalSessionId;
+    try {
+      const buf = await blob.arrayBuffer();
+      const db = await journalOpen();
+      if (!db || journalSessionId !== sid) return; // session ended while we awaited
+      const tx = db.transaction("chunks", "readwrite");
+      tx.objectStore("chunks").add({ sid: sid, buf: buf });
+      if (await jTxDone(tx)) journalChunkCount++;
+    } catch (e) {}
+  }
+
+  // The take finished (delivered OR failed loudly) — clear its journal record so
+  // boot never offers to recover a take the user already saw resolve.
+  async function journalFinish() {
+    const sid = journalSessionId;
+    journalSessionId = null;
+    if (journalDisabled || !sid) return;
+    try { await journalClear(sid); } catch (e) {}
+  }
+
+  async function journalClear(sid) {
+    const db = await journalOpen();
+    if (!db) return;
+    const tx = db.transaction(["sessions", "chunks"], "readwrite");
+    tx.objectStore("sessions").delete(sid);
+    const cur = tx.objectStore("chunks").index("sid").openKeyCursor(sid);
+    cur.onsuccess = function () {
+      const c = cur.result;
+      if (c) { tx.objectStore("chunks").delete(c.primaryKey); c.continue(); }
+    };
+    await jTxDone(tx);
+  }
+
+  // Boot: find a take that captured audio but never finished and surface a loud
+  // recovery affordance. Only the NEWEST orphan is offered; older ones are
+  // cleared (a stale multi-hour recovery must never auto-land on a chart).
+  async function restoreJournal() {
+    if (journalDisabled) return;
+    try {
+      const db = await journalOpen();
+      if (!db) return;
+      const sessions = await jReq(db.transaction("sessions", "readonly").objectStore("sessions").getAll());
+      if (!Array.isArray(sessions) || !sessions.length) return;
+      sessions.sort(function (a, b) { return (b.createdAt || "").localeCompare(a.createdAt || ""); });
+      const newest = sessions[0];
+      for (let i = 1; i < sessions.length; i++) { try { await journalClear(sessions[i].id); } catch (e) {} }
+      if (!newest || newest.state !== "recording") { try { await journalClear(newest.id); } catch (e) {} return; }
+      const rows = await jReq(db.transaction("chunks", "readonly").objectStore("chunks").index("sid").getAll(newest.id));
+      const bufs = (Array.isArray(rows) ? rows : []).map(function (r) { return r && r.buf; }).filter(Boolean);
+      const blob = bufs.length ? new Blob(bufs, { type: newest.mimeType || "audio/webm" }) : null;
+      if (!blob || blob.size < 1024) { try { await journalClear(newest.id); } catch (e) {} return; }
+      pendingRecovery = { session: newest, blob: blob };
+      showJournalRecover(newest);
+    } catch (e) {}
+  }
+
+  function showJournalRecover(session) {
+    if (!journalRecoverEl) return;
+    let when = "";
+    try { when = new Date(session.createdAt).toLocaleString(); } catch (e) {}
+    if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
+      "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it.";
+    journalRecoverEl.style.display = "";
+    warnBeep(); // loud: an un-recovered dictation is a potentially lost note
+  }
+
+  function hideJournalRecover() {
+    pendingRecovery = null;
+    if (journalRecoverEl) journalRecoverEl.style.display = "none";
+  }
+
+  // Recover: re-upload the saved audio and deliver it locally (a recovered take
+  // is never auto-relayed to a desktop — the link is likely long gone). The
+  // Recover click is a user gesture, so the clipboard write is allowed.
+  async function recoverPendingDictation() {
+    if (!pendingRecovery || recording || stopping || finishing) return;
+    const rec = pendingRecovery;
+    if (journalRecoverBtn) journalRecoverBtn.disabled = true;
+    setStatus("Recovering the interrupted dictation — uploading its audio…", "warn");
+    const fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
+    const r = await batchTranscribe(rec.blob, fileName, BATCH_UPLOAD_TIMEOUT_MS);
+    if (journalRecoverBtn) journalRecoverBtn.disabled = false;
+    if (!r.ok || !r.text || !r.text.trim()) {
+      setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try Recover again.", "err");
+      failBeep();
+      return; // keep pendingRecovery + the journal record for another attempt
+    }
+    const text = cleanTranscript(r.text);
+    const base = rec.session.base || "";
+    finalizedSegments = base ? [base, text] : [text];
+    currentPartial = "";
+    latestText = finalizedSegments.join(" ");
+    updateLiveDisplay();
+    try { addHistory(latestText, { language_code: "en", engine: "batch", recovered: true }); } catch (e) {}
+    const copied = await copyText(latestText);
+    try { await journalClear(rec.session.id); } catch (e) {}
+    hideJournalRecover();
+    if (copied) { setStatus("Recovered dictation transcribed & copied. Verify it before pasting!", "ok"); doneBeep(); }
+    else { setStatus("Recovered dictation saved but the clipboard copy FAILED — click 'Copy & clear'.", "err"); failBeep(); }
+    updateAppendChip();
+  }
+
+  async function discardPendingDictation() {
+    const rec = pendingRecovery;
+    hideJournalRecover();
+    if (rec) { try { await journalClear(rec.session.id); } catch (e) {} }
+    setStatus("Interrupted recording discarded.", "");
   }
 
   // Boot restore: show the most recent saved transcript instead of an empty
@@ -1874,7 +2104,10 @@ right lower quadrant"></textarea>
     currentPartial = "";
     // The box shows the newest note, so the slot shows the one before it (so the
     // "Last dictation" view is consistent across reloads, not just in-session).
-    if (items[1] && items[1].text && items[1].text.trim()) archivedText = items[1].text.trim();
+    if (items[1] && items[1].text && items[1].text.trim()) {
+      archivedText = items[1].text.trim();
+      archivedCreatedAt = items[1].createdAt || null; // slot ↔ that history row, for edit persistence
+    }
     updateLiveDisplay();
   }
 
@@ -2032,10 +2265,18 @@ right lower quadrant"></textarea>
     }
     var ids = Object.keys(counts);
     if (ids.length <= 1) return null; // single (or unlabeled) speaker: nothing to drop
+    var totalLabeled = 0;
+    for (var c = 0; c < ids.length; c++) totalLabeled += counts[ids[c]];
     var dominant = ids[0];
     for (var j = 1; j < ids.length; j++) {
       if (counts[ids[j]] > counts[dominant]) dominant = ids[j];
     }
+    var dominantShare = totalLabeled ? counts[dominant] / totalLabeled : 0;
+    // No clear majority ⇒ we cannot safely tell the clinician from a bystander
+    // (or Scribe split one continuous voice ~evenly). Dropping the wrong speaker
+    // would delete real clinical content, so keep EVERYTHING and let the
+    // unfiltered text stand — the filter only ever acts on a clear minority.
+    if (dominantShare < DIARIZE_PRIMARY_MIN_SHARE) return null;
     var kept = [];
     var removed = 0;
     for (var k = 0; k < words.length; k++) {
@@ -2050,8 +2291,15 @@ right lower quadrant"></textarea>
         removed++;
       }
     }
-    return { text: kept.join(" "), removedWords: removed, speakers: ids.length };
+    return { text: kept.join(" "), removedWords: removed, totalWords: totalLabeled, dominantShare: dominantShare, speakers: ids.length };
   }
+
+  // Diarization applies only on the phone / big-button surface, where bystanders
+  // are the real risk. A plain desktop keeps the proven single-speaker config
+  // (num_speakers=1 / diarize=false) regardless of the checkbox — flipping the
+  // default STT shape for all desktop users with no measured accuracy backing
+  // is a risk the prime directive (never wrong/missing chart text) doesn't take.
+  function diarizeActive() { return Boolean(diarizeEl.checked && bigButtonActive()); }
 
   /* ───── Batch transcription call (pure batch mode + hybrid refine) ───── */
   async function batchTranscribe(blob, fileName, timeoutMs) {
@@ -2064,7 +2312,7 @@ right lower quadrant"></textarea>
     form.append("timestamps_granularity", timestampsEl.value);
     form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
     form.append("tag_audio_events", String(tagEventsEl.checked));
-    form.append("diarize", String(diarizeEl.checked)); // keep-primary-speaker: drop bystander voices the mic caught
+    form.append("diarize", String(diarizeActive())); // keep-primary-speaker: drop bystander voices — phone/big-button surface only
     form.append("keyterms_json", precomputedBatchKeyterms || JSON.stringify(
       effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
     )); // [LATENCY] reuse the snapshot taken at session start; fall back if absent
@@ -2091,14 +2339,23 @@ right lower quadrant"></textarea>
       }
       var text = String(data.text || data.transcript || "");
       var removedWords = 0;
-      // Keep only the primary speaker when diarization is on. A failure to find a
-      // second speaker (or any words[]) leaves the full text untouched — the
-      // filter can only ever REMOVE bystander speech, never empty a clean note.
-      if (diarizeEl.checked && Array.isArray(data.words) && data.words.length) {
+      var removedShare = 0;
+      var unfilteredText = "";
+      // Keep only the primary speaker when diarization is active. A failure to find
+      // a clear-minority second speaker (or any words[]) leaves the full text
+      // untouched — the filter can only ever REMOVE a clear bystander, never empty
+      // a clean note. When it does cut, keep the unfiltered text so a wrongly
+      // dropped clinician utterance is recoverable from history.
+      if (diarizeActive() && Array.isArray(data.words) && data.words.length) {
         var prim = keepPrimarySpeaker(data.words);
-        if (prim && prim.text.trim()) { text = prim.text; removedWords = prim.removedWords; }
+        if (prim && prim.text.trim() && prim.removedWords > 0) {
+          unfilteredText = text;
+          text = prim.text;
+          removedWords = prim.removedWords;
+          removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
+        }
       }
-      return { ok: true, text: text, error: "", removedWords: removedWords };
+      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText };
     } catch (err) {
       const aborted = err && err.name === "AbortError";
       return {
@@ -2175,6 +2432,22 @@ right lower quadrant"></textarea>
              " gain:" + Number(micGainEl.value).toFixed(1) + "x" +
              " peak:" + maxRmsSeen.toFixed(5) + "]";
     } catch (e) { return ""; }
+  }
+
+  // Record a silent-capture failure: compute the diag ONCE, stash it in a bounded
+  // per-device ring (so the root cause can be inspected later, not just glimpsed
+  // on a red screen) and console.warn it. Returns the diag string so the caller
+  // can also append it to the visible status — one micDiag() call, two sinks.
+  function recordMicFailure(reason) {
+    var diag = micDiag();
+    try {
+      var log = JSON.parse(localStorage.getItem(MICFAIL_LOG_KEY) || "[]");
+      if (!Array.isArray(log)) log = [];
+      log.unshift({ at: new Date().toISOString(), reason: reason, diag: diag });
+      localStorage.setItem(MICFAIL_LOG_KEY, JSON.stringify(log.slice(0, MICFAIL_LOG_MAX)));
+    } catch (e) {}
+    try { if (typeof console !== "undefined" && console.warn) console.warn("[micfail] " + reason + diag); } catch (e) {}
+    return diag;
   }
 
   function audioGraphHealthy() {
@@ -2417,7 +2690,7 @@ right lower quadrant"></textarea>
             micAlarmBeep();
             setStatus((ctxDead
               ? "⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate."
-              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.") + micDiag(), "err");
+              : "⚠ MIC NOT CAPTURING — no audio signal detected. Stop, check the microphone, then redictate.") + recordMicFailure(ctxDead ? "ctx-interrupted" : "no-capture-flatline"), "err");
           }
         }
       }
@@ -2647,13 +2920,17 @@ right lower quadrant"></textarea>
     }
 
     mediaRecorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
+      if (e.data && e.data.size > 0) {
+        chunks.push(e.data);
+        journalAppend(e.data); // crash-safe mirror to IndexedDB (best-effort, non-blocking)
+      }
     };
     mediaRecorder.onstop = () => {
       if (sessionFinalized) return;
       finalizeSession(false);
     };
     mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
+    journalStart(preferred || "audio/webm"); // begin the crash-recovery journal for this take (fire-and-forget)
 
     recording = true;
     stopping = false;
@@ -2680,6 +2957,7 @@ right lower quadrant"></textarea>
     userStopped = true;
     stopping = true;
     refreshLatestEditable(); // keep the box locked through the upload phase
+    updateAppendChip();      // disable Copy & clear / Clear box through the upload
 
     // No tail/commit phases: stopping the recorder flushes the last chunk,
     // and its onstop handler drives the finalize/upload.
@@ -2712,6 +2990,7 @@ right lower quadrant"></textarea>
     recordBtn.classList.remove("danger");
     if (micAlarmFired) setMicPill("fail");
     else setMicPill(audioGraphHealthy() ? "ready" : "off");
+    updateAppendChip(); // keep Copy & clear / Clear box disabled through the upload
     // Phone big-button surface: the audio graph is RETAINED between takes (for a
     // fast next push-to-talk), but iOS can silently kill the mic track in the idle
     // gap while it keeps reporting readyState "live"/unmuted — audioGraphHealthy()
@@ -2784,13 +3063,20 @@ right lower quadrant"></textarea>
       return;
     }
 
-    // Surface diarization removals as a (non-beeping) status note: the clinician
-    // must be able to see that speech was dropped, in case the primary-speaker
-    // pick was wrong (the delivered text is still the cleaner, primary-only one).
+    // Surface diarization removals. A small trim is a clean success with a quiet
+    // note; a LARGE removal (≥ DIARIZE_WARN_SHARE of the take) is treated as
+    // degraded — the primary-speaker pick could be wrong, so it gets a warn beep,
+    // a "verify" status, and the unfiltered transcript stashed in history so a
+    // wrongly dropped clinician utterance can be recovered.
+    var degraded = r.removedWords > 0 && r.removedShare >= DIARIZE_WARN_SHARE;
     var note = r.removedWords
-      ? "Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers."
+      ? ("Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers." +
+         (degraded ? " VERIFY nothing of yours was dropped — the unfiltered version is saved in history." : ""))
       : "";
-    await deliverFinalText(cleanTranscript(latestText), { unexpected: unexpected, label: "Transcript", note: note });
+    await deliverFinalText(cleanTranscript(latestText), {
+      unexpected: unexpected, label: "Transcript", note: note,
+      degraded: degraded, unfilteredText: degraded ? r.unfilteredText : "",
+    });
   }
 
   // The single delivery exit: exactly one clipboard outcome and one beep per
@@ -2800,6 +3086,11 @@ right lower quadrant"></textarea>
   //   unexpectedMsg — override for the unexpected status line
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
+    // The take reached its single, cued outcome (success or loud failure), so
+    // the crash-recovery journal for it is no longer needed — clear it (best-
+    // effort). A crash BEFORE this point still leaves the journal for boot to
+    // recover; once we're here the user has (or is about to get) a loud cue.
+    journalFinish();
     // On a plain desktop the screen may sleep again once the outcome is
     // delivered; on the phone's big-button surface we deliberately KEEP the lock
     // so iOS doesn't auto-lock between takes and reclaim the mic (wakeLockDesired).
@@ -2811,7 +3102,7 @@ right lower quadrant"></textarea>
       if (opts.unexpected) {
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied.", "err");
       } else if (micAlarmFired) {
-        setStatus("No speech detected — the microphone never produced a signal. Check the mic." + micDiag(), "err");
+        setStatus("No speech detected — the microphone never produced a signal. Check the mic." + recordMicFailure("no-speech-mic-alarm"), "err");
       } else {
         // The sentinel is on the clipboard and the fail beep plays — this IS
         // a failure outcome and must read as one everywhere (incl. the
@@ -2819,7 +3110,7 @@ right lower quadrant"></textarea>
         // The diagnostic carries the audio-graph state (incl. ec:on|off + peak)
         // so a silent take that finalizes via the quick-release no-speech path
         // — never tripping the held-take watchdog — still reports why.
-        setStatus("No speech detected — nothing transcribed; sentinel copied." + micDiag(), "err");
+        setStatus("No speech detected — nothing transcribed; sentinel copied." + recordMicFailure("no-speech-quick-release"), "err");
       }
       failBeep();
       finishing = false;
@@ -2832,7 +3123,7 @@ right lower quadrant"></textarea>
     // Save final clean output to browser storage. A storage failure (quota)
     // must not block the actual deliverable — the clipboard write and beep.
     try {
-      addHistory(cleaned, { language_code: "en", engine: sessionEngine });
+      addHistory(cleaned, { language_code: "en", engine: sessionEngine, unfiltered: opts.unfilteredText || "" });
     } catch (e) {}
 
     // Joined + clean: the DESKTOP clipboard is the deliverable, so the relay
@@ -2866,6 +3157,10 @@ right lower quadrant"></textarea>
       } else if (micAlarmFired) {
         setStatus("⚠ Mic signal dropped during this dictation — verify the text before pasting!", "err");
         failBeep();
+      } else if (opts.degraded) {
+        // A large diarization removal: delivered + copied, but verify (warn, not Done!).
+        setStatus(label + " saved & copied." + noteSuffix, "warn");
+        warnBeep();
       } else {
         setStatus(label + " saved & copied. Done!" + noteSuffix, "ok");
         doneBeep();
@@ -2876,6 +3171,9 @@ right lower quadrant"></textarea>
       } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
+      } else if (opts.degraded) {
+        setStatus(label + " saved." + noteSuffix, "warn");
+        warnBeep();
       } else {
         setStatus(label + " saved." + noteSuffix, "ok");
         doneBeep();
@@ -3994,12 +4292,18 @@ right lower quadrant"></textarea>
     finalizedSegments = []; // Fixed: Make sure screen buffer is cleared alongside history
     currentPartial = "";
     archivedText = ""; // the slot mirrors history — wiping history empties it too
+    archivedCreatedAt = null;
     renderHistory();
     updateAppendChip();
     setStatus("History cleared.");
   };
 
   freshBtn.onclick = () => {
+    // Never clear mid-session or during the in-flight upload (finishing): the
+    // delivery rebuilds finalizedSegments from sessionBaseText and re-files, so a
+    // box cleared now would reappear with the delivered text. The button is also
+    // disabled in that window (updateAppendChip) — this guards the path anyway.
+    if (recording || stopping || finishing) return;
     // Clearing the box files the note into the "Last dictation" slot first, so
     // it stays visible (and one tap of "Append to this" can bring it back).
     fileToSlot(latestText);
@@ -4014,6 +4318,9 @@ right lower quadrant"></textarea>
   // failed copy keeps the box (the loud copyText status stands) so nothing is
   // lost before the deliverable actually landed.
   copyBtn.onclick = async () => {
+    // Same in-flight guard as freshBtn: Copy & clear empties the box, which the
+    // delivery would then overwrite from sessionBaseText. Don't clear mid-upload.
+    if (recording || stopping || finishing) return;
     if (!latestText || !latestText.trim()) return;
     const text = latestText;
     const ok = await copyText(text);
@@ -4035,14 +4342,19 @@ right lower quadrant"></textarea>
     if (!lastDictationTextEl) return;
     const newText = (lastDictationTextEl.textContent || "").trim();
     archivedText = lastDictationTextEl.textContent;
-    if (!newText || newText === (slotEditBase || "").trim()) return;
-    const all = getHistory();
-    const i = all.findIndex(function (it) { return (it.text || "").trim() === (slotEditBase || "").trim(); });
-    if (i >= 0) {
-      all[i].text = lastDictationTextEl.textContent;
-      all[i].editedAt = new Date().toISOString();
-      setHistory(all); // persist + re-render the list (the slot DOM is separate)
-      setStatus("Saved edit to the last dictation.", "ok");
+    if (!newText || newText === (slotEditBase || "").trim()) { slotEditBase = newText; return; }
+    // Persist by the linked row's createdAt — never by matching text (two rows
+    // with identical text would let the edit land on the wrong stored dictation).
+    // No link (a hand-edited box was filed) ⇒ the slot edit is slot-only.
+    if (archivedCreatedAt) {
+      const all = getHistory();
+      const i = all.findIndex(function (it) { return it.createdAt === archivedCreatedAt; });
+      if (i >= 0) {
+        all[i].text = lastDictationTextEl.textContent;
+        all[i].editedAt = new Date().toISOString();
+        setHistory(all); // persist + re-render the list (the slot DOM is separate)
+        setStatus("Saved edit to the last dictation.", "ok");
+      }
     }
     slotEditBase = newText;
   }
@@ -4069,11 +4381,15 @@ right lower quadrant"></textarea>
     finalizedSegments = [t];
     currentPartial = "";
     archivedText = ""; // it's the active note now, not the archived one
+    archivedCreatedAt = null;
     appendArmed = true;
     updateLiveDisplay();
     updateAppendChip();
     setStatus("Loaded the last dictation into the box — the next dictation will append to it.", "ok");
   };
+
+  if (journalRecoverBtn) journalRecoverBtn.onclick = () => recoverPendingDictation();
+  if (journalDiscardBtn) journalDiscardBtn.onclick = () => discardPendingDictation();
 
   if (phoneStartBtnEl) phoneStartBtnEl.onclick = () => startPhoneSession();
   if (phoneStopBtnEl)  phoneStopBtnEl.onclick  = () => stopPhoneSession();
@@ -4426,6 +4742,7 @@ right lower quadrant"></textarea>
   updateKeytermHint();
   updateHotkeyUI();
   restoreLatestFromHistory();
+  restoreJournal(); // surface a crash-interrupted dictation for recovery (best-effort, async)
   restorePhoneLink(); // resume/rejoin a persisted phone-link pairing
   applyBigButtonUI(); // after restorePhoneLink: a persisted/QR join boots straight into the big button
   updatePairButton(); // reflect any resumed phone session on the "Pair a phone" button

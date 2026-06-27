@@ -1,8 +1,21 @@
 # ElevenLabs Scribe v2 Dictation — working notes
 
-Personal notes on this app: what it is, what's worked, what hasn't, and what's next — so I can debug it and keep making it better. The full product guide and the hard invariants are in [`CLAUDE.md`](CLAUDE.md); the realtime dead-end is archived in [`REALTIME_HANDOFF.md`](REALTIME_HANDOFF.md).
+Personal notes on this app: what it is, for debugging and development purposes. 
 
-One file, no build, no dependencies: `worker.js` is the Cloudflare Worker *and* the whole client (one template literal). Keyterm lists live in `keyterms.js`. I use it for push-to-talk dictation into Cerner/Citrix via AutoHotkey, with the transcript handed off on the clipboard. Status: alpha, in real use.
+Goal is to create a web-only, dependency-free, highly accurate dictation tool that provides for short-form voice typing/dictation. The ideal use case is dictating clinical documentation, with domain specific prompting, focus on latency, and ability to work despite limitations of sandboxed/firewalled corporate environments. At this time, a cloudflare worker/DO serve at the edge and act as a go-between to ElevenLabs Scribe V2 API. 
+
+Ideal Use: 
+  -high quality microphone, installed to desktop as a PWA, and use autohotkey script to focus the window and activate dictation. Auto copy to clipboard, and then additional hotkey to paste into desired focused field. 
+
+Phone dictation:
+  -Using a QR or pairing code, link phone to same cloudflare worker, transmit audio to Elevenlabs via the worker, and then to the desktop where it can then enter the regular dictation workflow.
+  -Primary drawback is IOS microphone permission/wedging issue that is seemingly insurmountable. This is an intrinsic limitation of PWAs in IOS. 
+  -Workaround would be android or a device solely used for dictation that could be placed in focus mode.
+
+Learnings so far:
+  -Goal was a batch/realtime hybrid; where the realtime feedback would be backed up by a concurrent batch job that would be sent at the end of utterance. In practice, realtime transcription is not quite there. Attempted Soniox, ElevenLabs, Mistral. Soniox is close, but latency and accuracy issues were pervasive and      not fixable.
+  -To me however, this represents the gold standard of dictation software. Seamless dictation, with high accuracy, minimal latency, all going to the cursor in real time, with the backup of the high domain-specific accuracy of a batch "recheck" at the end of utterance.
+  -Realtime dictation products are close, but the multiple moving parts involved are a real last mile hurdle that is insurmountable at this time in this context.
 
 ## What it does
 

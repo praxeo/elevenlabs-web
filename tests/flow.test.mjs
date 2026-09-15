@@ -4513,5 +4513,131 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   domB47.window.close();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 48. [UX/RELIABILITY] The phone is a COMPLETE dictation device on its own.
+//     A joined phone whose desktop is not listening used to paint the whole
+//     screen FAILED with a warn beep on EVERY take -- even though the take was
+//     transcribed, put in the box, saved to history, and sitting in a durable
+//     code-bound queue that sends itself when the desktop returns. Nothing was
+//     lost, so nothing failed; and an alarm that fires on every normal take is
+//     how a loud-failure product teaches its user to ignore red.
+//     Now the cue splits on whether a desktop was EXPECTED:
+//       - none listening before the take  => success (done beep), stated plainly
+//         as queued and NOT as delivered;
+//       - one was listening and has gone  => still loud, because that is a
+//         genuine surprise -- and only ONCE, since the situation is then known.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 48: phone-only dictation is a success, not a failure ---');
+  const st48 = { statusListeners: 0, deliverListeners: 0, vibes: [], fetches: [] };
+  let w48;
+  const dom48 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w48 = win;
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.vibrate = (pat) => { st48.vibes.push(pat); return true; };
+      const track = { readyState: 'live', muted: false, addEventListener() {}, stop() {} };
+      const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(stream), addEventListener() {} };
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+      win.WebSocket = Sock;
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = (url) => {
+        const u = String(url);
+        st48.fetches.push(u);
+        // /status is what tells the phone whether a desktop is even there -- the
+        // signal the outcome cue now turns on.
+        if (u.includes('/status')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"listeners":' + st48.statusListeners + ',"buffered":0}') });
+        if (u.includes('/deliver')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"ok":true,"listeners":' + st48.deliverListeners + '}') });
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":"Phone only note."}') });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ joinedSessionCode: 'PHONLY', micGranted: true, saveApiKey: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-48');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (48):', e.message); failures++; });
+    },
+  });
+  await sleep(300); // boot: restorePhoneLink -> applyBigButtonUI -> first /status poll
+  const doc48 = dom48.window.document;
+  const s48 = () => doc48.getElementById('status').textContent.trim();
+  const cls48 = () => doc48.getElementById('status').className;
+  const lastVibe = () => JSON.stringify(st48.vibes[st48.vibes.length - 1]);
+  const DONE = '[40,60,40]', WARN = '[90,90,90]';
+
+  check('s48: the phone is on the big-button surface via its join', doc48.body.classList.contains('bigbtn'));
+  check('s48: the presence pill says no desktop is listening BEFORE dictating',
+    (doc48.getElementById('bigDesktopPill').textContent || '').includes('not listening'),
+    doc48.getElementById('bigDesktopPill').textContent);
+
+  // --- 48a: no desktop expected => a queued note is a SUCCESS ---------------
+  micRms = 0.05;
+  doc48.getElementById('recordBtn').click();
+  await sleep(160);
+  doc48.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s48a: the take still transcribed and is in the box',
+    (doc48.getElementById('latest').textContent || '').includes('Phone only note.'),
+    doc48.getElementById('latest').textContent);
+  check('s48a: a phone-only dictation is NOT reported as a failure', !cls48().includes('err'), cls48() + ' / ' + s48());
+  check('s48a: it reads as a success', cls48().includes('ok'), cls48() + ' / ' + s48());
+  check('s48a: it gets the DONE cue, not a warn', lastVibe() === DONE, lastVibe());
+  check('s48a: but it never claims the desktop has it', s48().includes('QUEUED') && !s48().includes('Delivered to the desktop'), s48());
+  check('s48a: the queue chip shows the note waiting',
+    doc48.getElementById('bigQueueChip').style.display !== 'none' && (doc48.getElementById('bigQueueChip').textContent || '').includes('1 note'),
+    doc48.getElementById('bigQueueChip').style.display + ' / ' + doc48.getElementById('bigQueueChip').textContent);
+  check('s48a: the phone screen does not read FAILED',
+    !(doc48.getElementById('bigState').textContent || '').includes('FAILED'),
+    doc48.getElementById('bigState').textContent);
+  check('s48a: the note is saved in history so it can be sent later',
+    JSON.parse(w48.localStorage.getItem('scribe_v2_transcripts_v9') || '[]').length === 1);
+
+  // --- 48b: a desktop that WAS there and vanished is still loud -------------
+  st48.statusListeners = 1;   // the desktop comes back...
+  doc48.getElementById('bigSettingsBtn'); // (no-op; keeps the next line readable)
+  await sleep(50);
+  st48.deliverListeners = 1;
+  doc48.getElementById('recordBtn').click(); // a delivered take re-establishes presence
+  await sleep(160);
+  doc48.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s48b: a delivered take reports delivery', s48().includes('Delivered to the desktop'), s48());
+  check('s48b: and gets the done cue', lastVibe() === DONE, lastVibe());
+
+  st48.deliverListeners = 0;  // ...then disappears mid-take: a real surprise
+  doc48.getElementById('recordBtn').click();
+  await sleep(160);
+  doc48.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s48b: a desktop that VANISHES is still loud', cls48().includes('err'), cls48() + ' / ' + s48());
+  check('s48b: and warns rather than claiming success', lastVibe() === WARN, lastVibe());
+
+  // --- 48c: the alarm fires on the CHANGE, then stops crying wolf -----------
+  doc48.getElementById('recordBtn').click();
+  await sleep(160);
+  doc48.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s48c: the NEXT take, now that the absence is known, is quiet', !cls48().includes('err'), cls48() + ' / ' + s48());
+  check('s48c: and gets the done cue', lastVibe() === DONE, lastVibe());
+  check('s48c: every undelivered note is still queued and visible',
+    (doc48.getElementById('bigQueueChip').textContent || '').includes('waiting to send'),
+    doc48.getElementById('bigQueueChip').textContent);
+  dom48.window.close();
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

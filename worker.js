@@ -3870,6 +3870,9 @@ right lower quadrant"></textarea>
     // the PREVIOUS take's healthy peak right next to it.
     maxRmsSeen = 0;
     lastProbeRms = -1;
+    // Snapshot the desktop's presence NOW: the delivery cue at the end needs to
+    // know whether a missing desktop is the expected situation or a surprise.
+    desktopKnownAtStart = joinedSessionCode ? desktopPresent : null;
     // A direct start supersedes any armed queued start (the timer would no-op
     // against recording=true anyway, but a dead handle must not linger where
     // the release guards read it).
@@ -4486,9 +4489,14 @@ right lower quadrant"></textarea>
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
       if (announceRelayOutcome) {
-        setStatus((copied
-          ? "Transcript copied here and sent to the desktop — confirming delivery…"
-          : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy & clear' if you need it here)") + noteSuffix, "warn");
+        // Don't claim it went to the desktop when we already know none is there:
+        // this line is what the phone's big screen shows while the relay runs.
+        var queueing = desktopKnownAtStart === false;
+        setStatus((queueing
+          ? (copied ? "Transcript copied here — queueing for the desktop…"
+                    : "Transcript saved — queueing for the desktop…")
+          : (copied ? "Transcript copied here and sent to the desktop — confirming delivery…"
+                    : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy & clear' if you need it here)")) + noteSuffix, "warn");
       } else if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy & clear'.", "err");
         failBeep();
@@ -4508,7 +4516,9 @@ right lower quadrant"></textarea>
       }
     } else {
       if (announceRelayOutcome) {
-        setStatus("Transcript sent to the desktop — confirming delivery…" + noteSuffix, "warn");
+        setStatus((desktopKnownAtStart === false
+          ? "Transcript saved — queueing for the desktop…"
+          : "Transcript sent to the desktop — confirming delivery…") + noteSuffix, "warn");
       } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
         failBeep();
@@ -5160,7 +5170,18 @@ right lower quadrant"></textarea>
     } catch (e) { setDesktopPill(null); }
   }
 
+  // Last KNOWN desktop presence (true / false / null = unknown). The phone used
+  // to hold no such memory, so it could not tell "no desktop was ever there"
+  // (a phone-only dictation, which is a perfectly good outcome) from "the
+  // desktop was listening and has gone" (a real regression worth an alarm).
+  // Both landed on the same red screen + warn beep, so someone deliberately
+  // dictating on the phone saw EVERY take reported as a failure — which is how
+  // a loud-failure product teaches its user to ignore red.
+  let desktopPresent = null;
+  let desktopKnownAtStart = null; // desktopPresent as of this take's start
+
   function setDesktopPill(state) {
+    desktopPresent = state; // null when unknown (poll failed / not joined)
     if (!bigDesktopPillEl) return;
     if (state === null || !joinedSessionCode || !bigButtonActive()) { bigDesktopPillEl.style.display = "none"; return; }
     bigDesktopPillEl.style.display = "";
@@ -5642,6 +5663,10 @@ right lower quadrant"></textarea>
     // deliverFinalText already played the loud local cue (fail beep + red
     // status). The queue still retries the text — we just never add a SECOND
     // cue (the one-outcome-beep-per-session invariant).
+    // Keep the presence memory fresh even when nothing is polling: an ack IS a
+    // presence check.
+    if (outcome === "delivered") desktopPresent = true;
+    else if (outcome === "buffered") desktopPresent = false;
     if (!announceOutcome) return;
     if (outcome === "delivered") {
       if (degradedNote) {
@@ -5656,10 +5681,29 @@ right lower quadrant"></textarea>
       setStatus("Delivered to the desktop clipboard. Done!", "ok");
       doneBeep();
     } else if (outcome === "buffered") {
-      // POST ok but nobody is listening: the desktop does not have it yet. The
-      // text is queued + retried, but the user must hear that it did not land.
-      setStatus("⚠ Desktop link is DOWN — transcript queued; it delivers when the desktop reconnects. VERIFY it lands before pasting!", "err");
-      warnBeep();
+      // POST ok but nobody is listening: the desktop does not have it yet.
+      //
+      // Whether that is a FAILURE depends entirely on whether a desktop was
+      // expected. The phone is a complete dictation device on its own: the take
+      // is transcribed, in the box, saved to history, and sitting in a durable
+      // code-bound queue that survives a relaunch and sends itself the moment
+      // the desktop reappears (the chip shows the count, and Send to desktop
+      // pushes it on demand). Nothing was lost, so nothing failed.
+      if (desktopKnownAtStart === false) {
+        // We already knew there was no desktop when the take started — this is
+        // the phone-only workflow working exactly as intended. Say plainly that
+        // it has NOT reached the desktop, then treat it as the success it is.
+        var waiting = deliveryQueue.length;
+        setStatus("Saved on the phone. No desktop is listening, so it is QUEUED" +
+          (waiting ? " (" + waiting + " waiting)" : "") +
+          " — it sends itself when the desktop is back, or tap 'Send to desktop'.", "ok");
+        doneBeep();
+      } else {
+        // The desktop WAS listening (or we never knew), and the note did not
+        // land: that is a genuine surprise and stays loud.
+        setStatus("⚠ Desktop link is DOWN — transcript queued; it delivers when the desktop reconnects. VERIFY it lands before pasting!", "err");
+        warnBeep();
+      }
     } else {
       // POST failed/timed out: link down. Loud, and queued for retry. When the
       // failure was an auth refusal, say exactly what unblocks it.

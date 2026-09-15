@@ -151,8 +151,9 @@ node --check /tmp/served.js
 
 # Full session-flow simulation — batch-only product, 35 scenario groups
 # (numbered 0,3,4,7,9,10,11,17,18,19,20,21,22,23,24,25,25w,29,30,31,31m,32,32j,
-# 33,34,35,36,37,38,39,40,41,42; the gaps are the deleted realtime/hybrid/
-# translator/pump/direct scenarios — numbering kept so git history lines up):
+# 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48; the gaps are the deleted
+# realtime/hybrid/translator/pump/direct scenarios — numbering kept so git
+# history lines up):
 #  0  boot shim: legacy access-code->passphrase migration, defaults, history
 #     restore, auth-section auto-collapse once a key is entered
 #  3  batch dead-mic flatline alarm -> sentinel
@@ -382,7 +383,7 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | `DELIVER_MAX_BYTES` | 102400 | (Worker) `/deliver` body cap — a note is KBs; the delivery ring persists to a single DO storage value (128 KiB limit) and every byte broadcasts to every listener |
 | `SESSION_RL` / `SESSION_FAIL_RL` | 600·/60s / 20·/60s | (`wrangler.toml` `[[ratelimits]]`) GLOBAL per-IP rate limits (aggregate across isolates in a location; limits match `LINK_RL_MAX_PER_IP`/`_FAILS_PER_IP`). Feature-detected + fail-open in the Worker — an account/plan without them still deploys and falls back to the per-isolate Map |
 
-The AHK script's `CLIP_TIMEOUT := 90` covers the duration-aware batch deadline (15 s floor + up to 60 s extra ≈ 75 s worst case on a long take). If you raise the deadline constants, raise it too.
+The AHK script's `CLIP_TIMEOUT := 165` covers the duration- AND size-aware batch deadline (15 s floor + up to 60 s take extra + up to 90 s upload allowance, hard-capped at 150 s by `UPLOAD_DEADLINE_MAX_MS`). **If you change any deadline constant, change it too** — a `CLIP_TIMEOUT` below the cap silently refuses to paste a long take that actually succeeded.
 
 ## Deployment
 

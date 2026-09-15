@@ -1521,6 +1521,7 @@ right lower quadrant"></textarea>
   let recEndedAt = 0;        // stamped at finalize entry; recEndedAt - recStartedAt = take length
   let speechDetected = false;
   let maxRmsSeen = 0;
+  let lastProbeRms = -1; // most recent corpse-probe reading (-1 = the probe has not run)
   // Coverage bookkeeping (30 ms gate-loop granularity). The truncation guard
   // baselines on the LAST gate-open moment — never wall-clock hold time — so a
   // clinician who keeps the button pressed after finishing a sentence is not
@@ -1666,12 +1667,25 @@ right lower quadrant"></textarea>
   const MIC_PROBE_DEAD_RMS  = 0.00001;
   const MIC_PROBE_SETTLE_MS = 400; // max wait for a first nonzero frame (fresh live graphs show one within ~1-3 frames)
   const MIC_PROBE_FRAME_MS  = 30;  // probe poll cadence — matches the gate loop
+  // The RE-probe, after we have just forced a fresh getUserMedia, gets a larger
+  // budget: a brand-new iOS stream taken moments after a resume can legitimately
+  // need much longer than 400 ms to deliver its first non-silent buffer, and
+  // failing at 400 ms turned working mics into "MIC NOT CAPTURING" refusals —
+  // strictly worse than the corpse it guards against, since the clinician could
+  // not dictate at all. A truly dead mic still fails loud, just ~a second later.
+  const MIC_PROBE_REBUILD_SETTLE_MS = 1500;
   // Idle mic-health sampler (big-button surface): iOS can kill the retained mic
   // between takes with NO event while it keeps reporting "live". Sampling one
   // analyser frame every few seconds catches the corpse while idle — rebuild
   // then is free (nobody is speaking) and the next press lands on a live mic.
   const MIC_IDLE_PROBE_MS   = 4000; // sampling cadence while idle + visible
   const MIC_IDLE_DEAD_COUNT = 2;    // consecutive dead frames before rebuilding (one frame can race a teardown)
+  // Cap the idle self-heal: rebuilding the audio graph over and over does not
+  // revive a mic iOS is not giving back, and tearing the graph down every few
+  // seconds actively makes the audio session worse. After this many consecutive
+  // heals with no live frame, STOP and say so — the press path (a real user
+  // gesture, which iOS treats far more favourably) becomes the way back.
+  const MIC_IDLE_HEAL_MAX   = 3;
   // [ACCURACY] Capture shaping around the load-bearing gate. The gate decides
   // from the UNDELAYED analyser but gates audio that is GATE_LOOKAHEAD_MS
   // behind it, so the ~70 ms of detection lag (30 ms tick + ~21 ms analysis
@@ -3313,7 +3327,13 @@ right lower quadrant"></textarea>
              " ec:" + (echoCancelEl.checked ? "on" : "off") +
              " agc:" + (autoGainEl.checked ? "on" : "off") +
              " gain:" + Number(micGainEl.value).toFixed(1) + "x" +
-             " peak:" + maxRmsSeen.toFixed(5) + "]";
+             " peak:" + maxRmsSeen.toFixed(5) +
+             // The pre-capture probe fails BEFORE the per-take reset of
+             // maxRmsSeen, so "peak" above is the PREVIOUS take there. Report
+             // what the probe itself just measured, or the report contradicts
+             // its own headline (a "delivering silence" failure that shows a
+             // healthy peak sent this bug in the wrong direction for a while).
+             (lastProbeRms >= 0 ? " probe:" + lastProbeRms.toFixed(5) : "") + "]";
     } catch (e) { return ""; }
   }
 
@@ -3358,15 +3378,19 @@ right lower quadrant"></textarea>
   // bound. Returns true = live floor seen; false = flat silence throughout.
   // Best-effort: any internal failure returns true so the probe can never block
   // a press the rest of the pipeline vetted (the watchdog stays the backstop).
-  async function probeMicAlive() {
+  async function probeMicAlive(settleMs) {
     try {
       if (!analyserNode || !gateBuf) return true;
-      var deadline = Date.now() + MIC_PROBE_SETTLE_MS;
+      var deadline = Date.now() + (settleMs || MIC_PROBE_SETTLE_MS);
+      var best = 0;
       for (;;) {
         analyserNode.getFloatTimeDomainData(gateBuf);
         var sum = 0;
         for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
-        if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) return true;
+        var rms = Math.sqrt(sum / gateBuf.length);
+        if (rms > best) best = rms;
+        lastProbeRms = best; // what the DIAGNOSTIC must report, not a stale take peak
+        if (rms >= MIC_PROBE_DEAD_RMS) return true;
         if (Date.now() >= deadline) return false;
         await new Promise(function (r) { setTimeout(r, MIC_PROBE_FRAME_MS); });
       }
@@ -3381,6 +3405,7 @@ right lower quadrant"></textarea>
     if (!state || !bigButtonActive()) { bigMicPillEl.style.display = "none"; return; }
     bigMicPillEl.style.display = "";
     if (state === "ok") { bigMicPillEl.textContent = "Mic ✓"; bigMicPillEl.className = "ok"; }
+    else if (state === "stuck") { bigMicPillEl.textContent = "Mic ⚠ press to reconnect"; bigMicPillEl.className = "bad"; }
     else { bigMicPillEl.textContent = "Mic ⚠ rebuilding"; bigMicPillEl.className = "bad"; }
   }
 
@@ -3393,6 +3418,16 @@ right lower quadrant"></textarea>
   // load-bearing guards. Fully try/caught; must never break anything.
   let micIdleTimer = null;
   let micIdleDeadFrames = 0;
+  let micIdleHeals = 0;        // consecutive idle rebuilds with no live frame since
+  let micIdleGaveUp = false;   // the "press to reconnect" state was already announced
+  // Returning to the app, or a press that proved the mic alive, earns a fresh
+  // heal budget: the give-up state is about not grinding in the background, and
+  // it must never persist once there is reason to think the mic is back.
+  function resetMicIdleHeal() {
+    micIdleDeadFrames = 0;
+    micIdleHeals = 0;
+    micIdleGaveUp = false;
+  }
   function micIdleSample() {
     try {
       if (!bigButtonActive() || document.visibilityState !== "visible") return;
@@ -3403,15 +3438,32 @@ right lower quadrant"></textarea>
       for (var i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
       if (Math.sqrt(sum / gateBuf.length) >= MIC_PROBE_DEAD_RMS) {
         micIdleDeadFrames = 0;
+        micIdleHeals = 0;    // a live frame means the graph is good again
+        micIdleGaveUp = false;
         setBigMicPill("ok");
         return;
       }
       micIdleDeadFrames++;
       if (micIdleDeadFrames >= MIC_IDLE_DEAD_COUNT) {
         micIdleDeadFrames = 0;
+        // Bounded: repeated teardowns do not get the mic back from iOS, and they
+        // degrade the audio session further. Past the cap, stop healing and say
+        // plainly that a press is the way back (a user gesture is treated far
+        // more favourably by iOS than our background re-acquire).
+        if (micIdleHeals >= MIC_IDLE_HEAL_MAX) {
+          setBigMicPill("stuck");
+          if (!micIdleGaveUp) {
+            micIdleGaveUp = true;
+            setStatus("Microphone is not responding between takes — press the button to reconnect it. Nothing has been lost.", "warn");
+          }
+          return;
+        }
+        micIdleHeals++;
         setBigMicPill("dead");
         audioSuspect = true; // the retained graph is a corpse — force a true rebuild
-        releaseAudio();
+        // No external releaseAudio(): audioSuspect makes ensureAudio tear down and
+        // rebuild internally, and an extra teardown here would supersede a build
+        // another resume handler may already have in flight.
         tryWarmOnLoad(); // warmWithRetry path: visible warn status if it keeps failing
       }
     } catch (e) {}
@@ -3431,7 +3483,49 @@ right lower quadrant"></textarea>
     setStatus("⚠ AUDIO INTERRUPTED — the mic was taken over (call/Siri/another app). Stop and redictate.", "err");
   }
 
-  async function ensureAudio() {
+  // THE STUCK-REBUILD BUG (2026-09). ensureAudio was re-entrant, and an iOS
+  // resume fires pageshow + visibilitychange + focus in quick succession, each
+  // calling tryWarmOnLoad -> warmWithRetry -> ensureAudio. Three builds then ran
+  // CONCURRENTLY: each called releaseAudio() and awaited its own getUserMedia,
+  // and because releaseAudio() can only stop the stream already ASSIGNED to the
+  // module variable, the streams still in flight were never stopped. Two (or
+  // three) live getUserMedia streams on one iOS input is precisely the state
+  // where iOS hands the audio session to ONE of them and the others deliver
+  // digital silence forever — so the surviving analyser read exact zeros while
+  // the track still reported live/unmuted and the context still read running.
+  // The corpse probe then declared the mic dead, forced ANOTHER rebuild, leaked
+  // ANOTHER stream, and the "Mic ⚠ rebuilding" pill stuck permanently (only an
+  // app relaunch, which drops every leaked stream, cleared it).
+  //
+  // Fix, two parts:
+  //   (1) COALESCE — concurrent callers share one in-flight build instead of
+  //       starting their own, so a resume can never open two streams.
+  //   (2) INVALIDATE — releaseAudio() bumps audioBuildSeq, so a build whose
+  //       getUserMedia resolves after it was superseded stops the stream it just
+  //       acquired rather than assigning it and leaking the old one.
+  // Together these make "rebuild the graph" idempotent under any event storm.
+  let audioBuildPromise = null;
+  let audioBuildSeq = 0;
+  function ensureAudio() {
+    if (audioBuildPromise) return audioBuildPromise; // join the build already running
+    audioBuildPromise = buildAudioGraph().catch(function (err) {
+      // "Superseded" is not a failure the CALLER should see: whatever tore the
+      // graph down wants one too, and a caller that swallows this rejection
+      // would go on to record with no audio graph at all. Try once more, now
+      // that the superseding teardown has settled.
+      if (err && /superseded/.test(String((err && err.message) || err))) return buildAudioGraph();
+      throw err;
+    });
+    // Clear the latch on BOTH outcomes, and swallow nothing: callers still see
+    // the rejection (startRecording's retry loop and warmWithRetry depend on it).
+    audioBuildPromise.then(
+      function () { audioBuildPromise = null; },
+      function () { audioBuildPromise = null; }
+    );
+    return audioBuildPromise;
+  }
+
+  async function buildAudioGraph() {
     // After ANY backgrounding the existing graph is suspect on iOS: the track can
     // be dead while still reporting readyState "live"/unmuted, so the reuse fast
     // path below would hand back a corpse that records silence. Skip it and force
@@ -3449,10 +3543,13 @@ right lower quadrant"></textarea>
     }
 
     releaseAudio();
+    // Stamp AFTER our own release (which bumps the seq) so we don't invalidate
+    // ourselves; any LATER release/rebuild bumps it again and supersedes us.
+    const myBuild = ++audioBuildSeq;
     audioSuspect = false; // cleared by the rebuild we are about to do
     audioReused = false;  // a fresh getUserMedia below is genuinely live — no probe needed
 
-    stream = await navigator.mediaDevices.getUserMedia({
+    const freshStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: echoCancelEl.checked,
@@ -3461,6 +3558,14 @@ right lower quadrant"></textarea>
         sampleRate: 48000,
       },
     });
+    // Superseded while iOS was handing the mic back: STOP what we just acquired.
+    // Assigning it would leave two live streams on one input — the silent-corpse
+    // state this whole guard exists to prevent.
+    if (myBuild !== audioBuildSeq) {
+      try { freshStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+      throw new Error("audio graph rebuild superseded");
+    }
+    stream = freshStream;
     if (!micEverGranted) {
       micEverGranted = true; // enables the iOS re-warm fallback in tryWarmOnLoad
       saveSettingsNow();     // persisted (micGranted): a relaunched iOS PWA re-warms at boot
@@ -3691,6 +3796,9 @@ right lower quadrant"></textarea>
   }
 
   function releaseAudio() {
+    // Invalidate any build still awaiting getUserMedia: it must stop the stream
+    // it acquires instead of assigning it over the teardown we are doing here.
+    audioBuildSeq++;
     if (gateTimer) { clearInterval(gateTimer); gateTimer = null; }
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
@@ -3755,6 +3863,13 @@ right lower quadrant"></textarea>
     if (recording || stopping || finishing) return;
     stopRequested = false;
     pendingStart = false;
+    // Zero the capture peak + probe reading UP FRONT, not just in the per-take
+    // reset further down: every pre-capture failure path (mic unavailable, the
+    // corpse probe, no graph) reports micDiag and returns BEFORE that reset, so
+    // leaving them stale made a "the mic is delivering silence" failure print
+    // the PREVIOUS take's healthy peak right next to it.
+    maxRmsSeen = 0;
+    lastProbeRms = -1;
     // A direct start supersedes any armed queued start (the timer would no-op
     // against recording=true anyway, but a dead handle must not linger where
     // the release guards read it).
@@ -3824,8 +3939,23 @@ right lower quadrant"></textarea>
       let micAlive = await probeMicAlive();
       if (!micAlive) {
         audioSuspect = true; // skip the healthy-reuse fast path — force a true rebuild
-        try { releaseAudio(); await ensureAudio(); } catch (e) {}
-        micAlive = await probeMicAlive();
+        // No explicit releaseAudio() here: audioSuspect already makes ensureAudio
+        // tear down and rebuild internally, and an extra external teardown only
+        // supersedes builds that other resume handlers may have in flight.
+        try { await ensureAudio(); } catch (e) {}
+        // A rebuild that could not produce a graph must fail LOUD rather than
+        // fall through — probeMicAlive treats a missing analyser as "alive"
+        // (fail-safe for a cold graph), which would otherwise start a take with
+        // no capture path at all.
+        if (!analyserNode || !audioCtx) {
+          await writeSentinel();
+          setMicPill("fail");
+          setBigMicPill("dead");
+          setStatus("MIC NOT AVAILABLE — the audio graph could not be rebuilt, so recording did NOT start (nothing was lost). Press again; if it repeats, relaunch the app." + recordMicFailure("precapture-no-graph"), "err");
+          failBeep();
+          return;
+        }
+        micAlive = await probeMicAlive(MIC_PROBE_REBUILD_SETTLE_MS);
       }
       if (!micAlive) {
         await writeSentinel();
@@ -3835,6 +3965,7 @@ right lower quadrant"></textarea>
         failBeep();
         return;
       }
+      resetMicIdleHeal(); // the mic answered a press — the idle sampler starts over
       setBigMicPill("ok");
     }
     if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
@@ -6321,6 +6452,7 @@ right lower quadrant"></textarea>
     pollLatestDeliveries(true); // desktop: sweep the room NOW — a zombie socket can look OPEN for up to the pong timeout; the sweep is dedupe-safe
     pollDesktopStatus(); // phone: refresh the desktop-presence pill the moment the surface is looked at
     if (wakeLockDesired()) acquireWakeLock(); // the OS auto-releases wake locks whenever the page hides — reclaim it
+    resetMicIdleHeal(); // a fresh visit gets a fresh heal budget
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
     // leave the live graph alone (the lock above is enough).
@@ -6335,6 +6467,7 @@ right lower quadrant"></textarea>
     pollLatestDeliveries(true); // desktop: dedupe-safe sweep past a possibly-zombie socket
     pollDesktopStatus(); // phone: refresh the presence pill on app-switch return
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
+    resetMicIdleHeal(); // a fresh visit gets a fresh heal budget
     if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });
 

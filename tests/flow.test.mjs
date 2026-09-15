@@ -3023,7 +3023,7 @@ const mkProbeDom = (onGum, settings) => new JSDOM(html, {
   const gumA0 = gumA;
   const fetchesA0 = domA.window._fetches;
   docA.getElementById('recordBtn').click(); // press -> probe settles -> rebuild -> re-probe -> loud pre-capture fail
-  await sleep(1300); // two settle windows (2 x 400 ms) + slack
+  await sleep(2300); // first settle (400 ms) + the longer post-rebuild settle (1500 ms) + slack
   check('s23p: a corpse mic forces exactly one pre-capture rebuild', gumA === gumA0 + 1, 'gum delta ' + (gumA - gumA0));
   check('s23p: a still-dead mic fails LOUD before capture (MIC NOT CAPTURING, no REC)', docA.getElementById('status').textContent.includes('MIC NOT CAPTURING') && docA.getElementById('status').textContent.includes('did NOT start'), docA.getElementById('status').textContent);
   check('s23p: the recorder never started on the dead mic', domA.window._recStarts === 0, 'recStarts ' + domA.window._recStarts);
@@ -3066,7 +3066,7 @@ console.log('--- scenario 37: fresh-graph silent capture fails loud BEFORE captu
   doc37.getElementById('apiKey').value = 'test-key';
   micRms = 0.0; // the fresh stream is silent (VPIO wall)
   doc37.getElementById('recordBtn').click();
-  await sleep(1400); // fresh build + two settle windows
+  await sleep(2400); // fresh build + first settle (400 ms) + post-rebuild settle (1500 ms)
   check('s37: a silent FRESH graph gets one rebuild then fails pre-capture', gum37 === 2, 'gum ' + gum37);
   check('s37: the fresh-graph silent press is loud (MIC NOT CAPTURING)', doc37.getElementById('status').textContent.includes('MIC NOT CAPTURING'), doc37.getElementById('status').textContent);
   check('s37: REC never started on the silent fresh graph', dom37.window._recStarts === 0, 'recStarts ' + dom37.window._recStarts);
@@ -4338,6 +4338,179 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
     deadlineBig46 <= 150000, deadlineBig46);
   chunkBytes46 = 2048;
   dom46.window.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 47. [RELIABILITY] The stuck mic rebuild after a mobile resume.
+//     ensureAudio was re-entrant, and an iOS resume fires pageshow +
+//     visibilitychange + focus in quick succession, each calling tryWarmOnLoad
+//     -> ensureAudio. Three builds ran concurrently; releaseAudio() can only
+//     stop the stream already ASSIGNED to the module variable, so the in-flight
+//     ones leaked. Two live getUserMedia streams on one iOS input is exactly the
+//     state where iOS feeds ONE and starves the others, so the surviving
+//     analyser read exact zeros while the track still reported live/unmuted --
+//     the corpse probe then rebuilt, leaked again, and "Mic (warn) rebuilding"
+//     stuck until the app was relaunched.
+//     Covered here: the storm opens ONE stream and leaks none; the idle heal is
+//     bounded instead of grinding forever; a mic that wakes shortly after the
+//     rebuild now records rather than being refused at 400 ms; and a pre-capture
+//     failure reports the PROBE's reading instead of the previous take's peak.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 47: resume rebuild storm + bounded idle heal ---');
+  let gum47 = 0;
+  let gumDelay47 = 0;
+  const streams47 = [];   // one entry per getUserMedia, so leaks are countable
+  const mk47 = () => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+      win.WebSocket = Sock;
+      win._recStarts = 0;
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { win._recStarts++; this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":"Storm note."}') });
+      // Each acquisition is its OWN stream, and stopping any of its tracks marks
+      // it stopped -- so an orphaned (never-stopped) stream is detectable, which
+      // is the whole bug.
+      win.navigator.mediaDevices = {
+        getUserMedia: () => {
+          gum47++;
+          const rec = { stopped: false };
+          streams47.push(rec);
+          const track = { readyState: 'live', muted: false, enabled: true, addEventListener() {}, stop() { rec.stopped = true; track.readyState = 'ended'; } };
+          const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+          return gumDelay47
+            ? new Promise((r) => setTimeout(() => r(stream), gumDelay47))
+            : Promise.resolve(stream);
+        },
+        addEventListener: () => {},
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true, bigButtonMode: 'always', saveApiKey: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-47');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (47):', e.message); failures++; });
+    },
+  });
+
+  const dom47 = mk47();
+  await sleep(200);
+  const w47 = dom47.window;
+  const doc47 = dom47.window.document;
+  const st47 = () => doc47.getElementById('status').textContent;
+  const liveStreams47 = () => streams47.filter((r) => !r.stopped).length;
+
+  micRms = 0.05;
+  await sleep(60);
+  const gumBoot = gum47;
+  check('s47: the graph warms once at boot', gumBoot >= 1, 'gum ' + gumBoot);
+
+  // --- 47a: the resume event storm must open exactly ONE stream -------------
+  gumDelay47 = 300; // iOS hands the mic back slowly, so naive builds would overlap
+  w47.dispatchEvent(new w47.Event('pagehide'));            // marks the graph suspect
+  w47.dispatchEvent(new w47.Event('pageshow'));            // three resume handlers,
+  doc47.dispatchEvent(new w47.Event('visibilitychange'));  // each of which used to
+  w47.dispatchEvent(new w47.Event('focus'));               // start its own rebuild
+  await sleep(1200);
+  check('s47a: the resume storm rebuilds the graph exactly ONCE (coalesced)',
+    gum47 === gumBoot + 1, 'gum delta ' + (gum47 - gumBoot));
+  check('s47a: no getUserMedia stream is left unstopped (the silent-corpse leak)',
+    liveStreams47() === 1, 'live streams ' + liveStreams47() + ' of ' + streams47.length);
+
+  // The storm must leave a WORKING mic, not just a tidy one.
+  gumDelay47 = 0;
+  doc47.getElementById('recordBtn').click();
+  await sleep(200);
+  check('s47a: a press right after the storm records normally', w47._recStarts === 1, 'recStarts ' + w47._recStarts);
+  doc47.getElementById('recordBtn').click();
+  await sleep(700);
+  check('s47a: that take delivers', (w47._clip || '').includes('Storm note.'), JSON.stringify(w47._clip));
+
+  // --- 47d: a pre-capture failure must not report the last take's peak ------
+  // The take above ran at micRms 0.05, so the OLD code printed peak:0.05000 next
+  // to a "the mic is delivering silence" headline and sent the diagnosis astray.
+  micRms = 0.0;
+  doc47.getElementById('recordBtn').click();
+  await sleep(2400); // first settle + the longer post-rebuild settle
+  check('s47d: the dead press is loud pre-capture', st47().includes('MIC NOT CAPTURING'), st47());
+  check('s47d: the diagnostic reports what the PROBE measured', st47().includes('probe:0.00000'), st47());
+  check('s47d: the peak is not the previous take’s level', st47().includes('peak:0.00000'), st47());
+
+  // --- 47c: a mic that wakes just after the rebuild should RECORD -----------
+  // A fresh iOS stream can need far longer than 400 ms to deliver its first
+  // buffer; refusing at 400 ms made a working mic undictatable, which is worse
+  // than the corpse the probe guards against.
+  w47._recStarts = 0;
+  micRms = 0.0;
+  doc47.getElementById('recordBtn').click();
+  setTimeout(() => { micRms = 0.05; }, 700); // comes alive during the post-rebuild settle
+  await sleep(1600);
+  check('s47c: a mic that wakes inside the longer settle window records',
+    w47._recStarts === 1, 'recStarts ' + w47._recStarts);
+  check('s47c: and it is not reported as a capture failure',
+    !st47().includes('MIC NOT CAPTURING'), st47());
+  doc47.getElementById('recordBtn').click();
+  await sleep(700);
+  dom47.window.close();
+
+  // --- 47b: the idle heal is BOUNDED (this is the "stuck" report) -----------
+  // Costs ~36 s of wall clock because MIC_IDLE_PROBE_MS is 4 s and the cap is 3
+  // heals at 2 dead frames each; worth it, since an unbounded loop is the bug.
+  let gumB47 = 0;
+  const domB47 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+      win.WebSocket = Sock;
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":""}') });
+      win.navigator.mediaDevices = {
+        getUserMedia: () => {
+          gumB47++;
+          const track = { readyState: 'live', muted: false, enabled: true, addEventListener() {}, stop() { track.readyState = 'ended'; } };
+          return Promise.resolve({ getAudioTracks: () => [track], getTracks: () => [track] });
+        },
+        addEventListener: () => {},
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ micGranted: true, bigButtonMode: 'always' }));
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (47b):', e.message); failures++; });
+    },
+  });
+  await sleep(200);
+  const docB47 = domB47.window.document;
+  micRms = 0.0; // a mic iOS will not give back, however often we rebuild
+  const gumB0 = gumB47;
+  await sleep(36000); // 8 sampler ticks = 4 heals' worth of dead frames
+  check('s47b: the idle heal stops at the cap instead of rebuilding forever',
+    gumB47 - gumB0 === 3, 'rebuilds ' + (gumB47 - gumB0) + ' (cap 3)');
+  check('s47b: the pill stops saying "rebuilding" and asks for a press',
+    (docB47.getElementById('bigMicPill').textContent || '').includes('press to reconnect'),
+    docB47.getElementById('bigMicPill').textContent);
+  check('s47b: and it says so without claiming anything was lost',
+    (docB47.getElementById('status').textContent || '').includes('Nothing has been lost'),
+    docB47.getElementById('status').textContent);
+  micRms = 0.05;
+  domB47.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

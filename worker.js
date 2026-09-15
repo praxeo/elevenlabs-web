@@ -715,7 +715,23 @@ const INDEX_HTML = `<!doctype html>
     #pairStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
     #pairStatus.ok { color: var(--ok); }
     #pairStatus.err { color: var(--danger); }
-    #pairPhoneBtn { flex: 0 0 auto; }
+    #pairPhoneBtn, #pairDesktopBtn { flex: 0 0 auto; }
+    /* "Pair to a desktop" overlay — the PHONE side of pairing (type the code the
+       desktop shows). Unlike #pairOverlay it is NOT hidden under body.bigbtn:
+       a solo big-button phone (override "always") needs it to reach a desktop.
+       Sits above #bigUi (40) and beside #pairOverlay (50). */
+    #joinOverlay { display: none; position: fixed; inset: 0; z-index: 52;
+      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+    #joinOverlay.show { display: flex; }
+    #joinCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      padding: 22px; max-width: 360px; width: 100%; text-align: center; }
+    #joinTitle { font-size: 18px; font-weight: 600; margin-bottom: 10px; }
+    #joinInstr { font-size: 13px; color: var(--muted); line-height: 1.5; text-align: left; }
+    #joinCodeInput { font-family: monospace; font-size: 26px; letter-spacing: 6px; text-transform: uppercase;
+      text-align: center; width: 100%; max-width: 200px; padding: 8px 6px; }
+    #joinStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
+    #joinStatus.ok { color: var(--ok); }
+    #joinStatus.err { color: var(--danger); }
     /* Desktop indicator that the paired phone is actively dictating. */
     #phoneRecBadge.rec { color: var(--danger); }
     #phoneRecBadge.xcribe { color: var(--muted); }
@@ -831,12 +847,18 @@ const INDEX_HTML = `<!doctype html>
     }
     body.bigbtn.bigbtn-settings #bigUi { display: none; }
     body.bigbtn.bigbtn-settings main > .grid { display: grid; }
+    /* Inside the big-button Settings view the big button is the record control;
+       the card's "Start recording" only invites a second, confusing way in. */
+    body.bigbtn.bigbtn-settings #recordBtn { display: none; }
     body.bigbtn.bigbtn-settings #bigReturnBtn {
       display: block; position: fixed; right: 12px; bottom: 12px; z-index: 41;
       background: #0c4a6e; border-color: #0369a1; font-weight: 600;
     }
-    #bigTopRow { width: 100%; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; }
-    #bigJoinedBadge { font-family: monospace; letter-spacing: 2px; color: var(--accent); font-size: 14px; flex: 1 1 auto; }
+    /* Wraps: at 375px the badge + pills + three buttons overflowed off-screen
+       (Settings unreachable) once the Pair/Leave button joined the row. */
+    #bigTopRow { width: 100%; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; flex: 0 0 auto; }
+    #bigJoinedBadge { font-family: monospace; letter-spacing: 1px; color: var(--accent); font-size: 13px; flex: 1 1 auto; min-width: 0; }
+    #bigTopRow button { flex: 0 0 auto; white-space: nowrap; }
     #bigMicPill, #bigDesktopPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
     #bigMicPill.ok, #bigDesktopPill.ok { color: var(--muted); }
     #bigMicPill.bad, #bigDesktopPill.bad { color: var(--danger); font-weight: 600; }
@@ -926,7 +948,7 @@ const INDEX_HTML = `<!doctype html>
       <label>Mic level
         <span id="micPill" class="pill">mic off</span>
         <span id="linkPill" class="pill">link idle</span>
-        <span id="gateState" class="pill" title="Local noise gate state (affects the saved audio preview only)">closed</span>
+        <span id="gateState" class="pill" title="Noise gate: open = your voice is being recorded, closed = silence is being cut">gate closed</span>
       </label>
       <div class="meterwrap">
         <div id="meterBar"></div>
@@ -943,11 +965,9 @@ const INDEX_HTML = `<!doctype html>
         <canvas id="waveCanvas"></canvas>
       </div>
 
-      <div class="status" id="status">
-        Ctrl+Space: tap to start/stop, hold to talk (CapsLock via AHK also works).
-        Browser beeps when text is ready on the clipboard — keep this tab focused
-        until the beep, then switch windows and Ctrl+V.
-      </div>
+      <!-- One line on purpose: .status is pre-wrap, so source indentation
+           rendered as ragged indents + hard breaks in a tiny window. -->
+      <div class="status" id="status">Ctrl+Space: tap to start/stop, hold to talk (CapsLock via AHK also works). Beeps when the text is on the clipboard — keep this tab focused until the beep, then switch windows and Ctrl+V.</div>
 
       <!-- Crash-recovery banner: shown only when the dictation journal finds a
            take that captured audio but never finished (the app died mid-dictation
@@ -985,7 +1005,13 @@ const INDEX_HTML = `<!doctype html>
       </div>
 
       <div class="row" style="margin-top: 8px; align-items: center; gap: 8px;">
-        <button id="pairPhoneBtn" title="Show a QR to pair your phone as the microphone — dictated text lands on this computer's clipboard">📱 Pair a phone</button>
+        <!-- Pairing is two-sided and the same page serves both ends, so BOTH
+             directions are named: "Pair a phone" is what the DESKTOP clicks
+             (show a QR/code); "Pair to a desktop" is what the PHONE taps
+             (type the desktop's code). One word each way — a user on the phone
+             used to see only "Pair a phone" and read it backwards. -->
+        <button id="pairPhoneBtn" title="On the DESKTOP: show a QR + code so your phone becomes the microphone — dictated text lands on this computer's clipboard">📱 Pair a phone</button>
+        <button id="pairDesktopBtn" title="On the PHONE: enter the code the desktop shows — what you dictate here lands on that desktop's clipboard">🖥 Pair to a desktop</button>
         <!-- Live indicator: lights up when the paired phone starts dictating, so
              the desktop user knows audio is being captured before the text lands.
              Hidden until a phone_recording ping arrives (relayed, not buffered). -->
@@ -1014,12 +1040,12 @@ const INDEX_HTML = `<!doctype html>
             <input id="passphrase" type="password" placeholder="passphrase" autocomplete="off" />
           </div>
 
-          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key (batch)</label>
-          <input id="apiKey" type="password" placeholder="xi-api-key" autocomplete="off" />
+          <label for="apiKey" id="apiKeyLabel">ElevenLabs API key</label>
+          <input id="apiKey" type="password" placeholder="Paste your ElevenLabs API key" autocomplete="off" />
 
           <!-- Realtime now runs on Deepgram Nova-3 via Workers AI (no STT key). This
                legacy field is hidden but kept so saved settings/clear paths still resolve. -->
-          <label for="sonioxKey" id="sonioxKeyLabel" style="display:none">Realtime STT key (unused — realtime runs on Workers AI)</label>
+          <label for="sonioxKey" id="sonioxKeyLabel" style="display:none">Legacy realtime key (unused — the product is batch-only)</label>
           <input id="sonioxKey" type="password" placeholder="unused" autocomplete="off" style="display:none" />
 
           <label class="checkbox">
@@ -1064,7 +1090,8 @@ const INDEX_HTML = `<!doctype html>
             Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
           </div>
 
-          <div class="hint" style="margin: 10px 0 4px; color: var(--text);">Phone mic</div>
+          <div class="hint" style="margin: 10px 0 4px; color: var(--text);">Phone ↔ desktop link</div>
+          <div class="hint" style="margin: 0 0 6px;">Same page, two roles. <b>This computer receives:</b> Start phone session (same as 📱 Pair a phone on the main card). <b>This phone sends:</b> join a desktop by its code (same as 🖥 Pair to a desktop).</div>
           <div class="row" style="margin-bottom: 4px; flex-wrap: wrap; gap: 6px; align-items: center;">
             <button id="phoneStartBtn">Start phone session</button>
             <span id="phoneCodeBadge" style="display:none; font-family: monospace; font-size: 20px; letter-spacing: 3px; color: var(--accent);"></span>
@@ -1094,9 +1121,9 @@ const INDEX_HTML = `<!doctype html>
 
           <label for="bigButtonMode">Big-button layout (per device)</label>
           <select id="bigButtonMode">
-            <option value="joined" selected>When joined to a desktop session</option>
-            <option value="always">Always — solo phone dictation</option>
-            <option value="never">Never — e.g. a desktop that joins</option>
+            <option value="joined" selected>Automatic — when this device is paired to a desktop</option>
+            <option value="always">Always — this is the phone I dictate on</option>
+            <option value="never">Never — keep the full page even when paired</option>
           </select>
           <div class="hint" style="margin: 6px 0 4px;">
             Turns this device into a one-button dictation surface. Stored on this device only.
@@ -1179,7 +1206,7 @@ right lower quadrant"></textarea>
           <div id="batchOptsSection">
             <label class="checkbox">
               <input type="checkbox" id="tagEvents" />
-              Tag audio events ((laughter), (cough), …) — batch transcription only
+              Tag audio events ((laughter), (cough), …)
             </label>
 
             <!-- Retired: word timestamps are now ALWAYS requested (the
@@ -1206,8 +1233,8 @@ right lower quadrant"></textarea>
 
           <h3>How do these settings work?</h3>
           <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. With a close mic, raising the open threshold rejects quieter, more distant voices before they're ever recorded.</p>
-          <p><strong>Noise filter</strong>: higher values ignore quiet hums, whispers, and background chatter.</p>
-          <p><strong>Click filter</strong>: higher values stop brief clicks/rustling being read as speech.</p>
+          <p><strong>Gate look-ahead and release tail</strong>: the recording starts a little <em>before</em> the gate opens and keeps going a little <em>after</em> you let go, so the first and last syllables are not clipped. Raise them if word edges go missing; 0 turns either off.</p>
+          <p><strong>Makeup gain</strong>: lifts a quiet mic above the gate. A dead mic still reads 0, so it can never hide a mic that is not capturing.</p>
           <p><strong>Filter out other speakers</strong>: when a second person's voice is loud enough to clear the gate, the speaker filter is the only thing that can drop it — the gate can't tell two equally-loud voices apart. It keeps the main (most-spoken) voice and reports what it removed. Pair it with a close mic for the best result.</p>
         </div>
       </details>
@@ -1241,8 +1268,11 @@ right lower quadrant"></textarea>
       <span id="bigMicPill" style="display:none"></span>
       <span id="bigDesktopPill" style="display:none"></span>
       <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
-      <button id="bigLeaveBtn">Leave</button>
-      <button id="bigSettingsBtn" title="Engine, credentials, keyterms and all other settings">Settings</button>
+      <!-- Solo big-button phone (override "always", not joined): the way to a
+           desktop must be on THIS surface — the overlay covers the card. -->
+      <button id="bigPairBtn" title="Enter the code the desktop shows — what you dictate here lands on that desktop's clipboard" style="display:none">🖥 Pair to a desktop</button>
+      <button id="bigLeaveBtn" title="Stop sending to the desktop — notes stay on this phone; anything undelivered is kept and sends when you pair again with the same code">Leave desktop</button>
+      <button id="bigSettingsBtn" title="Credentials, keyterms, mic tuning and all other settings">Settings</button>
     </div>
     <div id="bigQueueChip" style="display:none" role="button"></div>
     <div id="bigRecoverChip" style="display:none" role="button"></div>
@@ -1268,11 +1298,33 @@ right lower quadrant"></textarea>
       <div id="pairTitle">Scan to pair your phone</div>
       <div id="pairQr"></div>
       <div id="pairCode"></div>
-      <div id="pairInstr">Point your phone camera at the code — or open this page on your phone and type the code below. Your phone becomes the microphone; dictated text lands on THIS computer's clipboard.</div>
+      <div id="pairInstr">Point your phone camera at the code — or open this page on your phone and type the code under <b>🖥 Pair to a desktop</b>. Your phone becomes the microphone; dictated text lands on THIS computer's clipboard.<br><span style="opacity:0.8">Reading this on the phone? Close this and tap 🖥 Pair to a desktop instead.</span></div>
       <div id="pairStatus"></div>
       <div class="row" style="justify-content: center; margin-top: 16px;">
-        <button id="pairDoneBtn" class="primary">Done</button>
-        <button id="pairEndBtn">End session</button>
+        <!-- "Hide" only hides the code; the session keeps listening (the old
+             "Done" read as if pairing were finished, or ended). -->
+        <button id="pairDoneBtn" class="primary" title="Hide this card — the session keeps listening for the phone">Hide (keep waiting)</button>
+        <button id="pairEndBtn" title="Stop listening for a phone and forget the code">End session</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- "Pair to a desktop" overlay: the PHONE side of pairing. Opened from the
+       primary card's "Pair to a desktop" button and from the big-button top
+       row (a solo phone). Joins through the SAME joinDesktopSession() path as
+       the Options "Join desktop" row — no parallel session logic. -->
+  <div id="joinOverlay">
+    <div id="joinCard">
+      <div id="joinTitle">Pair this device to a desktop</div>
+      <div id="joinInstr">On the <b>desktop</b>, click <b>📱 Pair a phone</b> — it shows a 6‑character code and a QR. Scan the QR with this phone's camera, or type the code here. Everything you dictate on this device then lands on that desktop's clipboard.</div>
+      <div class="row" style="justify-content: center; margin-top: 14px; gap: 8px; flex-wrap: wrap;">
+        <input id="joinCodeInput" type="text" maxlength="6" placeholder="ABC123" autocomplete="off" autocapitalize="characters" spellcheck="false" inputmode="text" />
+        <button id="joinGoBtn" class="primary">Join</button>
+      </div>
+      <div id="joinStatus"></div>
+      <div class="row" style="justify-content: center; margin-top: 12px;">
+        <button id="joinLeaveBtn" style="display:none;">Leave this desktop</button>
+        <button id="joinCloseBtn">Close</button>
       </div>
     </div>
   </div>
@@ -1431,6 +1483,15 @@ right lower quadrant"></textarea>
   const pairStatusEl     = document.getElementById("pairStatus");
   const pairDoneBtnEl    = document.getElementById("pairDoneBtn");
   const pairEndBtnEl     = document.getElementById("pairEndBtn");
+  // "Pair to a desktop" (phone side) overlay elements
+  const pairDesktopBtnEl = document.getElementById("pairDesktopBtn");
+  const bigPairBtnEl     = document.getElementById("bigPairBtn");
+  const joinOverlayEl    = document.getElementById("joinOverlay");
+  const joinCodeInputEl  = document.getElementById("joinCodeInput");
+  const joinGoBtnEl      = document.getElementById("joinGoBtn");
+  const joinStatusEl     = document.getElementById("joinStatus");
+  const joinLeaveBtnEl   = document.getElementById("joinLeaveBtn");
+  const joinCloseBtnEl   = document.getElementById("joinCloseBtn");
 
   // Mic-tips onboarding (keep other voices out)
   const micTipsEl        = document.getElementById("micTips");
@@ -1559,6 +1620,7 @@ right lower quadrant"></textarea>
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
   let phoneJoined       = false; // desktop: a phone has joined this session (phone_join ping / first delivery) — drives the pairing overlay/button
+  let phoneLinkDropped  = false; // desktop: a "link dropped" alarm is showing — the reconnect must CLEAR it (a healed link left FAILED on screen)
   let phoneRecTimer     = null;  // desktop: safety auto-clear for the "phone is recording/transcribing" indicator (in case a stop/delivery ping is missed)
   let micTipsSeen       = false; // per-device: the "keep other voices out" onboarding nudge has been dismissed
   let micTipsAutoShown  = false; // session: the nudge has auto-shown once this load (re-show is guarded by micTipsSeen across loads)
@@ -1945,7 +2007,9 @@ right lower quadrant"></textarea>
     }
   }
 
+  let statusIsBootHint = true; // the HTML boot hint is still showing (no setStatus yet)
   function setStatus(msg, cls) {
+    statusIsBootHint = false;
     statusEl.className = "status " + (cls || "");
     statusEl.textContent = msg;
     lastStatusCls = cls || "";
@@ -2047,7 +2111,7 @@ right lower quadrant"></textarea>
     } else {
       authSummaryEl.textContent = SHARED_MODE
         ? "Access — enter the passphrase"
-        : "Access — enter your API key";
+        : "Access — paste your ElevenLabs API key";
     }
   }
 
@@ -2176,7 +2240,7 @@ right lower quadrant"></textarea>
   }
 
   function setGateStateUI(isOpen) {
-    gateStateEl.textContent = isOpen ? "OPEN" : "closed";
+    gateStateEl.textContent = isOpen ? "gate OPEN" : "gate closed";
     gateStateEl.className  = isOpen ? "pill open" : "pill";
   }
 
@@ -3895,7 +3959,7 @@ right lower quadrant"></textarea>
         setStatus("Enter the shared passphrase first.", "err");
         passphraseEl.focus();
       } else {
-        setStatus("Enter your ElevenLabs API key first (used for batch).", "err");
+        setStatus("Enter your ElevenLabs API key first.", "err");
         apiKeyEl.focus();
       }
       failBeep();
@@ -3925,7 +3989,14 @@ right lower quadrant"></textarea>
     if (audioErr) {
       await writeSentinel();
       setMicPill("fail");
-      setStatus("Microphone unavailable: " + (audioErr && audioErr.message ? audioErr.message : audioErr), "err");
+      // Name the fix, not just the error: "Permission denied" on its own left
+      // the clinician with nothing to do.
+      var micErrName = audioErr && audioErr.name ? String(audioErr.name) : "";
+      var micFix = (micErrName === "NotAllowedError" || micErrName === "SecurityError")
+        ? " Allow the microphone for this site — on iPhone: Settings → Safari → Microphone (or the aA menu → Website Settings), then reload this page."
+        : (micErrName === "NotFoundError" ? " No microphone was found — check the device/Bluetooth headset, then press again."
+        : " Close any other app using the mic, then press again.");
+      setStatus("Microphone unavailable: " + (audioErr && audioErr.message ? audioErr.message : audioErr) + "." + micFix, "err");
       failBeep();
       return;
     }
@@ -4810,8 +4881,44 @@ right lower quadrant"></textarea>
      moment a phone joins (a phone_join ping relayed through the room, with the
      first delivery as a fallback). */
   function updatePairButton() {
-    if (!pairPhoneBtnEl) return;
-    pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓" : "📱 Pair a phone";
+    // Three states, so a running-but-unpaired session is visible on the card
+    // (a phone user who tapped this by mistake could not see it was running —
+    // "End session" was a thousand pixels down in Options).
+    if (pairPhoneBtnEl) {
+      pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓"
+        : phoneSessionCode ? "📱 Waiting for phone · " + phoneSessionCode
+        : "📱 Pair a phone";
+    }
+    // The phone-side twin: reflects THIS device's join (the desktop side above
+    // reflects a phone having joined this desktop). Both live on the primary
+    // card because the same page serves both ends of the link.
+    if (pairDesktopBtnEl) pairDesktopBtnEl.textContent = joinedSessionCode ? "🖥 Paired to desktop " + joinedSessionCode + " ✓" : "🖥 Pair to a desktop";
+    if (bigPairBtnEl) bigPairBtnEl.style.display = joinedSessionCode ? "none" : "";
+  }
+
+  /* ───── "Pair to a desktop" overlay (phone side) ─────
+     The mirror of the desktop's QR overlay: type the code the desktop shows.
+     Reachable from the primary card AND the big-button top row (a solo phone
+     on the "always" override has no other way to a desktop — the overlay
+     covers the card). Joining goes through joinDesktopSession(), the same
+     path as the Options "Join desktop" row. */
+  function openJoinOverlay() {
+    if (!joinOverlayEl) return;
+    if (joinCodeInputEl) joinCodeInputEl.value = joinedSessionCode || "";
+    if (joinStatusEl) {
+      joinStatusEl.textContent = joinedSessionCode
+        ? "Paired to desktop " + joinedSessionCode + " — what you dictate here lands on that desktop's clipboard."
+        : "";
+      joinStatusEl.className = joinedSessionCode ? "ok" : "";
+    }
+    if (joinLeaveBtnEl) joinLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
+    if (joinGoBtnEl) joinGoBtnEl.textContent = joinedSessionCode ? "Switch" : "Join";
+    joinOverlayEl.classList.add("show");
+    if (joinCodeInputEl && !joinedSessionCode) { try { joinCodeInputEl.focus(); } catch (_) {} }
+  }
+
+  function closeJoinOverlay() {
+    if (joinOverlayEl) joinOverlayEl.classList.remove("show");
   }
 
   function openPairOverlay() {
@@ -4820,6 +4927,8 @@ right lower quadrant"></textarea>
     var joinUrl = window.location.origin + "/?join=" + phoneSessionCode;
     if (pairQrEl) renderQrSvg(joinUrl, pairQrEl);
     if (pairCodeEl) pairCodeEl.textContent = phoneSessionCode;
+    var pairTitleEl = document.getElementById("pairTitle");
+    if (pairTitleEl) pairTitleEl.textContent = phoneJoined ? "Phone paired ✓ — code " + phoneSessionCode : "Scan to pair your phone";
     if (pairStatusEl) {
       pairStatusEl.textContent = phoneJoined ? "Phone paired — dictate away." : "Waiting for your phone to scan…";
       pairStatusEl.className = phoneJoined ? "ok" : "";
@@ -4854,6 +4963,22 @@ right lower quadrant"></textarea>
         method: "POST",
         headers: linkAuthHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ message_type: "phone_join" }),
+      }).catch(function () {});
+    } catch (e) {}
+  }
+
+  // Phone side: tell the desktop this phone LEFT, so its "Phone paired ✓" does
+  // not stay lit over a phone that is gone (a clinician would dictate into a
+  // link with no mic on it). Same relay as phone_join: best-effort, unbuffered
+  // — a missed ping leaves the desktop's cue stale until the next join, never
+  // costs text. Fired BEFORE the join is cleared (needs the code).
+  function notifyDesktopOfLeave(code) {
+    if (!code) return;
+    try {
+      fetch("/api/session/" + code + "/deliver", {
+        method: "POST",
+        headers: linkAuthHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ message_type: "phone_leave" }),
       }).catch(function () {});
     } catch (e) {}
   }
@@ -5046,6 +5171,7 @@ right lower quadrant"></textarea>
       if (phoneJoinInputEl) phoneJoinInputEl.value = joinedSessionCode;
       if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
       if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
+      updatePairButton(); // the "Paired to desktop ✓" twin reflects the restored join
       // Crash recovery: a phone that died after transcribing but before its
       // delivery landed boots with the text still queued — flush it now.
       if (deliveryQueue.length) backgroundFlush();
@@ -5104,6 +5230,15 @@ right lower quadrant"></textarea>
       phoneReconnectDelayMs = 0;
       phoneLastPongAt = Date.now();
       setPhoneLinkUI(true);
+      // A reconnect after a drop must clear the red: the badge lost its ⚠ but
+      // the status, the window wash and the "⚠ LINK DOWN" title stayed put
+      // until some unrelated status overwrote them — a false FAILED beside a
+      // working link is exactly how users learn to ignore red. Neutral class:
+      // a healed link is not a delivered dictation.
+      if (phoneLinkDropped) {
+        phoneLinkDropped = false;
+        setStatus("Phone link restored — code " + code + " is live again.", "");
+      }
     };
     ws.onmessage = function(evt) {
       if (phoneSessionWs !== ws) return;
@@ -5132,6 +5267,7 @@ right lower quadrant"></textarea>
 
   function schedulePhoneReconnect() {
     setPhoneLinkUI(false);
+    phoneLinkDropped = true; // before setStatus: applyWindowState titles this "LINK DOWN", not "FAILED"
     setStatus("⚠ Phone link dropped — reconnecting… (code " + phoneSessionCode + " stays valid)", "err");
     warnBeep();
     phoneReconnectDelayMs = Math.min(phoneReconnectDelayMs ? phoneReconnectDelayMs * 2 : 1000, PHONE_RECONNECT_MAX_MS);
@@ -5181,7 +5317,20 @@ right lower quadrant"></textarea>
   let desktopKnownAtStart = null; // desktopPresent as of this take's start
 
   function setDesktopPill(state) {
+    var prev = desktopPresent;
     desktopPresent = state; // null when unknown (poll failed / not joined)
+    // Say it in words when the answer CHANGES — the pill alone left the status
+    // line reading "Paired … hold the button to dictate" under a red "not
+    // listening", with no next step. Idle only (a mid-take status belongs to
+    // the take), and only on a real transition so a steady state never nags.
+    // The pill is still a cue, never a gate: recording proceeds regardless.
+    if (joinedSessionCode && bigButtonActive() && !recording && !stopping && !finishing && state !== prev) {
+      if (state === false) {
+        setStatus("🖥 No desktop is listening for code " + joinedSessionCode + " — it may have ended the session. You can still dictate: notes queue here and send when it pairs again. Or tap Leave desktop to keep notes on this phone.", "warn");
+      } else if (state === true && prev === false) {
+        setStatus("🖥 Desktop is listening again — hold the button to dictate.", "");
+      }
+    }
     if (!bigDesktopPillEl) return;
     if (state === null || !joinedSessionCode || !bigButtonActive()) { bigDesktopPillEl.style.display = "none"; return; }
     bigDesktopPillEl.style.display = "";
@@ -5259,6 +5408,7 @@ right lower quadrant"></textarea>
     remoteCommitted   = "";
     remoteHasDelivery = false;
     phoneJoined       = false;
+    phoneLinkDropped  = false;
     pendingCopyText   = "";
     lastDeliveryId    = "";
     recentDeliveryIds = [];
@@ -5335,6 +5485,19 @@ right lower quadrant"></textarea>
       // the paired state (don't re-announce on a repeat ping).
       if (!onPhoneJoined()) {
         setStatus("Phone paired ✓ — dictate on the phone; the text lands on this clipboard.", "ok");
+      }
+      return;
+    }
+
+    if (msg.message_type === "phone_leave") {
+      // The phone left: drop the paired cue so the desktop does not keep
+      // promising a mic that is gone. The session (code) stays open — the
+      // same phone can pair again with it. Warn, not fail: no text is at risk.
+      if (phoneJoined) {
+        phoneJoined = false;
+        setPhoneRecIndicator("off");
+        updatePairButton();
+        setStatus("📱 The phone left the session. Code " + phoneSessionCode + " stays open — pair the phone again with the same code (📱 Pair a phone).", "warn");
       }
       return;
     }
@@ -5756,11 +5919,15 @@ right lower quadrant"></textarea>
       bigPeekExpanded = false;
     }
     if (bigJoinedBadgeEl) {
+      // Short on purpose: the top row has to hold this plus two pills and up to
+      // three buttons at 375px. The Desktop pill beside it says whether that
+      // desktop is listening; the Pair/Leave button says which state we are in.
       bigJoinedBadgeEl.textContent = joinedSessionCode
-        ? "Joined " + joinedSessionCode
-        : "Not joined — dictating to this device";
+        ? "Paired · " + joinedSessionCode
+        : "Not paired — notes stay on this phone";
     }
     if (bigLeaveBtnEl) bigLeaveBtnEl.style.display = joinedSessionCode ? "" : "none";
+    if (bigPairBtnEl) bigPairBtnEl.style.display = joinedSessionCode ? "none" : ""; // solo phone: the way to a desktop lives here
     updateQueueChip(); // the big-layout chip needs a paint when the surface flips
     updateRecoverChip(); // ditto the saved-recording retry chip
     updateBigScreen();
@@ -5768,7 +5935,15 @@ right lower quadrant"></textarea>
   }
 
   function setBigSettingsVisible(show) {
-    document.body.classList.toggle("bigbtn-settings", Boolean(show) && bigButtonActive());
+    var on = Boolean(show) && bigButtonActive();
+    document.body.classList.toggle("bigbtn-settings", on);
+    // Land ON the settings, not on the desktop page top: Options opens and
+    // scrolls into view (the record button is hidden here by CSS — the big
+    // button is this device's record control).
+    if (on && optionsSectionEl) {
+      optionsSectionEl.open = true;
+      try { if (typeof optionsSectionEl.scrollIntoView === "function") optionsSectionEl.scrollIntoView({ block: "start" }); } catch (_) {}
+    }
   }
 
   // Whole-screen state, derived from the SAME transitions that drive the
@@ -5811,6 +5986,9 @@ right lower quadrant"></textarea>
       document.title =
         st === "rec"   ? "\u25CF REC \u2014 Dictation" :
         st === "busy"  ? "\u2026 Working \u2014 Dictation" :
+        // A dropped phone link is its own word: "FAILED" in the tab title reads
+        // as "my dictation failed" from across the room.
+        (st === "fail" && phoneLinkDropped && !recording && !finishing) ? "\u26A0 LINK DOWN \u2014 Dictation" :
         (st === "fail" || st === "alarm") ? "\u26A0 FAILED \u2014 Dictation" :
         st === "warn"  ? "\u26A0 Check \u2014 Dictation" :
         st === "ok"    ? "\u2713 Done \u2014 Dictation" : BASE_TITLE;
@@ -5889,14 +6067,23 @@ right lower quadrant"></textarea>
         (recording && !stopping) ? "STOP" :
         (stopping || finishing) ? "…" : "HOLD TO TALK";
     }
-    if (bigStatusEl) bigStatusEl.textContent = statusEl.textContent;
+    if (bigStatusEl) {
+      // The boot hint is desktop copy (Ctrl+Space, Ctrl+V, "keep this tab
+      // focused"); on the phone screen it is noise. Until any real status
+      // replaces it, say what THIS surface does.
+      bigStatusEl.textContent = statusIsBootHint
+        ? (joinedSessionCode
+            ? "Hold the button and speak. The text lands on the desktop's clipboard."
+            : "Hold the button and speak. The text is copied on this phone.")
+        : statusEl.textContent;
+    }
     updateBigPeek();
   }
 
   // The latest transcript collapses to a one-line peek strip; tap to expand.
   function updateBigPeek() {
     if (!bigPeekEl) return;
-    bigPeekTextEl.textContent = latestText || "";
+    bigPeekTextEl.textContent = latestText || "No dictation yet."; // an empty strip looked broken when expanded
     // While a dictation is live, show the realtime words wrapped and pinned to the
     // newest line — a collapsed one-liner truncates from the end, so the latest
     // recognized words scroll off-screen and the strip looks frozen (the realtime
@@ -5909,7 +6096,11 @@ right lower quadrant"></textarea>
     bigPeekBarEl.textContent = live
       ? "Live transcript"
       : bigPeekExpanded
-        ? "Latest transcript — tap here to collapse · tap the text to append the next dictation"
+        // A joined phone is a dumb mic — the DESKTOP owns append, so the
+        // "tap the text to append" promise would be a silent no-op there.
+        ? (joinedSessionCode
+            ? "Latest transcript — tap here to collapse · append is decided on the desktop"
+            : "Latest transcript — tap here to collapse · tap the text to append the next dictation")
         : "Latest transcript — tap to expand";
     if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
     // Manual re-send from the phone surface (the overlay covers the normal
@@ -6130,9 +6321,15 @@ right lower quadrant"></textarea>
 
   if (phoneStartBtnEl) phoneStartBtnEl.onclick = () => startPhoneSession();
   if (phoneStopBtnEl)  phoneStopBtnEl.onclick  = () => stopPhoneSession();
-  if (phoneJoinBtnEl) phoneJoinBtnEl.onclick = () => {
-    var code = (phoneJoinInputEl ? phoneJoinInputEl.value : "").toUpperCase().replace(/[^A-Z0-9]/g, "");
-    if (!code || code.length < 4) { setStatus("Enter the 6-character code shown on the desktop.", "err"); return; }
+  // Join a desktop session by code — the ONE join path, shared by the Options
+  // "Join desktop" row, the primary card's "Pair to a desktop" overlay and the
+  // big-button top row. Returns true on a join (false on a bad code).
+  function joinDesktopSession(rawCode) {
+    var code = String(rawCode || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+    // Codes are always exactly 6 characters (makeSessionCode). The old "≥ 4"
+    // check let a 5-character typo "pair" the phone to a room nobody listens
+    // to — every take then queued against a desktop that never existed.
+    if (code.length !== 6) { setStatus("Enter the 6-character code shown on the desktop (under 📱 Pair a phone).", "err"); return false; }
     if (code !== joinedSessionCode) {
       // Switching to a different desktop: queued deliveries stay CODE-BOUND
       // (doFlush never auto-POSTs them to this new code — stale text must not
@@ -6144,23 +6341,45 @@ right lower quadrant"></textarea>
       deliveryRetryDelayMs = 0;
     }
     joinedSessionCode = code;
+    if (phoneJoinInputEl) phoneJoinInputEl.value = code; // the Options row mirrors a join made elsewhere
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "";
     if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "";
     saveSettingsNow(); // join survives reloads/PWA kills — see restorePhoneLink
     notifyDesktopOfJoin(code); // close the desktop's pairing QR overlay right away
+    closeJoinOverlay(); // the phone-side pairing card is done
+    updatePairButton(); // "Paired to desktop CODE ✓"
     applyBigButtonUI(); // joining flips this device into the big-button layout
     updateQueueChip();
     updateAppendChip(); // the manual "Send to desktop" button appears when joined
     renderHistory();    // history rows gain their per-row send buttons
     var joinAuthWarn = linkAuthSetupWarning();
-    setStatus("Joined session " + code + ". Start recording to send audio to the desktop." + joinAuthWarn, joinAuthWarn ? "err" : "ok");
+    // Neutral class on purpose: "ok" paints the big screen DONE/green, and
+    // DONE must mean a dictation reached the clipboard — not that a link was set up.
+    setStatus("Paired to desktop " + code + ". Hold the button to dictate — the text lands on that desktop's clipboard." + joinAuthWarn, joinAuthWarn ? "err" : "");
     // The self-heal moment for a stranded note: (re)joining the code its items
     // are bound to flushes them right away — no waiting on the backoff timer.
     if (deliveryQueue.length) backgroundFlush();
-  };
+    return true;
+  }
+  if (phoneJoinBtnEl) phoneJoinBtnEl.onclick = () => { joinDesktopSession(phoneJoinInputEl ? phoneJoinInputEl.value : ""); };
   if (pairPhoneBtnEl) pairPhoneBtnEl.onclick = () => openPairOverlay();
   if (pairDoneBtnEl)  pairDoneBtnEl.onclick  = () => closePairOverlay();
   if (pairEndBtnEl)   pairEndBtnEl.onclick   = () => { stopPhoneSession(); closePairOverlay(); };
+  // Phone side: "Pair to a desktop" (primary card + big-button top row).
+  if (pairDesktopBtnEl) pairDesktopBtnEl.onclick = () => openJoinOverlay();
+  if (bigPairBtnEl)     bigPairBtnEl.onclick     = () => openJoinOverlay();
+  if (joinGoBtnEl) joinGoBtnEl.onclick = () => {
+    var typed = joinCodeInputEl ? joinCodeInputEl.value : "";
+    if (!joinDesktopSession(typed) && joinStatusEl) {
+      joinStatusEl.textContent = "Enter the 6-character code shown on the desktop (under 📱 Pair a phone).";
+      joinStatusEl.className = "err";
+    }
+  };
+  if (joinCodeInputEl) joinCodeInputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && joinGoBtnEl) { e.preventDefault(); joinGoBtnEl.click(); } });
+  if (joinCloseBtnEl) joinCloseBtnEl.onclick = () => closeJoinOverlay();
+  if (joinLeaveBtnEl) joinLeaveBtnEl.onclick = () => { leaveDesktopSession(); closeJoinOverlay(); };
+  // Tapping the dark backdrop closes the card (nothing is lost — a join persists).
+  if (joinOverlayEl) joinOverlayEl.addEventListener("click", (e) => { if (e.target === joinOverlayEl) closeJoinOverlay(); });
 
   if (micTipsDoneBtnEl)    micTipsDoneBtnEl.onclick    = () => closeMicTips();
   if (bigTipsBtnEl)        bigTipsBtnEl.onclick        = () => showMicTips();
@@ -6168,7 +6387,10 @@ right lower quadrant"></textarea>
   // Tapping the dark backdrop dismisses the tips (counts as seen).
   if (micTipsEl) micTipsEl.addEventListener("click", (e) => { if (e.target === micTipsEl) closeMicTips(); });
 
-  if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => {
+  // Leave the desktop session — the ONE leave path (Options row, the join
+  // overlay's "Leave this desktop", and the big-button "Leave").
+  function leaveDesktopSession() {
+    notifyDesktopOfLeave(joinedSessionCode); // so the desktop's "Phone paired ✓" does not outlive the phone
     joinedSessionCode = "";
     // Queued deliveries are KEPT (code-bound, so they can never misdeliver):
     // re-linking passes through Leave, and the old wipe here destroyed the
@@ -6178,15 +6400,18 @@ right lower quadrant"></textarea>
     if (deliveryRetryTimer) { clearTimeout(deliveryRetryTimer); deliveryRetryTimer = null; }
     deliveryRetryDelayMs = 0; // a fresh join must start the retry backoff over (cf. phoneReconnectDelayMs)
     if (phoneJoinBadgeEl) phoneJoinBadgeEl.style.display = "none";
-    phoneLeaveBtnEl.style.display = "none";
+    if (phoneLeaveBtnEl)  phoneLeaveBtnEl.style.display = "none";
     saveSettingsNow();
+    updatePairButton(); // back to "Pair to a desktop"
     applyBigButtonUI(); // leaving reverts to the normal layout (unless the override is "always")
     updateQueueChip();
     updateAppendChip(); // hide the manual "Send to desktop" button
     renderHistory();    // drop the per-row send buttons
     setStatus("Left the desktop session — dictations stay on this device now." +
-      (deliveryQueue.length ? " " + deliveryQueue.length + " undelivered note" + (deliveryQueue.length === 1 ? " is" : "s are") + " kept — rejoin that code to deliver, or send from History." : ""), "ok");
-  };
+      (deliveryQueue.length ? " " + deliveryQueue.length + " undelivered note" + (deliveryQueue.length === 1 ? " is" : "s are") + " kept — rejoin that code to deliver, or send from History." : ""),
+      deliveryQueue.length ? "warn" : ""); // neutral (not "ok"/DONE) — a link change is not a delivered dictation; kept notes are worth a warn
+  }
+  if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => leaveDesktopSession();
 
   // "Append next" arms a one-shot: the next dictation is added onto the current
   // note instead of starting fresh — independent of the append-mode checkbox;
@@ -6360,7 +6585,15 @@ right lower quadrant"></textarea>
   // Credentials box: live summary while typing; collapse once credentials are
   // entered (change fires on blur). Reopen any time via the summary.
   for (const el of [apiKeyEl, sonioxKeyEl, passphraseEl]) {
-    el.addEventListener("input", updateAuthUI);
+    el.addEventListener("input", () => {
+      updateAuthUI();
+      // The "enter your key first" failure stayed FAILED/red after the key was
+      // typed — a stale alarm over a fixed problem. Clear it the moment the
+      // field gets content (only that specific status; a real failure stays).
+      if (lastStatusCls === "err" && /(API key|passphrase) first/.test(statusEl.textContent) && el.value.trim()) {
+        setStatus("Credentials entered — press the button to dictate.", "");
+      }
+    });
     el.addEventListener("change", () => {
       updateAuthUI();
       if (hasAuth() && authSectionEl) authSectionEl.open = false;

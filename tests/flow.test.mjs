@@ -314,7 +314,7 @@ check('legacy clean-up options removed from the DOM (now permanently on)',
   [doc.getElementById('noVerbatim'), doc.getElementById('stripNewlines'), doc.getElementById('stripEllipses'), doc.getElementById('trailingSpace')].map(Boolean).join(','));
 check('latest transcript restored from history on boot', latest().includes('Restored note.'), latest());
 check('auth section open while credentials are missing', doc.getElementById('authSection').open === true);
-check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('enter'), doc.getElementById('authSummary').textContent);
+check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('paste your ElevenLabs API key'), doc.getElementById('authSummary').textContent);
 
 doc.getElementById('apiKey').value = 'test-key';
 doc.getElementById('sonioxKey').value = 'test-skey';
@@ -2397,6 +2397,159 @@ console.log('--- scenario 26: phone pairing overlay ---');
   await sleep(20);
   const joinPing = fetch26p.find((c) => c.url.includes('/api/session/PAIR99/deliver') && c.opts && c.opts.method === 'POST' && String(c.opts.body).includes('phone_join'));
   check('s26p: joining POSTs a phone_join ping so the desktop overlay can close', !!joinPing, fetch26p.map((c) => c.url.replace('https://dictation.test', '')).join(','));
+
+  // ---- 26d: the PHONE side is named too. The same page serves both ends of
+  // the link, so a user on the phone used to see only "Pair a phone" and read
+  // it backwards. A "Pair to a desktop" twin on the primary card opens a code
+  // card that joins through the SAME path as the Options row; the big-button
+  // top row carries it too (a solo phone on the "always" override has no other
+  // way to reach a desktop — the overlay covers the card). ----
+  const mk26d = (settings) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win._fetches = [];
+      win.fetch = (url, opts) => { win._fetches.push({ url: String(url), opts: opts || {} }); return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') }); };
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+      if (settings) win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(settings));
+    },
+  });
+  const dom26d = mk26d(null);
+  await sleep(80);
+  const doc26d = dom26d.window.document;
+  const pairDesk = doc26d.getElementById('pairDesktopBtn');
+  const joinOv = doc26d.getElementById('joinOverlay');
+  check('s26d: a "Pair to a desktop" button sits beside "Pair a phone" on the primary card', !!pairDesk && doc26d.querySelector('section.card').contains(pairDesk) && pairDesk.textContent.includes('Pair to a desktop'), pairDesk ? pairDesk.textContent : 'missing');
+  check('s26d: the join card is hidden until asked for', !!joinOv && !joinOv.classList.contains('show'));
+  pairDesk.click();
+  check('s26d: "Pair to a desktop" opens the join card', joinOv.classList.contains('show'));
+  check('s26d: the join card tells the phone user to look for "Pair a phone" on the desktop', doc26d.getElementById('joinInstr').textContent.includes('Pair a phone'), doc26d.getElementById('joinInstr').textContent);
+  // A bad code is refused in the card (loud, inline) and nothing joins.
+  // Codes are exactly 6 characters: a 5-character typo used to "pair" the
+  // phone to a room nobody listens to (the old check accepted >= 4).
+  doc26d.getElementById('joinCodeInput').value = 'ABC12';
+  doc26d.getElementById('joinGoBtn').click();
+  await sleep(10);
+  check('s26d: a 5-character typo is refused inline and does not join', joinOv.classList.contains('show') && doc26d.getElementById('joinStatus').className === 'err' && !doc26d.body.classList.contains('bigbtn') && !JSON.parse(dom26d.window.localStorage.getItem('scribe_v2_settings_v9') || '{}').joinedSessionCode, doc26d.getElementById('joinStatus').textContent);
+  doc26d.getElementById('joinCodeInput').value = 'desk42'; // lower-case: normalised like the Options row
+  doc26d.getElementById('joinGoBtn').click();
+  await sleep(30);
+  check('s26d: a good code joins through the normal path (big-button layout + persisted join)', doc26d.body.classList.contains('bigbtn') && JSON.parse(dom26d.window.localStorage.getItem('scribe_v2_settings_v9')).joinedSessionCode === 'DESK42', doc26d.body.className);
+  check('s26d: the join card closes on a successful join', !joinOv.classList.contains('show'));
+  check('s26d: pairing does NOT paint the big screen DONE (DONE means a delivered dictation)', doc26d.getElementById('bigUi').getAttribute('data-screen') === 'idle', doc26d.getElementById('bigUi').getAttribute('data-screen'));
+  check('s26d: the Options "Join desktop" row mirrors the join made from the card', doc26d.getElementById('phoneJoinInput').value === 'DESK42' && doc26d.getElementById('phoneJoinBadge').style.display !== 'none', doc26d.getElementById('phoneJoinInput').value);
+  const joinPing26d = dom26d.window._fetches.find((c) => c.url.includes('/api/session/DESK42/deliver') && String(c.opts.body).includes('phone_join'));
+  check('s26d: the card join POSTs the phone_join ping like the Options row', !!joinPing26d);
+  check('s26d: the card button reads as paired, naming the desktop code', pairDesk.textContent.includes('Paired to desktop') && pairDesk.textContent.includes('DESK42'), pairDesk.textContent);
+  check('s26d: the big-button badge says "Paired to desktop <code>"', doc26d.getElementById('bigJoinedBadge').textContent.includes('Paired · DESK42'), doc26d.getElementById('bigJoinedBadge').textContent);
+  check('s26d: while joined the big-button top row hides "Pair to a desktop" and shows Leave', doc26d.getElementById('bigPairBtn').style.display === 'none' && doc26d.getElementById('bigLeaveBtn').style.display !== 'none');
+  // Reopening the card while joined offers Leave; leaving there is the normal leave.
+  pairDesk.click();
+  check('s26d: reopened while joined, the card offers "Leave this desktop"', joinOv.classList.contains('show') && doc26d.getElementById('joinLeaveBtn').style.display !== 'none' && doc26d.getElementById('joinStatus').textContent.includes('DESK42'), doc26d.getElementById('joinStatus').textContent);
+  doc26d.getElementById('joinLeaveBtn').click();
+  await sleep(10);
+  check('s26d: "Leave this desktop" leaves (normal layout, join cleared, card closed, button back to "Pair to a desktop")',
+    !doc26d.body.classList.contains('bigbtn') && !JSON.parse(dom26d.window.localStorage.getItem('scribe_v2_settings_v9')).joinedSessionCode && !joinOv.classList.contains('show') && pairDesk.textContent === '🖥 Pair to a desktop',
+    doc26d.body.className + ' | ' + pairDesk.textContent);
+
+  // Solo big-button phone (override "always", not joined): the top row must
+  // carry the way to a desktop, and it must open the SAME card ABOVE the overlay.
+  const dom26s = mk26d({ bigButtonMode: 'always' });
+  await sleep(80);
+  const doc26s = dom26s.window.document;
+  const bigPair = doc26s.getElementById('bigPairBtn');
+  check('s26s: a solo big-button phone shows "Pair to a desktop" in the top row (and no Leave)', doc26s.body.classList.contains('bigbtn') && bigPair.style.display !== 'none' && bigPair.textContent.includes('Pair to a desktop') && doc26s.getElementById('bigLeaveBtn').style.display === 'none', bigPair.textContent);
+  check('s26s: the solo badge says notes stay on this device', doc26s.getElementById('bigJoinedBadge').textContent.includes('Not paired'), doc26s.getElementById('bigJoinedBadge').textContent);
+  bigPair.click();
+  const joinOvS = doc26s.getElementById('joinOverlay');
+  check('s26s: the top-row button opens the join card over the big-button surface', joinOvS.classList.contains('show') && dom26s.window.getComputedStyle(joinOvS).display !== 'none', dom26s.window.getComputedStyle(joinOvS).display);
+  doc26s.getElementById('joinCodeInput').value = 'SOLO77';
+  doc26s.getElementById('joinGoBtn').click();
+  await sleep(30);
+  check('s26s: joining from the top row pairs the solo phone (Leave shown, Pair hidden, badge names the code)', JSON.parse(dom26s.window.localStorage.getItem('scribe_v2_settings_v9')).joinedSessionCode === 'SOLO77' && bigPair.style.display === 'none' && doc26s.getElementById('bigLeaveBtn').style.display !== 'none' && doc26s.getElementById('bigJoinedBadge').textContent.includes('SOLO77'), doc26s.getElementById('bigJoinedBadge').textContent);
+  doc26s.getElementById('bigLeaveBtn').click();
+  await sleep(10);
+  check('s26s: Leave on the solo phone stays on the big button (override) and brings "Pair to a desktop" back', doc26s.body.classList.contains('bigbtn') && bigPair.style.display !== 'none' && doc26s.getElementById('bigLeaveBtn').style.display === 'none');
+
+  // ---- 26L: the link's state is TOLD, both ways. (1) A phone that leaves
+  // POSTs phone_leave, and the desktop drops "Phone paired ✓" (it used to stay
+  // lit over a phone that was gone). (2) A listener socket that drops and
+  // reconnects CLEARS the red "link dropped" alarm (it used to stay FAILED
+  // until an unrelated status overwrote it). (3) A running-but-unpaired
+  // session is visible on the card as "Waiting for phone · CODE". ----
+  const domL = mk26d(null);
+  await sleep(80);
+  const docL = domL.window.document;
+  // Phone side: Leave POSTs phone_leave with the code it is leaving.
+  docL.getElementById('pairDesktopBtn').click(); // opening the card resets the field — type after
+  docL.getElementById('joinCodeInput').value = 'LEAVE1';
+  docL.getElementById('joinGoBtn').click();
+  await sleep(20);
+  docL.getElementById('bigLeaveBtn').click();
+  await sleep(20);
+  const leavePing = domL.window._fetches.find((c) => c.url.includes('/api/session/LEAVE1/deliver') && String(c.opts.body).includes('phone_leave'));
+  check('s26L: leaving POSTs a phone_leave ping to the code it is leaving', !!leavePing, domL.window._fetches.map((c) => c.url.replace('https://dictation.test', '') + ':' + String(c.opts.body)).join(' | ').slice(0, 300));
+  check('s26L: Leave does not paint the phone screen DONE', docL.getElementById('bigUi').getAttribute('data-screen') !== 'ok', docL.getElementById('bigUi').getAttribute('data-screen'));
+
+  // Desktop side.
+  const socksLD = [];
+  const domLD = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve({ getTracks: () => [{ readyState: 'live', stop() {}, addEventListener() {} }], getAudioTracks: () => [{ readyState: 'live', enabled: true, stop() {}, addEventListener() {} }] }), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1,"deliveries":[]}') });
+      win.MediaRecorder = class { constructor(s) { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+      const SockClass = class extends MockWS { constructor(url) { super(url); socksLD.push(this); } };
+      SockClass.CONNECTING = 0; SockClass.OPEN = 1; SockClass.CLOSING = 2; SockClass.CLOSED = 3;
+      win.WebSocket = SockClass;
+    },
+  });
+  await sleep(80);
+  const docLD = domLD.window.document;
+  const pairBtnLD = docLD.getElementById('pairPhoneBtn');
+  const statusLD = () => docLD.getElementById('status').textContent;
+  const clsLD = () => docLD.getElementById('status').className;
+  pairBtnLD.click();
+  await sleep(20);
+  const sockLD = socksLD[0];
+  sockLD.open();
+  await sleep(10);
+  check('s26L: a running-but-unpaired session shows "Waiting for phone · CODE" on the card', /Waiting for phone · [A-Z0-9]{6}/.test(pairBtnLD.textContent), pairBtnLD.textContent);
+  check('s26L: the overlay\'s hide button says the session keeps waiting (not "Done")', /keep waiting/i.test(docLD.getElementById('pairDoneBtn').textContent), docLD.getElementById('pairDoneBtn').textContent);
+  sockLD.msg({ message_type: 'phone_join' });
+  await sleep(20);
+  check('s26L: phone_join pairs', pairBtnLD.textContent.includes('paired'), pairBtnLD.textContent);
+  sockLD.msg({ message_type: 'phone_leave' });
+  await sleep(20);
+  check('s26L: phone_leave drops the paired cue on the desktop', !pairBtnLD.textContent.includes('paired') && pairBtnLD.textContent.includes('Waiting for phone'), pairBtnLD.textContent);
+  check('s26L: and says so (warn, names the code as still open)', clsLD().includes('warn') && /phone left/i.test(statusLD()) && /stays open/.test(statusLD()), clsLD() + ' / ' + statusLD());
+  check('s26L: a repeat phone_leave with nothing paired is a silent no-op', (() => { const before = statusLD(); sockLD.msg({ message_type: 'phone_leave' }); return statusLD() === before; })());
+  // Link drop -> red + LINK DOWN title; reconnect -> cleared.
+  sockLD.serverClose();
+  await sleep(20);
+  check('s26L: a dropped listener socket is loud', clsLD().includes('err') && /link dropped/i.test(statusLD()), clsLD() + ' / ' + statusLD());
+  check('s26L: the tab title names the LINK, not a failed dictation', docLD.title.includes('LINK DOWN'), docLD.title);
+  await sleep(1100); // reconnect backoff floor is 1 s
+  const sockLD2 = socksLD[socksLD.length - 1];
+  check('s26L: a reconnect socket opened', socksLD.length >= 2 && sockLD2 !== sockLD, String(socksLD.length));
+  sockLD2.open();
+  await sleep(20);
+  check('s26L: reconnecting CLEARS the red (no stale FAILED over a working link)', !clsLD().includes('err') && /link restored/i.test(statusLD()), clsLD() + ' / ' + statusLD());
+  check('s26L: and the title is back to normal', !docLD.title.includes('LINK DOWN') && !docLD.title.includes('FAILED'), docLD.title);
+  check('s26L: a healed link is not reported as a DONE dictation', !clsLD().includes('ok'), clsLD());
 }
 
 // ===== Scenario 26r: desktop "phone is recording" indicator =====
@@ -3342,6 +3495,22 @@ console.log('--- scenario 36: desktop-presence pill (phone /status poll) ---');
   dom36.window.dispatchEvent(new dom36.window.Event('focus'));
   await sleep(120);
   check('s36: zero listeners shows "not listening"', pill36.textContent.includes('not listening') && pill36.className.includes('bad'), pill36.textContent + '/' + pill36.className);
+  // The CHANGE is also said in words with a next step (the pill alone left the
+  // status contradicting it), as a warn — and only once per transition.
+  const st36 = doc36.getElementById('status');
+  check('s36: the desktop going away is explained in the status (warn, names the code, offers Leave)', st36.className.includes('warn') && /No desktop is listening for code STAT01/.test(st36.textContent) && /Leave/.test(st36.textContent), st36.className + ' / ' + st36.textContent);
+  const bigStatus36 = doc36.getElementById('bigStatus').textContent;
+  check('s36: the phone screen shows that explanation', /No desktop is listening/.test(bigStatus36), bigStatus36);
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: a steady "not listening" does not re-announce', st36.className.includes('warn') && /No desktop is listening/.test(st36.textContent), st36.className);
+  status36 = { ok: true, listeners: 1, buffered: 0 };
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
+  check('s36: the desktop coming back clears the warn (neutral, not DONE)', !st36.className.includes('warn') && !st36.className.includes('ok') && /listening again/.test(st36.textContent), st36.className + ' / ' + st36.textContent);
+  status36 = { ok: true, listeners: 0, buffered: 0 };
+  dom36.window.dispatchEvent(new dom36.window.Event('focus'));
+  await sleep(120);
 
   // Old worker (404) => the pill hides rather than mislead.
   status36 = null;

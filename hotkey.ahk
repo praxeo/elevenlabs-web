@@ -9,7 +9,7 @@ SPINUP         := 80           ; ms before speaking (mic is kept warm by the bro
 MIN_HOLD       := 200          ; taps shorter than this are discarded. Short-form dictation
                                ; ("yes", "normal", "negative") can finish inside 350 ms, and
                                ; the old value silently refused to paste those real takes.
-CLIP_TIMEOUT   := 90           ; backstop; must cover the duration-aware batch deadline (15s floor + up to 60s extra on a long take ≈ 75s worst case, plus the browser's sub-second capture tail); sentinel makes failures return in ~2s
+CLIP_TIMEOUT   := 165          ; backstop; must cover the duration- AND size-aware batch deadline (15s floor + up to 60s take extra + up to 90s upload allowance, hard-capped at 150s by UPLOAD_DEADLINE_MAX_MS, plus the browser's sub-second capture tail); sentinel makes failures return in ~2s
 ACT_TIMEOUT    := 0.15         ; per-attempt window-activation wait
 ACT_TRIES      := 2
 HOLD_CAP_MS    := 60000        ; absolute max hold before we force-stop (anti-wedge)

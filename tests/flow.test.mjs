@@ -4150,5 +4150,195 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   check('s45: the zero-tail take delivers too', (w45._clip || '').includes('Tail note'), w45._clip);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 46. [RELIABILITY] A failed/timed-out upload must NEVER cost the dictation.
+//     The field failure: phone-link takes timed out, and because the finalize
+//     path cleared the crash journal on its way out, the audio went with the
+//     text — the only option left was to redictate from memory. (The ElevenLabs
+//     request log showed ZERO failures and a 0.58 s median, i.e. the service
+//     never even saw the aborted takes: the deadline was killing the UPLOAD.)
+//     So: a retryable failure keeps the recording and offers a retry (banner on
+//     the desktop card, chip on the phone overlay that covers it), the retry
+//     delivers the note, the kept record survives a reload, the failed take's
+//     timing row names the stage + error class instead of logging blanks, and
+//     the deadline scales with the upload size. A PERMANENT rejection (413)
+//     offers no retry, because no retry could ever help.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 46: a failed upload keeps the recording ---');
+  const idb46 = new IDBFactory();
+  let w46;
+  let mode46 = { kind: 'hang' };  // 'hang' = never answers (forces our own deadline)
+  let chunkBytes46 = 2048;
+  const fetch46 = [];
+  const mkDom46 = (settings) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      w46 = win;
+      win.isSecureContext = true;
+      win.AudioContext = MockAudioCtx;
+      win.WebSocket = MockWS;
+      win.indexedDB = idb46;
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      Object.defineProperty(win.navigator, 'clipboard', {
+        value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true,
+      });
+      // start(1000)-alike: chunks land DURING the take so the journal mirrors them.
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; this._iv = null; }
+        static isTypeSupported() { return false; }
+        _emit() { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(chunkBytes46)], { type: 'audio/webm' }) }); }
+        start() { this.state = 'recording'; this._iv = win.setInterval(() => this._emit(), 40); }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this._iv) { win.clearInterval(this._iv); this._iv = null; }
+          this._emit();
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.fetch = (url, opts) => {
+        fetch46.push(String(url));
+        const m = mode46;
+        return new Promise((resolve, reject) => {
+          let t = null;
+          if (m.kind !== 'hang') {
+            t = setTimeout(() => resolve({
+              ok: m.status >= 200 && m.status < 300, status: m.status,
+              headers: { get: () => null },
+              text: () => Promise.resolve(JSON.stringify(m.body)),
+            }), 20);
+          }
+          // A hung POST is only ever ended by OUR AbortController — exactly the
+          // path that used to lose the dictation.
+          if (opts && opts.signal) {
+            opts.signal.addEventListener('abort', () => {
+              if (t) clearTimeout(t);
+              const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+            });
+          }
+        });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(
+        Object.assign({ saveApiKey: true, micGranted: true }, settings || {})));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-46');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (46):', e.message); failures++; });
+    },
+  });
+
+  const dom46 = mkDom46();
+  await sleep(200);
+  const doc46 = dom46.window.document;
+  // Pin this DOM's window: mkDom46 assigns the shared w46 in beforeParse, so
+  // building the second DOM below would otherwise repoint every later assertion
+  // at the wrong window (and at a window that is then closed).
+  const win46 = dom46.window;
+  const ring46 = () => { try { return JSON.parse(win46.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+  const banner46 = () => doc46.getElementById('journalRecover');
+  const st46 = () => doc46.getElementById('status').textContent.trim();
+
+  check('s46: the phone-overlay retry chip exists', !!doc46.getElementById('bigRecoverChip'));
+  check('s46: no retry offered before anything fails', banner46().style.display === 'none', banner46().style.display);
+
+  // --- 46a: a take whose upload never answers hits OUR deadline -------------
+  micRms = 0.05;
+  doc46.getElementById('recordBtn').click();
+  await sleep(220);
+  doc46.getElementById('recordBtn').click();
+  // The deadline is now the 15 s floor + take-scaled + byte-scaled allowance;
+  // on a ~10 KB take that is a shade over 15 s. Wait it out.
+  await sleep(17000);
+
+  check('s46a: the timed-out take is still LOUD (sentinel copied)',
+    win46._clip === '##DICTATION_FAILED##', JSON.stringify(win46._clip));
+  check('s46a: the status reads as a failure', doc46.getElementById('status').className.includes('err'), doc46.getElementById('status').className);
+  check('s46a: the status says the RECORDING was saved (do not redictate)',
+    st46().includes('RECORDING was saved'), st46());
+  check('s46a: the retry affordance is shown', banner46().style.display !== 'none', banner46().style.display);
+  check('s46a: it is worded as a failed upload, not a crash',
+    doc46.getElementById('journalRecoverMsg').textContent.includes('upload FAILED'),
+    doc46.getElementById('journalRecoverMsg').textContent);
+  check('s46a: the button offers a retry', doc46.getElementById('journalRecoverBtn').textContent.includes('Retry'),
+    doc46.getElementById('journalRecoverBtn').textContent);
+  check('s46a: the chip stays hidden off the phone overlay',
+    doc46.getElementById('bigRecoverChip').style.display === 'none', doc46.getElementById('bigRecoverChip').style.display);
+
+  const e46a = ring46()[0] || {};
+  check('s46a: the failed take is recorded (not a blank row)', ring46().length === 1, ring46().length);
+  check('s46a: the failure is classified as a timeout', e46a.errKind === 'timeout', e46a.errKind);
+  check('s46a: the stage shows the response never came back',
+    e46a.stage === 'uploadStart', e46a.stage);
+  check('s46a: the deadline it blew is recorded', typeof e46a.deadline === 'number' && e46a.deadline >= 15000, e46a.deadline);
+  check('s46a: ElevenLabs never answered, so there is no service timing', e46a.elMs === null || e46a.elMs === undefined, e46a.elMs);
+  check('s46a: the readout leads with the failure, not blanks',
+    (doc46.getElementById('timingReadout').textContent || '').includes('FAILED'),
+    doc46.getElementById('timingReadout').textContent);
+
+  // --- 46b: the retry lands the note that used to be lost -------------------
+  mode46 = { kind: 'ok', status: 200, body: { text: 'Rescued note.' } };
+  doc46.getElementById('journalRecoverBtn').click();
+  await sleep(500);
+  check('s46b: retrying the saved audio delivers the note',
+    (win46._clip || '').includes('Rescued note.'), JSON.stringify(win46._clip));
+  check('s46b: the retry affordance clears once it lands', banner46().style.display === 'none', banner46().style.display);
+  check('s46b: the retry reports success', doc46.getElementById('status').className.includes('ok'), st46());
+
+  // --- 46c: a 5xx is retryable too, and its record must SURVIVE a reload ----
+  mode46 = { kind: 'ok', status: 500, body: { error: 'service exploded' } };
+  doc46.getElementById('recordBtn').click();
+  await sleep(220);
+  doc46.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s46c: a 5xx failure also keeps the recording', banner46().style.display !== 'none', banner46().style.display);
+  check('s46c: the 5xx is classified by status', (ring46()[0] || {}).errKind === 'http-500', (ring46()[0] || {}).errKind);
+  check('s46c: a service that DID answer reaches the body stage (not uploadStart)',
+    (ring46()[0] || {}).stage === 'body', (ring46()[0] || {}).stage);
+  const deadlineSmall46 = (ring46()[0] || {}).deadline;
+
+  // --- 46d: the kept journal record is offered again after a relaunch -------
+  // (left un-retried on purpose: the whole point is that a clinician who walks
+  //  away still finds the dictation waiting.) Booted as a PHONE surface, where
+  //  the overlay covers the banner and the chip is the only way to reach it.
+  const dom46b = mkDom46({ bigButtonMode: 'always' });
+  await sleep(400);
+  const doc46b = dom46b.window.document;
+  check('s46d: a relaunch still offers the un-retried recording',
+    doc46b.getElementById('journalRecover').style.display !== 'none',
+    doc46b.getElementById('journalRecover').style.display);
+  check('s46d: the phone overlay surfaces it as a tappable chip',
+    doc46b.getElementById('bigRecoverChip').style.display !== 'none',
+    doc46b.getElementById('bigRecoverChip').style.display);
+  dom46b.window.close();
+
+  // --- 46e: a PERMANENT rejection offers no retry ---------------------------
+  // 413 means this audio can never transcribe; pretending a retry might help
+  // would be a false promise, and the take must stay plainly failed.
+  doc46.getElementById('journalDiscardBtn').click();
+  await sleep(50);
+  mode46 = { kind: 'ok', status: 413, body: { error: 'Recording too large.' } };
+  chunkBytes46 = 40000; // also makes this take much bigger than 46c's
+  doc46.getElementById('recordBtn').click();
+  await sleep(220);
+  doc46.getElementById('recordBtn').click();
+  await sleep(900);
+  check('s46e: an over-size rejection is still loud', win46._clip === '##DICTATION_FAILED##', JSON.stringify(win46._clip));
+  check('s46e: no retry is offered for a permanently rejected recording',
+    banner46().style.display === 'none', banner46().style.display);
+  check('s46e: the status does not promise a saved recording',
+    !st46().includes('RECORDING was saved'), st46());
+
+  // --- 46f: the deadline scales with the upload size -----------------------
+  const deadlineBig46 = (ring46()[0] || {}).deadline;
+  check('s46f: a bigger upload gets a longer deadline (the byte-scaled allowance)',
+    typeof deadlineBig46 === 'number' && typeof deadlineSmall46 === 'number' && deadlineBig46 > deadlineSmall46,
+    JSON.stringify([deadlineSmall46, deadlineBig46]));
+  check('s46f: the deadline stays bounded by UPLOAD_DEADLINE_MAX_MS',
+    deadlineBig46 <= 150000, deadlineBig46);
+  chunkBytes46 = 2048;
+  dom46.window.close();
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

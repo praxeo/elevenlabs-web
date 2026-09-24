@@ -238,6 +238,14 @@ export default {
       return new Response("Expected POST", { status: 400 });
     }
 
+    if (url.pathname === "/api/transcribe-stream") {
+      // The same transcription, uploaded while the take is being spoken.
+      if (request.method === "POST") {
+        return handleTranscribeStream(request, env);
+      }
+      return new Response("Expected POST", { status: 400 });
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -384,9 +392,67 @@ export default {
   },
 };
 
+// The transcription model and endpoint, shared by the batch proxy and the
+// streamed upload so the two can never send ElevenLabs different requests.
+// Scribe v2 Medical: ElevenLabs' clinical fine-tune of Scribe v2 (drug names,
+// anatomy, pathology). Same endpoint, same request shape (keyterms, diarize,
+// no_verbatim, timestamps) and same price as scribe_v2. (The OpenAPI
+// no_verbatim note still says "only scribe_v2"; the 2026-09-11 changelog
+// confirms Medical supports it.)
+const STT_MODEL_ID = "scribe_v2_medical";
+const ELEVENLABS_STT_URL = "https://api.elevenlabs.io/v1/speech-to-text";
+const STT_MIN_AUDIO_BYTES = 1024;
+const STT_MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+
+// Every ElevenLabs field except model_id and the audio itself, in the order
+// the batch proxy has always sent them (there they follow the file part; in a
+// streamed upload they precede it, because the audio has to be the last part).
+// get(name) returns the client's value for a field, or null.
+function sttUpstreamFields(get) {
+  const fields = [
+    ["file_format", String(get("file_format") || "other")],
+    ["language_code", "en"],
+  ];
+
+  // Diarization (keep-primary-speaker) is the lever against bystander voices
+  // the mic picks up: noise suppression / iOS Voice Isolation strip *noise*,
+  // but another person's speech is speech and survives both. When the client
+  // asks for it, let Scribe label speakers (don't force num_speakers=1) and
+  // return word-level data so the client can keep only the primary speaker.
+  // The client does the filtering (the Worker stays a thin proxy); we just
+  // shape the request so the per-word speaker_id is present.
+  const diarize = get("diarize") === "true";
+  if (diarize) {
+    fields.push(["diarize", "true"]);
+  } else {
+    fields.push(["diarize", "false"], ["num_speakers", "1"]);
+  }
+  fields.push(["temperature", "0"]);
+
+  // Word-granular timestamps guarantee the words[] array (with speaker_id)
+  // the client needs to drop other speakers; otherwise honor the client's ask.
+  fields.push(["timestamps_granularity", diarize ? "word" : String(get("timestamps_granularity") || "none")]);
+
+  fields.push(["no_verbatim", String(get("no_verbatim") !== "false")]);
+  fields.push(["tag_audio_events", String(get("tag_audio_events") === "true")]);
+
+  let keyterms = [];
+  try {
+    keyterms = JSON.parse(String(get("keyterms_json") || "[]"));
+  } catch {
+    keyterms = [];
+  }
+
+  // Batch API caps: 1000 terms, each < 50 chars and <= 5 words.
+  for (const term of sanitizeKeyterms(keyterms, { maxChars: 49, maxWords: 5, maxTerms: 1000 })) {
+    fields.push(["keyterms", term]);
+  }
+  return fields;
+}
+
 // Batch proxy: receives the recorded audio blob as multipart form data and
-// forwards it to ElevenLabs batch Scribe v2 Medical. Serves pure batch mode and the
-// hybrid mode's accuracy re-transcription pass.
+// forwards it to ElevenLabs batch Scribe v2 Medical. The fallback for every
+// streamed take, and the only path on browsers that cannot stream an upload.
 async function handleTranscribeBatch(request, env) {
   // [PERF] Stage stamps behind the Server-Timing response header the client
   // folds into its timing ring. This is what splits OUR transport + proxy cost
@@ -420,64 +486,18 @@ async function handleTranscribeBatch(request, env) {
       return json({ error: "No ElevenLabs API key available (none provided, and no shared key/access code configured)." }, 400);
     }
     if (!file || typeof file === "string") return json({ error: "No audio file uploaded." }, 400);
-    if (file.size < 1024) return json({ error: "Recording too short or empty." }, 400);
-    if (file.size > 25 * 1024 * 1024) return json({ error: "Recording too large." }, 413);
+    if (file.size < STT_MIN_AUDIO_BYTES) return json({ error: "Recording too short or empty." }, 400);
+    if (file.size > STT_MAX_AUDIO_BYTES) return json({ error: "Recording too large." }, 413);
 
     const form = new FormData();
-
-    // Scribe v2 Medical: ElevenLabs' clinical fine-tune of Scribe v2 (drug
-    // names, anatomy, pathology). Same endpoint, same request shape (keyterms,
-    // diarize, no_verbatim, timestamps) and same price as scribe_v2, so every
-    // field below is unchanged. (The OpenAPI no_verbatim note still says
-    // "only scribe_v2"; the 2026-09-11 changelog confirms Medical supports it.)
-    form.append("model_id", "scribe_v2_medical");
+    form.append("model_id", STT_MODEL_ID);
     form.append("file", file, file.name || "recording.webm");
-    form.append("file_format", String(incoming.get("file_format") || "other"));
-
-    form.append("language_code", "en");
-
-    // Diarization (keep-primary-speaker) is the lever against bystander voices
-    // the mic picks up: noise suppression / iOS Voice Isolation strip *noise*,
-    // but another person's speech is speech and survives both. When the client
-    // asks for it, let Scribe label speakers (don't force num_speakers=1) and
-    // return word-level data so the client can keep only the primary speaker.
-    // The client does the filtering (the Worker stays a thin proxy); we just
-    // shape the request so the per-word speaker_id is present.
-    const diarize = incoming.get("diarize") === "true";
-    if (diarize) {
-      form.append("diarize", "true");
-    } else {
-      form.append("diarize", "false");
-      form.append("num_speakers", "1");
-    }
-    form.append("temperature", "0");
-
-    // Word-granular timestamps guarantee the words[] array (with speaker_id)
-    // the client needs to drop other speakers; otherwise honor the client's ask.
-    form.append(
-      "timestamps_granularity",
-      diarize ? "word" : String(incoming.get("timestamps_granularity") || "none")
-    );
-
-    const noVerbatim = incoming.get("no_verbatim") !== "false";
-    form.append("no_verbatim", String(noVerbatim));
-
-    form.append("tag_audio_events", String(incoming.get("tag_audio_events") === "true"));
-
-    let keyterms = [];
-    try {
-      keyterms = JSON.parse(String(incoming.get("keyterms_json") || "[]"));
-    } catch {
-      keyterms = [];
-    }
-
-    // Batch API caps: 1000 terms, each < 50 chars and <= 5 words.
-    for (const term of sanitizeKeyterms(keyterms, { maxChars: 49, maxWords: 5, maxTerms: 1000 })) {
-      form.append("keyterms", term);
+    for (const [name, value] of sttUpstreamFields((k) => incoming.get(k))) {
+      form.append(name, value);
     }
 
     tElStart = Date.now();
-    const eleven = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
+    const eleven = await fetch(ELEVENLABS_STT_URL, {
       method: "POST",
       headers: { "xi-api-key": apiKey },
       body: form,
@@ -505,6 +525,235 @@ async function handleTranscribeBatch(request, env) {
       500
     );
   }
+}
+
+// ───── Streamed upload: the audio goes up WHILE the clinician is talking ─────
+// Ported from WhisperInk's StreamedTranscription, which measured it on
+// scribe_v2_medical at 240 vs 323 ms for a 4 s take and 307 vs 402 ms for an
+// 11 s take. The browser opens this request when recording starts and feeds
+// it each recorder chunk as it is produced; the Worker opens the ElevenLabs
+// request at the same moment and relays the audio into it as the file part of
+// the ordinary multipart request. At the release only the last chunk is left
+// to send, so the wait is for the transcript alone.
+//
+// The request body is a sequence of frames: 1 type byte, a 4-byte big-endian
+// length, then the payload.
+//   "O" options: JSON, the same fields the batch form carries (always first)
+//   "A" audio:   the next recorder chunk, byte for byte
+//   "E" end:     JSON {bytes, chunks}, what the client recorded
+// The upstream body is ended ONLY once the end frame has arrived and matches
+// what was relayed, byte for byte and chunk for chunk. Anything else (a
+// dropped connection, a short or garbled body, a mismatch, an oversize take)
+// aborts the upstream request instead, so ElevenLabs never receives a
+// complete request for audio that is not the whole take, and bills nothing.
+// Credentials ride headers (x-app-auth / x-el-key), never the URL, and are
+// checked before anything is read or sent. The client falls back to
+// /api/transcribe on any failure except its own deadline.
+const STREAM_FRAME_OPTIONS = 0x4f; // "O"
+const STREAM_FRAME_AUDIO   = 0x41; // "A"
+const STREAM_FRAME_END     = 0x45; // "E"
+const STREAM_OPTIONS_MAX_BYTES = 256 * 1024;      // 1000 keyterms of 49 chars fit with room to spare
+const STREAM_FRAME_MAX_BYTES   = 4 * 1024 * 1024; // one recorder chunk is ~8 KB per second of audio
+
+async function handleTranscribeStream(request, env) {
+  // Durations only, as in the batch proxy: never log the URL, headers or body.
+  const tStart = Date.now();
+  const clientKey  = String(request.headers.get("x-el-key") || "").trim();
+  const serverKey  = (env && env.ELEVENLABS_API_KEY) || "";
+  const serverPass = ((env && env.APP_PASSPHRASE) || "").trim();
+
+  let apiKey = clientKey;
+  if (!apiKey && serverKey && serverPass) {
+    const given = String(request.headers.get("x-app-auth") || "").trim();
+    if (!safeEqual(given, serverPass)) {
+      return json({ error: "Invalid or missing access code." }, 401);
+    }
+    apiKey = serverKey;
+  }
+  if (!apiKey) {
+    return json({ error: "No ElevenLabs API key available (none provided, and no shared key/access code configured)." }, 400);
+  }
+  if (!request.body) return json({ error: "No audio stream." }, 400);
+
+  const frames = streamFrameReader(request.body);
+  let writer = null;
+  const abortUpstream = (why) => {
+    if (writer) writer.abort(new Error(why)).catch(() => {});
+    writer = null;
+  };
+
+  try {
+    const first = await frames.next(STREAM_OPTIONS_MAX_BYTES);
+    if (!first || first.type !== STREAM_FRAME_OPTIONS) {
+      frames.cancel();
+      return json({ error: "The audio stream must start with its options." }, 400);
+    }
+    let opts = null;
+    try {
+      opts = JSON.parse(new TextDecoder().decode(first.payload));
+    } catch {
+      opts = null;
+    }
+    if (!opts || typeof opts !== "object") {
+      frames.cancel();
+      return json({ error: "Unreadable audio stream options." }, 400);
+    }
+    const get = (k) => (opts[k] === undefined || opts[k] === null ? null : String(opts[k]));
+    // Only fixed shapes reach a multipart header, so nothing the client sends
+    // can add a header line or fake a boundary.
+    const fileName = /^recording\.(webm|ogg)$/.test(get("file_name") || "") ? get("file_name") : "recording.webm";
+    const mime = /^audio\/(webm|ogg)(;codecs=opus)?$/.test(get("mime") || "") ? get("mime") : "audio/webm";
+
+    const boundary = "----ScribeStream" + crypto.randomUUID().replace(/-/g, "");
+    let head = "";
+    for (const [name, value] of [["model_id", STT_MODEL_ID], ...sttUpstreamFields(get)]) {
+      head += "--" + boundary + "\r\n" +
+        'Content-Disposition: form-data; name="' + name + '"\r\n\r\n' +
+        value + "\r\n";
+    }
+    head += "--" + boundary + "\r\n" +
+      'Content-Disposition: form-data; name="file"; filename="' + fileName + '"\r\n' +
+      "Content-Type: " + mime + "\r\n\r\n";
+
+    const pipe = new TransformStream();
+    writer = pipe.writable.getWriter();
+    const upstream = fetch(ELEVENLABS_STT_URL, {
+      method: "POST",
+      headers: { "xi-api-key": apiKey, "content-type": "multipart/form-data; boundary=" + boundary },
+      body: pipe.readable,
+    });
+    // ElevenLabs can only answer before the end with an error: it needs the
+    // whole body to transcribe. Once it has answered, stop relaying (a write it
+    // will never read must not stall the stream) but keep reading the client's
+    // frames, so the client can finish its body and receive the answer.
+    let answered = false;
+    const settled = upstream.then(() => { answered = true; }, () => { answered = true; });
+    const relay = async (bytes) => {
+      if (answered || !writer) return;
+      const write = writer.write(bytes).catch(() => {});
+      await Promise.race([write, settled]);
+    };
+
+    const enc = new TextEncoder();
+    await relay(enc.encode(head));
+    let bytes = 0;
+    let count = 0;
+    let end = null;
+    for (;;) {
+      const frame = await frames.next(STREAM_FRAME_MAX_BYTES);
+      if (!frame) break; // the body ended without an end frame
+      if (frame.type === STREAM_FRAME_AUDIO) {
+        bytes += frame.payload.length;
+        count += 1;
+        if (bytes > STT_MAX_AUDIO_BYTES) {
+          abortUpstream("too large");
+          frames.cancel();
+          return json({ error: "Recording too large." }, 413);
+        }
+        await relay(frame.payload);
+      } else if (frame.type === STREAM_FRAME_END) {
+        try {
+          end = JSON.parse(new TextDecoder().decode(frame.payload));
+        } catch {
+          end = {};
+        }
+        break;
+      } else {
+        abortUpstream("unknown frame");
+        frames.cancel();
+        return json({ error: "Unknown audio stream frame." }, 400);
+      }
+    }
+    const tEnd = Date.now();
+
+    if (!end) {
+      abortUpstream("no end frame");
+      return json({ error: "The audio stream ended before the take did." }, 400);
+    }
+    if (end.bytes !== bytes || end.chunks !== count) {
+      abortUpstream("integrity");
+      return json({
+        error: "Stream integrity check failed: relayed " + bytes + " bytes in " + count +
+               " chunks, but the take has " + end.bytes + " in " + end.chunks + ".",
+      }, 400);
+    }
+    if (bytes < STT_MIN_AUDIO_BYTES) {
+      abortUpstream("too short");
+      return json({ error: "Recording too short or empty." }, 400);
+    }
+
+    // Verified: now, and only now, end the upstream body.
+    await relay(enc.encode("\r\n--" + boundary + "--\r\n"));
+    if (!answered && writer) {
+      await Promise.race([writer.close().catch(() => {}), settled]);
+    }
+
+    let eleven;
+    try {
+      eleven = await upstream;
+    } catch (err) {
+      return json({ error: "Worker transcription proxy failed.", message: err?.message || String(err) }, 502);
+    }
+    const responseText = await eleven.text();
+    const tElEnd = Date.now();
+
+    return new Response(responseText, {
+      status: eleven.status,
+      headers: {
+        "content-type":
+          eleven.headers.get("content-type") || "application/json; charset=utf-8",
+        "cache-control": "no-store",
+        // Measured from the end frame, so the numbers are the wait AFTER the
+        // release and compare directly with the batch path's: el = end frame
+        // to ElevenLabs' answer. open = how long the stream ran (the take).
+        "server-timing": "parse;dur=0" +
+                         ", el;dur=" + (tElEnd - tEnd) +
+                         ", worker;dur=" + (Date.now() - tEnd) +
+                         ", open;dur=" + (tEnd - tStart),
+      },
+    });
+  } catch (err) {
+    abortUpstream("stream failed");
+    frames.cancel();
+    return json({ error: "Audio stream failed.", message: err?.message || String(err) }, 400);
+  }
+}
+
+// Reads the framed request body incrementally, as the client sends it.
+function streamFrameReader(body) {
+  const reader = body.getReader();
+  let buf = new Uint8Array(0);
+  const fill = async (n) => {
+    while (buf.length < n) {
+      const { value, done } = await reader.read();
+      if (done) return false;
+      if (value && value.length) {
+        const joined = new Uint8Array(buf.length + value.length);
+        joined.set(buf, 0);
+        joined.set(value, buf.length);
+        buf = joined;
+      }
+    }
+    return true;
+  };
+  return {
+    // The next frame, or null when the body ends cleanly between frames.
+    async next(maxLen) {
+      if (!(await fill(5))) {
+        if (buf.length) throw new Error("the audio stream ended mid-frame");
+        return null;
+      }
+      const len = buf[1] * 16777216 + buf[2] * 65536 + buf[3] * 256 + buf[4];
+      if (len > maxLen) throw new Error("an audio stream frame was too large");
+      if (!(await fill(5 + len))) throw new Error("the audio stream ended mid-frame");
+      const frame = { type: buf[0], payload: buf.slice(5, 5 + len) };
+      buf = buf.slice(5 + len);
+      return frame;
+    },
+    cancel() {
+      reader.cancel().catch(() => {});
+    },
+  };
 }
 
 function safeEqual(a, b) {
@@ -1228,6 +1477,11 @@ right lower quadrant"></textarea>
             </div>
           </div>
 
+          <label class="checkbox" style="margin-top:14px;">
+            <input type="checkbox" id="streamUpload" checked />
+            Upload while you dictate <span class="hint">(on by default; Chrome/Edge. Sends the audio while you are still talking, so letting go only waits for the transcript. If anything goes wrong it falls back to the normal upload on its own. The timing log shows which path each take used.)</span>
+          </label>
+
           <label style="margin-top:14px;">Last take timing</label>
           <div id="timingReadout">No takes recorded yet.</div>
           <div class="row" style="margin-top: 8px;">
@@ -1421,6 +1675,7 @@ right lower quadrant"></textarea>
   const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
+  const streamUploadEl   = document.getElementById("streamUpload");
   const echoCancelEl     = document.getElementById("echoCancel");
   const diarizeEl        = document.getElementById("diarize");
   const startBeepEl      = document.getElementById("startBeep");
@@ -1798,6 +2053,16 @@ right lower quadrant"></textarea>
   const UPLOAD_MS_PER_KB         = 60;     // upload allowance per KB of audio
   const UPLOAD_BUDGET_MAX_MS     = 90000;  // cap on that byte-scaled part alone
   const UPLOAD_DEADLINE_MAX_MS   = 150000; // hard cap on the WHOLE deadline (hotkey.ahk CLIP_TIMEOUT must cover it)
+  // [LATENCY] Streamed upload (see openTakeStream): the audio goes up while the
+  // clinician is still talking. Past the length cap the stream is given up and
+  // the take uploads the ordinary way at release; after this many consecutive
+  // stream failures streaming is switched off until the page reloads, so a
+  // network that cannot stream costs at most that many slower takes.
+  const STREAM_MAX_REC_MS        = 5 * 60 * 1000;
+  const STREAM_FAIL_DISABLE      = 2;
+  const STREAM_FRAME_OPTIONS     = 0x4f; // "O" — must match the Worker's frame types
+  const STREAM_FRAME_AUDIO       = 0x41; // "A"
+  const STREAM_FRAME_END         = 0x45; // "E"
   // NOTE: Cloudflare's edge may terminate a very long request before this cap is
   // reached, in which case the client sees a network error rather than its own
   // timeout. Both are classified retryable and both keep the recording, so the
@@ -2350,6 +2615,7 @@ right lower quadrant"></textarea>
       gateLookahead:  gateLookaheadEl ? gateLookaheadEl.value : String(GATE_LOOKAHEAD_MS_DEFAULT),
       releaseTail:    releaseTailEl ? releaseTailEl.value : String(RELEASE_TAIL_MS_DEFAULT),
       windowTint:     windowTintEl ? windowTintEl.value : "full",
+      streamUpload:   streamUploadEl ? streamUploadEl.checked : true, // per-device: this network may not stream
       audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
       audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
@@ -2422,6 +2688,7 @@ right lower quadrant"></textarea>
       if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
         windowTintEl.value = s.windowTint;
       }
+      if (typeof s.streamUpload === "boolean" && streamUploadEl) streamUploadEl.checked = s.streamUpload;
       if (typeof s.audioSeedVersion === "number")  audioSeedVersion = s.audioSeedVersion;
       if (typeof s.audioUserTuned   === "boolean") audioUserTuned   = s.audioUserTuned;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
@@ -2511,6 +2778,9 @@ right lower quadrant"></textarea>
   const JOURNAL_MAX_CHUNKS = 1800; // soft cap (~30 min @ 1s timeslice ≈ 14 MB IDB) — bound the write cost; the in-memory path is unaffected past this; a capped recovery SAYS so (showJournalRecover)
   let journalDb = null;
   let uploadTicker = null;       // interval id for the "uploading… Ns" status counter
+  let takeStream = null;         // the streamed upload of the take being recorded (openTakeStream)
+  let streamFailStreak = 0;      // consecutive streamed takes that fell back or timed out
+  let streamOffReason = "";      // set once STREAM_FAIL_DISABLE is reached: streaming is off until reload
   let journalDisabled = (typeof indexedDB === "undefined");
   let journalSessionId = null;   // id of the in-flight take's journal record (null = not journaling)
   let journalChunkCount = 0;
@@ -3018,24 +3288,103 @@ right lower quadrant"></textarea>
     uploadTicker = null;
   }
 
+  // The client's fields of every transcription request, uploaded or streamed:
+  // one list, so the two paths can never ask for different transcripts.
+  function sttClientFields() {
+    return [
+      ["file_format", "other"],
+      // Always request word timestamps: the transcript-coverage guard needs per-
+      // word end times on EVERY dictation to catch a silently truncated result
+      // (the old Advanced select defaulted to "none", which left the client blind
+      // to a half-length transcript — it is retired/hidden, not removed).
+      ["timestamps_granularity", "word"],
+      ["no_verbatim", "true"], // always on — the "remove filler/false starts" toggle was removed
+      ["tag_audio_events", String(tagEventsEl.checked)],
+      ["diarize", String(diarizeActive())], // keep-primary-speaker: drop bystander voices — phone/big-button surface only
+      ["keyterms_json", precomputedBatchKeyterms || JSON.stringify(
+        effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
+      )], // [LATENCY] reuse the snapshot taken at session start; fall back if absent
+    ];
+  }
+
+  // Turn a transcription response into the result finishBatchSession consumes.
+  // Shared by the ordinary upload and the streamed one, so a streamed take is
+  // judged exactly like an uploaded one: the same errors, the same speaker
+  // filter, the same coverage-guard inputs.
+  async function readTranscribeResponse(res) {
+    stampTake("headers"); // [PERF] response headers back = upload + service done
+    // Fold the Worker's own Server-Timing in: "el" is the ElevenLabs round
+    // trip, so (service - worker) is OUR network overhead — the only part any
+    // transport work could ever recover. Character classes only, no
+    // backslashes: this source lives inside a template literal.
+    try {
+      var stHeader = (res.headers && res.headers.get) ? res.headers.get("server-timing") : "";
+      if (stHeader && takeTimings) {
+        var mParse = /parse;dur=([0-9.]+)/.exec(stHeader);
+        var mEl    = /el;dur=([0-9.]+)/.exec(stHeader);
+        var mWk    = /worker;dur=([0-9.]+)/.exec(stHeader);
+        if (mParse) takeTimings.serverParseMs = Math.round(Number(mParse[1]));
+        if (mEl)    takeTimings.serverElMs    = Math.round(Number(mEl[1]));
+        if (mWk)    takeTimings.serverTotalMs = Math.round(Number(mWk[1]));
+      }
+    } catch (e) {}
+    const raw = await res.text();
+    stampTake("body"); // [PERF] full response in hand
+    let data;
+    try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
+
+    if (!res.ok) {
+      const msg = (data && data.detail && data.detail.message) ||
+                  (data && data.message) ||
+                  (data && data.error) ||
+                  raw || "transcription request failed";
+      // retryable says whether KEEPING the audio for a retry could ever help.
+      // Only a recording the service will always refuse (too large, or too
+      // short/empty to be audio at all) is permanent; everything else —
+      // 5xx, 429, even a wrong access code — transcribes fine on a retry, so
+      // the audio must be kept (see armUploadRecovery).
+      const permanent = res.status === 413 ||
+        (res.status === 400 && /too short|too large|empty|no audio file/i.test(String(msg)));
+      return {
+        ok: false, text: "", error: String(msg),
+        errKind: "http-" + res.status, retryable: !permanent,
+      };
+    }
+    var text = String(data.text || data.transcript || "");
+    var removedWords = 0;
+    var removedShare = 0;
+    var unfilteredText = "";
+    // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
+    // measures what the service transcribed, not what the filter kept) and the
+    // decoded audio duration. Both null when absent so the guard can only ever
+    // no-op on missing data, never false-warn.
+    var words = (Array.isArray(data.words) && data.words.length) ? data.words : null;
+    var audioDurationSecs = (typeof data.audio_duration_secs === "number" && isFinite(data.audio_duration_secs))
+      ? data.audio_duration_secs : null;
+    // Keep only the primary speaker when diarization is active. A failure to find
+    // a clear-minority second speaker (or any words[]) leaves the full text
+    // untouched — the filter can only ever REMOVE a clear bystander, never empty
+    // a clean note. When it does cut, keep the unfiltered text so a wrongly
+    // dropped clinician utterance is recoverable from history.
+    if (diarizeActive() && words) {
+      var prim = keepPrimarySpeaker(words);
+      if (prim && prim.text.trim() && prim.removedWords > 0) {
+        unfilteredText = text;
+        text = prim.text;
+        removedWords = prim.removedWords;
+        removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
+      }
+    }
+    return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs };
+  }
+
   async function batchTranscribe(blob, fileName, timeoutMs, label) {
     const form = new FormData();
     const apiKey = apiKeyEl.value.trim();
     if (apiKey) form.append("api_key", apiKey);
     if (SHARED_MODE) form.append("passphrase", passphraseEl.value.trim());
     form.append("file", blob, fileName);
-    form.append("file_format", "other");
-    // Always request word timestamps: the transcript-coverage guard needs per-
-    // word end times on EVERY dictation to catch a silently truncated result
-    // (the old Advanced select defaulted to "none", which left the client blind
-    // to a half-length transcript — it is retired/hidden, not removed).
-    form.append("timestamps_granularity", "word");
-    form.append("no_verbatim", "true"); // always on — the "remove filler/false starts" toggle was removed
-    form.append("tag_audio_events", String(tagEventsEl.checked));
-    form.append("diarize", String(diarizeActive())); // keep-primary-speaker: drop bystander voices — phone/big-button surface only
-    form.append("keyterms_json", precomputedBatchKeyterms || JSON.stringify(
-      effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
-    )); // [LATENCY] reuse the snapshot taken at session start; fall back if absent
+    sttClientFields().forEach(function (f) { form.append(f[0], f[1]); });
 
     const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
     const killer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs) : null;
@@ -3048,70 +3397,7 @@ right lower quadrant"></textarea>
         body: form,
         signal: ctrl ? ctrl.signal : undefined,
       });
-      stampTake("headers"); // [PERF] response headers back = upload + service done
-      // Fold the Worker's own Server-Timing in: "el" is the ElevenLabs round
-      // trip, so (service - worker) is OUR network overhead — the only part any
-      // transport work could ever recover. Character classes only, no
-      // backslashes: this source lives inside a template literal.
-      try {
-        var stHeader = (res.headers && res.headers.get) ? res.headers.get("server-timing") : "";
-        if (stHeader && takeTimings) {
-          var mParse = /parse;dur=([0-9.]+)/.exec(stHeader);
-          var mEl    = /el;dur=([0-9.]+)/.exec(stHeader);
-          var mWk    = /worker;dur=([0-9.]+)/.exec(stHeader);
-          if (mParse) takeTimings.serverParseMs = Math.round(Number(mParse[1]));
-          if (mEl)    takeTimings.serverElMs    = Math.round(Number(mEl[1]));
-          if (mWk)    takeTimings.serverTotalMs = Math.round(Number(mWk[1]));
-        }
-      } catch (e) {}
-      const raw = await res.text();
-      stampTake("body"); // [PERF] full response in hand
-      let data;
-      try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
-
-      if (!res.ok) {
-        const msg = (data && data.detail && data.detail.message) ||
-                    (data && data.message) ||
-                    (data && data.error) ||
-                    raw || "transcription request failed";
-        // retryable says whether KEEPING the audio for a retry could ever help.
-        // Only a recording the service will always refuse (too large, or too
-        // short/empty to be audio at all) is permanent; everything else —
-        // 5xx, 429, even a wrong access code — transcribes fine on a retry, so
-        // the audio must be kept (see armUploadRecovery).
-        const permanent = res.status === 413 ||
-          (res.status === 400 && /too short|too large|empty|no audio file/i.test(String(msg)));
-        return {
-          ok: false, text: "", error: String(msg),
-          errKind: "http-" + res.status, retryable: !permanent,
-        };
-      }
-      var text = String(data.text || data.transcript || "");
-      var removedWords = 0;
-      var removedShare = 0;
-      var unfilteredText = "";
-      // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
-      // measures what the service transcribed, not what the filter kept) and the
-      // decoded audio duration. Both null when absent so the guard can only ever
-      // no-op on missing data, never false-warn.
-      var words = (Array.isArray(data.words) && data.words.length) ? data.words : null;
-      var audioDurationSecs = (typeof data.audio_duration_secs === "number" && isFinite(data.audio_duration_secs))
-        ? data.audio_duration_secs : null;
-      // Keep only the primary speaker when diarization is active. A failure to find
-      // a clear-minority second speaker (or any words[]) leaves the full text
-      // untouched — the filter can only ever REMOVE a clear bystander, never empty
-      // a clean note. When it does cut, keep the unfiltered text so a wrongly
-      // dropped clinician utterance is recoverable from history.
-      if (diarizeActive() && words) {
-        var prim = keepPrimarySpeaker(words);
-        if (prim && prim.text.trim() && prim.removedWords > 0) {
-          unfilteredText = text;
-          text = prim.text;
-          removedWords = prim.removedWords;
-          removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
-        }
-      }
-      return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs };
+      return await readTranscribeResponse(res);
     } catch (err) {
       const aborted = err && err.name === "AbortError";
       // Both are retryable by definition: the audio never reached a verdict.
@@ -3131,6 +3417,242 @@ right lower quadrant"></textarea>
       if (killer) clearTimeout(killer);
       stopUploadTicker();
     }
+  }
+
+  /* ───── [LATENCY] Streamed upload (ported from WhisperInk) ─────
+     The take's upload starts when recording starts: each recorder chunk goes
+     up as it is produced, and the Worker relays it straight into the
+     ElevenLabs request it opened at the same moment (handleTranscribeStream).
+     At the release only the last chunk is left to send, so the wait is for the
+     transcript alone. It can only make a take faster, never lose or change it:
+       - chunks[] and the crash journal are fed exactly as before; the stream
+         is a copy of the same chunks, in the same order.
+       - The streamed transcript is used only if the stream carried exactly the
+         recording's bytes and chunks. That is checked here BEFORE the body is
+         ended, and again by the Worker before it ends the upstream body.
+       - Any failure except the take's deadline falls back to the ordinary
+         upload of the in-memory recording (batchTranscribe), which owns the
+         error semantics. The deadline stays final, exactly as for the
+         ordinary upload: loud, with the recording kept for a retry.
+       - A take that ends without an upload (empty, too short) cancels the
+         stream mid-body, so ElevenLabs never receives a request to bill.
+     Chrome/Edge only (fetch upload streaming needs HTTP/2); every other
+     browser keeps the ordinary upload, untouched. */
+  var streamSupport = null;
+  function uploadStreamingSupported() {
+    if (streamSupport !== null) return streamSupport;
+    streamSupport = false;
+    try {
+      if (typeof ReadableStream !== "function" || typeof Request !== "function") return streamSupport;
+      // The standard probe: a browser that can stream a request body reads the
+      // duplex option and does NOT turn the stream into a text body.
+      var duplexAccessed = false;
+      var hasContentType = new Request(location.href, {
+        body: new ReadableStream(),
+        method: "POST",
+        get duplex() { duplexAccessed = true; return "half"; },
+      }).headers.has("Content-Type");
+      streamSupport = duplexAccessed && !hasContentType;
+    } catch (e) { streamSupport = false; }
+    return streamSupport;
+  }
+
+  function streamFrameBytes(type, payload) {
+    var n = payload.length;
+    var out = new Uint8Array(5 + n);
+    out[0] = type;
+    out[1] = (n >>> 24) & 255;
+    out[2] = (n >>> 16) & 255;
+    out[3] = (n >>> 8) & 255;
+    out[4] = n & 255;
+    out.set(payload, 5);
+    return out;
+  }
+
+  function streamJsonFrame(type, obj) {
+    return streamFrameBytes(type, new TextEncoder().encode(JSON.stringify(obj)));
+  }
+
+  // Open the take's stream right after the recorder starts. Best-effort: when
+  // streaming is off, unsupported, or fails to open, the take simply uploads
+  // the ordinary way at release.
+  function openTakeStream(mimeType) {
+    abortTakeStream("superseded"); // never two streams: a leftover belongs to no take
+    if (!streamUploadEl || !streamUploadEl.checked || streamOffReason || !uploadStreamingSupported()) return;
+    var st = {
+      seq: sessionSeq, bytes: 0, chunks: 0, chain: Promise.resolve(),
+      failed: "", aborted: false, controller: null, response: null,
+      ctrl: (typeof AbortController !== "undefined") ? new AbortController() : null,
+    };
+    try {
+      var body = new ReadableStream({ start: function (c) { st.controller = c; } });
+      var opts = {};
+      sttClientFields().forEach(function (f) { opts[f[0]] = f[1]; });
+      var mime = String(mimeType || "audio/webm").replace(/ /g, "");
+      opts.mime = mime;
+      opts.file_name = mime.indexOf("ogg") >= 0 ? "recording.ogg" : "recording.webm";
+      st.controller.enqueue(streamJsonFrame(STREAM_FRAME_OPTIONS, opts));
+      // Credentials ride headers, never the URL (see CLAUDE.md, Known sharp edges).
+      var headers = { "content-type": "application/octet-stream" };
+      var apiKey = apiKeyEl.value.trim();
+      if (apiKey) headers["x-el-key"] = apiKey;
+      if (SHARED_MODE) headers["x-app-auth"] = passphraseEl.value.trim();
+      st.response = fetch("/api/transcribe-stream", {
+        method: "POST",
+        body: body,
+        duplex: "half",
+        headers: headers,
+        signal: st.ctrl ? st.ctrl.signal : undefined,
+      });
+      // A network that cannot stream (an HTTP/1.1 proxy, a dropped link)
+      // rejects here, often at once: note it, and the release falls back.
+      st.response.catch(function (err) {
+        if (!st.failed) st.failed = "network: " + ((err && err.message) || String(err));
+      });
+      takeStream = st;
+    } catch (e) {
+      noteStreamFailure("open: " + ((e && e.message) || String(e)));
+    }
+  }
+
+  // Called with each recorder chunk, right after it is pushed to chunks[].
+  function takeStreamAppend(blob) {
+    var st = takeStream;
+    if (!st || st.failed) return;
+    if (recStartedAt && Date.now() - recStartedAt > STREAM_MAX_REC_MS) {
+      abandonTakeStream(st, "the take passed " + Math.round(STREAM_MAX_REC_MS / 60000) + " min");
+      return;
+    }
+    // Chained, so the chunks go up in recorder order whatever the reads cost.
+    st.chain = st.chain.then(function () {
+      if (st.failed) return;
+      return blob.arrayBuffer().then(function (buf) {
+        if (st.failed) return;
+        st.controller.enqueue(streamFrameBytes(STREAM_FRAME_AUDIO, new Uint8Array(buf)));
+        st.bytes += buf.byteLength;
+        st.chunks += 1;
+      });
+    }).catch(function (e) {
+      abandonTakeStream(st, "chunk: " + ((e && e.message) || String(e)));
+    });
+  }
+
+  // Cancel the body mid-stream: the Worker then aborts the ElevenLabs request
+  // before it is complete, so nothing is transcribed or billed.
+  function abandonTakeStream(st, reason) {
+    if (!st) return;
+    if (!st.failed) st.failed = reason || "abandoned";
+    if (st.aborted) return;
+    st.aborted = true;
+    try { if (st.controller) st.controller.error(new Error(st.failed)); } catch (e) {}
+    try { if (st.ctrl) st.ctrl.abort(); } catch (e) {}
+  }
+
+  function abortTakeStream(reason) {
+    var st = takeStream;
+    takeStream = null;
+    if (st) abandonTakeStream(st, reason);
+  }
+
+  // Hand the take's stream to its finalize, sealed: a chunk arriving after the
+  // recording was assembled can no longer reach the stream either.
+  function claimTakeStream() {
+    var st = takeStream;
+    takeStream = null;
+    if (!st) return null;
+    if (st.seq !== sessionSeq) { abandonTakeStream(st, "stale take"); return null; }
+    return st;
+  }
+
+  function noteStreamFailure(reason) {
+    streamFailStreak++;
+    if (streamFailStreak >= STREAM_FAIL_DISABLE && !streamOffReason) {
+      streamOffReason = reason || "repeated failures";
+      try { if (typeof console !== "undefined" && console.warn) console.warn("[stream] upload streaming is off until reload: " + streamOffReason); } catch (e) {}
+    }
+  }
+
+  // Finish a streamed take: verify, end the body, wait for the transcript.
+  // Returns a batchTranscribe-shaped result, or { fallback: reason } when the
+  // ordinary upload should carry the take instead.
+  async function transcribeViaStream(st, blob, blobChunks, deadlineMs) {
+    try { await st.chain; } catch (e) {} // chunks queued before the seal still land
+    if (st.failed) {
+      abandonTakeStream(st, st.failed);
+      return { fallback: st.failed };
+    }
+    if (st.bytes !== blob.size || st.chunks !== blobChunks) {
+      abandonTakeStream(st, "the stream carried " + st.bytes + " bytes in " + st.chunks +
+        " chunks, but the recording has " + blob.size + " in " + blobChunks);
+      return { fallback: st.failed };
+    }
+    try {
+      st.controller.enqueue(streamJsonFrame(STREAM_FRAME_END, { bytes: st.bytes, chunks: st.chunks }));
+      st.controller.close();
+    } catch (e) {
+      abandonTakeStream(st, "end: " + ((e && e.message) || String(e)));
+      return { fallback: st.failed };
+    }
+    stampTake("uploadStart"); // [PERF] the audio is all up; from here it is the wait for the transcript
+    startUploadTicker("Transcribing", deadlineMs);
+    var timedOut = false;
+    var killer = null;
+    var deadline = new Promise(function (resolve, reject) {
+      killer = setTimeout(function () {
+        timedOut = true;
+        try { if (st.ctrl) st.ctrl.abort(); } catch (e) {}
+        reject(new Error("deadline"));
+      }, deadlineMs);
+    });
+    try {
+      var res = await Promise.race([st.response, deadline]);
+      if (!res.ok) {
+        // Any refusal is retried the ordinary way, which owns the error
+        // semantics (what is retryable, what is permanent): the stream may
+        // change how fast a take lands, never how it ends.
+        abandonTakeStream(st, "HTTP " + res.status);
+        return { fallback: st.failed };
+      }
+      return await Promise.race([readTranscribeResponse(res), deadline]);
+    } catch (err) {
+      if (timedOut) {
+        abandonTakeStream(st, "deadline");
+        return {
+          ok: false, text: "", errKind: "timeout", retryable: true,
+          error: "timed out after " + Math.round(deadlineMs / 1000) + "s",
+        };
+      }
+      abandonTakeStream(st, "network: " + ((err && err.message) || String(err)));
+      return { fallback: st.failed };
+    } finally {
+      if (killer) clearTimeout(killer);
+      deadline.catch(function () {});
+      stopUploadTicker();
+    }
+  }
+
+  // One take's transcription: the streamed result when the stream held, the
+  // ordinary upload of the in-memory recording otherwise. The fallback runs
+  // under what is left of the SAME deadline, so a take never waits longer than
+  // an ordinary upload may (hotkey.ahk's CLIP_TIMEOUT covers that cap).
+  async function transcribeTake(st, blob, blobChunks, fileName, deadlineMs) {
+    if (!st) {
+      noteTakePath("batch", streamOffReason ? "streaming off until reload: " + streamOffReason : "");
+      return batchTranscribe(blob, fileName, deadlineMs);
+    }
+    var t0 = Date.now();
+    var r = await transcribeViaStream(st, blob, blobChunks, deadlineMs);
+    if (!r.fallback) {
+      if (r.ok) streamFailStreak = 0;
+      else if (r.errKind === "timeout") noteStreamFailure("the transcript missed the deadline");
+      noteTakePath("stream", r.ok ? "" : (r.errKind || "failed"));
+      return r;
+    }
+    noteStreamFailure(r.fallback);
+    noteTakePath("stream>batch", r.fallback);
+    resetTransportStamps();
+    var left = Math.max(1000, deadlineMs - (Date.now() - t0));
+    return batchTranscribe(blob, fileName, left);
   }
 
   /* ───── Real-time Audio Graph (mic → highpass → gate → script processor) ───── */
@@ -3209,6 +3731,7 @@ right lower quadrant"></textarea>
       // against an ElevenLabs request log that shows no such request — pins the
       // loss on the UPLOAD leg rather than on inference.
       errKind: "", deadlineMs: null,
+      path: "", pathNote: "", // [LATENCY] stream / batch / stream>batch, and why (noteTakePath)
     };
   }
 
@@ -3216,6 +3739,26 @@ right lower quadrant"></textarea>
   // F14, a finalize reached by two paths) must not move a stage backwards.
   function stampTake(key) {
     try { if (takeTimings && !takeTimings[key]) takeTimings[key] = perfNow(); } catch (e) {}
+  }
+
+  // Which path carried the take (stream / batch / stream>batch) and why, so the
+  // timing log shows whether the streamed upload is actually working here.
+  function noteTakePath(path, note) {
+    try { if (takeTimings) { takeTimings.path = path; takeTimings.pathNote = note || ""; } } catch (e) {}
+  }
+
+  // A fallback upload is a fresh transport leg: clear the stream's stamps so
+  // the timing row describes the upload that actually delivered the take.
+  function resetTransportStamps() {
+    try {
+      if (!takeTimings) return;
+      takeTimings.uploadStart = 0;
+      takeTimings.headers = 0;
+      takeTimings.body = 0;
+      takeTimings.serverParseMs = null;
+      takeTimings.serverElMs = null;
+      takeTimings.serverTotalMs = null;
+    } catch (e) {}
   }
 
   function msBetween(a, b) {
@@ -3267,6 +3810,10 @@ right lower quadrant"></textarea>
         stage:    furthestStage(t),
         errKind:  t.errKind || "",
         deadline: (typeof t.deadlineMs === "number") ? t.deadlineMs : null,
+        path:     t.path || "",     // [LATENCY] stream / batch / stream>batch
+        // Why a stream fell back: a class of error, never a URL or body. One
+        // line, bounded, so it can never break a TSV row.
+        pathNote: String(t.pathNote || "").replace(/\\s+/g, " ").slice(0, 160),
       };
       // net = what the service round trip cost us MINUS what the Worker says it
       // spent: our own network + Cloudflare overhead, the part transport work
@@ -3308,6 +3855,7 @@ right lower quadrant"></textarea>
           " · reached " + (entry.stage || "?") +
           " · deadline " + fmtMs(entry.deadline) +
           " · uploaded " + entry.kb + " KB of a " + (entry.recMs / 1000).toFixed(1) + "s take" +
+          (entry.path ? " · path " + entry.path + (entry.pathNote ? " (" + entry.pathNote + ")" : "") : "") +
           " · service " + fmtMs(entry.service) +
           (typeof entry.elMs === "number" ? " (ElevenLabs " + entry.elMs + " ms)" : " (ElevenLabs never answered)");
         var sumF = timingSummaryLine();
@@ -3323,7 +3871,10 @@ right lower quadrant"></textarea>
         " = " + fmtMs(entry.total) +
         "  [" + (entry.recMs / 1000).toFixed(1) + "s take, " + entry.kb + " KB, " +
         (entry.fmt || "?") + ", " + entry.keyterms + " keyterms" +
-        (entry.tailMs ? ", +" + entry.tailMs + " ms tail" : "") + "]";
+        (entry.tailMs ? ", +" + entry.tailMs + " ms tail" : "") +
+        (entry.path === "stream" ? ", uploaded while dictating" : "") +
+        (entry.path === "stream>batch" ? ", stream fell back (" + (entry.pathNote || "?") + ")" : "") +
+        (entry.path === "batch" && entry.pathNote ? ", " + entry.pathNote : "") + "]";
       var sum = timingSummaryLine();
       timingReadoutEl.textContent = head + (sum ? "\\n" + sum : "");
     } catch (e) {}
@@ -3366,7 +3917,7 @@ right lower quadrant"></textarea>
   // TSV so a shift's worth pastes straight into a spreadsheet.
   function timingLogTsv() {
     var cols = ["at","outcome","stage","errKind","deadline","total","flush","upload","service","net","elMs","parseMs","workerMs",
-                "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize"];
+                "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize","path","pathNote"];
     var out = [cols.join("\\t")];
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
@@ -4162,6 +4713,7 @@ right lower quadrant"></textarea>
       if (e.data && e.data.size > 0) {
         chunks.push(e.data);
         journalAppend(e.data); // crash-safe mirror to IndexedDB (best-effort, non-blocking)
+        takeStreamAppend(e.data); // [LATENCY] the same chunk, uploaded now (no-op when not streaming)
       }
     };
     mediaRecorder.onstop = () => {
@@ -4170,6 +4722,7 @@ right lower quadrant"></textarea>
     };
     mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
     journalStart(preferred || "audio/webm"); // begin the crash-recovery journal for this take (fire-and-forget)
+    openTakeStream(mediaRecorder.mimeType || preferred || "audio/webm"); // [LATENCY] upload while the take is spoken (best-effort)
 
     recording = true;
     stopping = false;
@@ -4369,6 +4922,10 @@ right lower quadrant"></textarea>
     const blob = chunks.length
       ? new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" })
       : null;
+    // [LATENCY] The take's stream (if any) must carry exactly these chunks:
+    // claim it in the same synchronous step, so no later chunk can reach it.
+    const blobChunks = chunks.length;
+    const streamed = claimTakeStream();
 
     // Classify the empty outcomes by the captured peak so the loud failure names
     // the real cause instead of a generic "no speech":
@@ -4386,7 +4943,9 @@ right lower quadrant"></textarea>
                    maxRmsSeen < Number(gateOpenEl.value || 0.03);
 
     if (!blob || blob.size < 1024) {
-      // Gate never opened / instant tap: nothing worth uploading.
+      // Gate never opened / instant tap: nothing worth uploading. Cancel the
+      // stream mid-body so ElevenLabs never gets a request to transcribe or bill.
+      if (streamed) abandonTakeStream(streamed, "nothing to transcribe");
       await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal });
       return;
     }
@@ -4398,12 +4957,12 @@ right lower quadrant"></textarea>
       takeTimings.fileFormat = (blob.type || "").includes("ogg") ? "ogg" : "webm";
     }
     setLinkPill("uploading");
-    setStatus("Uploading audio for transcription…", "warn");
+    setStatus(streamed ? "Transcribing…" : "Uploading audio for transcription…", "warn");
 
     const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
     const deadlineMs = batchUploadTimeoutMs(recMs, blob.size || 0);
     if (takeTimings) takeTimings.deadlineMs = deadlineMs;
-    const r = await batchTranscribe(blob, fileName, deadlineMs);
+    const r = await transcribeTake(streamed, blob, blobChunks, fileName, deadlineMs);
 
     if (!r.ok) {
       lastWsError = r.error || "upload failed"; // surfaces in the failure status line
@@ -6610,7 +7169,7 @@ right lower quadrant"></textarea>
 
   for (const el of [
     apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
-    autoCopyEl, appendModeEl, startBeepEl, diarizeEl,
+    autoCopyEl, appendModeEl, startBeepEl, diarizeEl, streamUploadEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);

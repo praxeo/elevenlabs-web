@@ -12,7 +12,7 @@ Realtime is **out of scope** — it stays archived in `REALTIME_HANDOFF.md`. Thi
 supersedes the archived `LATENCY_PLAN.md`, which was written for the hybrid finalize path
 that no longer exists.
 
-> **Status: Phases 0 and 1 have shipped.** What is now live: the per-take timing ring with
+> **Status: Phases 0 and 1 have shipped, and so has 4b (streamed upload, 2026-09 — see §4b).** What is now live: the per-take timing ring with
 > a `Server-Timing` transport-vs-inference split (Advanced readout + TSV export, `?perf=1`),
 > the whole-window recording cue with title/favicon/badge, the AutoHotkey focus return +
 > always-on-top state bar + `MIN_HOLD` 350→200 ms, and the gate look-ahead (120 ms) with
@@ -398,7 +398,28 @@ certainly dominated by inference.
 **Recommendation: don't**, unless Phase 0 shows the Worker hop is material. Keep server-side
 enforcement.
 
-### 4b. Streaming request body — analysed and rejected
+### 4b. Streaming request body — LANDED 2026-09 (Chrome/Edge), originally rejected
+
+> **Superseded.** The objections below were checked against evidence and shipped anyway,
+> because each one turned out smaller than estimated:
+> - **The gain is real on short takes.** WhisperInk (the native sibling app) shipped the
+>   same design on `scribe_v2_medical` and measured 240 vs 323 ms for a 4 s take and 307 vs
+>   402 ms for an 11 s take (medians of 5, identical transcripts). The saving is not only
+>   transfer: the service's request is already open and fed when the key comes up.
+> - **Cloudflare does not buffer the request body before the Worker runs.** Probed on the
+>   live worker: a POST with a body still streaming for 6 s got the Worker's answer at
+>   0.46 s. So the Worker can open the ElevenLabs request at the key-press, which also
+>   hides the Worker→ElevenLabs connection setup this path used to pay at release.
+> - **Chrome/Edge-only is fine** because the dictation desktop is Chrome/Edge; Safari,
+>   Firefox and any proxy that forces HTTP/1.1 simply keep the ordinary upload.
+>
+> The shipped design (`openTakeStream` / `handleTranscribeStream`, hard invariant in
+> `CLAUDE.md`, scenarios 50–51): each recorder chunk is framed and streamed as it is
+> produced; the Worker relays it into the ORDINARY multipart request (shared field builder,
+> file part last) and ends that body only after the client's end frame matches the relayed
+> bytes and chunks; any failure but the deadline falls back to the batch upload of the
+> in-memory blob; two consecutive failures switch streaming off until reload; the timing
+> log names the path. The original analysis is kept below for the record.
 
 Streaming the upload during the hold sounds ideal, but the constraints kill it:
 

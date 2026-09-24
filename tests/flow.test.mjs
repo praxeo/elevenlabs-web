@@ -4876,5 +4876,498 @@ console.log('--- scenario 49: upstream request = scribe_v2_medical, shape unchan
   }
 }
 
+// ---- helpers for the streamed-upload scenarios (50, 51) ----
+const STREAM_O = 0x4f, STREAM_A = 0x41, STREAM_E = 0x45;
+const streamFrame = (type, payload) => {
+  const out = new Uint8Array(5 + payload.length);
+  out[0] = type;
+  new DataView(out.buffer).setUint32(1, payload.length);
+  out.set(payload, 5);
+  return out;
+};
+const streamJson = (type, obj) => streamFrame(type, new TextEncoder().encode(JSON.stringify(obj)));
+// Binary-safe multipart parse: [{name, filename, ctype, data}], plus .closed
+// when the closing boundary arrived and .truncated when a part never ended.
+const parseMultipart = (buf, boundary) => {
+  const delim = Buffer.from('--' + boundary);
+  const parts = [];
+  let pos = buf.indexOf(delim);
+  while (pos !== -1) {
+    const after = pos + delim.length;
+    if (buf.subarray(after, after + 2).toString() === '--') { parts.closed = true; break; }
+    const headEnd = buf.indexOf('\r\n\r\n', after + 2);
+    if (headEnd === -1) { parts.truncated = true; break; }
+    const head = buf.subarray(after + 2, headEnd).toString('utf8');
+    const next = buf.indexOf(delim, headEnd + 4);
+    if (next === -1) { parts.truncated = true; break; }
+    const m = (re) => { const r = re.exec(head); return r ? r[1] : null; };
+    parts.push({ name: m(/name="([^"]*)"/), filename: m(/filename="([^"]*)"/), ctype: m(/Content-Type: ([^\r\n]*)/i), data: buf.subarray(headEnd + 4, next - 2) });
+    pos = next;
+  }
+  return parts;
+};
+
+// ===== Scenario 50: the streamed upload route (Worker) =====
+// Ported from WhisperInk: the Worker opens the ElevenLabs request as soon as
+// the take starts and relays each audio chunk into it, so the release waits
+// only for the transcript. The properties that make it safe are asserted
+// here: credentials are checked before ElevenLabs is contacted; the request is
+// the ORDINARY one field for field (file part last); the audio arrives byte
+// for byte; and the upstream body is ended ONLY after the client's end frame
+// matches what was relayed — a mismatch, a truncated body or a too-short take
+// aborts it instead, so ElevenLabs never gets a complete request to bill.
+console.log('--- scenario 50: /api/transcribe-stream (Worker) ---');
+{
+  const realFetch = globalThis.fetch;
+  const upstream50 = [];
+  let upstreamMode50 = 'ok'; // 'ok' | 'early401' (answers at once without reading the body)
+  globalThis.fetch = async (url, init) => {
+    const rec = { url: String(url), headers: (init && init.headers) || {}, openedAt: Date.now(), aborted: false, buf: null, form: null };
+    upstream50.push(rec);
+    if (init && init.body instanceof FormData) {
+      rec.form = [...init.body.entries()].map(([k, v]) => [k, typeof v === 'string' ? v : '<file>']);
+      return new Response(JSON.stringify({ text: 'Batch ok.' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (upstreamMode50 === 'early401') {
+      return new Response(JSON.stringify({ detail: { message: 'invalid api key' } }), { status: 401, headers: { 'content-type': 'application/json' } });
+    }
+    const reader = init.body.getReader();
+    const parts = [];
+    rec.done = (async () => {
+      try {
+        for (;;) { const { value, done } = await reader.read(); if (done) break; parts.push(Buffer.from(value)); }
+      } catch (e) {
+        rec.aborted = true;
+        throw e;
+      } finally {
+        rec.buf = Buffer.concat(parts);
+      }
+    })();
+    rec.done.catch(() => {});
+    await rec.done; // a real server needs the whole body: an aborted body fails the request
+    return new Response(JSON.stringify({ text: 'Streamed ok.' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const boundaryOf = (rec) => /boundary=(.+)$/.exec(rec.headers['content-type'] || '')[1];
+  const env50 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame' };
+  const opts50 = (diarize) => ({
+    file_format: 'other', timestamps_granularity: 'word', no_verbatim: 'true', tag_audio_events: 'false',
+    diarize: String(diarize), keyterms_json: JSON.stringify(['metoprolol', 'right lower quadrant']),
+    file_name: 'recording.webm', mime: 'audio/webm;codecs=opus',
+  });
+  const openStream50 = (headers) => {
+    let ctl;
+    const body = new ReadableStream({ start(c) { ctl = c; } });
+    const resP = worker.default.fetch(new Request('https://dictation.test/api/transcribe-stream', {
+      method: 'POST', body, duplex: 'half', headers: headers || { 'x-app-auth': 'sesame' },
+    }), env50);
+    return { ctl, resP };
+  };
+  const within = (p, ms) => Promise.race([p, new Promise((r) => setTimeout(() => r('TIMEOUT'), ms))]);
+  const audio50 = [new Uint8Array(3000).fill(7), new Uint8Array(1500).fill(9), new Uint8Array(700).fill(3)];
+  const audioTotal50 = 5200;
+
+  try {
+    // (a) credentials first: no access code -> 401, ElevenLabs never contacted
+    {
+      const { ctl, resP } = openStream50({});
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      ctl.close();
+      const r = await resP;
+      check('s50a: a stream without the access code is 401', r.status === 401, r.status);
+      check('s50a: ...and never contacts ElevenLabs', upstream50.length === 0, upstream50.length);
+    }
+
+    // (b) the happy path
+    {
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      ctl.enqueue(streamFrame(STREAM_A, audio50[0]));
+      await sleep(60);
+      check('s50b: the ElevenLabs request opens while the take is still being spoken',
+        upstream50.length === 1 && upstream50[0].url === 'https://api.elevenlabs.io/v1/speech-to-text', upstream50.length);
+      ctl.enqueue(streamFrame(STREAM_A, audio50[1]));
+      ctl.enqueue(streamFrame(STREAM_A, audio50[2]));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: audioTotal50, chunks: 3 }));
+      ctl.close();
+      const r = await resP;
+      const body = await r.text();
+      check('s50b: the transcript comes back', r.status === 200 && body.includes('Streamed ok.'), r.status + ' ' + body);
+      const st = r.headers.get('server-timing') || '';
+      check('s50b: Server-Timing carries el/worker (from the end frame) and how long the stream ran',
+        /el;dur=\d+/.test(st) && /worker;dur=\d+/.test(st) && /open;dur=\d+/.test(st), st);
+      const rec = upstream50[0];
+      await rec.done.catch(() => {});
+      check('s50b: the master key rides the upstream header', rec.headers['xi-api-key'] === 'srv-key', rec.headers['xi-api-key']);
+      const parts = parseMultipart(rec.buf, boundaryOf(rec));
+      check('s50b: the upstream body ends with the closing boundary', parts.closed === true && !parts.truncated);
+      const file = parts.find((p) => p.name === 'file');
+      check('s50b: the audio is the LAST part', parts[parts.length - 1] === file, parts.map((p) => p.name).join(','));
+      check('s50b: the audio arrives byte for byte',
+        !!file && Buffer.compare(file.data, Buffer.concat(audio50.map((a) => Buffer.from(a)))) === 0, file && file.data.length);
+      check('s50b: the file part keeps the recording name and type',
+        !!file && file.filename === 'recording.webm' && file.ctype === 'audio/webm;codecs=opus', file && (file.filename + ' ' + file.ctype));
+      check('s50b: the access code never goes upstream', !rec.buf.includes(Buffer.from('sesame')));
+
+      // The same options through the ordinary batch route: the fields must be
+      // IDENTICAL, in the same order (only the file part's position differs).
+      const fd = new FormData();
+      fd.append('passphrase', 'sesame');
+      fd.append('file', new Blob([new Uint8Array(4096)], { type: 'audio/webm' }), 'recording.webm');
+      for (const [k, v] of Object.entries(opts50(false))) if (k !== 'file_name' && k !== 'mime') fd.append(k, v);
+      await worker.default.fetch(new Request('https://dictation.test/api/transcribe', { method: 'POST', body: fd }), env50);
+      const batchFields = upstream50[1].form.filter(([k]) => k !== 'file');
+      const streamFields = parts.filter((p) => p.name !== 'file').map((p) => [p.name, p.data.toString('utf8')]);
+      check('s50b: the streamed request is the ordinary one, field for field',
+        JSON.stringify(streamFields) === JSON.stringify(batchFields), JSON.stringify(streamFields));
+      check('s50b: ...on Scribe v2 Medical', streamFields[0] && streamFields[0][0] === 'model_id' && streamFields[0][1] === 'scribe_v2_medical',
+        JSON.stringify(streamFields[0]));
+    }
+
+    // (c) the phone surface's diarize shape rides the stream too
+    {
+      const before = upstream50.length;
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(true)));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(2048)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 2048, chunks: 1 }));
+      ctl.close();
+      await resP;
+      const rec = upstream50[before];
+      await rec.done.catch(() => {});
+      const parts = parseMultipart(rec.buf, boundaryOf(rec));
+      const val = (n) => { const p = parts.find((x) => x.name === n); return p ? p.data.toString('utf8') : null; };
+      check('s50c: diarize=true with no forced num_speakers and word timestamps',
+        val('diarize') === 'true' && val('num_speakers') === null && val('timestamps_granularity') === 'word',
+        [val('diarize'), val('num_speakers'), val('timestamps_granularity')].join('/'));
+    }
+
+    // (d) an end frame that does not match what was relayed: 400, and the
+    //     upstream body is ABORTED — ElevenLabs never gets a complete request
+    {
+      const before = upstream50.length;
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(3000)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 9999, chunks: 2 }));
+      ctl.close();
+      const r = await resP;
+      const rec = upstream50[before];
+      await rec.done.catch(() => {});
+      check('s50d: a byte/chunk mismatch is refused', r.status === 400 && (await r.text()).includes('integrity'), r.status);
+      check('s50d: ...and the upstream body is aborted, never completed', rec.aborted === true, rec.aborted);
+      check('s50d: ...so no closing boundary ever reaches ElevenLabs',
+        !parseMultipart(rec.buf, boundaryOf(rec)).closed);
+    }
+
+    // (e) a body that ends without an end frame (the client went away)
+    {
+      const before = upstream50.length;
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(3000)));
+      ctl.close();
+      const r = await resP;
+      const rec = upstream50[before];
+      await rec.done.catch(() => {});
+      check('s50e: a take that never ended is refused', r.status === 400, r.status);
+      check('s50e: ...and its upstream body is aborted', rec.aborted === true, rec.aborted);
+    }
+
+    // (f) a verified but too-short take: the same 1 KB gate as the batch path
+    {
+      const before = upstream50.length;
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(500)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 500, chunks: 1 }));
+      ctl.close();
+      const r = await resP;
+      const rec = upstream50[before];
+      await rec.done.catch(() => {});
+      check('s50f: a sub-1 KB take is refused like the batch path', r.status === 400 && (await r.text()).includes('too short'), r.status);
+      check('s50f: ...and nothing complete reaches ElevenLabs', rec.aborted === true, rec.aborted);
+    }
+
+    // (g) the stream must start with its options: nothing is sent upstream otherwise
+    {
+      const before = upstream50.length;
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(2048)));
+      ctl.close();
+      const r = await resP;
+      check('s50g: a stream that does not open with its options is refused', r.status === 400, r.status);
+      check('s50g: ...before ElevenLabs is contacted', upstream50.length === before, upstream50.length - before);
+    }
+
+    // (h) ElevenLabs answers early (an error: it cannot transcribe a partial
+    //     body). The Worker must not stall on writes nobody reads: it keeps
+    //     reading the client's frames and hands the answer back at the end.
+    {
+      upstreamMode50 = 'early401';
+      const { ctl, resP } = openStream50();
+      ctl.enqueue(streamJson(STREAM_O, opts50(false)));
+      for (let i = 0; i < 20; i++) ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(4096)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 20 * 4096, chunks: 20 }));
+      ctl.close();
+      const r = await within(resP, 3000);
+      check('s50h: an early ElevenLabs refusal comes back instead of stalling the stream',
+        r !== 'TIMEOUT' && r.status === 401, r === 'TIMEOUT' ? r : r.status);
+      upstreamMode50 = 'ok';
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ===== Scenario 51: the client streams the take while it is spoken =====
+// The page opens the stream when recording starts (Chrome/Edge only: the
+// feature probe needs ReadableStream + Request, which this jsdom build lacks,
+// so every OTHER scenario runs the unchanged ordinary upload). The streamed
+// transcript is used only when the stream carried exactly the recording; any
+// failure but the deadline falls back to the ordinary upload of the same
+// audio; two failures in a row switch streaming off until reload; a take with
+// nothing to upload cancels the stream; the deadline stays final (loud, the
+// recording kept, no second upload); and the timing log names the path.
+console.log('--- scenario 51: the client streams the take while it is spoken ---');
+{
+  let mode51 = 'ok';          // stream behaviour: 'ok' | 'reject' | 'http500' | 'hang'
+  let chunkBytes51 = 2048;
+  let calls51 = [];            // every fetch: stream records + batch posts
+  const batch51 = [];          // queued answers for /api/transcribe
+  const streamFetch51 = (url, init) => {
+    const rec = { url, kind: 'stream', headers: init.headers || {}, frames: [], closed: false, aborted: false, mode: mode51 };
+    calls51.push(rec);
+    if (rec.mode === 'reject') return Promise.reject(new TypeError('Failed to fetch'));
+    const reader = init.body.getReader();
+    let buf = Buffer.alloc(0);
+    const bodyDone = (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) { rec.closed = true; break; }
+          buf = Buffer.concat([buf, Buffer.from(value)]);
+          while (buf.length >= 5) {
+            const len = buf.readUInt32BE(1);
+            if (buf.length < 5 + len) break;
+            const type = String.fromCharCode(buf[0]);
+            const payload = Buffer.from(buf.subarray(5, 5 + len));
+            rec.frames.push({ type, len, at: Date.now(), json: type === 'A' ? null : JSON.parse(payload.toString('utf8')), payload });
+            buf = buf.subarray(5 + len);
+          }
+        }
+      } catch (e) { rec.aborted = true; }
+    })();
+    return new Promise((resolve, reject) => {
+      let t = null;
+      if (init.signal) {
+        init.signal.addEventListener('abort', () => {
+          rec.aborted = true;
+          if (t) clearTimeout(t);
+          const e = new Error('aborted'); e.name = 'AbortError'; reject(e);
+        });
+      }
+      if (rec.mode === 'hang') return;
+      // Half duplex: the answer comes only after the body is complete.
+      bodyDone.then(() => {
+        if (rec.aborted || !rec.closed) return;
+        t = setTimeout(() => resolve(rec.mode === 'http500'
+          ? { ok: false, status: 500, headers: { get: () => null }, text: () => Promise.resolve(JSON.stringify({ error: 'boom' })) }
+          : { ok: true, status: 200,
+              headers: { get: (k) => (String(k).toLowerCase() === 'server-timing' ? 'parse;dur=0, el;dur=210, worker;dur=215, open;dur=900' : null) },
+              text: () => Promise.resolve(JSON.stringify({ text: 'Streamed note.' })) }), 10);
+      });
+    });
+  };
+  const mkDom51 = (o) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      o = o || {};
+      if (!o.noStreams) { win.ReadableStream = ReadableStream; win.Request = Request; } // a Chrome/Edge-capable page
+      win.isSecureContext = true;
+      win.AudioContext = MockAudioCtx;
+      win.WebSocket = MockWS;
+      win.URL.createObjectURL = () => 'blob:mock';
+      win.URL.revokeObjectURL = () => {};
+      Object.defineProperty(win.navigator, 'clipboard', {
+        value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true,
+      });
+      // start(1000)-alike: chunks land DURING the take, so they can stream.
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; this._iv = null; }
+        static isTypeSupported() { return false; }
+        _emit() { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(chunkBytes51).fill(5)], { type: 'audio/webm' }) }); }
+        start() { this.state = 'recording'; this._iv = win.setInterval(() => this._emit(), 40); }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this._iv) { win.clearInterval(this._iv); this._iv = null; }
+          this._emit();
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.fetch = (url, init) => {
+        const u = String(url);
+        if (u.includes('/api/transcribe-stream')) return streamFetch51(u, init || {});
+        calls51.push({ url: u, kind: 'batch' });
+        const next = batch51.shift() || { status: 500, body: { error: 'unexpected batch upload' } };
+        return new Promise((resolve) => setTimeout(() => resolve({
+          ok: next.status >= 200 && next.status < 300, status: next.status,
+          headers: { get: () => null }, text: () => Promise.resolve(JSON.stringify(next.body)),
+        }), 10));
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(
+        Object.assign({ saveApiKey: true, micGranted: true }, o.settings || {})));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-51');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (51):', e.message); failures++; });
+    },
+  });
+  const streams51 = () => calls51.filter((c) => c.kind === 'stream');
+  const batches51 = () => calls51.filter((c) => c.kind === 'batch');
+  const take51 = async (doc, holdMs) => {
+    doc.getElementById('recordBtn').click();
+    await sleep(holdMs || 220);
+    doc.getElementById('recordBtn').click();
+  };
+  micRms = 0.05;
+
+  // --- 51a: the happy path --------------------------------------------------
+  const dom51 = mkDom51();
+  await sleep(200);
+  const win51 = dom51.window;
+  const doc51 = win51.document;
+  const ring51 = () => { try { return JSON.parse(win51.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+  check('s51: the Advanced toggle exists and is on by default',
+    !!doc51.getElementById('streamUpload') && doc51.getElementById('streamUpload').checked === true);
+
+  doc51.getElementById('recordBtn').click();
+  await sleep(60);
+  check('s51a: the upload opens when recording STARTS', streams51().length === 1, streams51().length);
+  const rec51 = streams51()[0] || { frames: [], headers: {} };
+  await sleep(180);
+  const audioBeforeRelease = rec51.frames.filter((f) => f.type === 'A').length;
+  check('s51a: audio goes up WHILE the take is spoken', audioBeforeRelease >= 2, audioBeforeRelease);
+  doc51.getElementById('recordBtn').click();
+  await sleep(600);
+  const o51 = (rec51.frames[0] && rec51.frames[0].json) || {};
+  check('s51a: the options frame comes first and asks for the same transcript as the upload',
+    rec51.frames[0] && rec51.frames[0].type === 'O' && o51.file_format === 'other' && o51.timestamps_granularity === 'word' &&
+    o51.no_verbatim === 'true' && o51.diarize === 'false' && typeof o51.keyterms_json === 'string',
+    JSON.stringify(o51).slice(0, 160));
+  const aFrames = rec51.frames.filter((f) => f.type === 'A');
+  const endFrame = rec51.frames.find((f) => f.type === 'E');
+  const aBytes = aFrames.reduce((n, f) => n + f.len, 0);
+  check('s51a: the end frame vouches for exactly what was streamed',
+    !!endFrame && endFrame.json.bytes === aBytes && endFrame.json.chunks === aFrames.length,
+    JSON.stringify(endFrame && endFrame.json) + ' vs ' + aBytes + '/' + aFrames.length);
+  check('s51a: the streamed audio is the recording, chunk for chunk',
+    aFrames.every((f) => f.payload.length === 2048 && f.payload.every((b) => b === 5)), aFrames.length);
+  check('s51a: the body was completed (not aborted)', rec51.closed === true && rec51.aborted === false);
+  check('s51a: the streamed transcript lands on the clipboard', (win51._clip || '').includes('Streamed note.'), win51._clip);
+  check('s51a: and there is NO second upload', batches51().length === 0, batches51().length);
+  check('s51a: credentials ride a header, never the URL',
+    rec51.headers['x-el-key'] === 'k-51' && !rec51.url.includes('k-51'), rec51.url);
+  const e51a = ring51()[0] || {};
+  check('s51a: the timing log names the stream path', e51a.path === 'stream' && !e51a.pathNote, e51a.path + ' ' + e51a.pathNote);
+  check('s51a: and folds in the stream\'s Server-Timing', e51a.elMs === 210 && e51a.workerMs === 215, JSON.stringify([e51a.elMs, e51a.workerMs]));
+  check('s51a: the readout says the take uploaded while dictating',
+    (doc51.getElementById('timingReadout').textContent || '').includes('uploaded while dictating'),
+    doc51.getElementById('timingReadout').textContent);
+
+  // --- 51b: a network that cannot stream falls back to the ordinary upload ---
+  mode51 = 'reject';
+  batch51.push({ status: 200, body: { text: 'Fallback note.' } });
+  await take51(doc51);
+  await sleep(600);
+  check('s51b: a refused stream falls back to ONE ordinary upload', batches51().length === 1, batches51().length);
+  check('s51b: and still delivers the take', (win51._clip || '').includes('Fallback note.'), win51._clip);
+  const e51b = ring51()[0] || {};
+  check('s51b: the timing log shows the fallback and why',
+    e51b.path === 'stream>batch' && /network/.test(e51b.pathNote), e51b.path + ' ' + e51b.pathNote);
+
+  // --- 51c: a stream the server refuses (HTTP 500) falls back too ----------
+  mode51 = 'http500';
+  batch51.push({ status: 200, body: { text: 'Second fallback.' } });
+  await take51(doc51);
+  await sleep(700);
+  check('s51c: an HTTP error on the stream falls back to the ordinary upload', batches51().length === 2, batches51().length);
+  check('s51c: and delivers the take', (win51._clip || '').includes('Second fallback.'), win51._clip);
+  check('s51c: the fallback reason is the HTTP status', /HTTP 500/.test((ring51()[0] || {}).pathNote || ''), (ring51()[0] || {}).pathNote);
+
+  // --- 51d: two failures in a row switch streaming off until reload --------
+  mode51 = 'ok';
+  const streamsBefore = streams51().length;
+  batch51.push({ status: 200, body: { text: 'Plain upload.' } });
+  await take51(doc51);
+  await sleep(600);
+  check('s51d: after two consecutive failures no stream is opened', streams51().length === streamsBefore, streams51().length - streamsBefore);
+  check('s51d: the take uploads the ordinary way', (win51._clip || '').includes('Plain upload.'), win51._clip);
+  const e51d = ring51()[0] || {};
+  check('s51d: the timing log says streaming is off and why',
+    e51d.path === 'batch' && /streaming off until reload/.test(e51d.pathNote), e51d.path + ' ' + e51d.pathNote);
+  dom51.window.close();
+
+  // --- 51e: a take with nothing to upload cancels the stream ---------------
+  calls51 = [];
+  chunkBytes51 = 100; // a tap: well under the 1 KB upload floor
+  const dom51e = mkDom51();
+  await sleep(200);
+  await take51(dom51e.window.document, 120);
+  await sleep(500);
+  const rec51e = streams51()[0] || {};
+  check('s51e: the stream was opened for the tap', streams51().length === 1, streams51().length);
+  check('s51e: and CANCELLED mid-body (ElevenLabs never gets a request to bill)', rec51e.aborted === true, rec51e.aborted);
+  check('s51e: nothing is uploaded the ordinary way either', batches51().length === 0, batches51().length);
+  check('s51e: the outcome is the same loud no-speech sentinel as ever',
+    dom51e.window._clip === '##DICTATION_FAILED##', JSON.stringify(dom51e.window._clip));
+  dom51e.window.close();
+  chunkBytes51 = 2048;
+
+  // --- 51f: the per-device toggle turns it off ------------------------------
+  calls51 = [];
+  const dom51f = mkDom51({ settings: { streamUpload: false } });
+  await sleep(200);
+  check('s51f: a saved "off" is restored', dom51f.window.document.getElementById('streamUpload').checked === false);
+  batch51.push({ status: 200, body: { text: 'Toggle off note.' } });
+  await take51(dom51f.window.document);
+  await sleep(600);
+  check('s51f: with the toggle off no stream is opened', streams51().length === 0, streams51().length);
+  check('s51f: the take uploads the ordinary way', (dom51f.window._clip || '').includes('Toggle off note.'), dom51f.window._clip);
+  dom51f.window.close();
+
+  // --- 51g: a browser that cannot stream (Safari, Firefox) is untouched -----
+  calls51 = [];
+  const dom51g = mkDom51({ noStreams: true });
+  await sleep(200);
+  batch51.push({ status: 200, body: { text: 'Safari note.' } });
+  await take51(dom51g.window.document);
+  await sleep(600);
+  check('s51g: no stream on a browser without upload streaming', streams51().length === 0, streams51().length);
+  check('s51g: it uploads the ordinary way', (dom51g.window._clip || '').includes('Safari note.'), dom51g.window._clip);
+  dom51g.window.close();
+
+  // --- 51h: the deadline stays FINAL on the stream path ---------------------
+  // A stream whose transcript never comes back fails loudly at the take's own
+  // deadline with the recording kept for a retry — exactly like the ordinary
+  // upload — and does NOT start a second upload (that would double the wait).
+  calls51 = [];
+  mode51 = 'hang';
+  const dom51h = mkDom51();
+  await sleep(200);
+  const doc51h = dom51h.window.document;
+  await take51(doc51h);
+  await sleep(17000); // the 15 s floor + the take- and size-scaled allowance
+  check('s51h: a stream past its deadline is LOUD (sentinel copied)',
+    dom51h.window._clip === '##DICTATION_FAILED##', JSON.stringify(dom51h.window._clip));
+  check('s51h: the recording is KEPT for a retry',
+    doc51h.getElementById('status').textContent.includes('RECORDING was saved'), doc51h.getElementById('status').textContent.trim());
+  check('s51h: and no second upload was started', batches51().length === 0, batches51().length);
+  check('s51h: the hung stream was cancelled', (streams51()[0] || {}).aborted === true);
+  const e51h = (() => { try { return JSON.parse(dom51h.window.localStorage.getItem('scribe_v2_timing_v9') || '[]')[0] || {}; } catch (e) { return {}; } })();
+  check('s51h: the timing log records a stream timeout', e51h.path === 'stream' && e51h.errKind === 'timeout', e51h.path + ' ' + e51h.errKind);
+  dom51h.window.close();
+  mode51 = 'ok';
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

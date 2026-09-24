@@ -385,7 +385,7 @@ export default {
 };
 
 // Batch proxy: receives the recorded audio blob as multipart form data and
-// forwards it to ElevenLabs batch Scribe v2. Serves pure batch mode and the
+// forwards it to ElevenLabs batch Scribe v2 Medical. Serves pure batch mode and the
 // hybrid mode's accuracy re-transcription pass.
 async function handleTranscribeBatch(request, env) {
   // [PERF] Stage stamps behind the Server-Timing response header the client
@@ -425,7 +425,12 @@ async function handleTranscribeBatch(request, env) {
 
     const form = new FormData();
 
-    form.append("model_id", "scribe_v2");
+    // Scribe v2 Medical: ElevenLabs' clinical fine-tune of Scribe v2 (drug
+    // names, anatomy, pathology). Same endpoint, same request shape (keyterms,
+    // diarize, no_verbatim, timestamps) and same price as scribe_v2, so every
+    // field below is unchanged. (The OpenAPI no_verbatim note still says
+    // "only scribe_v2"; the 2026-09-11 changelog confirms Medical supports it.)
+    form.append("model_id", "scribe_v2_medical");
     form.append("file", file, file.name || "recording.webm");
     form.append("file_format", String(incoming.get("file_format") || "other"));
 
@@ -557,7 +562,7 @@ const KEYTERM_PRESETS_CLIENT_JSON = JSON.stringify(
 const MANIFEST = {
   name: "Scribe Dictation",
   short_name: "Dictation",
-  description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 (batch)",
+  description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 Medical (batch)",
   start_url: "/",
   display: "standalone",
   background_color: "#0b0d10",
@@ -1252,8 +1257,8 @@ right lower quadrant"></textarea>
       </details>
 
       <div class="hint" style="margin-top: 14px;">
-        English‑only, Scribe v2. Mic stays warm between dictations for instant start.
-        Audio uploads to ElevenLabs Scribe v2 on release.
+        English‑only, Scribe v2 Medical. Mic stays warm between dictations for instant start.
+        Audio uploads to ElevenLabs Scribe v2 Medical on release.
       </div>
     </section>
   </div>

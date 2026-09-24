@@ -331,6 +331,12 @@ audio, which is the only way to settle B and C.
 
 ## Phase 3 — PCM upload for short takes (conditional on Phase 0)
 
+> **Deprioritized 2026-09-24.** With the streamed upload live, the bytes no longer sit on the
+> post-release path, so PCM's only remaining saving is ElevenLabs' decode (likely tens of ms of
+> a ~390 ms wait). Judged on the whole pipeline, that does not pay for putting a JS AudioWorklet
+> and a 48→16 kHz resampler into the recording path (the dropped-frame trap below), or for 4x
+> the bytes on weak phone links. Revisit only if the numbers change.
+
 The API reference is explicit: with `file_format=pcm_s16le_16` (16-bit PCM, 16 kHz, mono,
 little-endian) *"latency will be lower than with passing an encoded waveform"*. Today every
 take is webm/opus with `file_format=other` (`worker.js:2665`), so ElevenLabs decodes first.
@@ -420,6 +426,13 @@ enforcement.
 > bytes and chunks; any failure but the deadline falls back to the batch upload of the
 > in-memory blob; two consecutive failures switch streaming off until reload; the timing
 > log names the path. The original analysis is kept below for the record.
+>
+> **Field result (2026-09-24, desktop, Scribe v2 Medical):** streamed takes of 6–19 s landed
+> 336–571 ms after release (ElevenLabs median 384 ms), against 565–998 ms for 4–8 s takes
+> before streaming (median 570 ms), and the wait no longer grows with length (two 19 s takes:
+> 391 and 422 ms). Client ~20 ms, network ~17 ms, ElevenLabs ~90% of the rest. Short takes are
+> NOT yet proven: the first 3.5 s streamed take took 549 ms at ElevenLabs vs 219–335 ms for 8
+> short non-streamed takes — settle with an interleaved on/off A/B (see `CLAUDE.md`).
 
 Streaming the upload during the hold sounds ideal, but the constraints kill it:
 

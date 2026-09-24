@@ -4808,5 +4808,73 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   dom48.window.close();
 }
 
+// ===== Scenario 49: the upstream STT request (Worker -> ElevenLabs) =====
+// Pins what the Worker actually sends ElevenLabs: the model is Scribe v2
+// Medical, and the rest of the proven request shape is unchanged — English,
+// temperature 0, the single-speaker config on a plain desktop, the diarize
+// shape (no forced num_speakers) when the phone surface asks for it, word
+// timestamps, no_verbatim, the keyterms passthrough, and the master key in the
+// header (the access code never rides upstream). A silent drift in any of
+// these changes the transcript, so it is asserted field by field.
+console.log('--- scenario 49: upstream request = scribe_v2_medical, shape unchanged ---');
+{
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), headers: (init && init.headers) || {}, form: init && init.body });
+    return new Response(JSON.stringify({ text: 'ok' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const env49 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame' };
+    // The same fields the client's batchTranscribe posts in shared mode.
+    const mkUpload = (diarize) => {
+      const fd = new FormData();
+      fd.append('passphrase', 'sesame');
+      fd.append('file', new Blob([new Uint8Array(4096)], { type: 'audio/webm' }), 'recording.webm');
+      fd.append('file_format', 'other');
+      fd.append('timestamps_granularity', 'word');
+      fd.append('no_verbatim', 'true');
+      fd.append('tag_audio_events', 'false');
+      fd.append('diarize', String(diarize));
+      fd.append('keyterms_json', JSON.stringify(['metoprolol', 'right lower quadrant']));
+      return new Request('https://dictation.test/api/transcribe', { method: 'POST', body: fd });
+    };
+
+    // (a) plain desktop: diarize=false -> the proven single-speaker config
+    let r = await worker.default.fetch(mkUpload(false), env49);
+    check('s49a: the transcribe proxy answers 200', r.status === 200, r.status);
+    check('s49a: exactly one upstream call, to the ElevenLabs STT endpoint',
+      sent.length === 1 && sent[0].url === 'https://api.elevenlabs.io/v1/speech-to-text',
+      sent.map((s) => s.url).join(','));
+    const f = sent[0].form;
+    check('s49a: model_id is scribe_v2_medical', f.get('model_id') === 'scribe_v2_medical', f.get('model_id'));
+    check('s49a: exactly one model_id field', f.getAll('model_id').length === 1, f.getAll('model_id').length);
+    check('s49a: language_code stays en', f.get('language_code') === 'en', f.get('language_code'));
+    check('s49a: temperature stays 0', f.get('temperature') === '0', f.get('temperature'));
+    check('s49a: desktop keeps diarize=false + num_speakers=1',
+      f.get('diarize') === 'false' && f.get('num_speakers') === '1', f.get('diarize') + '/' + f.get('num_speakers'));
+    check('s49a: word timestamps pass through', f.get('timestamps_granularity') === 'word', f.get('timestamps_granularity'));
+    check('s49a: no_verbatim stays on', f.get('no_verbatim') === 'true', f.get('no_verbatim'));
+    check('s49a: tag_audio_events stays off', f.get('tag_audio_events') === 'false', f.get('tag_audio_events'));
+    check('s49a: file_format stays other', f.get('file_format') === 'other', f.get('file_format'));
+    check('s49a: the audio file rides along', f.get('file') && f.get('file').size === 4096, f.get('file') && f.get('file').size);
+    check('s49a: keyterms pass through', f.getAll('keyterms').join('|') === 'metoprolol|right lower quadrant', f.getAll('keyterms').join('|'));
+    check('s49a: the master key rides the header; the access code never goes upstream',
+      sent[0].headers['xi-api-key'] === 'srv-key' && !f.has('passphrase') && !f.has('api_key'),
+      sent[0].headers['xi-api-key'] + '/' + f.has('passphrase') + '/' + f.has('api_key'));
+
+    // (b) phone surface: diarize=true -> same model, no forced num_speakers
+    r = await worker.default.fetch(mkUpload(true), env49);
+    check('s49b: the diarize take answers 200 upstream-once', r.status === 200 && sent.length === 2, r.status + '/' + sent.length);
+    const g = sent[1].form;
+    check('s49b: the diarize take uses the same model', g.get('model_id') === 'scribe_v2_medical', g.get('model_id'));
+    check('s49b: diarize=true with no forced num_speakers',
+      g.get('diarize') === 'true' && !g.has('num_speakers'), g.get('diarize') + '/' + g.get('num_speakers'));
+    check('s49b: diarize keeps word timestamps (speaker_id per word)', g.get('timestamps_granularity') === 'word', g.get('timestamps_granularity'));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

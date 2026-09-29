@@ -1,14 +1,19 @@
 // Deployer-curated keyterm lists, merged client-side with the user's custom
-// terms on every dictation. Lists marked `always: true` never appear in the
-// UI and ride every dictation — which also means every dictation pays the
-// ~20 % keyterm cost surcharge. The rest render as checkboxes in the
-// Keyterms section (checked ids persist per browser as `presetIds` in the
-// v9 settings). To add or edit a list: change this array and
-// `npx wrangler deploy` — the HTML is served no-store, so every user gets
-// the update on next load. Terms longer than 20 chars or 5 words are
-// skipped by the realtime feed but still bias the batch/hybrid-refine call
-// (< 50 chars there); when the realtime 50-term cap overflows, the user's
-// custom terms win, then checked presets, then `always` lists.
+// terms on every dictation. Each list renders as a checkbox in the Keyterms
+// section (checked ids persist per browser as `presetIds` in the v9
+// settings). A list marked `always: true` would instead ride every dictation
+// with no checkbox. None ships since 2026-09-29: the standard list was
+// dropped after testing in WhisperInk showed Scribe v2 Medical doesn't need
+// it. A dictation with nothing checked and no custom terms therefore sends
+// no keyterms and pays no keyterm surcharge.
+//
+// Cost: any keyterms add ~20 %, and over 100 terms ElevenLabs bills each
+// request as at least 20 s of audio (the wound care list alone is over 100).
+// Terms must be < 50 chars and <= 5 words. If the 1000-term cap is hit, the
+// user's custom terms win, then checked lists, then `always` lists.
+// To add or edit a list: change this array and push to main (Workers Builds
+// deploys it; the page is served no-store, so every device picks it up on
+// its next load).
 export const KEYTERM_PRESETS = [
   {
     id: "wound",

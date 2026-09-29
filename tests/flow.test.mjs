@@ -5816,5 +5816,85 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   R.dom.window.close();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 53. [RELIABILITY] While ElevenLabs is slow, wait longer. The field log of
+//     2026-09-29 had 3-4 s takes waiting 3.3 s and 16.8 s at ElevenLabs (normally
+//     0.3-0.8 s), then timeouts at the ~19 s deadline. When this device's timing
+//     ring shows a recent timeout or a long ElevenLabs wait, the deadline floor
+//     rises from 15 s to 45 s; healthy (or long ago), it stays 15 s.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 53: longer deadline while the service is slow ---');
+  const mk53 = (ring, delayMs) => {
+    let w;
+    const dom = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        w = win;
+        win.isSecureContext = true;
+        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; }
+          static isTypeSupported() { return false; }
+          start() { this.state = 'recording'; }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+        };
+        win.fetch = () => new Promise((r) => setTimeout(() => r({
+          ok: true, status: 200, headers: { get: () => null },
+          text: () => Promise.resolve(JSON.stringify({ text: 'Deadline note.' })),
+        }), delayMs || 20));
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-53');
+        if (ring) win.localStorage.setItem('scribe_v2_timing_v9', JSON.stringify(ring));
+      },
+    });
+    return { dom, win: () => w, doc: dom.window.document };
+  };
+  const ago = (ms) => new Date(Date.now() - ms).toISOString();
+  const take53 = async (d, waitMs) => {
+    micRms = 0.05;
+    d.doc.getElementById('recordBtn').click();
+    await sleep(140);
+    d.doc.getElementById('recordBtn').click();
+    await sleep(waitMs || 600);
+  };
+  const newestDeadline = (d) => { try { return JSON.parse(d.win().localStorage.getItem('scribe_v2_timing_v9') || '[]')[0].deadline; } catch (e) { return null; } };
+
+  const A = mk53(null);
+  await sleep(150);
+  await take53(A);
+  check('s53a: healthy, the floor stays 15 s', newestDeadline(A) >= 15000 && newestDeadline(A) < 20000, newestDeadline(A));
+  A.dom.window.close();
+
+  const B = mk53([{ at: ago(60000), outcome: 'ok', elMs: 16757 }], 2600);
+  await sleep(150);
+  micRms = 0.05;
+  B.doc.getElementById('recordBtn').click();
+  await sleep(140);
+  B.doc.getElementById('recordBtn').click();
+  await sleep(2300); // mid-upload: the countdown is showing
+  const midB = B.doc.getElementById('status').textContent;
+  check('s53b: the countdown says ElevenLabs has been slow', midB.includes('ElevenLabs has been slow') && midB.includes('allowing up to 4'), midB);
+  await sleep(900);
+  check('s53b: after a 16.8 s ElevenLabs wait a minute ago, the floor is 45 s', newestDeadline(B) >= 45000 && newestDeadline(B) < 50000, newestDeadline(B));
+  check('s53b: and the slow take still delivers', (B.win()._clip || '').includes('Deadline note.'), JSON.stringify(B.win()._clip));
+  B.dom.window.close();
+
+  const C = mk53([{ at: ago(120000), outcome: 'empty', errKind: 'timeout', stage: 'uploadStart' }, { at: ago(180000), outcome: 'ok', elMs: 500 }]);
+  await sleep(150);
+  await take53(C);
+  check('s53c: a recent timeout raises the floor too (so the Retry gets the longer wait)', newestDeadline(C) >= 45000, newestDeadline(C));
+  C.dom.window.close();
+
+  const D = mk53([{ at: ago(2 * 3600000), outcome: 'ok', elMs: 16757 }]);
+  await sleep(150);
+  await take53(D);
+  check('s53d: a slow take hours ago does not', newestDeadline(D) < 20000, newestDeadline(D));
+  D.dom.window.close();
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

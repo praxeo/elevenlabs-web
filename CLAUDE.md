@@ -160,10 +160,10 @@ const js = h.slice(h.indexOf('<script>')+8, h.indexOf('</'+'script>'));
 writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
-# Full session-flow simulation — batch-only product, 43 numbered scenario
-# groups, 832 checks as of 2026-09-29
+# Full session-flow simulation — batch-only product, 44 numbered scenario
+# groups, 838 checks as of 2026-09-29
 # (numbered 0,3,4,7,9,10,11,17,18,19,20,21,22,23,24,25,25w,29,30,31,31m,32,32j,
-# 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52; the gaps are the deleted
+# 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53; the gaps are the deleted
 # realtime/hybrid/translator/pump/direct scenarios — numbering kept so git
 # history lines up):
 #  0  boot shim: legacy access-code->passphrase migration, defaults, history
@@ -407,6 +407,10 @@ node --check /tmp/served.js
 #     a retry locks the notes, refuses a take LOUDLY and ignores a double tap;
 #     a failed save is FAILED, never SAVED; the 100-entry cap keeps an unsent
 #     note; a note added to while paired is tracked
+# 53  while ElevenLabs is slow, wait longer: with no history the deadline floor
+#     is 15 s; after a take that waited 16.8 s at ElevenLabs a minute ago (or a
+#     recent timeout) it is 45 s and the countdown says "ElevenLabs has been
+#     slow"; a slow take hours ago does not raise it
 npm install --no-save jsdom jsqr fake-indexeddb
 node tests/flow.test.mjs
 ```
@@ -420,6 +424,7 @@ jsdom gotchas baked into the harness: define `window.isSecureContext = true` and
 | Constant | Default | Meaning |
 |---|---|---|
 | `BATCH_UPLOAD_TIMEOUT_MS` | 15000 | Batch upload + transcription deadline FLOOR (a hung request fails loudly past the computed deadline) |
+| `SLOW_SERVICE_FLOOR_MS` / `SLOW_SERVICE_EL_MS` / `SLOW_SERVICE_LOOKBACK` / `SLOW_SERVICE_WINDOW_MS` | 45000 / 8000 / 5 / 30 min | **The floor while ElevenLabs is slow** (`deadlineFloorMs`/`serviceSlowRecently`): if one of this device's last 5 takes (within 30 min) timed out or waited > 8 s at ElevenLabs (`elMs` in the timing ring), the floor is 45 s instead of 15 s — the 2026-09-29 field log had 3–4 s takes waiting 3.3 s and 16.8 s at ElevenLabs (normally 0.3–0.8 s, our network 0.1–0.3 s) and then timing out at ~19 s. A timed-out take's own Retry therefore gets the longer wait; the upload countdown says "ElevenLabs has been slow". Healthy, a hung request still fails in 15 s. Still under `UPLOAD_DEADLINE_MAX_MS`, so `CLIP_TIMEOUT` is unchanged |
 | `UPLOAD_TIMEOUT_REC_FRAC` / `UPLOAD_TIMEOUT_EXTRA_MAX_MS` | 0.25 / 60000 | The deadline scales with the take (`batchUploadTimeoutMs`): floor + 25% of the recorded length, extra capped at +60 s (~75 s worst case) — a flat 15 s starved multi-minute takes that were succeeding |
 | `UPLOAD_MS_PER_KB` / `UPLOAD_BUDGET_MAX_MS` / `UPLOAD_DEADLINE_MAX_MS` | 60 / 90000 / 150000 | **Byte-scaled upload allowance** on top of the transcription budget: the phone-link timeouts were the UPLOAD leg, not inference (an ElevenLabs request log over a week showed 0 failures and a 0.58 s median — the service never saw the aborted takes). Sized for a poor-but-working uplink (~17 KB/s). The whole deadline is hard-capped at 150 s; `hotkey.ahk` `CLIP_TIMEOUT` (165) must cover it |
 | `COVERAGE_MIN_SLACK_S` / `COVERAGE_SLACK_FRAC` | 20 / 0.25 | Transcript-coverage guard slack: a last-word end (or decoded `audio_duration_secs`) more than max(20 s, 25% of take) short of the observed speech ⇒ degraded WARN ("may be INCOMPLETE"), never a clean Done! — baselined on the last gate-open moment so held-but-silent tails never false-warn |

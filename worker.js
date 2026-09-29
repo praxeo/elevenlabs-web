@@ -252,6 +252,9 @@ export default {
       return new Response(
         INDEX_HTML
           .replace("__SHARED_MODE__", sharedMode ? "true" : "false")
+          // Which transcription services have a key here (Options greys out
+          // the rest). Booleans only — never a key.
+          .replace("__STT_AVAILABLE__", () => JSON.stringify(sttServicesAvailable(env, sharedMode)))
           // Function replacer: a plain string replacement would interpret
           // $-sequences inside the JSON as replacement patterns.
           .replace("__KEYTERM_PRESETS__", () => KEYTERM_PRESETS_CLIENT_JSON),
@@ -453,7 +456,7 @@ function sttUpstreamFields(get) {
 // Batch proxy: receives the recorded audio blob as multipart form data and
 // forwards it to ElevenLabs batch Scribe v2 Medical. The fallback for every
 // streamed take, and the only path on browsers that cannot stream an upload.
-// With the shared key, Soniox backs ElevenLabs up (sttWithFallback).
+// The client picks the main service and its backup (sttPlan / sttRace).
 async function handleTranscribeBatch(request, env, ctx) {
   // [PERF] Stage stamps behind the Server-Timing response header the client
   // folds into its timing ring. This is what splits OUR transport + proxy cost
@@ -490,32 +493,20 @@ async function handleTranscribeBatch(request, env, ctx) {
     if (file.size < STT_MIN_AUDIO_BYTES) return json({ error: "Recording too short or empty." }, 400);
     if (file.size > STT_MAX_AUDIO_BYTES) return json({ error: "Recording too large." }, 413);
 
-    const form = new FormData();
-    form.append("model_id", STT_MODEL_ID);
-    form.append("file", file, file.name || "recording.webm");
-    for (const [name, value] of sttUpstreamFields((k) => incoming.get(k))) {
-      form.append(name, value);
-    }
-
-    const elCtrl = new AbortController();
-    const tElStart = Date.now();
-    const eleven = settleEleven(fetch(ELEVENLABS_STT_URL, {
-      method: "POST",
-      headers: { "xi-api-key": apiKey },
-      body: form,
-      signal: elCtrl.signal,
-    }), 500);
-
-    const out = await sttWithFallback({
-      env, ctx, eleven, elCtrl, tElStart,
-      enabled: sttFallbackEnabled(env, sharedKey),
-      audio: file,
-      fileName: file.name || "recording.webm",
-      get: (k) => incoming.get(k),
+    // The main service the client chose (ElevenLabs unless swapped in
+    // Options), backed up by another when it errors or stalls (sttRace).
+    const get = (k) => incoming.get(k);
+    const plan = sttPlan(get, env, sharedKey, false);
+    const job = { env, ctx, apiKey, file, fileName: file.name || "recording.webm", get, netStatus: 500 };
+    const tJob = Date.now();
+    const out = await sttRace({
+      env, plan, tStart: tJob,
+      primary: startSttJob(plan.primary, job),
+      startBackup: plan.backup ? () => startSttJob(plan.backup, job) : null,
       audioSecs: audioSecondsOf(incoming.get("rec_ms"), file.size),
     });
     // parse = buffering/re-serializing the upload in the Worker;
-    // el = the ElevenLabs round trip (upload + inference + response).
+    // el = the main service's round trip (upload + inference + response).
     return sttResponse(out, "parse;dur=" + (tParsed - tStart), tStart, "");
   } catch (err) {
     return json(
@@ -615,10 +606,11 @@ async function handleTranscribeStream(request, env, ctx) {
       'Content-Disposition: form-data; name="file"; filename="' + fileName + '"\r\n' +
       "Content-Type: " + mime + "\r\n\r\n";
 
-    // With the Soniox fallback on, the Worker keeps its own copy of the audio
-    // it relays, so Soniox can be sent the same take if ElevenLabs stalls.
-    const fallbackOn = sttFallbackEnabled(env, sharedKey);
-    const kept = fallbackOn ? [] : null;
+    // ElevenLabs is the main service on a streamed take. With a backup set,
+    // the Worker keeps its own copy of the audio it relays, so the backup can
+    // be sent the same take if ElevenLabs errors or stalls.
+    const plan = sttPlan(get, env, sharedKey, true);
+    const kept = plan.backup ? [] : null;
     const elCtrl = new AbortController();
 
     const pipe = new TransformStream();
@@ -696,14 +688,13 @@ async function handleTranscribeStream(request, env, ctx) {
       await Promise.race([writer.close().catch(() => {}), settled]);
     }
 
-    const out = await sttWithFallback({
-      env, ctx, elCtrl,
-      eleven: settleEleven(upstream, 502),
-      tElStart: tEnd, // ElevenLabs has had the audio all along: its wait starts at the release
-      enabled: fallbackOn,
-      audio: kept ? new Blob(kept, { type: mime }) : null,
-      fileName,
-      get,
+    const out = await sttRace({
+      env, plan,
+      tStart: tEnd, // ElevenLabs has had the audio all along: its wait starts at the release
+      primary: jobFromFetch(upstream, elCtrl, 502),
+      startBackup: kept
+        ? () => startSttJob(plan.backup, { env, ctx, file: new Blob(kept, { type: mime }), fileName, get })
+        : null,
       audioSecs: audioSecondsOf(end.rec_ms, bytes),
     });
     // Measured from the end frame, so the numbers are the wait AFTER the
@@ -754,37 +745,80 @@ function streamFrameReader(body) {
   };
 }
 
-// ───── Soniox fallback: when ElevenLabs is slow or failing ─────
-// The same take goes to Soniox (stt-async-v5, a different company on
-// different infrastructure) when ElevenLabs returns an error, or has not
-// answered FALLBACK_AFTER_MS after it has the whole take (normally it answers
-// in 0.3–0.8 s; on 2026-09-29 it took 16.8 s and then stopped answering). The
-// first good transcript wins; ElevenLabs keeps running while Soniox works, so
-// a late ElevenLabs answer still wins if it arrives first. Soniox's result is
-// reshaped into ElevenLabs' (text, per-word timings and speakers, decoded
-// duration), so the client's speaker filter and coverage guard judge it
-// exactly like an ElevenLabs transcript, and the client labels it.
+// ───── Choosing the service, and backing it up when it is slow or failing ─────
+// Three services can transcribe a take: ElevenLabs Scribe v2 Medical (the
+// default), Soniox (stt-async-v5) and OpenAI gpt-transcribe. The client picks
+// the MAIN service and a BACKUP (Options, per device, sent as stt_primary /
+// stt_backup; an old client that sends neither gets ElevenLabs backed up by
+// Soniox). The main service is asked first; the backup is sent the SAME audio
+// when the main one returns an error, or has not answered after
+// sttFallbackAfterMs (ElevenLabs normally answers in 0.3–0.8 s; on 2026-09-29
+// it took 16.8 s and then stopped answering). The first good transcript wins;
+// the main service keeps running while the backup works, so its late answer
+// still wins if it comes first. Every answer is in ElevenLabs' shape (text,
+// per-word timings and speakers when the service has them, decoded duration),
+// so the client's speaker filter and coverage guard judge it exactly like an
+// ElevenLabs transcript, and it says which service wrote it.
 // Rules:
-//   - Only on the shared key (the owner's deployment) with SONIOX_API_KEY set;
-//     a BYO ElevenLabs key never spends the owner's Soniox account.
-//   - A take ElevenLabs refused as unusable audio (413, or a 400 naming it too
-//     short, too large or empty) is not sent: Soniox cannot do better.
+//   - Soniox and OpenAI only on the shared key (the owner's deployment) with
+//     their key set; a BYO ElevenLabs key never spends the owner's accounts.
+//     A main service with no key here falls back to ElevenLabs, SAYING so.
+//   - The streamed upload feeds ElevenLabs, so it is always the main service
+//     there (the client streams only when ElevenLabs is its main service).
+//   - A take the main service refused as unusable audio (413, or a 400 naming
+//     it too short, too large or empty) is not sent to the backup.
 //   - Soniox has no one-shot endpoint: upload the file, start a job, poll it,
-//     fetch the transcript. The file and the job are always DELETED afterwards
-//     (waitUntil), including a job abandoned because ElevenLabs answered first.
+//     fetch the transcript. Its file and job are always DELETED afterwards
+//     (waitUntil), including a job abandoned because the other service won.
 //   - Both failing is still one loud failure, naming both.
+const STT_SERVICES = ["elevenlabs", "soniox", "openai"];
+const STT_SERVICE_NAMES = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI" };
 const SONIOX_API_URL = "https://api.soniox.com/v1";
 const SONIOX_MODEL = "stt-async-v5";
-const FALLBACK_AFTER_MS = 4000;             // the wait for ElevenLabs before Soniox is asked too
+const OPENAI_STT_URL = "https://api.openai.com/v1/audio/transcriptions";
+const OPENAI_STT_MODEL = "gpt-transcribe";
+// Context only, never a vocabulary list: OpenAI warns its keywords can make
+// unspoken terms appear, and a speech model reciting a term list into a chart
+// is the failure WhisperInk measured on Qwen3. Keyterms stay ElevenLabs/Soniox.
+const OPENAI_STT_PROMPT = "A clinician dictating a medical note for a patient chart.";
+// The wait for the main service before the backup is asked too. ElevenLabs is
+// measured (0.3–0.8 s, worst seen ~2 s); Soniox's async jobs and OpenAI are
+// not measured here yet, so they get more room.
+const FALLBACK_AFTER_MS = { elevenlabs: 4000, openai: 6000, soniox: 8000 };
 const FALLBACK_AFTER_PER_AUDIO_S_MS = 40;   // ...longer for a long take (ElevenLabs needs ~1.1 s per minute)
 const FALLBACK_AFTER_MAX_MS = 20000;
 const SONIOX_POLL_MS = [150, 250, 350, 500, 700, 900, 1000]; // then every 1000 ms
 const SONIOX_POLL_MAX = 30;                 // with the other calls, well under a Worker's subrequest limit
 const SONIOX_TERMS_MAX_CHARS = 6000;        // Soniox's whole context limit is ~10,000 characters
 const SONIOX_CLEANUP_TRIES = 5;
+const JSON_CT = "application/json; charset=utf-8";
 
-function sttFallbackEnabled(env, sharedKey) {
-  return Boolean(sharedKey && env && env.SONIOX_API_KEY);
+// Which services this deployment can use for a request (the page is told the
+// same thing, so the client greys out a service with no key).
+function sttServicesAvailable(env, sharedKey) {
+  return {
+    elevenlabs: true,
+    soniox: Boolean(sharedKey && env && env.SONIOX_API_KEY),
+    openai: Boolean(sharedKey && env && env.OPENAI_API_KEY),
+  };
+}
+
+// The main service and its backup for one take, from the client's choice and
+// what this deployment has keys for. note: said to the client when the main
+// service it asked for could not be used.
+function sttPlan(get, env, sharedKey, streamed) {
+  const avail = sttServicesAvailable(env, sharedKey);
+  let primary = String(get("stt_primary") || "elevenlabs");
+  if (!STT_SERVICES.includes(primary) || streamed) primary = "elevenlabs";
+  let note = "";
+  if (!avail[primary]) {
+    note = STT_SERVICE_NAMES[primary] + " is not set up on the server (no API key), so ElevenLabs transcribed this.";
+    primary = "elevenlabs";
+  }
+  const asked = get("stt_backup");
+  let backup = asked === null || asked === undefined || asked === "" ? "soniox" : String(asked);
+  if (!STT_SERVICES.includes(backup) || backup === primary || !avail[backup]) backup = "";
+  return { primary, backup, note };
 }
 
 // The take's length: the client's own measure when it sent one, else the
@@ -796,124 +830,225 @@ function audioSecondsOf(recMs, bytes) {
   return Math.max(0, Number(bytes) || 0) / 8000;
 }
 
-// env.SONIOX_FALLBACK_AFTER_MS (an optional plain variable) overrides the base.
-function sttFallbackAfterMs(env, audioSecs) {
+// env.SONIOX_FALLBACK_AFTER_MS (an optional plain variable) overrides the base
+// for every service.
+function sttFallbackAfterMs(env, primary, audioSecs) {
   const set = Number(env && env.SONIOX_FALLBACK_AFTER_MS);
-  const base = isFinite(set) && set > 0 ? set : FALLBACK_AFTER_MS;
+  const base = isFinite(set) && set > 0 ? set : (FALLBACK_AFTER_MS[primary] || FALLBACK_AFTER_MS.elevenlabs);
   return Math.round(Math.min(FALLBACK_AFTER_MAX_MS, base + FALLBACK_AFTER_PER_AUDIO_S_MS * Math.max(0, audioSecs || 0)));
 }
 
-// ElevenLabs' answer as a plain value: never rejects. A network failure is
-// netStatus (the batch route has always answered 500 there, the stream 502).
-function settleEleven(fetchPromise, netStatus) {
-  const netFail = (err) => ({
-    status: netStatus,
-    body: JSON.stringify({ error: "Worker transcription proxy failed.", message: err?.message || String(err) }),
-    ctype: "application/json; charset=utf-8",
-    network: true,
-    at: Date.now(),
+// A job: { result, abandon }. result resolves (never rejects) to
+//   { ok: true, status, body (ElevenLabs-shaped object), raw?, ctype? } or
+//   { ok: false, status, error, brief?, raw?, ctype?, network? }
+// raw/ctype carry ElevenLabs' own response, passed through byte for byte when
+// ElevenLabs answers as the main service.
+function jobFromFetch(fetchPromise, ctrl, netStatus) {
+  const result = fetchPromise.then(async (r) => {
+    const raw = await r.text();
+    const ctype = r.headers.get("content-type") || "";
+    if (r.ok) {
+      let body = null;
+      try { body = JSON.parse(raw); } catch { body = null; }
+      return { ok: true, status: r.status, raw, ctype, body };
+    }
+    return { ok: false, status: r.status, raw, ctype, error: upstreamMessage(r.status, raw) };
+  }).catch((err) => {
+    const message = err?.message || String(err);
+    return {
+      ok: false, status: netStatus, network: true, error: "could not be reached (" + message + ")",
+      raw: JSON.stringify({ error: "Worker transcription proxy failed.", message }), ctype: JSON_CT,
+    };
   });
-  return fetchPromise.then(
-    async (r) => ({ status: r.status, body: await r.text(), ctype: r.headers.get("content-type") || "", at: Date.now() })
-  ).catch(netFail);
+  return { result, abandon() { try { ctrl.abort(); } catch {} } };
 }
 
-// Whether a failed ElevenLabs answer is worth sending to Soniox: everything
-// except a recording no service can use (mirrors the client's "permanent").
-function worthFallingBack(el) {
-  if (el.status >= 200 && el.status < 300) return false;
-  if (el.status === 413) return false;
-  if (el.status === 400 && /too short|too large|empty|no audio/i.test(el.body || "")) return false;
-  return true;
-}
-
-function upstreamMessage(el) {
-  if (el.network) return "could not be reached";
+function upstreamMessage(status, raw) {
   let msg = "";
   try {
-    const d = JSON.parse(el.body || "");
+    const d = JSON.parse(raw || "");
     msg = (d && d.detail && (d.detail.message || (typeof d.detail === "string" ? d.detail : ""))) ||
-          (d && (d.message || d.error)) || "";
+          (d && d.error && typeof d.error === "object" ? d.error.message : "") ||
+          (d && (d.message || (typeof d.error === "string" ? d.error : ""))) || "";
   } catch {
     msg = "";
   }
-  return "HTTP " + el.status + (msg ? ": " + String(msg).slice(0, 200) : "");
+  return "HTTP " + status + (msg ? ": " + String(msg).slice(0, 200) : "");
 }
 
-// The race. Returns { status, body, ctype, elMs, hedgeMs?, sxMs? } for
-// sttResponse. o: { env, ctx, eleven (settleEleven), elCtrl, tElStart,
-// enabled, audio, fileName, get, audioSecs }.
-async function sttWithFallback(o) {
-  let el = null;
-  const elDone = o.eleven.then((r) => { el = r; return "el"; });
-  const fromEleven = (r) => ({ status: r.status, body: r.body, ctype: r.ctype, elMs: r.at - o.tElStart });
-  if (!o.enabled || !o.audio) return fromEleven(await o.eleven);
+// Start one service on the take. o: { env, ctx, apiKey, file, fileName, get, netStatus }.
+function startSttJob(name, o) {
+  if (name === "soniox") return startSonioxJob(o.env, o.ctx, o.file, o.fileName, o.get);
+  if (name === "openai") return startOpenAiJob(o.env, o.file, o.fileName);
+  // ElevenLabs: the ordinary request, fields in the order it has always had.
+  const form = new FormData();
+  form.append("model_id", STT_MODEL_ID);
+  form.append("file", o.file, o.fileName);
+  for (const [n, v] of sttUpstreamFields(o.get)) form.append(n, v);
+  const ctrl = new AbortController();
+  return jobFromFetch(fetch(ELEVENLABS_STT_URL, {
+    method: "POST",
+    headers: { "xi-api-key": o.apiKey },
+    body: form,
+    signal: ctrl.signal,
+  }), ctrl, o.netStatus || 500);
+}
 
-  const waitMs = sttFallbackAfterMs(o.env, o.audioSecs);
+// Whether a failed answer is worth sending to the backup: everything except a
+// recording no service can use (mirrors the client's "permanent").
+function worthFallingBack(p) {
+  if (p.ok) return false;
+  if (p.status === 413) return false;
+  if (p.status === 400 && /too short|too large|empty|no audio/i.test((p.raw || "") + " " + (p.error || ""))) return false;
+  return true;
+}
+
+function decorateJson(raw, extra) {
+  if (!Object.keys(extra).length) return raw;
+  try {
+    return JSON.stringify(Object.assign(JSON.parse(raw), extra));
+  } catch {
+    return raw;
+  }
+}
+
+function primaryResponse(p, plan, tStart) {
+  const waitMs = p.at - tStart;
+  const extra = {};
+  if (plan.primary !== "elevenlabs") extra.stt_provider = plan.primary;
+  if (plan.note) extra.stt_note = plan.note;
+  if (p.ok) {
+    const body = p.raw !== undefined ? decorateJson(p.raw, extra) : JSON.stringify(Object.assign({}, p.body, extra));
+    return { status: p.status || 200, body, ctype: p.raw !== undefined ? (p.ctype || JSON_CT) : JSON_CT, waitMs };
+  }
+  if (p.raw !== undefined) return { status: p.status, body: p.raw, ctype: p.ctype || JSON_CT, waitMs };
+  return {
+    status: p.status || 502, ctype: JSON_CT, waitMs,
+    body: JSON.stringify(Object.assign({ error: STT_SERVICE_NAMES[plan.primary] + " " + p.error }, extra)),
+  };
+}
+
+// The race. o: { env, plan, tStart, primary (job), startBackup (() => job, or
+// null), audioSecs }. Returns { status, body, ctype, waitMs, hedgeMs?,
+// backupMs? } for sttResponse.
+async function sttRace(o) {
+  const plan = o.plan;
+  let p = null;
+  const pDone = o.primary.result.then((r) => { p = Object.assign(r, { at: Date.now() }); return "p"; });
+  if (!o.startBackup) {
+    await pDone;
+    return primaryResponse(p, plan, o.tStart);
+  }
+
+  const waitMs = sttFallbackAfterMs(o.env, plan.primary, o.audioSecs);
   let timer = null;
   const first = await Promise.race([
-    elDone,
+    pDone,
     new Promise((resolve) => { timer = setTimeout(() => resolve("timer"), waitMs); }),
   ]);
   clearTimeout(timer);
-  if (first === "el" && !worthFallingBack(el)) return fromEleven(el);
+  if (first === "p" && !worthFallingBack(p)) return primaryResponse(p, plan, o.tStart);
 
-  const tSx = Date.now();
-  const reason = el
-    ? "returned an error (" + (el.network ? "could not be reached" : "HTTP " + el.status) + ")"
+  const tB = Date.now();
+  const why = p
+    ? "returned an error (" + (p.network ? "could not be reached" : (p.brief || "HTTP " + p.status)) + ")"
     : "had not answered after " + (waitMs % 1000 === 0 ? waitMs / 1000 : (waitMs / 1000).toFixed(1)) + " s";
-  const job = startSonioxJob(o.env, o.ctx, o.audio, o.fileName, o.get);
-  let sx = null;
-  const sxDone = job.result.then((r) => { sx = r; return "sx"; });
-  const hedge = () => ({ hedgeMs: tSx - o.tElStart, sxMs: Date.now() - tSx });
-
-  const fromSoniox = () => ({
+  const reason = STT_SERVICE_NAMES[plan.primary] + " " + why;
+  const job = o.startBackup();
+  let b = null;
+  const bDone = job.result.then((r) => { b = r; return "b"; });
+  const hedge = () => ({ hedgeMs: tB - o.tStart, backupMs: Date.now() - tB });
+  const fromBackup = () => ({
     status: 200,
-    ctype: "application/json; charset=utf-8",
-    body: JSON.stringify(Object.assign({}, sx.body, { stt_provider: "soniox", stt_fallback: reason })),
-    elMs: (el ? el.at : Date.now()) - o.tElStart, // how long ElevenLabs was waited on
+    ctype: JSON_CT,
+    body: JSON.stringify(Object.assign({}, b.body, { stt_provider: plan.backup, stt_fallback: reason },
+      plan.note ? { stt_note: plan.note } : {})),
+    waitMs: (p ? p.at : Date.now()) - o.tStart, // how long the main service was waited on
     ...hedge(),
   });
 
-  const next = el ? await sxDone : await Promise.race([elDone, sxDone]);
-  if (next === "sx" && sx.ok) {
-    try { o.elCtrl.abort(); } catch {} // stop waiting on ElevenLabs
-    return fromSoniox();
+  const next = p ? await bDone : await Promise.race([pDone, bDone]);
+  if (next === "b" && b.ok) {
+    o.primary.abandon(); // stop waiting on the main service
+    return fromBackup();
   }
-  if (next === "el" && !worthFallingBack(el)) {
-    job.abandon(); // ElevenLabs answered first after all; Soniox's job is deleted
-    return { ...fromEleven(el), ...hedge() };
+  if (next === "p" && !worthFallingBack(p)) {
+    job.abandon(); // the main service answered first after all
+    return { ...primaryResponse(p, plan, o.tStart), ...hedge() };
   }
   // One of the two failed: the other is the last chance.
-  if (!sx) await sxDone;
-  if (sx.ok) return fromSoniox();
-  if (!el) await elDone;
-  if (!worthFallingBack(el)) return { ...fromEleven(el), ...hedge() };
+  if (!b) await bDone;
+  if (b.ok) return fromBackup();
+  if (!p) await pDone;
+  if (!worthFallingBack(p)) return { ...primaryResponse(p, plan, o.tStart), ...hedge() };
   return {
     // A 400 would read to the client as a recording no service can use; keep
     // the audio retryable instead.
-    status: el.status === 400 ? 502 : el.status,
-    ctype: "application/json; charset=utf-8",
+    status: p.status === 400 ? 502 : (p.status || 502),
+    ctype: JSON_CT,
     body: JSON.stringify({
-      error: "ElevenLabs " + upstreamMessage(el) + "; the Soniox fallback failed too (" + sx.error + ").",
+      error: STT_SERVICE_NAMES[plan.primary] + " " + p.error + "; the " +
+             STT_SERVICE_NAMES[plan.backup] + " fallback failed too (" + b.error + ").",
     }),
-    elMs: el.at - o.tElStart,
+    waitMs: p.at - o.tStart,
     ...hedge(),
   };
 }
 
+// el = how long the main service was waited on (the name predates the other
+// services; the client's slow-service detection reads it), hedge = when the
+// backup was asked, backup = how long the backup worked.
 function sttResponse(out, before, tBase, after) {
-  let timing = before + ", el;dur=" + Math.max(0, out.elMs || 0) + ", worker;dur=" + (Date.now() - tBase);
+  let timing = before + ", el;dur=" + Math.max(0, out.waitMs || 0) + ", worker;dur=" + (Date.now() - tBase);
   if (typeof out.hedgeMs === "number") timing += ", hedge;dur=" + out.hedgeMs;
-  if (typeof out.sxMs === "number") timing += ", sx;dur=" + out.sxMs;
+  if (typeof out.backupMs === "number") timing += ", backup;dur=" + out.backupMs;
   return new Response(out.body, {
     status: out.status,
     headers: {
-      "content-type": out.ctype || "application/json; charset=utf-8",
+      "content-type": out.ctype || JSON_CT,
       "cache-control": "no-store",
       "server-timing": timing + (after || ""),
     },
   });
+}
+
+// OpenAI names the container by the file name, so the name follows the
+// recording's type (iOS Safari records mp4 even where the client says webm).
+function openAiFileName(type, fallback) {
+  const t = String(type || "").toLowerCase();
+  if (t.includes("mp4") || t.includes("m4a") || t.includes("aac")) return "recording.mp4";
+  if (t.includes("ogg")) return "recording.ogg";
+  if (t.includes("wav")) return "recording.wav";
+  if (t.includes("mpeg") || t.includes("mp3")) return "recording.mp3";
+  if (t.includes("webm")) return "recording.webm";
+  return fallback || "recording.webm";
+}
+
+// One take through OpenAI gpt-transcribe: English, a one-line context prompt,
+// no keyword list (see OPENAI_STT_PROMPT). It returns text only (no word
+// timings, no speakers, no duration), so the speaker filter and the coverage
+// guard have nothing to act on for an OpenAI take.
+function startOpenAiJob(env, file, fileName) {
+  const ctrl = new AbortController();
+  const fd = new FormData();
+  fd.append("model", OPENAI_STT_MODEL);
+  fd.append("file", file, openAiFileName(file.type, fileName));
+  fd.append("languages[]", "en");
+  fd.append("prompt", OPENAI_STT_PROMPT);
+  const result = fetch(OPENAI_STT_URL, {
+    method: "POST",
+    headers: { authorization: "Bearer " + env.OPENAI_API_KEY },
+    body: fd,
+    signal: ctrl.signal,
+  }).then(async (r) => {
+    const raw = await r.text();
+    if (!r.ok) return { ok: false, status: r.status, error: upstreamMessage(r.status, raw), brief: "HTTP " + r.status };
+    let d = null;
+    try { d = JSON.parse(raw); } catch { d = null; }
+    if (!d || typeof d.text !== "string") return { ok: false, status: 502, error: "an unreadable answer", brief: "unreadable answer" };
+    return { ok: true, status: 200, body: { language_code: "en", text: d.text.trim(), words: [] } };
+  }).catch((err) => ({ ok: false, status: 502, network: true, error: "could not be reached (" + (err?.message || String(err)) + ")" }));
+  return { result, abandon() { try { ctrl.abort(); } catch {} } };
 }
 
 function keepAlive(ctx, promise) {
@@ -977,7 +1112,10 @@ function startSonioxJob(env, ctx, audio, fileName, get) {
   let abandoned = false;
   const failed = (step, status, data) => {
     const msg = data && (data.message || data.error_message || data.error_type);
-    return { ok: false, error: step + (status ? " HTTP " + status : "") + (msg ? ": " + String(msg).slice(0, 200) : "") };
+    return {
+      ok: false, status: 502, brief: step + (status ? " HTTP " + status : ""),
+      error: step + (status ? " HTTP " + status : "") + (msg ? ": " + String(msg).slice(0, 200) : ""),
+    };
   };
   const result = (async () => {
     try {
@@ -987,7 +1125,7 @@ function startSonioxJob(env, ctx, audio, fileName, get) {
       let data = await readJsonSafe(r);
       if (!r.ok || !data || !data.id) return failed("upload", r.status, data);
       ids.file = data.id;
-      if (abandoned) return { ok: false, error: "abandoned" };
+      if (abandoned) return { ok: false, status: 499, error: "abandoned" };
 
       r = await fetch(SONIOX_API_URL + "/transcriptions", {
         method: "POST",
@@ -1001,24 +1139,24 @@ function startSonioxJob(env, ctx, audio, fileName, get) {
       let job = data;
       for (let i = 0; job.status !== "completed"; i++) {
         if (job.status === "error") {
-          return { ok: false, error: "job failed: " + String(job.error_message || job.error_type || "no reason given").slice(0, 200) };
+          return { ok: false, status: 502, brief: "job failed", error: "job failed: " + String(job.error_message || job.error_type || "no reason given").slice(0, 200) };
         }
-        if (i >= SONIOX_POLL_MAX) return { ok: false, error: "not finished after " + i + " checks" };
+        if (i >= SONIOX_POLL_MAX) return { ok: false, status: 504, brief: "not finished", error: "not finished after " + i + " checks" };
         await sleepMs(SONIOX_POLL_MS[Math.min(i, SONIOX_POLL_MS.length - 1)]);
-        if (abandoned) return { ok: false, error: "abandoned" };
+        if (abandoned) return { ok: false, status: 499, error: "abandoned" };
         r = await fetch(SONIOX_API_URL + "/transcriptions/" + ids.tx, { headers: auth });
         data = await readJsonSafe(r);
         if (!r.ok || !data) return failed("status", r.status, data);
         job = data;
       }
-      if (abandoned) return { ok: false, error: "abandoned" };
+      if (abandoned) return { ok: false, status: 499, error: "abandoned" };
 
       r = await fetch(SONIOX_API_URL + "/transcriptions/" + ids.tx + "/transcript", { headers: auth });
       data = await readJsonSafe(r);
       if (!r.ok || !data) return failed("transcript", r.status, data);
-      return { ok: true, body: sonioxToElevenShape(data, job.audio_duration_ms) };
+      return { ok: true, status: 200, body: sonioxToElevenShape(data, job.audio_duration_ms) };
     } catch (err) {
-      return { ok: false, error: "network: " + (err?.message || String(err)) };
+      return { ok: false, status: 502, network: true, error: "network: " + (err?.message || String(err)) };
     }
   })();
   keepAlive(ctx, result.then(() => sonioxCleanup(auth, ids)));
@@ -1736,6 +1874,24 @@ const INDEX_HTML = `<!doctype html>
             Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
           </div>
 
+          <label for="sttPrimary">Transcription service (per device)</label>
+          <select id="sttPrimary">
+            <option value="elevenlabs" selected>ElevenLabs Scribe v2 Medical</option>
+            <option value="soniox">Soniox (stt-async-v5)</option>
+            <option value="openai">OpenAI gpt-transcribe</option>
+          </select>
+          <label for="sttBackup">Backup when it is slow or failing</label>
+          <select id="sttBackup">
+            <option value="soniox" selected>Soniox</option>
+            <option value="openai">OpenAI gpt-transcribe</option>
+            <option value="elevenlabs">ElevenLabs</option>
+            <option value="none">None</option>
+          </select>
+          <div class="hint" id="sttHint" style="margin: 6px 0 12px;">
+            Switch the main service here if ElevenLabs is having problems. The backup gets the same
+            recording automatically when the main one errors or has not answered within a few seconds.
+          </div>
+
           <div class="hint" style="margin: 10px 0 4px; color: var(--text);">Phone ↔ desktop link</div>
           <div class="hint" style="margin: 0 0 6px;">Same page, two roles. <b>This computer receives:</b> Start phone session (same as 📱 Pair a phone on the main card). <b>This phone sends:</b> join a desktop by its code (same as 🖥 Pair to a desktop).</div>
           <div class="row" style="margin-bottom: 4px; flex-wrap: wrap; gap: 6px; align-items: center;">
@@ -2042,6 +2198,11 @@ right lower quadrant"></textarea>
 <script>
 (() => {
   const SHARED_MODE      = (__SHARED_MODE__);
+  // Which transcription services this server has a key for (injected at serve
+  // time; ElevenLabs is always there). Booleans only.
+  const STT_AVAILABLE    = (__STT_AVAILABLE__);
+  const STT_NAMES        = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI" };
+  const STT_LONG_NAMES   = { elevenlabs: "ElevenLabs Scribe v2 Medical", soniox: "Soniox (stt-async-v5)", openai: "OpenAI gpt-transcribe" };
   // Deployer-curated keyterm lists (pre-sanitized), injected at serve time.
   const KEYTERM_PRESETS  = (__KEYTERM_PRESETS__);
 
@@ -2101,6 +2262,9 @@ right lower quadrant"></textarea>
   const releaseTailEl      = document.getElementById("releaseTail");
   const releaseTailValEl   = document.getElementById("releaseTailVal");
   const windowTintEl       = document.getElementById("windowTint");
+  const sttPrimaryEl       = document.getElementById("sttPrimary");
+  const sttBackupEl        = document.getElementById("sttBackup");
+  const sttHintEl          = document.getElementById("sttHint");
   const timingReadoutEl    = document.getElementById("timingReadout");
   const copyTimingBtn      = document.getElementById("copyTimingBtn");
   const clearTimingBtn     = document.getElementById("clearTimingBtn");
@@ -3076,6 +3240,10 @@ right lower quadrant"></textarea>
       gateLookahead:  gateLookaheadEl ? gateLookaheadEl.value : String(GATE_LOOKAHEAD_MS_DEFAULT),
       releaseTail:    releaseTailEl ? releaseTailEl.value : String(RELEASE_TAIL_MS_DEFAULT),
       windowTint:     windowTintEl ? windowTintEl.value : "full",
+      // Which service transcribes, and which backs it up (per device for now;
+      // a portable-settings candidate once settings sync).
+      sttPrimary:     sttPrimaryEl ? sttPrimaryEl.value : "elevenlabs",
+      sttBackup:      sttBackupEl ? sttBackupEl.value : "soniox",
       streamUpload:   streamUploadEl ? streamUploadEl.checked : true, // per-device: this network may not stream
       audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
       audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
@@ -3149,6 +3317,12 @@ right lower quadrant"></textarea>
       if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
       if (s.gateLookahead !== undefined && gateLookaheadEl) gateLookaheadEl.value = s.gateLookahead;
       if (s.releaseTail   !== undefined && releaseTailEl)   releaseTailEl.value   = s.releaseTail;
+      if (sttPrimaryEl && (s.sttPrimary === "elevenlabs" || s.sttPrimary === "soniox" || s.sttPrimary === "openai")) {
+        sttPrimaryEl.value = s.sttPrimary;
+      }
+      if (sttBackupEl && (s.sttBackup === "elevenlabs" || s.sttBackup === "soniox" || s.sttBackup === "openai" || s.sttBackup === "none")) {
+        sttBackupEl.value = s.sttBackup;
+      }
       if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
         windowTintEl.value = s.windowTint;
       }
@@ -3268,7 +3442,7 @@ right lower quadrant"></textarea>
       // desktop — the list tracks whether it got there ("Not sent" until a
       // listener acks a delivery that carried it, which stamps sentAt).
       if (meta.sendable) entry.sendable = true;
-      if (meta.stt === "soniox") entry.stt = "soniox"; // transcribed by the Soniox fallback, not ElevenLabs
+      if (meta.stt === "soniox" || meta.stt === "openai") entry.stt = meta.stt; // transcribed by another service, not ElevenLabs
     }
     items.unshift(entry);
     setHistory(items);
@@ -3601,8 +3775,9 @@ right lower quadrant"></textarea>
     }
     const text = cleanTranscript(r.text);
     const base = rec.session.base || "";
-    const viaSoniox = r.provider === "soniox"
-      ? " Transcribed by Soniox — ElevenLabs " + (r.fallbackReason || "was slow") + "." : "";
+    const viaNote = sttOutcomeNote(r);
+    const viaText = viaNote ? " " + viaNote : "";
+    const viaService = r.provider && r.provider !== "elevenlabs" ? r.provider : "";
     // Phone notes layout: a take that was ADDING to a note goes back onto that
     // note — onto its CURRENT text, which may have been edited since — and a
     // take meant to stay on the phone stays there. If the note is gone, the
@@ -3622,12 +3797,12 @@ right lower quadrant"></textarea>
     try {
       const addFields = { appendedAt: new Date().toISOString() };
       if (joinedSessionCode && bigButtonActive()) addFields.sendable = true; // built while paired: meant for the desktop
-      if (viaSoniox) addFields.stt = "soniox";
+      if (viaService) addFields.stt = viaService;
       if (target && updateNoteText(target.createdAt, cleanTranscript(latestText), addFields)) {
         savedId = target.createdAt;
       } else {
         savedId = addHistory(latestText, { language_code: "en", engine: "batch", recovered: true,
-          sendable: Boolean(joinedSessionCode && bigButtonActive()), stt: viaSoniox ? "soniox" : "" }).createdAt;
+          sendable: Boolean(joinedSessionCode && bigButtonActive()), stt: viaService }).createdAt;
       }
     } catch (e) {}
     const copied = await copyText(latestText);
@@ -3651,12 +3826,12 @@ right lower quadrant"></textarea>
     if (bigButtonActive() && savedId) {
       setStatus((target ? "Recovered and added to the note" : "Recovered dictation saved as a note") +
         (joinedSessionCode ? " — NOT sent to the desktop yet." : ".") +
-        (copied ? " Copied here too." : (joinedSessionCode ? "" : " NOT copied — tap Copy on the note.")) + " Verify it." + viaSoniox, "ok", "SAVED");
+        (copied ? " Copied here too." : (joinedSessionCode ? "" : " NOT copied — tap Copy on the note.")) + " Verify it." + viaText, "ok", "SAVED");
       doneBeep();
       updateAppendChip();
       return;
     }
-    if (copied) { setStatus("Recovered dictation transcribed & copied. Verify it before pasting!" + viaSoniox, "ok"); doneBeep(); }
+    if (copied) { setStatus("Recovered dictation transcribed & copied. Verify it before pasting!" + viaText, "ok"); doneBeep(); }
     else { setStatus("Recovered dictation saved but the clipboard copy FAILED — click 'Copy & clear'.", "err"); failBeep(); }
     updateAppendChip();
   }
@@ -3717,7 +3892,7 @@ right lower quadrant"></textarea>
       meta.className = "history-meta";
       meta.textContent = new Date(item.createdAt).toLocaleString() +
         (item.engine ? " · " + item.engine : "") +
-        (item.stt === "soniox" ? " · via Soniox" : "") +
+        (item.stt ? " · via " + sttName(item.stt) : "") +
         (item.editedAt ? " · edited" : "");
 
       // Past transcripts are hand-editable in place — like the active box and
@@ -3750,7 +3925,7 @@ right lower quadrant"></textarea>
         saveHistoryItems(all);
         meta.textContent = new Date(item.createdAt).toLocaleString() +
           (item.engine ? " · " + item.engine : "") +
-          (item.stt === "soniox" ? " · via Soniox" : "") + " · edited";
+          (item.stt ? " · via " + sttName(item.stt) : "") + " · edited";
         original = newText;
         setStatus("Saved edit to the transcript.", "ok");
       });
@@ -3890,6 +4065,56 @@ right lower quadrant"></textarea>
   // is a risk the prime directive (never wrong/missing chart text) doesn't take.
   function diarizeActive() { return Boolean(diarizeEl.checked && bigButtonActive()); }
 
+  // Which service transcribes this device's takes, and which backs it up when
+  // the main one errors or stalls (Options). A service the server has no key
+  // for is greyed out and never sent; the Worker enforces the same rules.
+  function sttUsable(p) { return p === "elevenlabs" || Boolean(STT_AVAILABLE && STT_AVAILABLE[p]); }
+  function sttPrimary() {
+    var p = sttPrimaryEl ? sttPrimaryEl.value : "elevenlabs";
+    return sttUsable(p) ? p : "elevenlabs";
+  }
+  function sttBackup() {
+    var b = sttBackupEl ? sttBackupEl.value : "soniox";
+    if (b === "none" || b === sttPrimary() || !sttUsable(b)) return "none";
+    return b;
+  }
+  function sttName(p) { return STT_NAMES[p] || String(p || "ElevenLabs"); }
+  // What the status line says about which service wrote a take: nothing for
+  // an ordinary ElevenLabs take, the service when another one is the main
+  // service, and the backup plus why when the Worker had to fall back.
+  function sttOutcomeNote(r) {
+    var n = "";
+    if (r && r.fallbackReason) n = "Transcribed by " + sttName(r.provider) + " — " + r.fallbackReason + ".";
+    else if (r && r.provider && r.provider !== "elevenlabs") n = "Transcribed by " + STT_LONG_NAMES[r.provider] + ".";
+    if (r && r.sttNote) n = (n ? n + " " : "") + r.sttNote;
+    return n;
+  }
+  function refreshSttUi() {
+    try {
+      [sttPrimaryEl, sttBackupEl].forEach(function (sel) {
+        if (!sel) return;
+        for (var i = 0; i < sel.options.length; i++) {
+          var o = sel.options[i];
+          if (o.value === "none" || o.value === "elevenlabs") continue;
+          var ok = sttUsable(o.value);
+          o.disabled = !ok;
+          var label = (sel === sttPrimaryEl || o.value === "openai") ? STT_LONG_NAMES[o.value] : STT_NAMES[o.value];
+          o.textContent = label + (ok ? "" : " — not set up on the server");
+        }
+      });
+      if (sttHintEl) {
+        var p = sttPrimary(), b = sttBackup();
+        var msg = SHARED_MODE
+          ? "Now: " + STT_LONG_NAMES[p] + (b === "none" ? ", with no backup." : ", backed up by " + sttName(b) + ".") +
+            " Switch the main service here if it is having problems; the backup gets the same recording automatically when the main one errors or has not answered within a few seconds."
+          : "With your own ElevenLabs key only ElevenLabs is available; the other services need the shared access code.";
+        if (p !== "elevenlabs") msg += " Only ElevenLabs uploads while you dictate, so " + sttName(p) + " starts when you let go.";
+        if (p === "openai" || b === "openai") msg += " OpenAI returns text only: its takes get no speaker filter, no incomplete-transcript check and no keyterms.";
+        sttHintEl.textContent = msg;
+      }
+    } catch (e) {}
+  }
+
   /* ───── Batch transcription call (pure batch mode + hybrid refine) ───── */
   // A long upload must never read as a hang. The deadline is now duration- AND
   // size-aware (up to UPLOAD_DEADLINE_MAX_MS on a big take over a slow uplink),
@@ -3908,7 +4133,7 @@ right lower quadrant"></textarea>
           const secs = Math.round((Date.now() - t0) / 1000);
           if (secs < 2) return; // don't clutter a fast take
           setStatus(label + "… " + secs + "s" + (cap ? " (allowing up to " + cap + "s" +
-            (slow ? " — ElevenLabs has been slow" : "") + ")" : ""), "warn");
+            (slow ? " — " + sttName(sttPrimary()) + " has been slow" : "") + ")" : ""), "warn");
         } catch (e) {}
       }, 1000);
     } catch (e) { uploadTicker = null; }
@@ -3932,6 +4157,8 @@ right lower quadrant"></textarea>
       ["no_verbatim", "true"], // always on — the "remove filler/false starts" toggle was removed
       ["tag_audio_events", String(tagEventsEl.checked)],
       ["diarize", String(diarizeActive())], // keep-primary-speaker: drop bystander voices — phone/big-button surface only
+      ["stt_primary", sttPrimary()], // which service transcribes (Options)
+      ["stt_backup", sttBackup()],   // ...and which one the Worker asks when it errors or stalls
       ["keyterms_json", precomputedBatchKeyterms || JSON.stringify(
         effectiveKeyterms(BATCH_KEYTERM_MAX_CHARS, BATCH_KEYTERM_MAX_TERMS)
       )], // [LATENCY] reuse the snapshot taken at session start; fall back if absent
@@ -3955,12 +4182,12 @@ right lower quadrant"></textarea>
         var mEl    = /(^|[ ,])el;dur=([0-9.]+)/.exec(stHeader);
         var mWk    = /worker;dur=([0-9.]+)/.exec(stHeader);
         var mHedge = /hedge;dur=([0-9.]+)/.exec(stHeader); // when the Soniox fallback was started
-        var mSx    = /sx;dur=([0-9.]+)/.exec(stHeader);    // how long Soniox worked
+        var mSx    = /backup;dur=([0-9.]+)/.exec(stHeader); // how long the backup service worked
         if (mParse) takeTimings.serverParseMs = Math.round(Number(mParse[1]));
         if (mEl)    takeTimings.serverElMs    = Math.round(Number(mEl[2]));
         if (mWk)    takeTimings.serverTotalMs = Math.round(Number(mWk[1]));
         if (mHedge) takeTimings.serverHedgeMs = Math.round(Number(mHedge[1]));
-        if (mSx)    takeTimings.serverSxMs    = Math.round(Number(mSx[1]));
+        if (mSx)    takeTimings.serverBackupMs = Math.round(Number(mSx[1]));
       }
     } catch (e) {}
     const raw = await res.text();
@@ -3986,10 +4213,14 @@ right lower quadrant"></textarea>
       };
     }
     var text = String(data.text || data.transcript || "");
-    // The Worker's Soniox fallback answers in ElevenLabs' shape and says so.
-    var provider = data.stt_provider === "soniox" ? "soniox" : "elevenlabs";
-    var fallbackReason = provider === "soniox" ? String(data.stt_fallback || "was slow").slice(0, 120) : "";
-    try { if (takeTimings) takeTimings.provider = provider; } catch (e) {}
+    // Which service wrote it: the main one, or the backup the Worker asked
+    // because the main one errored or stalled (stt_fallback says why). Every
+    // service answers in ElevenLabs' shape.
+    var provider = (data.stt_provider === "soniox" || data.stt_provider === "openai" || data.stt_provider === "elevenlabs")
+      ? data.stt_provider : "elevenlabs";
+    var fallbackReason = data.stt_fallback ? String(data.stt_fallback).slice(0, 160) : "";
+    var sttNote = data.stt_note ? String(data.stt_note).slice(0, 200) : "";
+    try { if (takeTimings) { takeTimings.provider = provider; takeTimings.fallback = Boolean(fallbackReason); } } catch (e) {}
     var removedWords = 0;
     var removedShare = 0;
     var unfilteredText = "";
@@ -4015,7 +4246,7 @@ right lower quadrant"></textarea>
       }
     }
     return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs,
-             provider: provider, fallbackReason: fallbackReason };
+             provider: provider, fallbackReason: fallbackReason, sttNote: sttNote };
   }
 
   async function batchTranscribe(blob, fileName, timeoutMs, label, recMs) {
@@ -4122,6 +4353,7 @@ right lower quadrant"></textarea>
   function openTakeStream(mimeType) {
     abortTakeStream("superseded"); // never two streams: a leftover belongs to no take
     if (!streamUploadEl || !streamUploadEl.checked || streamOffReason || !uploadStreamingSupported()) return;
+    if (sttPrimary() !== "elevenlabs") return; // the stream feeds ElevenLabs; another main service gets the whole take at release
     var st = {
       seq: sessionSeq, bytes: 0, chunks: 0, chain: Promise.resolve(),
       failed: "", aborted: false, controller: null, response: null,
@@ -4280,7 +4512,8 @@ right lower quadrant"></textarea>
   // an ordinary upload may (hotkey.ahk's CLIP_TIMEOUT covers that cap).
   async function transcribeTake(st, blob, blobChunks, fileName, deadlineMs, recMs) {
     if (!st) {
-      noteTakePath("batch", streamOffReason ? "streaming off until reload: " + streamOffReason : "");
+      noteTakePath("batch", sttPrimary() !== "elevenlabs" ? "main service " + sttName(sttPrimary()) + " (streams only to ElevenLabs)"
+        : (streamOffReason ? "streaming off until reload: " + streamOffReason : ""));
       return batchTranscribe(blob, fileName, deadlineMs, undefined, recMs);
     }
     var t0 = Date.now();
@@ -4402,7 +4635,8 @@ right lower quadrant"></textarea>
       takeTimings.serverElMs = null;
       takeTimings.serverTotalMs = null;
       takeTimings.serverHedgeMs = null;
-      takeTimings.serverSxMs = null;
+      takeTimings.serverBackupMs = null;
+      takeTimings.fallback = false;
       takeTimings.provider = "";
     } catch (e) {}
   }
@@ -4457,13 +4691,17 @@ right lower quadrant"></textarea>
         errKind:  t.errKind || "",
         deadline: (typeof t.deadlineMs === "number") ? t.deadlineMs : null,
         path:     t.path || "",     // [LATENCY] stream / batch / stream>batch
-        // [RELIABILITY] Who transcribed it: "soniox" when the Worker's fallback
-        // answered because ElevenLabs was slow or failing. hedgeMs = when the
-        // fallback was started (also set when ElevenLabs then won the race),
-        // sxMs = how long Soniox worked.
+        // [RELIABILITY] Who transcribed it. primary = the main service this
+        // device asked for (elMs is ITS wait, whatever the column is called);
+        // provider = the one that answered; fallback = the Worker had to ask
+        // the backup because the main one errored or stalled. hedgeMs = when
+        // the backup was asked (also set when the main one then won the race),
+        // backupMs = how long the backup worked.
+        primary:  t.primary || "",
         provider: t.provider || "",
+        fallback: Boolean(t.fallback),
         hedgeMs:  (typeof t.serverHedgeMs === "number") ? t.serverHedgeMs : null,
-        sxMs:     (typeof t.serverSxMs === "number") ? t.serverSxMs : null,
+        backupMs: (typeof t.serverBackupMs === "number") ? t.serverBackupMs : null,
         // Why a stream fell back: a class of error, never a URL or body. One
         // line, bounded, so it can never break a TSV row.
         pathNote: String(t.pathNote || "").replace(/\\s+/g, " ").slice(0, 160),
@@ -4519,7 +4757,7 @@ right lower quadrant"></textarea>
         "Last take: flush " + fmtMs(entry.flush) +
         " · upload " + fmtMs(entry.upload) +
         " · service " + fmtMs(entry.service) +
-        (typeof entry.elMs === "number" ? " (ElevenLabs " + entry.elMs + " ms, net " + fmtMs(entry.net) + ")" : "") +
+        (typeof entry.elMs === "number" ? " (" + sttName(entry.primary || "elevenlabs") + " " + entry.elMs + " ms, net " + fmtMs(entry.net) + ")" : "") +
         " · deliver " + fmtMs(entry.deliver) +
         " = " + fmtMs(entry.total) +
         "  [" + (entry.recMs / 1000).toFixed(1) + "s take, " + entry.kb + " KB, " +
@@ -4528,9 +4766,11 @@ right lower quadrant"></textarea>
         (entry.path === "stream" ? ", uploaded while dictating" : "") +
         (entry.path === "stream>batch" ? ", stream fell back (" + (entry.pathNote || "?") + ")" : "") +
         (entry.path === "batch" && entry.pathNote ? ", " + entry.pathNote : "") + "]" +
-        (entry.provider === "soniox"
-          ? "  TRANSCRIBED BY SONIOX: ElevenLabs was given " + fmtMs(entry.hedgeMs) + ", Soniox took " + fmtMs(entry.sxMs) + "."
-          : (typeof entry.hedgeMs === "number" ? "  (Soniox was asked at " + entry.hedgeMs + " ms; ElevenLabs answered first.)" : ""));
+        (entry.fallback
+          ? "  TRANSCRIBED BY " + sttName(entry.provider).toUpperCase() + " (the backup): " + sttName(entry.primary || "elevenlabs") +
+            " was given " + fmtMs(entry.hedgeMs) + ", " + sttName(entry.provider) + " took " + fmtMs(entry.backupMs) + "."
+          : (entry.provider && entry.provider !== "elevenlabs" ? "  Transcribed by " + sttName(entry.provider) + "." : "") +
+            (typeof entry.hedgeMs === "number" ? "  (The backup was asked at " + entry.hedgeMs + " ms; " + sttName(entry.primary || "elevenlabs") + " answered first.)" : ""));
       var sum = timingSummaryLine();
       timingReadoutEl.textContent = head + (sum ? "\\n" + sum : "");
     } catch (e) {}
@@ -4544,15 +4784,15 @@ right lower quadrant"></textarea>
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
       if (!Array.isArray(log) || !log.length) return "";
-      var fails = 0, noReply = 0, els = [], nets = [], viaSoniox = 0;
+      var fails = 0, noReply = 0, els = [], nets = [], viaBackup = 0;
       for (var i = 0; i < log.length; i++) {
         var e = log[i] || {};
-        if (e.provider === "soniox") viaSoniox++;
+        if (e.fallback) viaBackup++;
         if (e.errKind) {
           fails++;
           if (e.stage !== "headers" && e.stage !== "body") noReply++;
         }
-        if (typeof e.elMs === "number") els.push(e.elMs);
+        if (typeof e.elMs === "number" && (!e.primary || e.primary === "elevenlabs") && !e.fallback) els.push(e.elMs);
         if (typeof e.net === "number") nets.push(e.net);
       }
       var mEl = medianOf(els), mNet = medianOf(nets);
@@ -4560,7 +4800,7 @@ right lower quadrant"></textarea>
                 fails + " failed" + (fails ? " (" + noReply + " with NO reply from the service)" : "");
       if (mEl !== null)  out += " · median ElevenLabs " + mEl + " ms";
       if (mNet !== null) out += " · median our network " + mNet + " ms";
-      if (viaSoniox) out += " · " + viaSoniox + " transcribed by Soniox (ElevenLabs slow or failing)";
+      if (viaBackup) out += " · " + viaBackup + " transcribed by the backup service (main one slow or failing)";
       if (fails > 0 && noReply === fails) out += " — the failures are the UPLOAD leg, not transcription";
       return out;
     } catch (e) { return ""; }
@@ -4576,7 +4816,7 @@ right lower quadrant"></textarea>
   function timingLogTsv() {
     var cols = ["at","outcome","stage","errKind","deadline","total","flush","upload","service","net","elMs","parseMs","workerMs",
                 "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize","path","pathNote",
-                "provider","hedgeMs","sxMs"];
+                "primary","provider","fallback","hedgeMs","backupMs"];
     var out = [cols.join("\\t")];
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
@@ -5568,7 +5808,7 @@ right lower quadrant"></textarea>
         if (!isFinite(at) || now - at > SLOW_SERVICE_WINDOW_MS) break; // newest first: the rest are older
         if (e.errKind === "timeout") return true;
         if (typeof e.elMs === "number" && e.elMs > SLOW_SERVICE_EL_MS) return true;
-        if (e.provider === "soniox") return true; // the Worker had to fall back: ElevenLabs was slow or failing
+        if (e.fallback === true) return true; // the Worker had to ask the backup: the main service was slow or failing
       }
     } catch (e) {}
     return false;
@@ -5678,7 +5918,7 @@ right lower quadrant"></textarea>
 
     const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
     const deadlineMs = batchUploadTimeoutMs(recMs, blob.size || 0);
-    if (takeTimings) takeTimings.deadlineMs = deadlineMs;
+    if (takeTimings) { takeTimings.deadlineMs = deadlineMs; takeTimings.primary = sttPrimary(); }
     const r = await transcribeTake(streamed, blob, blobChunks, fileName, deadlineMs, recMs);
 
     if (!r.ok) {
@@ -5721,13 +5961,13 @@ right lower quadrant"></textarea>
       ? ("Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers." +
          (degraded ? " VERIFY nothing of yours was dropped — the unfiltered version is saved in history." : ""))
       : "";
-    // The Worker's Soniox fallback carried this take because ElevenLabs was slow
-    // or failing. A real transcript, so a clean success (during an outage every
-    // take would otherwise warn, and a warning on every take teaches the user
-    // to ignore warnings), but the status says which engine wrote it.
-    if (r.provider === "soniox") {
-      note = "Transcribed by Soniox — ElevenLabs " + (r.fallbackReason || "was slow") + "." + (note ? " " + note : "");
-    }
+    // Another service wrote this take: the one chosen in Options, or the
+    // backup the Worker asked because the main one was slow or failing. A real
+    // transcript, so a clean success (during an outage every take would
+    // otherwise warn, and a warning on every take teaches the user to ignore
+    // warnings), but the status says which service wrote it and why.
+    var sttN = sttOutcomeNote(r);
+    if (sttN) note = sttN + (note ? " " + note : "");
 
     // Coverage guard: a partial result must never read as a clean "Done!". The
     // text is still delivered (it is real, just possibly incomplete); the diag
@@ -5851,7 +6091,7 @@ right lower quadrant"></textarea>
         const addFields = { appendedAt: new Date().toISOString() };
         if (opts.unfilteredText) addFields.unfiltered = opts.unfilteredText;
         if (joinedSessionCode && phoneLayout) addFields.sendable = true; // built while paired: meant for the desktop
-        if (opts.provider === "soniox") addFields.stt = "soniox"; // some of this note came from the fallback
+        if (opts.provider && opts.provider !== "elevenlabs") addFields.stt = opts.provider; // some of this note came from another service
         if (updateNoteText(target.createdAt, cleaned, addFields)) {
           noteId = target.createdAt;
           addedToNote = true;
@@ -5860,7 +6100,7 @@ right lower quadrant"></textarea>
       if (!noteId) {
         const meta = { language_code: "en", engine: sessionEngine, unfiltered: opts.unfilteredText || "",
           sendable: Boolean(joinedSessionCode && phoneLayout) };
-        if (opts.provider === "soniox") meta.stt = "soniox"; // transcribed by the fallback, not ElevenLabs
+        if (opts.provider && opts.provider !== "elevenlabs") meta.stt = opts.provider; // transcribed by another service, not ElevenLabs
         noteId = addHistory(cleaned, meta).createdAt;
       }
     } catch (e) {}
@@ -7587,7 +7827,7 @@ right lower quadrant"></textarea>
     if (!sameDay) {
       try { day = d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", "; } catch (e) { day = d.toDateString() + ", "; }
     }
-    return day + time + (item.recovered ? " · recovered" : "") + (item.stt === "soniox" ? " · via Soniox" : "");
+    return day + time + (item.recovered ? " · recovered" : "") + (item.stt ? " · via " + sttName(item.stt) : "");
   }
 
   function notePreview(text) {
@@ -8418,6 +8658,21 @@ right lower quadrant"></textarea>
     applyWindowTintMode();
     saveSettings();
   });
+  if (sttPrimaryEl) sttPrimaryEl.addEventListener("change", () => {
+    // The backup can never be the main service: move it off the new choice.
+    if (sttBackupEl && sttBackupEl.value === sttPrimaryEl.value) {
+      sttBackupEl.value = sttPrimaryEl.value !== "elevenlabs" ? "elevenlabs"
+        : (sttUsable("soniox") ? "soniox" : (sttUsable("openai") ? "openai" : "none"));
+    }
+    refreshSttUi();
+    saveSettings();
+    setStatus("Transcription service: " + STT_LONG_NAMES[sttPrimary()] +
+      (sttBackup() === "none" ? ", no backup." : ", backed up by " + sttName(sttBackup()) + "."), "");
+  });
+  if (sttBackupEl) sttBackupEl.addEventListener("change", () => {
+    refreshSttUi();
+    saveSettings();
+  });
   if (copyTimingBtn) copyTimingBtn.addEventListener("click", async () => {
     var ok = await copyText(timingLogTsv());
     setStatus(ok ? "Timing log copied (TSV)." : "Could not copy the timing log — click the page, then retry.", ok ? "ok" : "err");
@@ -8642,6 +8897,7 @@ right lower quadrant"></textarea>
   seedIosAudioDefaults(); // after loadSettings (respect a hand-tuned device), before updateGateLabels/tryWarmOnLoad so the seeded gain+gate are reflected and built
   applyEngineUI();
   applyWindowTintMode();   // window-wide recording cue: paint the persisted mode at boot
+  refreshSttUi();          // the chosen transcription service + backup (greys out services with no key)
   renderTimingReadout(null); // show the most recent stored take, if any
   updateGateLabels();
   updateKeytermHint();

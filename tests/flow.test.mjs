@@ -5897,15 +5897,18 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 54. [RELIABILITY] The Soniox fallback (Worker). When ElevenLabs returns an
-//     error, or has not answered a few seconds after it has the whole take, the
-//     Worker sends the SAME audio to Soniox's async API and the first good
-//     transcript wins. Soniox's tokens are reshaped into ElevenLabs' shape (text,
-//     per-word timings in seconds, speakers, decoded duration) and labelled.
-//     Soniox's file and job are always deleted afterwards. It never runs for a
-//     recording no service can use, without SONIOX_API_KEY, or on a BYO key.
+// 54. [RELIABILITY] The main service and its backup (Worker). When the main
+//     service (ElevenLabs unless the client chose another) returns an error, or
+//     has not answered a few seconds after it has the whole take, the Worker
+//     sends the SAME audio to the backup (Soniox unless the client chose
+//     another) and the first good transcript wins. Soniox's tokens are reshaped
+//     into ElevenLabs' shape (text, per-word timings in seconds, speakers,
+//     decoded duration); OpenAI gpt-transcribe returns text only. Answers are
+//     labelled. Soniox's file and job are always deleted afterwards. A backup
+//     never runs for a recording no service can use, without its key, or on a
+//     BYO key.
 // ─────────────────────────────────────────────────────────────────────────────
-console.log('--- scenario 54: the Soniox fallback (Worker) ---');
+console.log('--- scenario 54: the main service and its backup (Worker) ---');
 {
   const realFetch = globalThis.fetch;
   const EL_URL = 'https://api.elevenlabs.io/v1/speech-to-text';
@@ -5921,6 +5924,7 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
   ];
   let el = { mode: 'ok' }; // ok | status | late | hang
   let sx = {};
+  let oa = { mode: 'ok' }; // ok | status | hang
   let calls = [];
   const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
   globalThis.fetch = async (url, init = {}) => {
@@ -5942,6 +5946,22 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
         const t = el.mode === 'late' ? setTimeout(() => resolve(jsonRes({ text: 'Late ElevenLabs text.' })), el.delayMs) : null;
         if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; clearTimeout(t); reject(new DOMException('aborted', 'AbortError')); });
       });
+    }
+    if (url === 'https://api.openai.com/v1/audio/transcriptions') {
+      const fd = init.body;
+      const f = fd.get('file');
+      rec.oa = {
+        model: fd.get('model'), languages: fd.getAll('languages[]'), language: fd.get('language'), prompt: fd.get('prompt'),
+        keywords: fd.getAll('keywords[]'), fileName: f.name, fileType: f.type, fileBytes: Buffer.from(await f.arrayBuffer()),
+        fields: [...fd.keys()],
+      };
+      if (oa.mode === 'status') return jsonRes({ error: { message: 'server had an error', type: 'server_error' } }, oa.status);
+      if (oa.mode === 'hang') {
+        return new Promise((resolve, reject) => {
+          if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('aborted', 'AbortError')); });
+        });
+      }
+      return jsonRes({ text: ' OpenAI note about hematochezia. ', languages: [{ code: 'en' }], usage: { type: 'duration', seconds: 3 } });
     }
     if (url.startsWith(SX)) {
       const path = url.slice(SX.length);
@@ -5977,12 +5997,12 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
   const pending = [];
   const ctx = { waitUntil: (p) => { pending.push(p); } };
   const settle = async () => { while (pending.length) await Promise.all(pending.splice(0)); };
-  const env54 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx-key', SONIOX_FALLBACK_AFTER_MS: '150' };
+  const env54 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx-key', OPENAI_API_KEY: 'oa-key', SONIOX_FALLBACK_AFTER_MS: '150' };
   const audio54 = new Uint8Array(4096); for (let i = 0; i < audio54.length; i++) audio54[i] = i % 251;
   const mkUpload54 = (o = {}) => {
     const fd = new FormData();
     if (o.byo) fd.append('api_key', 'byo-key'); else fd.append('passphrase', 'sesame');
-    fd.append('file', new Blob([audio54], { type: 'audio/webm' }), 'recording.webm');
+    fd.append('file', new Blob([audio54], { type: o.type || 'audio/webm' }), 'recording.webm');
     fd.append('file_format', 'other');
     fd.append('timestamps_granularity', 'word');
     fd.append('no_verbatim', 'true');
@@ -5990,10 +6010,14 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
     fd.append('diarize', String(Boolean(o.diarize)));
     fd.append('keyterms_json', JSON.stringify(['metoprolol', 'hematochezia']));
     if (o.recMs) fd.append('rec_ms', String(o.recMs));
+    if (o.primary) fd.append('stt_primary', o.primary);
+    if (o.backup) fd.append('stt_backup', o.backup);
     return new Request('https://dictation.test/api/transcribe', { method: 'POST', body: fd });
   };
-  const reset = (elMode, sxMode) => { el = elMode; sx = sxMode || {}; calls = []; };
+  const reset = (elMode, sxMode, oaMode) => { el = elMode; sx = sxMode || {}; oa = oaMode || { mode: 'ok' }; calls = []; };
   const sxCalls = () => calls.filter((c) => c.url.startsWith(SX));
+  const oaCalls = () => calls.filter((c) => c.url.startsWith('https://api.openai.com/'));
+  const elCalls = () => calls.filter((c) => c.url === EL_URL);
   const timingOf = (r) => r.headers.get('server-timing') || '';
   const durOf = (st, name) => { const m = new RegExp('(^|[ ,])' + name + ';dur=(\\d+)').exec(st); return m ? Number(m[2]) : null; };
 
@@ -6012,7 +6036,7 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
     r = await worker.default.fetch(mkUpload54(), env54, ctx);
     body = await r.json();
     check('s54b: a silent ElevenLabs is backed up by Soniox (200)', r.status === 200 && body.stt_provider === 'soniox', r.status + ' ' + JSON.stringify(body).slice(0, 200));
-    check('s54b: the reason says ElevenLabs had not answered', /^had not answered after [0-9.]+ s$/.test(body.stt_fallback || ''), body.stt_fallback);
+    check('s54b: the reason says ElevenLabs had not answered', /^ElevenLabs had not answered after [0-9.]+ s$/.test(body.stt_fallback || ''), body.stt_fallback);
     check('s54b: Soniox tokens are rebuilt into words ("hema"+"to"+"che"+"zia" + ".")', body.text === 'Patient has hematochezia.', body.text);
     check('s54b: words carry ElevenLabs-shaped timings in seconds',
       Array.isArray(body.words) && body.words.length === 3 && body.words[2].text === 'hematochezia.' &&
@@ -6038,7 +6062,7 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
     check('s54b: the ElevenLabs request is abandoned once Soniox answered', calls.find((c) => c.url === EL_URL).aborted === true);
     const st54b = timingOf(r);
     check('s54b: Server-Timing says when the fallback started and how long Soniox took',
-      durOf(st54b, 'hedge') >= 140 && durOf(st54b, 'hedge') < 330 && durOf(st54b, 'sx') !== null && durOf(st54b, 'el') >= 140, st54b);
+      durOf(st54b, 'hedge') >= 140 && durOf(st54b, 'hedge') < 330 && durOf(st54b, 'backup') !== null && durOf(st54b, 'el') >= 140, st54b);
     check('s54b: the answer came soon after the fallback started', Date.now() - t0 < 2500, Date.now() - t0);
     await settle();
     const dels = sxCalls().filter((c) => c.method === 'DELETE').map((c) => c.url.slice(SX.length));
@@ -6050,7 +6074,7 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
     r = await worker.default.fetch(mkUpload54(), { ...env54, SONIOX_FALLBACK_AFTER_MS: '5000' }, ctx);
     body = await r.json();
     check('s54c: an ElevenLabs 503 goes to Soniox immediately', r.status === 200 && body.stt_provider === 'soniox' && Date.now() - t0 < 2000, r.status + ' ' + (Date.now() - t0) + 'ms');
-    check('s54c: ...and the reason names the error', body.stt_fallback === 'returned an error (HTTP 503)', body.stt_fallback);
+    check('s54c: ...and the reason names the error', body.stt_fallback === 'ElevenLabs returned an error (HTTP 503)', body.stt_fallback);
     await settle();
 
     // (c2) a 400 that is not about the audio (a rejected field) is worth the fallback too
@@ -6152,6 +6176,76 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
     check('s54l: a 5 s take waits 150 + 40 ms per second before the fallback', hedgeL >= 340 && hedgeL < 700, timingOf(r));
     await settle();
 
+    // (p) OpenAI gpt-transcribe as the MAIN service: text only, no keyword list
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'openai', backup: 'soniox' }), env54, ctx);
+    body = await r.json();
+    check('s54p: OpenAI as the main service answers, labelled', r.status === 200 && body.stt_provider === 'openai' && body.text === 'OpenAI note about hematochezia.' && !body.stt_fallback,
+      r.status + ' ' + JSON.stringify(body));
+    check('s54p: ...in ElevenLabs\' shape with no word timings (the guards no-op)', Array.isArray(body.words) && body.words.length === 0 && !('audio_duration_secs' in body), JSON.stringify(body));
+    check('s54p: ...and neither ElevenLabs nor Soniox is contacted', elCalls().length === 0 && sxCalls().length === 0, elCalls().length + '/' + sxCalls().length);
+    const oaReq = (oaCalls()[0] || {}).oa || {};
+    check('s54p: the request is gpt-transcribe, English via languages[] (never language), with a context prompt',
+      oaReq.model === 'gpt-transcribe' && JSON.stringify(oaReq.languages) === '["en"]' && oaReq.language === null && /clinician/.test(oaReq.prompt || ''),
+      JSON.stringify({ model: oaReq.model, languages: oaReq.languages, language: oaReq.language, prompt: oaReq.prompt }));
+    check('s54p: no keyword list goes to OpenAI (it can make unspoken terms appear)', (oaReq.keywords || []).length === 0 && !(oaReq.fields || []).some((f) => /keyword/.test(f)), JSON.stringify(oaReq.fields));
+    check('s54p: OpenAI gets the same audio under a name matching its type, with the OpenAI key only',
+      Buffer.compare(oaReq.fileBytes || Buffer.alloc(0), Buffer.from(audio54)) === 0 && oaReq.fileName === 'recording.webm' &&
+      oaCalls()[0].headers.authorization === 'Bearer oa-key' && !JSON.stringify(oaCalls()[0].headers).includes('sesame'),
+      oaReq.fileName + ' ' + JSON.stringify(oaCalls()[0] && oaCalls()[0].headers));
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'openai', backup: 'none', type: 'audio/mp4' }), env54, ctx);
+    check('s54p: an iPhone mp4 recording is named .mp4 for OpenAI', ((oaCalls()[0] || {}).oa || {}).fileName === 'recording.mp4', ((oaCalls()[0] || {}).oa || {}).fileName);
+
+    // (q) OpenAI as the main service fails: its backup (Soniox) carries the take
+    reset({ mode: 'ok' }, {}, { mode: 'status', status: 500 });
+    r = await worker.default.fetch(mkUpload54({ primary: 'openai', backup: 'soniox' }), env54, ctx);
+    body = await r.json();
+    check('s54q: a failing OpenAI main service falls back to Soniox',
+      r.status === 200 && body.stt_provider === 'soniox' && body.stt_fallback === 'OpenAI returned an error (HTTP 500)' && body.text === 'Patient has hematochezia.',
+      r.status + ' ' + JSON.stringify(body).slice(0, 200));
+    await settle();
+
+    // (r) Soniox as the main service, ElevenLabs as its backup
+    reset({ mode: 'ok' }, { polls: ['error'] });
+    r = await worker.default.fetch(mkUpload54({ primary: 'soniox', backup: 'elevenlabs' }), env54, ctx);
+    body = await r.json();
+    check('s54r: a failed Soniox job falls back to ElevenLabs, labelled',
+      r.status === 200 && body.text === 'ElevenLabs text.' && body.stt_provider === 'elevenlabs' && /^Soniox returned an error \(job failed\)$/.test(body.stt_fallback || ''),
+      r.status + ' ' + JSON.stringify(body));
+    const elReqR = elCalls()[0];
+    check('s54r: ElevenLabs is asked only after Soniox failed', !!elReqR && elReqR.at >= sxCalls().find((c) => c.config).at, elCalls().length);
+    await settle();
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'soniox', backup: 'elevenlabs' }), env54, ctx);
+    body = await r.json();
+    check('s54r: Soniox as the main service answers, labelled, and ElevenLabs is never asked',
+      r.status === 200 && body.stt_provider === 'soniox' && !body.stt_fallback && elCalls().length === 0, r.status + ' ' + JSON.stringify(body).slice(0, 120) + ' el=' + elCalls().length);
+    await settle();
+
+    // (s) OpenAI as the BACKUP of a silent ElevenLabs
+    reset({ mode: 'hang' });
+    r = await worker.default.fetch(mkUpload54({ backup: 'openai' }), env54, ctx);
+    body = await r.json();
+    check('s54s: OpenAI can be the backup', r.status === 200 && body.stt_provider === 'openai' && /^ElevenLabs had not answered/.test(body.stt_fallback || '') && sxCalls().length === 0,
+      r.status + ' ' + JSON.stringify(body).slice(0, 160));
+
+    // (t) no backup chosen, or the backup equal to the main service: no backup
+    for (const [label, o] of [['none', { backup: 'none' }], ['the same service', { primary: 'elevenlabs', backup: 'elevenlabs' }]]) {
+      reset({ mode: 'status', status: 503, body: { detail: { message: 'service overloaded' } } });
+      r = await worker.default.fetch(mkUpload54(o), env54, ctx);
+      check('s54t: backup ' + label + ' = no backup (the 503 passes through)', r.status === 503 && sxCalls().length === 0 && oaCalls().length === 0 && elCalls().length === 1,
+        r.status + ' sx=' + sxCalls().length + ' oa=' + oaCalls().length + ' el=' + elCalls().length);
+    }
+
+    // (u) a main service with no key here: ElevenLabs transcribes, and says so
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'openai', backup: 'soniox' }), { ...env54, OPENAI_API_KEY: '' }, ctx);
+    body = await r.json();
+    check('s54u: an unconfigured main service falls back to ElevenLabs WITH a note',
+      r.status === 200 && body.text === 'ElevenLabs text.' && /OpenAI is not set up on the server/.test(body.stt_note || '') && oaCalls().length === 0,
+      r.status + ' ' + JSON.stringify(body));
+
     // (m) the streamed route: the Worker keeps the audio it relayed and sends
     //     Soniox exactly that when ElevenLabs stalls after the release
     const openStream54 = (env) => {
@@ -6198,8 +6292,22 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
       ctl.close();
       r = (await Promise.race([resP, sleep(5000).then(() => null)])) || new Response('{}', { status: 599 });
       body = await r.json();
-      check('s54n: an early ElevenLabs refusal of a streamed take falls back to Soniox', r.status === 200 && body.stt_provider === 'soniox' && body.stt_fallback === 'returned an error (HTTP 401)', r.status + ' ' + JSON.stringify(body).slice(0, 160));
+      check('s54n: an early ElevenLabs refusal of a streamed take falls back to Soniox', r.status === 200 && body.stt_provider === 'soniox' && body.stt_fallback === 'ElevenLabs returned an error (HTTP 401)', r.status + ' ' + JSON.stringify(body).slice(0, 160));
       await settle();
+    }
+
+    // (w) a streamed take always has ElevenLabs as its main service
+    reset({ mode: 'ok' });
+    {
+      const { ctl, resP } = openStream54();
+      ctl.enqueue(streamJson(STREAM_O, { ...opts54, stt_primary: 'soniox', stt_backup: 'openai' }));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(2048).fill(1)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 2048, chunks: 1 }));
+      ctl.close();
+      r = (await Promise.race([resP, sleep(5000).then(() => null)])) || new Response('{}', { status: 599 });
+      body = await r.json();
+      check('s54w: a streamed take goes to ElevenLabs whatever the options say', r.status === 200 && body.text === 'ElevenLabs text.' && elCalls().length === 1 && sxCalls().length === 0 && oaCalls().length === 0,
+        r.status + ' ' + JSON.stringify(body).slice(0, 120));
     }
 
     // (o) a streamed take that fails its integrity check never reaches Soniox
@@ -6253,9 +6361,9 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
         const soniox = answer === 'soniox';
         const bodyObj = soniox
           ? { language_code: 'en', text: 'Fallback note about hematochezia.', words: [{ text: 'Fallback', start: 0.1, end: 0.5, type: 'word' }],
-              audio_duration_secs: 0.9, stt_provider: 'soniox', stt_fallback: 'had not answered after 4 s' }
+              audio_duration_secs: 0.9, stt_provider: 'soniox', stt_fallback: 'ElevenLabs had not answered after 4 s' }
           : { text: 'Normal note.' };
-        const timing = soniox ? 'parse;dur=1, el;dur=4100, worker;dur=5230, hedge;dur=4000, sx;dur=1130' : 'parse;dur=1, el;dur=400, worker;dur=420';
+        const timing = soniox ? 'parse;dur=1, el;dur=4100, worker;dur=5230, hedge;dur=4000, backup;dur=1130' : 'parse;dur=1, el;dur=400, worker;dur=420';
         return new Promise((r) => setTimeout(() => r({
           ok: true, status: 200, headers: { get: (h) => (String(h).toLowerCase() === 'server-timing' ? timing : null) },
           text: () => Promise.resolve(JSON.stringify(bodyObj)),
@@ -6286,9 +6394,9 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
   check('s55: the take\'s length rides the upload (rec_ms)', sent.length === 1 && Number(sent[0].recMs) > 0, JSON.stringify(sent));
   const e0 = ring()[0] || {};
   check('s55: the timing log records the provider and the fallback timings',
-    e0.provider === 'soniox' && e0.hedgeMs === 4000 && e0.sxMs === 1130 && e0.elMs === 4100, JSON.stringify(e0));
+    e0.provider === 'soniox' && e0.fallback === true && e0.primary === 'elevenlabs' && e0.hedgeMs === 4000 && e0.backupMs === 1130 && e0.elMs === 4100, JSON.stringify(e0));
   const readout = (doc.getElementById('timingReadout') || { textContent: '' }).textContent;
-  check('s55: the Advanced readout says the take was transcribed by Soniox', readout.includes('TRANSCRIBED BY SONIOX') && readout.includes('1 transcribed by Soniox'), readout);
+  check('s55: the Advanced readout says the backup (Soniox) transcribed the take', readout.includes('TRANSCRIBED BY SONIOX (the backup)') && readout.includes('1 transcribed by the backup service'), readout);
   const hist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
   check('s55: the saved note is tagged as transcribed by Soniox', hist[0] && hist[0].stt === 'soniox', JSON.stringify(hist[0]));
   if (doc.getElementById('history').style.display === 'none') doc.getElementById('toggleHistoryBtn').click();
@@ -6304,6 +6412,116 @@ console.log('--- scenario 54: the Soniox fallback (Worker) ---');
   check('s55: an ordinary ElevenLabs take has no Soniox note and no provider tag',
     !st.textContent.includes('Soniox') && e1.provider === 'elevenlabs', st.textContent + ' / ' + e1.provider);
   dom.window.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 56. [RELIABILITY] Swapping the transcription service by hand (client). Options
+//     has a main-service picker and a backup picker; a service the server has
+//     no key for is greyed out and never sent; the backup can never equal the
+//     main service; the choice rides every upload, persists per device, and a
+//     take written by another service says so.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 56: choosing the transcription service (client) ---');
+  const r56 = await worker.default.fetch(new Request('https://dictation.test/'),
+    { ELEVENLABS_API_KEY: 'k', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx' }); // no OPENAI_API_KEY
+  const html56 = await r56.text();
+  const store = {};
+  const mk56 = (answer) => {
+    let w;
+    const sent = [];
+    const dom = new JSDOM(html56, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        w = win;
+        win.isSecureContext = true;
+        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; }
+          static isTypeSupported() { return false; }
+          start() { this.state = 'recording'; }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+        };
+        win.fetch = (url, init) => {
+          const fd = init && init.body && init.body.get ? init.body : null;
+          sent.push({ url: String(url), primary: fd ? fd.get('stt_primary') : null, backup: fd ? fd.get('stt_backup') : null });
+          return new Promise((r) => setTimeout(() => r({
+            ok: true, status: 200, headers: { get: () => null },
+            text: () => Promise.resolve(JSON.stringify(answer())),
+          }), 20));
+        };
+        for (const k of Object.keys(store)) win.localStorage.setItem(k, store[k]);
+        if (!store.scribe_v2_settings_v9) win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        win.localStorage.setItem('scribe_v2_passphrase_v9', 'sesame');
+      },
+    });
+    return { dom, win: () => w, doc: dom.window.document, sent };
+  };
+  const take56 = async (d) => {
+    micRms = 0.05;
+    d.doc.getElementById('recordBtn').click();
+    await sleep(160);
+    d.doc.getElementById('recordBtn').click();
+    await sleep(600);
+  };
+  const opt = (d, sel, v) => [...d.doc.getElementById(sel).options].find((o) => o.value === v);
+
+  let reply = () => ({ text: 'ElevenLabs note.' });
+  const A = mk56(() => reply());
+  await sleep(200);
+  check('s56: the defaults are ElevenLabs, backed up by Soniox',
+    A.doc.getElementById('sttPrimary').value === 'elevenlabs' && A.doc.getElementById('sttBackup').value === 'soniox', A.doc.getElementById('sttPrimary').value + '/' + A.doc.getElementById('sttBackup').value);
+  check('s56: a service with no key on the server is greyed out and says why',
+    opt(A, 'sttPrimary', 'openai').disabled && /not set up on the server/.test(opt(A, 'sttPrimary', 'openai').textContent) &&
+    !opt(A, 'sttPrimary', 'soniox').disabled && opt(A, 'sttBackup', 'openai').disabled, opt(A, 'sttPrimary', 'openai').textContent);
+  check('s56: the hint names the current setup', /Now: ElevenLabs Scribe v2 Medical, backed up by Soniox/.test(A.doc.getElementById('sttHint').textContent), A.doc.getElementById('sttHint').textContent);
+  await take56(A);
+  check('s56: a take sends the main service and its backup', A.sent.length === 1 && A.sent[0].primary === 'elevenlabs' && A.sent[0].backup === 'soniox', JSON.stringify(A.sent));
+
+  // Swap to Soniox: the backup moves off it (to ElevenLabs)
+  const selP = A.doc.getElementById('sttPrimary');
+  selP.value = 'soniox';
+  selP.dispatchEvent(new (A.win().Event)('change'));
+  check('s56: choosing Soniox moves the backup to ElevenLabs', A.doc.getElementById('sttBackup').value === 'elevenlabs', A.doc.getElementById('sttBackup').value);
+  check('s56: ...and says so in the status', /Transcription service: Soniox \(stt-async-v5\), backed up by ElevenLabs\./.test(A.doc.getElementById('status').textContent), A.doc.getElementById('status').textContent);
+  check('s56: ...and the hint says Soniox starts at the release (only ElevenLabs streams)', /only ElevenLabs uploads while you dictate/i.test(A.doc.getElementById('sttHint').textContent), A.doc.getElementById('sttHint').textContent);
+  reply = () => ({ text: 'Soniox note.', words: [], stt_provider: 'soniox' });
+  await take56(A);
+  check('s56: the next take asks for Soniox, backed up by ElevenLabs', A.sent[1] && A.sent[1].primary === 'soniox' && A.sent[1].backup === 'elevenlabs', JSON.stringify(A.sent[1]));
+  const stA = A.doc.getElementById('status');
+  check('s56: a Soniox take says so, as a clean success', /Transcribed by Soniox \(stt-async-v5\)\./.test(stA.textContent) && stA.className.includes('ok') && stA.textContent.includes('Done!'), stA.className + ' | ' + stA.textContent);
+  const ringA = JSON.parse(A.win().localStorage.getItem('scribe_v2_timing_v9') || '[]');
+  check('s56: the timing log names the main service and why it did not stream',
+    ringA[0] && ringA[0].primary === 'soniox' && ringA[0].provider === 'soniox' && ringA[0].fallback === false && /main service Soniox/.test(ringA[0].pathNote || ''), JSON.stringify(ringA[0]));
+  const histA = JSON.parse(A.win().localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  check('s56: the note is tagged with the service that wrote it', histA[0] && histA[0].stt === 'soniox', JSON.stringify(histA[0]));
+
+  // A backup answer from ElevenLabs while Soniox is the main service
+  reply = () => ({ text: 'Rescued note.', stt_provider: 'elevenlabs', stt_fallback: 'Soniox had not answered after 8 s' });
+  await take56(A);
+  check('s56: a backup answer names the backup and why', /Transcribed by ElevenLabs — Soniox had not answered after 8 s\./.test(stA.textContent) && stA.className.includes('ok'), stA.textContent);
+  const ringA2 = JSON.parse(A.win().localStorage.getItem('scribe_v2_timing_v9') || '[]');
+  check('s56: ...and the timing log marks it a fallback', ringA2[0] && ringA2[0].fallback === true && ringA2[0].provider === 'elevenlabs', JSON.stringify(ringA2[0]));
+
+  // Persisted per device; an unavailable saved choice is never sent
+  Object.assign(store, { scribe_v2_settings_v9: A.win().localStorage.getItem('scribe_v2_settings_v9') });
+  A.dom.window.close();
+  reply = () => ({ text: 'Reloaded note.' });
+  const B = mk56(() => reply());
+  await sleep(200);
+  check('s56: the choice survives a reload', B.doc.getElementById('sttPrimary').value === 'soniox' && B.doc.getElementById('sttBackup').value === 'elevenlabs',
+    B.doc.getElementById('sttPrimary').value + '/' + B.doc.getElementById('sttBackup').value);
+  B.dom.window.close();
+  const saved = JSON.parse(store.scribe_v2_settings_v9);
+  store.scribe_v2_settings_v9 = JSON.stringify({ ...saved, sttPrimary: 'openai', sttBackup: 'soniox' });
+  const C = mk56(() => reply());
+  await sleep(200);
+  await take56(C);
+  check('s56: a saved service with no key here is not sent (ElevenLabs is used)', C.sent[0] && C.sent[0].primary === 'elevenlabs' && C.sent[0].backup === 'soniox', JSON.stringify(C.sent));
+  C.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

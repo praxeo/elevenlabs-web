@@ -14,6 +14,8 @@ compatibility_date = "2025-01-01"
 #                       shared mode, and only shared mode can use the two below
 #   SONIOX_API_KEY      Soniox, as the main service or the backup (optional)
 #   OPENAI_API_KEY      OpenAI gpt-transcribe, likewise (optional)
+#   MISTRAL_API_KEY     Mistral Voxtral (voxtral-mini-latest), likewise (optional)
+# Names are case-sensitive: openai_api_key is not OPENAI_API_KEY.
 # A service without its key is greyed out in Options. Secrets survive every
 # deploy.
 #

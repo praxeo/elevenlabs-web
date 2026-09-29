@@ -746,8 +746,9 @@ function streamFrameReader(body) {
 }
 
 // ───── Choosing the service, and backing it up when it is slow or failing ─────
-// Three services can transcribe a take: ElevenLabs Scribe v2 Medical (the
-// default), Soniox (stt-async-v5) and OpenAI gpt-transcribe. The client picks
+// Four services can transcribe a take: ElevenLabs Scribe v2 Medical (the
+// default), Soniox (stt-async-v5), OpenAI gpt-transcribe and Mistral Voxtral
+// (voxtral-mini-latest). The client picks
 // the MAIN service and a BACKUP (Options, per device, sent as stt_primary /
 // stt_backup; an old client that sends neither gets ElevenLabs backed up by
 // Soniox). The main service is asked first; the backup is sent the SAME audio
@@ -760,8 +761,8 @@ function streamFrameReader(body) {
 // so the client's speaker filter and coverage guard judge it exactly like an
 // ElevenLabs transcript, and it says which service wrote it.
 // Rules:
-//   - Soniox and OpenAI only on the shared key (the owner's deployment) with
-//     their key set; a BYO ElevenLabs key never spends the owner's accounts.
+//   - Soniox, OpenAI and Mistral only on the shared key (the owner's
+//     deployment) with their key set; a BYO ElevenLabs key never spends the owner's accounts.
 //     A main service with no key here falls back to ElevenLabs, SAYING so.
 //   - The streamed upload feeds ElevenLabs, so it is always the main service
 //     there (the client streams only when ElevenLabs is its main service).
@@ -771,20 +772,23 @@ function streamFrameReader(body) {
 //     fetch the transcript. Its file and job are always DELETED afterwards
 //     (waitUntil), including a job abandoned because the other service won.
 //   - Both failing is still one loud failure, naming both.
-const STT_SERVICES = ["elevenlabs", "soniox", "openai"];
-const STT_SERVICE_NAMES = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI" };
+const STT_SERVICES = ["elevenlabs", "soniox", "openai", "mistral"];
+const STT_SERVICE_NAMES = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI", mistral: "Mistral" };
 const SONIOX_API_URL = "https://api.soniox.com/v1";
 const SONIOX_MODEL = "stt-async-v5";
 const OPENAI_STT_URL = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_STT_MODEL = "gpt-transcribe";
 // Context only, never a vocabulary list: OpenAI warns its keywords can make
 // unspoken terms appear, and a speech model reciting a term list into a chart
-// is the failure WhisperInk measured on Qwen3. Keyterms stay ElevenLabs/Soniox.
+// is the failure WhisperInk measured on Qwen3. Keyterms stay ElevenLabs/Soniox/Mistral.
 const OPENAI_STT_PROMPT = "A clinician dictating a medical note for a patient chart.";
+const MISTRAL_STT_URL = "https://api.mistral.ai/v1/audio/transcriptions";
+const MISTRAL_STT_MODEL = "voxtral-mini-latest"; // Voxtral Mini Transcribe 2
+const MISTRAL_BIAS_MAX_TERMS = 100;         // Mistral's context_bias limit
 // The wait for the main service before the backup is asked too. ElevenLabs is
-// measured (0.3–0.8 s, worst seen ~2 s); Soniox's async jobs and OpenAI are
-// not measured here yet, so they get more room.
-const FALLBACK_AFTER_MS = { elevenlabs: 4000, openai: 6000, soniox: 8000 };
+// measured (0.3–0.8 s, worst seen ~2 s); Soniox's async jobs, OpenAI and
+// Mistral are not measured here yet, so they get more room.
+const FALLBACK_AFTER_MS = { elevenlabs: 4000, openai: 6000, mistral: 6000, soniox: 8000 };
 const FALLBACK_AFTER_PER_AUDIO_S_MS = 40;   // ...longer for a long take (ElevenLabs needs ~1.1 s per minute)
 const FALLBACK_AFTER_MAX_MS = 20000;
 const SONIOX_POLL_MS = [150, 250, 350, 500, 700, 900, 1000]; // then every 1000 ms
@@ -800,6 +804,7 @@ function sttServicesAvailable(env, sharedKey) {
     elevenlabs: true,
     soniox: Boolean(sharedKey && env && env.SONIOX_API_KEY),
     openai: Boolean(sharedKey && env && env.OPENAI_API_KEY),
+    mistral: Boolean(sharedKey && env && env.MISTRAL_API_KEY),
   };
 }
 
@@ -867,7 +872,8 @@ function upstreamMessage(status, raw) {
   let msg = "";
   try {
     const d = JSON.parse(raw || "");
-    msg = (d && d.detail && (d.detail.message || (typeof d.detail === "string" ? d.detail : ""))) ||
+    msg = (d && Array.isArray(d.detail) && d.detail[0] && d.detail[0].msg ? String(d.detail[0].msg) : "") || // a validation error (Mistral)
+          (d && d.detail && (d.detail.message || (typeof d.detail === "string" ? d.detail : ""))) ||
           (d && d.error && typeof d.error === "object" ? d.error.message : "") ||
           (d && (d.message || (typeof d.error === "string" ? d.error : ""))) || "";
   } catch {
@@ -880,6 +886,7 @@ function upstreamMessage(status, raw) {
 function startSttJob(name, o) {
   if (name === "soniox") return startSonioxJob(o.env, o.ctx, o.file, o.fileName, o.get);
   if (name === "openai") return startOpenAiJob(o.env, o.file, o.fileName);
+  if (name === "mistral") return startMistralJob(o.env, o.file, o.fileName, o.get);
   // ElevenLabs: the ordinary request, fields in the order it has always had.
   const form = new FormData();
   form.append("model_id", STT_MODEL_ID);
@@ -1047,6 +1054,58 @@ function startOpenAiJob(env, file, fileName) {
     try { d = JSON.parse(raw); } catch { d = null; }
     if (!d || typeof d.text !== "string") return { ok: false, status: 502, error: "an unreadable answer", brief: "unreadable answer" };
     return { ok: true, status: 200, body: { language_code: "en", text: d.text.trim(), words: [] } };
+  }).catch((err) => ({ ok: false, status: 502, network: true, error: "could not be reached (" + (err?.message || String(err)) + ")" }));
+  return { result, abandon() { try { ctrl.abort(); } catch {} } };
+}
+
+// The take's keyterms as Mistral context_bias terms: the client's order
+// (custom, then checked lists) decides which fit under the 100-term limit.
+// Mistral writes a phrase with underscores for its spaces ("affordable_health_care"
+// in its own docs), so a phrase goes up that way.
+function mistralBiasTerms(get) {
+  let keyterms = [];
+  try {
+    keyterms = JSON.parse(String(get("keyterms_json") || "[]"));
+  } catch {
+    keyterms = [];
+  }
+  return sanitizeKeyterms(keyterms, { maxChars: 49, maxWords: 5, maxTerms: MISTRAL_BIAS_MAX_TERMS })
+    .map((t) => t.replace(/ /g, "_"));
+}
+
+// Mistral's answer can carry a biased phrase exactly as it was sent,
+// underscores and all (its docs show "the security of affordable_health_care").
+// A dictated note never contains an underscore, so they all become spaces.
+function mistralText(text) {
+  return String(text || "").replace(/_+/g, " ").replace(/ {2,}/g, " ").trim();
+}
+
+// One take through Mistral Voxtral (voxtral-mini-latest): English, temperature
+// 0, the take's keyterms as context_bias (one field per term, as Mistral's own
+// curl example sends them). Mistral cannot combine word timestamps with a
+// language, and English is sent, so it returns text only (no word timings, no
+// speakers, no duration): the speaker filter and the coverage guard have
+// nothing to act on for a Mistral take, as for an OpenAI one.
+function startMistralJob(env, file, fileName, get) {
+  const ctrl = new AbortController();
+  const fd = new FormData();
+  fd.append("model", MISTRAL_STT_MODEL);
+  fd.append("file", file, openAiFileName(file.type, fileName));
+  fd.append("language", "en");
+  fd.append("temperature", "0");
+  for (const term of mistralBiasTerms(get)) fd.append("context_bias", term);
+  const result = fetch(MISTRAL_STT_URL, {
+    method: "POST",
+    headers: { authorization: "Bearer " + env.MISTRAL_API_KEY },
+    body: fd,
+    signal: ctrl.signal,
+  }).then(async (r) => {
+    const raw = await r.text();
+    if (!r.ok) return { ok: false, status: r.status, error: upstreamMessage(r.status, raw), brief: "HTTP " + r.status };
+    let d = null;
+    try { d = JSON.parse(raw); } catch { d = null; }
+    if (!d || typeof d.text !== "string") return { ok: false, status: 502, error: "an unreadable answer", brief: "unreadable answer" };
+    return { ok: true, status: 200, body: { language_code: "en", text: mistralText(d.text), words: [] } };
   }).catch((err) => ({ ok: false, status: 502, network: true, error: "could not be reached (" + (err?.message || String(err)) + ")" }));
   return { result, abandon() { try { ctrl.abort(); } catch {} } };
 }
@@ -1879,11 +1938,13 @@ const INDEX_HTML = `<!doctype html>
             <option value="elevenlabs" selected>ElevenLabs Scribe v2 Medical</option>
             <option value="soniox">Soniox (stt-async-v5)</option>
             <option value="openai">OpenAI gpt-transcribe</option>
+            <option value="mistral">Mistral Voxtral (voxtral-mini-latest)</option>
           </select>
           <label for="sttBackup">Backup when it is slow or failing</label>
           <select id="sttBackup">
             <option value="soniox" selected>Soniox</option>
             <option value="openai">OpenAI gpt-transcribe</option>
+            <option value="mistral">Mistral Voxtral</option>
             <option value="elevenlabs">ElevenLabs</option>
             <option value="none">None</option>
           </select>
@@ -2201,8 +2262,8 @@ right lower quadrant"></textarea>
   // Which transcription services this server has a key for (injected at serve
   // time; ElevenLabs is always there). Booleans only.
   const STT_AVAILABLE    = (__STT_AVAILABLE__);
-  const STT_NAMES        = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI" };
-  const STT_LONG_NAMES   = { elevenlabs: "ElevenLabs Scribe v2 Medical", soniox: "Soniox (stt-async-v5)", openai: "OpenAI gpt-transcribe" };
+  const STT_NAMES        = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI", mistral: "Mistral" };
+  const STT_LONG_NAMES   = { elevenlabs: "ElevenLabs Scribe v2 Medical", soniox: "Soniox (stt-async-v5)", openai: "OpenAI gpt-transcribe", mistral: "Mistral Voxtral (voxtral-mini-latest)" };
   // Deployer-curated keyterm lists (pre-sanitized), injected at serve time.
   const KEYTERM_PRESETS  = (__KEYTERM_PRESETS__);
 
@@ -3317,10 +3378,10 @@ right lower quadrant"></textarea>
       if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
       if (s.gateLookahead !== undefined && gateLookaheadEl) gateLookaheadEl.value = s.gateLookahead;
       if (s.releaseTail   !== undefined && releaseTailEl)   releaseTailEl.value   = s.releaseTail;
-      if (sttPrimaryEl && (s.sttPrimary === "elevenlabs" || s.sttPrimary === "soniox" || s.sttPrimary === "openai")) {
+      if (sttPrimaryEl && (s.sttPrimary === "elevenlabs" || s.sttPrimary === "soniox" || s.sttPrimary === "openai" || s.sttPrimary === "mistral")) {
         sttPrimaryEl.value = s.sttPrimary;
       }
-      if (sttBackupEl && (s.sttBackup === "elevenlabs" || s.sttBackup === "soniox" || s.sttBackup === "openai" || s.sttBackup === "none")) {
+      if (sttBackupEl && (s.sttBackup === "elevenlabs" || s.sttBackup === "soniox" || s.sttBackup === "openai" || s.sttBackup === "mistral" || s.sttBackup === "none")) {
         sttBackupEl.value = s.sttBackup;
       }
       if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
@@ -3442,7 +3503,7 @@ right lower quadrant"></textarea>
       // desktop — the list tracks whether it got there ("Not sent" until a
       // listener acks a delivery that carried it, which stamps sentAt).
       if (meta.sendable) entry.sendable = true;
-      if (meta.stt === "soniox" || meta.stt === "openai") entry.stt = meta.stt; // transcribed by another service, not ElevenLabs
+      if (meta.stt === "soniox" || meta.stt === "openai" || meta.stt === "mistral") entry.stt = meta.stt; // transcribed by another service, not ElevenLabs
     }
     items.unshift(entry);
     setHistory(items);
@@ -4098,7 +4159,8 @@ right lower quadrant"></textarea>
           if (o.value === "none" || o.value === "elevenlabs") continue;
           var ok = sttUsable(o.value);
           o.disabled = !ok;
-          var label = (sel === sttPrimaryEl || o.value === "openai") ? STT_LONG_NAMES[o.value] : STT_NAMES[o.value];
+          var label = (sel === sttPrimaryEl || o.value === "openai") ? STT_LONG_NAMES[o.value]
+            : (o.value === "mistral" ? "Mistral Voxtral" : STT_NAMES[o.value]);
           o.textContent = label + (ok ? "" : " — not set up on the server");
         }
       });
@@ -4110,6 +4172,7 @@ right lower quadrant"></textarea>
           : "With your own ElevenLabs key only ElevenLabs is available; the other services need the shared access code.";
         if (p !== "elevenlabs") msg += " Only ElevenLabs uploads while you dictate, so " + sttName(p) + " starts when you let go.";
         if (p === "openai" || b === "openai") msg += " OpenAI returns text only: its takes get no speaker filter, no incomplete-transcript check and no keyterms.";
+        if (p === "mistral" || b === "mistral") msg += " Mistral gets your keyterms (the first 100: your own terms, then the checked lists) but returns text only: its takes get no speaker filter and no incomplete-transcript check.";
         sttHintEl.textContent = msg;
       }
     } catch (e) {}
@@ -4216,7 +4279,7 @@ right lower quadrant"></textarea>
     // Which service wrote it: the main one, or the backup the Worker asked
     // because the main one errored or stalled (stt_fallback says why). Every
     // service answers in ElevenLabs' shape.
-    var provider = (data.stt_provider === "soniox" || data.stt_provider === "openai" || data.stt_provider === "elevenlabs")
+    var provider = (data.stt_provider === "soniox" || data.stt_provider === "openai" || data.stt_provider === "mistral" || data.stt_provider === "elevenlabs")
       ? data.stt_provider : "elevenlabs";
     var fallbackReason = data.stt_fallback ? String(data.stt_fallback).slice(0, 160) : "";
     var sttNote = data.stt_note ? String(data.stt_note).slice(0, 200) : "";
@@ -8662,7 +8725,7 @@ right lower quadrant"></textarea>
     // The backup can never be the main service: move it off the new choice.
     if (sttBackupEl && sttBackupEl.value === sttPrimaryEl.value) {
       sttBackupEl.value = sttPrimaryEl.value !== "elevenlabs" ? "elevenlabs"
-        : (sttUsable("soniox") ? "soniox" : (sttUsable("openai") ? "openai" : "none"));
+        : (sttUsable("soniox") ? "soniox" : (sttUsable("openai") ? "openai" : (sttUsable("mistral") ? "mistral" : "none")));
     }
     refreshSttUi();
     saveSettings();

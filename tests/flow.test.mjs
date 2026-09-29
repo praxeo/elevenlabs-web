@@ -5925,6 +5925,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   let el = { mode: 'ok' }; // ok | status | late | hang
   let sx = {};
   let oa = { mode: 'ok' }; // ok | status | hang
+  let mi = { mode: 'ok' }; // ok | status | hang (Mistral)
   let calls = [];
   const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } });
   globalThis.fetch = async (url, init = {}) => {
@@ -5963,6 +5964,22 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       }
       return jsonRes({ text: ' OpenAI note about hematochezia. ', languages: [{ code: 'en' }], usage: { type: 'duration', seconds: 3 } });
     }
+    if (url === 'https://api.mistral.ai/v1/audio/transcriptions') {
+      const fd = init.body;
+      const f = fd.get('file');
+      rec.mi = {
+        model: fd.get('model'), language: fd.get('language'), temperature: fd.get('temperature'),
+        bias: fd.getAll('context_bias'), fileName: f.name, fileBytes: Buffer.from(await f.arrayBuffer()), fields: [...fd.keys()],
+      };
+      if (mi.mode === 'status') return jsonRes(mi.body || { object: 'error', message: 'Service unavailable', type: 'server_error' }, mi.status);
+      if (mi.mode === 'hang') {
+        return new Promise((resolve, reject) => {
+          if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('aborted', 'AbortError')); });
+        });
+      }
+      return jsonRes({ model: 'voxtral-mini-2602', text: mi.text || ' Patient on metoprolol, start negative_pressure_wound_therapy. ', language: null, segments: [],
+        usage: { prompt_audio_seconds: 3, prompt_tokens: 4, total_tokens: 40, completion_tokens: 12 } });
+    }
     if (url.startsWith(SX)) {
       const path = url.slice(SX.length);
       if (method === 'POST' && path === '/files') {
@@ -5997,7 +6014,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   const pending = [];
   const ctx = { waitUntil: (p) => { pending.push(p); } };
   const settle = async () => { while (pending.length) await Promise.all(pending.splice(0)); };
-  const env54 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx-key', OPENAI_API_KEY: 'oa-key', SONIOX_FALLBACK_AFTER_MS: '150' };
+  const env54 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx-key', OPENAI_API_KEY: 'oa-key', MISTRAL_API_KEY: 'mi-key', SONIOX_FALLBACK_AFTER_MS: '150' };
   const audio54 = new Uint8Array(4096); for (let i = 0; i < audio54.length; i++) audio54[i] = i % 251;
   const mkUpload54 = (o = {}) => {
     const fd = new FormData();
@@ -6008,16 +6025,17 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     fd.append('no_verbatim', 'true');
     fd.append('tag_audio_events', 'false');
     fd.append('diarize', String(Boolean(o.diarize)));
-    fd.append('keyterms_json', JSON.stringify(['metoprolol', 'hematochezia']));
+    fd.append('keyterms_json', JSON.stringify(o.keyterms || ['metoprolol', 'hematochezia']));
     if (o.recMs) fd.append('rec_ms', String(o.recMs));
     if (o.primary) fd.append('stt_primary', o.primary);
     if (o.backup) fd.append('stt_backup', o.backup);
     return new Request('https://dictation.test/api/transcribe', { method: 'POST', body: fd });
   };
-  const reset = (elMode, sxMode, oaMode) => { el = elMode; sx = sxMode || {}; oa = oaMode || { mode: 'ok' }; calls = []; };
+  const reset = (elMode, sxMode, oaMode, miMode) => { el = elMode; sx = sxMode || {}; oa = oaMode || { mode: 'ok' }; mi = miMode || { mode: 'ok' }; calls = []; };
   const sxCalls = () => calls.filter((c) => c.url.startsWith(SX));
   const oaCalls = () => calls.filter((c) => c.url.startsWith('https://api.openai.com/'));
   const elCalls = () => calls.filter((c) => c.url === EL_URL);
+  const miCalls = () => calls.filter((c) => c.url.startsWith('https://api.mistral.ai/'));
   const timingOf = (r) => r.headers.get('server-timing') || '';
   const durOf = (st, name) => { const m = new RegExp('(^|[ ,])' + name + ';dur=(\\d+)').exec(st); return m ? Number(m[2]) : null; };
 
@@ -6246,6 +6264,74 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       r.status === 200 && body.text === 'ElevenLabs text.' && /OpenAI is not set up on the server/.test(body.stt_note || '') && oaCalls().length === 0,
       r.status + ' ' + JSON.stringify(body));
 
+    // (x) Mistral Voxtral as the MAIN service: English, the keyterms as
+    //     context_bias (one field per term, phrases underscored), text only
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'soniox', keyterms: ['metoprolol', 'negative pressure wound therapy', 'hematochezia'] }), env54, ctx);
+    body = await r.json();
+    check('s54x: Mistral as the main service answers, labelled', r.status === 200 && body.stt_provider === 'mistral' && !body.stt_fallback,
+      r.status + ' ' + JSON.stringify(body));
+    check('s54x: a biased phrase comes back with spaces, not Mistral\'s underscores',
+      body.text === 'Patient on metoprolol, start negative pressure wound therapy.', body.text);
+    check('s54x: ...in ElevenLabs\' shape with no word timings (the guards no-op)', Array.isArray(body.words) && body.words.length === 0 && !('audio_duration_secs' in body), JSON.stringify(body));
+    check('s54x: ...and neither ElevenLabs nor Soniox is contacted', elCalls().length === 0 && sxCalls().length === 0, elCalls().length + '/' + sxCalls().length);
+    const miReq = (miCalls()[0] || {}).mi || {};
+    check('s54x: the request is voxtral-mini-latest, English, temperature 0, no timestamps (Mistral cannot combine them with a language)',
+      miReq.model === 'voxtral-mini-latest' && miReq.language === 'en' && miReq.temperature === '0' &&
+      !(miReq.fields || []).some((f) => /timestamp|diarize/.test(f)), JSON.stringify({ model: miReq.model, language: miReq.language, t: miReq.temperature, fields: miReq.fields }));
+    check('s54x: the keyterms go as context_bias, one field per term, in order, a phrase with underscores',
+      JSON.stringify(miReq.bias) === '["metoprolol","negative_pressure_wound_therapy","hematochezia"]', JSON.stringify(miReq.bias));
+    check('s54x: Mistral gets the same audio under a name matching its type, with the Mistral key only',
+      Buffer.compare(miReq.fileBytes || Buffer.alloc(0), Buffer.from(audio54)) === 0 && miReq.fileName === 'recording.webm' &&
+      miCalls()[0].headers.authorization === 'Bearer mi-key' && !/sesame|srv-key|oa-key|sx-key/.test(JSON.stringify(miCalls()[0].headers)),
+      miReq.fileName + ' ' + JSON.stringify(miCalls()[0] && miCalls()[0].headers));
+    // 150 terms: Mistral takes 100, so the first 100 in the client's order
+    // (custom terms, then the checked lists) go
+    const many = Array.from({ length: 150 }, (_, i) => 'term' + i);
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'none', keyterms: many }), env54, ctx);
+    const biasMany = ((miCalls()[0] || {}).mi || {}).bias || [];
+    check('s54x: more than 100 keyterms: the FIRST 100 go (Mistral\'s limit)', biasMany.length === 100 && biasMany[0] === 'term0' && biasMany[99] === 'term99', biasMany.length + ' ' + biasMany[99]);
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'none', keyterms: [] }), env54, ctx);
+    check('s54x: no keyterms = no context_bias field', r.status === 200 && !(((miCalls()[0] || {}).mi || {}).fields || []).includes('context_bias'), JSON.stringify(((miCalls()[0] || {}).mi || {}).fields));
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'none', type: 'audio/mp4' }), env54, ctx);
+    check('s54x: an iPhone mp4 recording is named .mp4 for Mistral', ((miCalls()[0] || {}).mi || {}).fileName === 'recording.mp4', ((miCalls()[0] || {}).mi || {}).fileName);
+
+    // (y) Mistral refuses the request (a validation error): the backup carries
+    //     the take and the reason names Mistral's own message
+    reset({ mode: 'ok' }, {}, {}, { mode: 'status', status: 422, body: { detail: [{ loc: ['body', 'context_bias'], msg: 'Invalid context bias term', type: 'value_error' }] } });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'soniox' }), env54, ctx);
+    body = await r.json();
+    check('s54y: a refused Mistral request falls back to Soniox', r.status === 200 && body.stt_provider === 'soniox' && body.stt_fallback === 'Mistral returned an error (HTTP 422)' && body.text === 'Patient has hematochezia.',
+      r.status + ' ' + JSON.stringify(body).slice(0, 200));
+    await settle();
+    reset({ mode: 'ok' }, { polls: ['error'] }, {}, { mode: 'status', status: 422, body: { detail: [{ loc: ['body', 'context_bias'], msg: 'Invalid context bias term', type: 'value_error' }] } });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'soniox' }), env54, ctx);
+    body = await r.json();
+    check('s54y: both failing names Mistral\'s validation message (loud, retryable)', r.status === 422 && /^Mistral HTTP 422: Invalid context bias term; the Soniox fallback failed too/.test(body.error || ''),
+      r.status + ' ' + JSON.stringify(body));
+    await settle();
+
+    // (z) Mistral as the BACKUP of a silent ElevenLabs; no key = not used
+    reset({ mode: 'hang' });
+    r = await worker.default.fetch(mkUpload54({ backup: 'mistral' }), env54, ctx);
+    body = await r.json();
+    check('s54z: Mistral can be the backup', r.status === 200 && body.stt_provider === 'mistral' && /^ElevenLabs had not answered/.test(body.stt_fallback || '') &&
+      body.text === 'Patient on metoprolol, start negative pressure wound therapy.' && sxCalls().length === 0,
+      r.status + ' ' + JSON.stringify(body).slice(0, 160));
+    check('s54z: ...and it gets the take\'s keyterms too', JSON.stringify(((miCalls()[0] || {}).mi || {}).bias) === '["metoprolol","hematochezia"]', JSON.stringify(((miCalls()[0] || {}).mi || {}).bias));
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'soniox' }), { ...env54, MISTRAL_API_KEY: '' }, ctx);
+    body = await r.json();
+    check('s54z: no MISTRAL_API_KEY: ElevenLabs transcribes, WITH a note', r.status === 200 && body.text === 'ElevenLabs text.' && /Mistral is not set up on the server/.test(body.stt_note || '') && miCalls().length === 0,
+      r.status + ' ' + JSON.stringify(body));
+    reset({ mode: 'ok' });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'soniox', byo: true }), env54, ctx);
+    body = await r.json();
+    check('s54z: a BYO ElevenLabs key never spends the Mistral account', r.status === 200 && miCalls().length === 0 && body.text === 'ElevenLabs text.', r.status + ' mi=' + miCalls().length);
+
     // (m) the streamed route: the Worker keeps the audio it relayed and sends
     //     Soniox exactly that when ElevenLabs stalls after the release
     const openStream54 = (env) => {
@@ -6279,6 +6365,26 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       const stS = timingOf(r);
       check('s54m: the streamed take\'s Server-Timing keeps open and adds hedge (from the end frame, rec_ms honoured)',
         /open;dur=\d+/.test(stS) && durOf(stS, 'hedge') >= 250 && durOf(stS, 'hedge') < 600, stS);
+      await settle();
+    }
+
+    // (m2) the same stall with Mistral as the backup: Mistral gets the streamed
+    //      audio and the keyterms from the stream's options frame
+    reset({ mode: 'hang' });
+    {
+      const { ctl, resP } = openStream54();
+      ctl.enqueue(streamJson(STREAM_O, { ...opts54, stt_backup: 'mistral' }));
+      ctl.enqueue(streamFrame(STREAM_A, chunksS[0]));
+      ctl.enqueue(streamFrame(STREAM_A, chunksS[1]));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 4200, chunks: 2, rec_ms: 3000 }));
+      ctl.close();
+      r = (await Promise.race([resP, sleep(5000).then(() => null)])) || new Response('{}', { status: 599 });
+      body = await r.json();
+      const miS = (miCalls()[0] || {}).mi || {};
+      check('s54m2: a stalled streamed take can be backed up by Mistral, with the streamed audio and the keyterms',
+        r.status === 200 && body.stt_provider === 'mistral' && JSON.stringify(miS.bias) === '["metoprolol"]' &&
+        Buffer.compare(miS.fileBytes || Buffer.alloc(0), Buffer.concat(chunksS.map((c) => Buffer.from(c)))) === 0 && sxCalls().length === 0,
+        r.status + ' ' + JSON.stringify(body).slice(0, 160) + ' ' + JSON.stringify(miS.bias));
       await settle();
     }
 
@@ -6427,10 +6533,10 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     { ELEVENLABS_API_KEY: 'k', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx' }); // no OPENAI_API_KEY
   const html56 = await r56.text();
   const store = {};
-  const mk56 = (answer) => {
+  const mk56 = (answer, html = html56) => {
     let w;
     const sent = [];
-    const dom = new JSDOM(html56, {
+    const dom = new JSDOM(html, {
       runScripts: 'dangerously', url: 'https://dictation.test/',
       beforeParse(win) {
         w = win;
@@ -6477,6 +6583,10 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   check('s56: a service with no key on the server is greyed out and says why',
     opt(A, 'sttPrimary', 'openai').disabled && /not set up on the server/.test(opt(A, 'sttPrimary', 'openai').textContent) &&
     !opt(A, 'sttPrimary', 'soniox').disabled && opt(A, 'sttBackup', 'openai').disabled, opt(A, 'sttPrimary', 'openai').textContent);
+  check('s56: Mistral Voxtral is offered as main and backup, greyed out with no MISTRAL_API_KEY',
+    opt(A, 'sttPrimary', 'mistral') && opt(A, 'sttBackup', 'mistral') && opt(A, 'sttPrimary', 'mistral').disabled && opt(A, 'sttBackup', 'mistral').disabled &&
+    /^Mistral Voxtral \(voxtral-mini-latest\) — not set up on the server$/.test(opt(A, 'sttPrimary', 'mistral').textContent),
+    opt(A, 'sttPrimary', 'mistral') && opt(A, 'sttPrimary', 'mistral').textContent);
   check('s56: the hint names the current setup', /Now: ElevenLabs Scribe v2 Medical, backed up by Soniox/.test(A.doc.getElementById('sttHint').textContent), A.doc.getElementById('sttHint').textContent);
   await take56(A);
   check('s56: a take sends the main service and its backup', A.sent.length === 1 && A.sent[0].primary === 'elevenlabs' && A.sent[0].backup === 'soniox', JSON.stringify(A.sent));
@@ -6522,6 +6632,41 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   await take56(C);
   check('s56: a saved service with no key here is not sent (ElevenLabs is used)', C.sent[0] && C.sent[0].primary === 'elevenlabs' && C.sent[0].backup === 'soniox', JSON.stringify(C.sent));
   C.dom.window.close();
+
+  // Mistral Voxtral on a deployment that has its key
+  const htmlM = await (await worker.default.fetch(new Request('https://dictation.test/'),
+    { ELEVENLABS_API_KEY: 'k', APP_PASSPHRASE: 'sesame', SONIOX_API_KEY: 'sx', MISTRAL_API_KEY: 'mi' })).text();
+  store.scribe_v2_settings_v9 = JSON.stringify({ saveApiKey: true, micGranted: true });
+  reply = () => ({ text: 'ElevenLabs note.' });
+  const D = mk56(() => reply(), htmlM);
+  await sleep(200);
+  check('s56m: with its key, Mistral can be chosen', !opt(D, 'sttPrimary', 'mistral').disabled && !opt(D, 'sttBackup', 'mistral').disabled &&
+    opt(D, 'sttBackup', 'mistral').textContent === 'Mistral Voxtral', opt(D, 'sttBackup', 'mistral').textContent);
+  const selD = D.doc.getElementById('sttPrimary');
+  selD.value = 'mistral';
+  selD.dispatchEvent(new (D.win().Event)('change'));
+  check('s56m: choosing Mistral keeps Soniox as the backup and says so',
+    D.doc.getElementById('sttBackup').value === 'soniox' &&
+    /Transcription service: Mistral Voxtral \(voxtral-mini-latest\), backed up by Soniox\./.test(D.doc.getElementById('status').textContent), D.doc.getElementById('status').textContent);
+  check('s56m: the hint says Mistral gets the first 100 keyterms and returns text only',
+    /Mistral gets your keyterms \(the first 100/.test(D.doc.getElementById('sttHint').textContent) && /no speaker filter and no incomplete-transcript check/.test(D.doc.getElementById('sttHint').textContent),
+    D.doc.getElementById('sttHint').textContent);
+  reply = () => ({ text: 'Voxtral note.', words: [], stt_provider: 'mistral' });
+  await take56(D);
+  check('s56m: the take asks for Mistral, backed up by Soniox', D.sent[0] && D.sent[0].primary === 'mistral' && D.sent[0].backup === 'soniox', JSON.stringify(D.sent));
+  const stD = D.doc.getElementById('status');
+  check('s56m: a Mistral take says so, as a clean success', /Transcribed by Mistral Voxtral \(voxtral-mini-latest\)\./.test(stD.textContent) && stD.className.includes('ok') && stD.textContent.includes('Done!'),
+    stD.className + ' | ' + stD.textContent);
+  const histD = JSON.parse(D.win().localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  check('s56m: the note is tagged mistral', histD[0] && histD[0].stt === 'mistral', JSON.stringify(histD[0]));
+  const ringD = JSON.parse(D.win().localStorage.getItem('scribe_v2_timing_v9') || '[]');
+  check('s56m: the timing log names Mistral', ringD[0] && ringD[0].primary === 'mistral' && ringD[0].provider === 'mistral' && ringD[0].fallback === false, JSON.stringify(ringD[0]));
+  Object.assign(store, { scribe_v2_settings_v9: D.win().localStorage.getItem('scribe_v2_settings_v9') });
+  D.dom.window.close();
+  const E = mk56(() => reply(), htmlM);
+  await sleep(200);
+  check('s56m: the Mistral choice survives a reload', E.doc.getElementById('sttPrimary').value === 'mistral', E.doc.getElementById('sttPrimary').value);
+  E.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

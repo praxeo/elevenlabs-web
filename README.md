@@ -88,7 +88,7 @@ Push to `main` → Cloudflare Workers Builds deploys the worker `eleven` (`npx w
 - **Shared mode:** set `ELEVENLABS_API_KEY` + `APP_PASSPHRASE`. Users enter only the passphrase; the Worker checks it in constant time and injects the key server-side — it never reaches the browser. Add `SONIOX_API_KEY` and/or `OPENAI_API_KEY` to make Soniox and OpenAI gpt-transcribe selectable as the main service or the backup (shared mode only; a BYO key never uses them). Optional plain variable `SONIOX_FALLBACK_AFTER_MS` changes the wait before the backup is asked.
 - **Bring your own key:** leave the passphrase unset; each user enters their own ElevenLabs key, stored per browser.
 
-Set secrets in the Cloudflare dashboard (the local wrangler token can't write secrets). Install as an app from Chrome/Edge for a standalone window that keeps mic permission and stays usable shrunk to a sliver.
+Set secrets in the Cloudflare dashboard (the local wrangler token can't write secrets): Workers & Pages → eleven → Settings → Variables and Secrets, type **Secret**, then Deploy — not under Build, which the running Worker never sees. `wrangler.toml` lists them and keeps dashboard variables across deploys (`keep_vars`). Install as an app from Chrome/Edge for a standalone window that keeps mic permission and stays usable shrunk to a sliver.
 
 ## Tuning the gate
 

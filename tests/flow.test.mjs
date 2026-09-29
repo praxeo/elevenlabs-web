@@ -6028,7 +6028,8 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     fd.append('keyterms_json', JSON.stringify(o.keyterms || ['metoprolol', 'hematochezia']));
     if (o.recMs) fd.append('rec_ms', String(o.recMs));
     if (o.primary) fd.append('stt_primary', o.primary);
-    if (o.backup) fd.append('stt_backup', o.backup);
+    const backup = o.backup === undefined ? 'soniox' : o.backup; // null = an old client that names no backup
+    if (backup) fd.append('stt_backup', backup);
     return new Request('https://dictation.test/api/transcribe', { method: 'POST', body: fd });
   };
   const reset = (elMode, sxMode, oaMode, miMode) => { el = elMode; sx = sxMode || {}; oa = oaMode || { mode: 'ok' }; mi = miMode || { mode: 'ok' }; calls = []; };
@@ -6299,6 +6300,27 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: 'none', type: 'audio/mp4' }), env54, ctx);
     check('s54x: an iPhone mp4 recording is named .mp4 for Mistral', ((miCalls()[0] || {}).mi || {}).fileName === 'recording.mp4', ((miCalls()[0] || {}).mi || {}).fileName);
 
+    // (d) an old client that names no backup: Mistral is the default backup,
+    //     Soniox when this deployment has no Mistral key
+    reset({ mode: 'hang' });
+    r = await worker.default.fetch(mkUpload54({ backup: null }), env54, ctx);
+    body = await r.json();
+    check('s54d: with no backup named, a silent ElevenLabs is backed up by Mistral (the default)',
+      r.status === 200 && body.stt_provider === 'mistral' && /^ElevenLabs had not answered/.test(body.stt_fallback || '') && sxCalls().length === 0 && miCalls().length === 1,
+      r.status + ' ' + JSON.stringify(body).slice(0, 160) + ' sx=' + sxCalls().length + ' mi=' + miCalls().length);
+    reset({ mode: 'hang' });
+    r = await worker.default.fetch(mkUpload54({ backup: null }), { ...env54, MISTRAL_API_KEY: '' }, ctx);
+    body = await r.json();
+    check('s54d: ...and by Soniox when there is no Mistral key', r.status === 200 && body.stt_provider === 'soniox' && miCalls().length === 0,
+      r.status + ' ' + JSON.stringify(body).slice(0, 160));
+    await settle();
+    reset({ mode: 'ok' }, {}, {}, { mode: 'status', status: 500 });
+    r = await worker.default.fetch(mkUpload54({ primary: 'mistral', backup: null }), env54, ctx);
+    body = await r.json();
+    check('s54d: Mistral as the main service with no backup named falls back to Soniox, never to itself',
+      r.status === 200 && body.stt_provider === 'soniox' && miCalls().length === 1, r.status + ' ' + JSON.stringify(body).slice(0, 160) + ' mi=' + miCalls().length);
+    await settle();
+
     // (y) Mistral refuses the request (a validation error): the backup carries
     //     the take and the reason names Mistral's own message
     reset({ mode: 'ok' }, {}, {}, { mode: 'status', status: 422, body: { detail: [{ loc: ['body', 'context_bias'], msg: 'Invalid context bias term', type: 'value_error' }] } });
@@ -6343,7 +6365,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       return { ctl, resP };
     };
     const opts54 = { file_format: 'other', timestamps_granularity: 'word', no_verbatim: 'true', tag_audio_events: 'false',
-      diarize: 'false', keyterms_json: JSON.stringify(['metoprolol']), file_name: 'recording.webm', mime: 'audio/webm;codecs=opus' };
+      diarize: 'false', keyterms_json: JSON.stringify(['metoprolol']), file_name: 'recording.webm', mime: 'audio/webm;codecs=opus', stt_backup: 'soniox' };
     const chunksS = [new Uint8Array(3000).fill(5), new Uint8Array(1200).fill(6)];
     reset({ mode: 'hang' });
     {
@@ -6578,7 +6600,8 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   let reply = () => ({ text: 'ElevenLabs note.' });
   const A = mk56(() => reply());
   await sleep(200);
-  check('s56: the defaults are ElevenLabs, backed up by Soniox',
+  check('s56: the backup list leads with Mistral Voxtral', A.doc.getElementById('sttBackup').options[0].value === 'mistral', A.doc.getElementById('sttBackup').options[0].value);
+  check('s56: without a Mistral key the default backup falls to Soniox',
     A.doc.getElementById('sttPrimary').value === 'elevenlabs' && A.doc.getElementById('sttBackup').value === 'soniox', A.doc.getElementById('sttPrimary').value + '/' + A.doc.getElementById('sttBackup').value);
   check('s56: a service with no key on the server is greyed out and says why',
     opt(A, 'sttPrimary', 'openai').disabled && /not set up on the server/.test(opt(A, 'sttPrimary', 'openai').textContent) &&
@@ -6642,18 +6665,24 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   await sleep(200);
   check('s56m: with its key, Mistral can be chosen', !opt(D, 'sttPrimary', 'mistral').disabled && !opt(D, 'sttBackup', 'mistral').disabled &&
     opt(D, 'sttBackup', 'mistral').textContent === 'Mistral Voxtral', opt(D, 'sttBackup', 'mistral').textContent);
+  check('s56m: with its key, Mistral is the default backup behind ElevenLabs',
+    D.doc.getElementById('sttPrimary').value === 'elevenlabs' && D.doc.getElementById('sttBackup').value === 'mistral' &&
+    /Now: ElevenLabs Scribe v2 Medical, backed up by Mistral\./.test(D.doc.getElementById('sttHint').textContent),
+    D.doc.getElementById('sttBackup').value + ' | ' + D.doc.getElementById('sttHint').textContent);
+  await take56(D);
+  check('s56m: ...and a take sends it', D.sent[0] && D.sent[0].primary === 'elevenlabs' && D.sent[0].backup === 'mistral', JSON.stringify(D.sent));
   const selD = D.doc.getElementById('sttPrimary');
   selD.value = 'mistral';
   selD.dispatchEvent(new (D.win().Event)('change'));
-  check('s56m: choosing Mistral keeps Soniox as the backup and says so',
-    D.doc.getElementById('sttBackup').value === 'soniox' &&
-    /Transcription service: Mistral Voxtral \(voxtral-mini-latest\), backed up by Soniox\./.test(D.doc.getElementById('status').textContent), D.doc.getElementById('status').textContent);
+  check('s56m: choosing Mistral as the main service moves the backup off it (to ElevenLabs) and says so',
+    D.doc.getElementById('sttBackup').value === 'elevenlabs' &&
+    /Transcription service: Mistral Voxtral \(voxtral-mini-latest\), backed up by ElevenLabs\./.test(D.doc.getElementById('status').textContent), D.doc.getElementById('status').textContent);
   check('s56m: the hint says Mistral gets the first 100 keyterms and returns text only',
     /Mistral gets your keyterms \(the first 100/.test(D.doc.getElementById('sttHint').textContent) && /no speaker filter and no incomplete-transcript check/.test(D.doc.getElementById('sttHint').textContent),
     D.doc.getElementById('sttHint').textContent);
   reply = () => ({ text: 'Voxtral note.', words: [], stt_provider: 'mistral' });
   await take56(D);
-  check('s56m: the take asks for Mistral, backed up by Soniox', D.sent[0] && D.sent[0].primary === 'mistral' && D.sent[0].backup === 'soniox', JSON.stringify(D.sent));
+  check('s56m: the take asks for Mistral, backed up by ElevenLabs', D.sent[1] && D.sent[1].primary === 'mistral' && D.sent[1].backup === 'elevenlabs', JSON.stringify(D.sent));
   const stD = D.doc.getElementById('status');
   check('s56m: a Mistral take says so, as a clean success', /Transcribed by Mistral Voxtral \(voxtral-mini-latest\)\./.test(stD.textContent) && stD.className.includes('ok') && stD.textContent.includes('Done!'),
     stD.className + ' | ' + stD.textContent);
@@ -6667,6 +6696,30 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   await sleep(200);
   check('s56m: the Mistral choice survives a reload', E.doc.getElementById('sttPrimary').value === 'mistral', E.doc.getElementById('sttPrimary').value);
   E.dom.window.close();
+
+  // A device that saved Soniox as the backup when it was the default moves to
+  // Mistral; one where it was picked by hand keeps it
+  store.scribe_v2_settings_v9 = JSON.stringify({ saveApiKey: true, micGranted: true, sttPrimary: 'elevenlabs', sttBackup: 'soniox' });
+  const F = mk56(() => reply(), htmlM);
+  await sleep(200);
+  check('s56b: a saved Soniox backup nobody picked (the old default) becomes Mistral', F.doc.getElementById('sttBackup').value === 'mistral', F.doc.getElementById('sttBackup').value);
+  const selF = F.doc.getElementById('sttBackup');
+  selF.value = 'soniox';
+  selF.dispatchEvent(new (F.win().Event)('change'));
+  const savedF = JSON.parse(F.win().localStorage.getItem('scribe_v2_settings_v9') || '{}');
+  check('s56b: picking Soniox by hand is remembered as a choice', savedF.sttBackup === 'soniox' && savedF.sttBackupSet === true, JSON.stringify({ b: savedF.sttBackup, set: savedF.sttBackupSet }));
+  Object.assign(store, { scribe_v2_settings_v9: F.win().localStorage.getItem('scribe_v2_settings_v9') });
+  F.dom.window.close();
+  const G = mk56(() => reply(), htmlM);
+  await sleep(200);
+  check('s56b: ...and a hand-picked Soniox backup survives a reload', G.doc.getElementById('sttBackup').value === 'soniox', G.doc.getElementById('sttBackup').value);
+  G.dom.window.close();
+  store.scribe_v2_settings_v9 = JSON.stringify({ saveApiKey: true, micGranted: true, sttPrimary: 'mistral', sttBackup: 'soniox' });
+  const H = mk56(() => reply(), htmlM);
+  await sleep(200);
+  check('s56b: behind a Mistral main service a saved Soniox backup is left alone', H.doc.getElementById('sttPrimary').value === 'mistral' && H.doc.getElementById('sttBackup').value === 'soniox',
+    H.doc.getElementById('sttPrimary').value + '/' + H.doc.getElementById('sttBackup').value);
+  H.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

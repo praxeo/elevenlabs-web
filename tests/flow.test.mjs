@@ -5394,7 +5394,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
     opts = opts || {};
     const st = {
       fetches: [], vibes: [], win: null,
-      deliverListeners: 1, batchText: 'Note.', batchFail: false, clipFail: false,
+      deliverListeners: 1, batchText: 'Note.', batchFail: false, clipFail: false, batchDelayMs: 0,
     };
     st.dom = new JSDOM(html, {
       runScripts: 'dangerously', url: 'https://dictation.test/',
@@ -5415,10 +5415,11 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
           st.fetches.push({ url: u, body: fOpts && fOpts.body });
           if (u.includes('/status')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"listeners":' + st.deliverListeners + ',"buffered":0}') });
           if (u.includes('/deliver')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"ok":true,"listeners":' + st.deliverListeners + '}') });
-          return Promise.resolve({
-            ok: !st.batchFail, status: st.batchFail ? 500 : 200, headers: { get: () => null },
-            text: () => Promise.resolve(JSON.stringify(st.batchFail ? { error: 'upload exploded' } : { text: st.batchText })),
-          });
+          const fail = st.batchFail, text = st.batchText;
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ok: !fail, status: fail ? 500 : 200, headers: { get: () => null },
+            text: () => Promise.resolve(JSON.stringify(fail ? { error: 'upload exploded' } : { text: text })),
+          }), st.batchDelayMs || 0));
         };
         win.MediaRecorder = class {
           constructor() { this.state = 'inactive'; }
@@ -5484,17 +5485,22 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   check('s52b: the outcome says added + not sent', status52(A).includes('Added to the note') && status52(A).includes('NOT sent'), status52(A));
   check('s52b: it is a success that reads SAVED, not DONE', A.doc.getElementById('status').className.includes('ok') && A.doc.getElementById('bigState').textContent === 'SAVED', A.doc.getElementById('bigState').textContent);
   check('s52b: exactly one outcome cue, the done cue', outcomes52(A.vibes.slice(vibB)).length === 1 && JSON.stringify(outcomes52(A.vibes.slice(vibB))[0]) === DONE52, JSON.stringify(A.vibes.slice(vibB)));
-  check('s52b: the note now reads "Changed since sent"', cardTag(cards(A)[0]).includes('Changed since sent'), cardTag(cards(A)[0]));
+  check('s52b: the grown note reads "New words not sent"', cardTag(cards(A)[0]).includes('New words not sent'), cardTag(cards(A)[0]));
   check('s52b: the arm is one-shot (button back to HOLD, bar gone)', A.doc.getElementById('bigBtn').textContent === 'HOLD' && A.doc.getElementById('bigTargetBar').style.display === 'none');
   check('s52b: the not-sent reminder counts it', A.doc.getElementById('bigSelBar').style.display !== 'none' && A.doc.getElementById('bigSelInfo').textContent.includes('1 note not sent'), A.doc.getElementById('bigSelInfo').textContent);
 
-  // --- 52c: per-note Send delivers the WHOLE note and marks it Sent --------
+  // --- 52c: Send on a GROWN note sends only its new words -------------------
+  // The desktop already has "First note." — the whole note would repeat it
+  // (appended onto what the desktop holds). Only the added words go.
   cards(A)[0].querySelector('.bnote-send').click();
   await sleep(250);
   const sentC = deliveries52(A);
-  check('s52c: Send posts the whole note as a fresh delivery', sentC.length === delivB + 1 && sentC[sentC.length - 1].text === 'First note. Added words. ' && sentC[sentC.length - 1].delivery_id !== sentC[0].delivery_id, JSON.stringify(sentC[sentC.length - 1]));
+  const lastC = sentC[sentC.length - 1];
+  check('s52c: Send posts ONLY the new words (the desktop has the rest)', sentC.length === delivB + 1 && lastC.text === 'Added words. ' && !lastC.replace, JSON.stringify(lastC));
+  check('s52c: as a fresh delivery', lastC.delivery_id !== sentC[0].delivery_id);
   check('s52c: the ack marks it Sent again', cardTag(cards(A)[0]).includes('✓ Sent'), cardTag(cards(A)[0]));
-  check('s52c: the delivery is announced', status52(A).includes('Delivered to the desktop clipboard'), status52(A));
+  check('s52c: the ack records the whole note as what the desktop has', hist52(A)[0].sentText === 'First note. Added words. ', JSON.stringify(hist52(A)[0].sentText));
+  check('s52c: the delivery says only the new words went', status52(A).includes('new words reached the desktop'), status52(A));
   check('s52c: nothing left unsent -> the reminder hides', A.doc.getElementById('bigSelBar').style.display === 'none');
 
   // --- 52i: editing a sent note flags it as changed -------------------------
@@ -5504,13 +5510,28 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   txtI.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
   await sleep(30);
   check('s52i: the edit is saved to the note', hist52(A)[0].text === 'First note, corrected.' && !!hist52(A)[0].editedAt, JSON.stringify(hist52(A)[0]));
-  check('s52i: an edited sent note reads "Changed since sent"', cardTag(cards(A)[0]).includes('Changed since sent'), cardTag(cards(A)[0]));
+  check('s52i: an edited sent note reads "Edited since sent"', cardTag(cards(A)[0]).includes('Edited since sent'), cardTag(cards(A)[0]));
   const txtI2 = cards(A)[0].querySelector('.bnote-text');
   txtI2.dispatchEvent(new A.win.Event('focus', { bubbles: true }));
   txtI2.textContent = '   ';
   txtI2.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
   await sleep(30);
   check('s52i: emptying a note is refused (Delete is the way)', hist52(A)[0].text === 'First note, corrected.', JSON.stringify(hist52(A)[0].text));
+  // Sending an edited note sends the WHOLE note as a replace: the desktop swaps
+  // it in instead of appending (appending would repeat the old version).
+  const nI = deliveries52(A).length;
+  cards(A)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  const lastI = deliveries52(A)[deliveries52(A).length - 1];
+  check('s52i: an edited note goes whole, marked replace', deliveries52(A).length === nI + 1 && lastI.text === 'First note, corrected. ' && lastI.replace === true, JSON.stringify(lastI));
+  check('s52i: the phone says it replaced the desktop copy', status52(A).includes('REPLACED'), status52(A));
+  check('s52i: and the note is Sent again', cardTag(cards(A)[0]).includes('✓ Sent'), cardTag(cards(A)[0]));
+  // Edit it once more so the next legs still have an edited note to count.
+  const txtI3 = cards(A)[0].querySelector('.bnote-text');
+  txtI3.dispatchEvent(new A.win.Event('focus', { bubbles: true }));
+  txtI3.textContent = 'First note, corrected twice.';
+  txtI3.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
+  await sleep(30);
 
   // --- 52d: Keep on phone, then send the set as ONE note --------------------
   A.doc.getElementById('bigModeKeepBtn').click();
@@ -5628,7 +5649,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   J.doc.getElementById('bigQueueChip').click();
   await sleep(300);
   check('s52j: the queued text was delivered', deliveries52(J).some((d) => d.text === 'Queued note. '), JSON.stringify(deliveries52(J).map((d) => d.text)));
-  check('s52j: an edit made while it waited still reads "Changed since sent"', cardTag(cards(J)[0]).includes('Changed since sent'), cardTag(cards(J)[0]));
+  check('s52j: an edit made while it waited still reads "Edited since sent"', cardTag(cards(J)[0]).includes('Edited since sent'), cardTag(cards(J)[0]));
 
   // --- 52k: "Select" sweeps only the set just dictated -----------------------
   // An older unsent note behind a sent one (say, another patient's) is counted
@@ -5643,6 +5664,156 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   const selK = cards(J).filter((c) => c.classList.contains('selected')).map(cardText);
   check('s52k: it selected only the newest note', selK.length === 1 && selK[0] === 'Newest. ', JSON.stringify(selK));
   J.dom.window.close();
+
+  // --- 52l: the DESKTOP honors a replace -------------------------------------
+  {
+    const socksL = [];
+    let wL;
+    const domL = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        wL = win;
+        win.isSecureContext = true;
+        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+        win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+        const Sock = class extends MockWS { constructor(url) { super(url); socksL.push(this); } };
+        Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+        win.WebSocket = Sock;
+      },
+    });
+    await sleep(80);
+    const docL = domL.window.document;
+    docL.getElementById('appendMode').checked = true; // the desktop appends phone takes
+    docL.getElementById('phoneStartBtn').click();
+    await sleep(20);
+    const sockL = socksL.find((x) => x.url.includes('/api/session/'));
+    sockL.open();
+    await sleep(10);
+    sockL.msg({ message_type: 'phone_delivery', text: 'First part.', delivery_id: 'L1' });
+    await sleep(30);
+    sockL.msg({ message_type: 'phone_delivery', text: 'New words.', delivery_id: 'L2' });
+    await sleep(30);
+    check('s52l: a plain delivery still appends on an append-mode desktop', docL.getElementById('latest').textContent === 'First part. New words. ', JSON.stringify(docL.getElementById('latest').textContent));
+    sockL.msg({ message_type: 'phone_delivery', text: 'First part, corrected. New words.', delivery_id: 'L3', replace: true });
+    await sleep(30);
+    check('s52l: a replace delivery takes the note\'s place (no repeat)', docL.getElementById('latest').textContent === 'First part, corrected. New words.' && wL._clip === 'First part, corrected. New words.', JSON.stringify(docL.getElementById('latest').textContent));
+    check('s52l: and says so', docL.getElementById('status').textContent.includes('REPLACED'), docL.getElementById('status').textContent);
+    domL.window.close();
+  }
+
+  // --- 52m: a note already waiting to send is never sent twice ---------------
+  const M = mk52({ settings: { joinedSessionCode: 'NOTE04', phoneKeepMode: true } });
+  await sleep(250);
+  await take52(M, 'Waiting note.');
+  M.deliverListeners = 0;
+  cards(M)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  cards(M)[0].querySelector('.bnote-send').click(); // tapped again while it waits
+  await sleep(250);
+  const idsM = new Set(deliveries52(M).filter((d) => d.text === 'Waiting note. ').map((d) => d.delivery_id));
+  check('s52m: a second Send on a waiting note retries it, never a second copy', idsM.size === 1, JSON.stringify([...idsM]));
+  check('s52m: and says it is retrying', status52(M).includes('already waiting'), status52(M));
+  M.dom.window.close();
+
+  // --- 52n: "Send as one" sends only what the desktop does not have ----------
+  const N = mk52({ settings: { joinedSessionCode: 'NOTE05', phoneKeepMode: true } });
+  await sleep(250);
+  await take52(N, 'Note one.');
+  await take52(N, 'Note two.');
+  cards(N)[1].querySelector('.bnote-send').click(); // "Note one." goes on its own
+  await sleep(250);
+  cards(N)[0].querySelector('.bnote-sel').click();
+  cards(N)[1].querySelector('.bnote-sel').click();
+  const nN = deliveries52(N).length;
+  N.doc.getElementById('bigSelSendBtn').click();
+  await sleep(250);
+  const setN = deliveries52(N).slice(nN);
+  check('s52n: a note the desktop already has is left out of the set', setN.length === 1 && setN[0].text === 'Note two. ', JSON.stringify(setN.map((d) => d.text)));
+  check('s52n: the set was delivered', status52(N).includes('Delivered to the desktop'), status52(N));
+  // An edited sent note cannot join a set (only a whole-note replace fixes it).
+  const txtN = cards(N)[1].querySelector('.bnote-text');
+  txtN.dispatchEvent(new N.win.Event('focus', { bubbles: true }));
+  txtN.textContent = 'Note one, corrected.';
+  txtN.dispatchEvent(new N.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+  await take52(N, 'Note three.');
+  cards(N)[0].querySelector('.bnote-sel').click();  // Note three
+  cards(N)[2].querySelector('.bnote-sel').click();  // Note one, corrected
+  const nN2 = deliveries52(N).length;
+  N.doc.getElementById('bigSelSendBtn').click();
+  await sleep(250);
+  check('s52n: a set with an edited sent note is refused — nothing sent', deliveries52(N).length === nN2 && status52(N).includes('edited after it was sent'), status52(N));
+  N.dom.window.close();
+
+  // --- 52o: a retry owns its note while it uploads ---------------------------
+  const O = mk52({ settings: { joinedSessionCode: 'NOTE06' }, history: [{ text: 'Base note. ', createdAt: new Date(Date.now() - 60000).toISOString(), sendable: true, sentAt: new Date(Date.now() - 50000).toISOString(), sentText: 'Base note. ' }] });
+  await sleep(250);
+  cards(O)[0].querySelector('.bnote-add').click();
+  O.batchFail = true;
+  await take52(O, 'Rescued words.');
+  O.batchFail = false;
+  O.batchDelayMs = 500; // a slow retry
+  const transcribes = () => O.fetches.filter((f) => f.url.includes('/api/transcribe')).length;
+  const nO = transcribes();
+  O.doc.getElementById('bigRecoverChip').click();
+  await sleep(50);
+  O.doc.getElementById('bigRecoverChip').click(); // double tap
+  await sleep(50);
+  check('s52o: the notes are locked while the retry uploads', cards(O)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'false');
+  check('s52o: the chip says the retry is running', O.doc.getElementById('bigRecoverChip').textContent.includes('Retrying'), O.doc.getElementById('bigRecoverChip').textContent);
+  O.win._clip = 'UNTOUCHED';
+  const idO = ++pid52;
+  pev52(O, O.doc.getElementById('bigBtn'), 'pointerdown', idO);
+  await sleep(100);
+  check('s52o: a take cannot start during the retry — refused LOUDLY', O.win._clip === '##DICTATION_FAILED##' && status52(O).includes('did NOT start') && O.doc.getElementById('recordBtn').textContent.includes('Start'), status52(O));
+  pev52(O, O.doc.getElementById('bigBtn'), 'pointerup', idO);
+  await sleep(700); // the retry lands
+  check('s52o: a double tap never starts a second upload', transcribes() === nO + 1, (transcribes() - nO) + ' uploads');
+  check('s52o: the rescued words land on the note', hist52(O).length === 1 && hist52(O)[0].text === 'Base note. Rescued words. ', JSON.stringify(hist52(O).map((h) => h.text)));
+  check('s52o: the notes unlock afterwards', cards(O)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'true');
+  O.dom.window.close();
+
+  // --- 52p: a note that could not be saved is a FAILURE, never SAVED --------
+  const P = mk52({ settings: { bigButtonMode: 'always' } });
+  await sleep(250);
+  P.clipFail = true;
+  const origSetP = P.win.Storage.prototype.setItem;
+  P.win.Storage.prototype.setItem = function (k, v) {
+    if (k === 'scribe_v2_transcripts_v9') throw new Error('QuotaExceededError');
+    return origSetP.call(this, k, v);
+  };
+  const vibP = P.vibes.length;
+  await take52(P, 'Unsaved note.');
+  check('s52p: a failed save is loud', status52(P).includes('could NOT be saved') && P.doc.getElementById('status').className.includes('err'), status52(P));
+  check('s52p: FAILED, with the fail cue — never SAVED + done', P.doc.getElementById('bigState').textContent === 'FAILED' && JSON.stringify(outcomes52(P.vibes.slice(vibP))) === '[[220,90,220]]', P.doc.getElementById('bigState').textContent + ' ' + JSON.stringify(P.vibes.slice(vibP)));
+  P.win.Storage.prototype.setItem = origSetP;
+  P.dom.window.close();
+
+  // --- 52q: the 100-entry cap never trims a note the desktop does not have ---
+  const histQ = [];
+  for (let i = 0; i < 99; i++) histQ.push({ text: 'Old untracked ' + i + '. ', createdAt: new Date(Date.now() - (i + 2) * 60000).toISOString() });
+  histQ.push({ text: 'Oldest unsent. ', createdAt: new Date(Date.now() - 500 * 60000).toISOString(), sendable: true });
+  const Q = mk52({ settings: { joinedSessionCode: 'NOTE07', phoneKeepMode: true }, history: histQ });
+  await sleep(250);
+  await take52(Q, 'Newest kept.');
+  const hq = hist52(Q);
+  check('s52q: the history stays capped at 100', hq.length === 100, hq.length);
+  check('s52q: the oldest UNSENT note survived the trim', hq.some((h) => h.text === 'Oldest unsent. '), hq.slice(-2).map((h) => h.text).join(' | '));
+  check('s52q: an untracked old entry went instead', !hq.some((h) => h.text === 'Old untracked 98. '), hq.slice(-3).map((h) => h.text).join(' | '));
+  Q.dom.window.close();
+
+  // --- 52r: a note added to while paired is tracked for sending --------------
+  const R = mk52({ settings: { joinedSessionCode: 'NOTE08' }, history: [{ text: 'Solo-era note. ', createdAt: new Date(Date.now() - 60000).toISOString() }] });
+  await sleep(250);
+  check('s52r: an old untracked note has no send tag', cardTag(cards(R)[0]) === '', cardTag(cards(R)[0]));
+  cards(R)[0].querySelector('.bnote-add').click();
+  await take52(R, 'More words.');
+  check('s52r: once added to while paired it reads "Not sent"', cardText(cards(R)[0]) === 'Solo-era note. More words. ' && cardTag(cards(R)[0]) === 'Not sent', cardText(cards(R)[0]) + ' / ' + cardTag(cards(R)[0]));
+  R.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

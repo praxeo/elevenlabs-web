@@ -2004,6 +2004,7 @@ right lower quadrant"></textarea>
   let pendingDeleteTimer  = null;
   let lastStatusHeadline  = "";    // optional headline for an ok status ("SAVED" when a note stayed on the phone)
   let lastQueuedSig       = "";    // which notes the delivery queue carries (re-render the tags when it changes)
+  let recovering          = false; // a saved recording is being re-uploaded (recoverPendingDictation): no take may start, notes are locked
   let lastChromeBusy      = null;  // session busy state last mirrored into the notes (editable or not)
 
   // In-app push-to-talk hotkey (F13/F14 via AHK always work in addition)
@@ -2839,10 +2840,17 @@ right lower quadrant"></textarea>
         // and keeps a stranded note flushable after this update lands.
         deliveryQueue.forEach(function (it) {
           if (typeof it.code !== "string") it.code = joinedSessionCode || "";
-          // Additive: the phone-note ids a delivery carries (marks them sent).
+          // Additive: the phone-note ids a delivery carries (marks them sent),
+          // their texts as sent, and the replace flag.
           if (it.notes !== undefined) {
             it.notes = Array.isArray(it.notes) ? it.notes.filter(function (x) { return typeof x === "string"; }) : [];
           }
+          if (it.noteTexts !== undefined) {
+            var okTexts = Array.isArray(it.noteTexts) && Array.isArray(it.notes) && it.noteTexts.length === it.notes.length &&
+              it.noteTexts.every(function (x) { return typeof x === "string"; });
+            if (!okTexts) delete it.noteTexts;
+          }
+          if (it.replace !== undefined && it.replace !== true) delete it.replace;
         });
       }
       if (s.micGranted === true) micEverGranted = true;
@@ -2869,8 +2877,26 @@ right lower quadrant"></textarea>
     catch (e) { return []; }
   }
 
+  // History keeps the newest HISTORY_MAX entries — except that a phone note
+  // the desktop does not have yet is never the one trimmed: in keep-on-phone
+  // mode the history IS the only copy of it. Up to HISTORY_HARD_MAX entries.
+  const HISTORY_MAX = 100;
+  const HISTORY_HARD_MAX = 200;
+  function trimHistory(items) {
+    if (items.length <= HISTORY_MAX) return items;
+    const keep = items.slice();
+    for (let i = keep.length - 1; i >= 0 && keep.length > HISTORY_MAX; i--) {
+      if (!noteNeedsSending(keep[i])) keep.splice(i, 1);
+    }
+    return keep.slice(0, HISTORY_HARD_MAX);
+  }
+  // The one way history is written (the list re-renders are the callers' choice).
+  function saveHistoryItems(items) {
+    localStorage.setItem(STORE_KEY, JSON.stringify(trimHistory(items)));
+  }
+
   function setHistory(items) {
-    localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
+    saveHistoryItems(items);
     renderHistory();
     renderPhoneNotes(); // the phone layout's notes ARE these entries
   }
@@ -2924,22 +2950,29 @@ right lower quadrant"></textarea>
   }
 
   // A desktop listener acked a delivery that carried these notes. sentAt is
-  // when that delivery was QUEUED (atMs), not when it was acked: the desktop
-  // got the text as it was then, so an edit made while it waited must still
-  // read "Changed since sent".
-  function markNotesSent(ids, atMs) {
+  // when that delivery was QUEUED (atMs), and sentText is each note's full
+  // text as it was then (texts, parallel to ids) — what the desktop now has
+  // of it. An edit made while it waited therefore still reads as unsent, and
+  // a note that only GREW since can later send just its new words.
+  function markNotesSent(ids, atMs, texts) {
     if (!ids || !ids.length) return;
     const items = getHistory();
     const at = new Date(atMs || Date.now()).toISOString();
     let changed = false;
     for (const it of items) {
-      if (ids.indexOf(it.createdAt) !== -1 && isoMs(at) > isoMs(it.sentAt)) { it.sentAt = at; changed = true; }
+      const k = ids.indexOf(it.createdAt);
+      if (k !== -1 && isoMs(at) > isoMs(it.sentAt)) {
+        it.sentAt = at;
+        if (texts && typeof texts[k] === "string") it.sentText = texts[k];
+        else delete it.sentText; // unknown: fall back to the timestamps (noteSendState)
+        changed = true;
+      }
     }
     if (!changed) return;
     // Direct write + the phone list only: the full-page History rows do not
     // show sent state, and re-rendering them here (an ack can land any time)
     // could tear down a row someone is editing.
-    localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
+    saveHistoryItems(items);
     renderPhoneNotes();
   }
 
@@ -3124,9 +3157,11 @@ right lower quadrant"></textarea>
       return;
     }
     bigRecoverChipEl.style.display = "";
-    bigRecoverChipEl.textContent = pendingRecovery.fromUpload
-      ? "⚠ Upload failed — recording SAVED. Tap to retry"
-      : "⚠ Interrupted dictation saved. Tap to recover";
+    bigRecoverChipEl.textContent = recovering
+      ? "⏳ Retrying the saved recording…"
+      : pendingRecovery.fromUpload
+        ? "⚠ Upload failed — recording SAVED. Tap to retry"
+        : "⚠ Interrupted dictation saved. Tap to recover";
   }
 
   // RELIABILITY: a failed/timed-out UPLOAD used to cost the whole dictation —
@@ -3186,14 +3221,31 @@ right lower quadrant"></textarea>
       setStatus("Finish the dictation in progress first, then retry the saved recording.", "warn");
       return;
     }
+    if (recovering) return; // a second tap while the first retry is uploading must not start another
     const rec = pendingRecovery;
+    // While the re-upload runs the retry owns the note it will write: no take
+    // may start (startRecording refuses) and the notes are locked — a note
+    // being edited is saved first. Otherwise a take or an edit could land on
+    // the same note from a stale copy and overwrite the rescued words.
+    recovering = true;
+    blurEditingNote();
+    updateRecoverChip();
     if (journalRecoverBtn) journalRecoverBtn.disabled = true;
     const retryLabel = rec.fromUpload ? "Retrying the upload" : "Recovering the interrupted dictation";
     setStatus(retryLabel + " — uploading its audio…", "warn");
     const fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
     // Duration estimated from size (64 kbps ⇒ 8 bytes/ms): a long recovered take
     // needs the same extended transcription deadline as a live one.
-    const r = await batchTranscribe(rec.blob, fileName, batchUploadTimeoutMs(rec.blob.size / 8, rec.blob.size), retryLabel);
+    let r;
+    try {
+      r = await batchTranscribe(rec.blob, fileName, batchUploadTimeoutMs(rec.blob.size / 8, rec.blob.size), retryLabel);
+    } catch (e) {
+      r = { ok: false, error: (e && e.message) || "upload failed" };
+    }
+    // Everything below up to the first await is synchronous, so the note is
+    // written before anything else can run.
+    recovering = false;
+    updateRecoverChip();
     if (journalRecoverBtn) journalRecoverBtn.disabled = false;
     if (!r.ok || !r.text || !r.text.trim()) {
       setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try again.", "err");
@@ -3219,7 +3271,9 @@ right lower quadrant"></textarea>
     latestText = finalizedSegments.join(" ");
     updateLiveDisplay();
     try {
-      if (target && updateNoteText(target.createdAt, cleanTranscript(latestText), { appendedAt: new Date().toISOString() })) {
+      const addFields = { appendedAt: new Date().toISOString() };
+      if (joinedSessionCode && bigButtonActive()) addFields.sendable = true; // built while paired: meant for the desktop
+      if (target && updateNoteText(target.createdAt, cleanTranscript(latestText), addFields)) {
         savedId = target.createdAt;
       } else {
         savedId = addHistory(latestText, { language_code: "en", engine: "batch", recovered: true,
@@ -3240,13 +3294,14 @@ right lower quadrant"></textarea>
       relayDeliveryToDesktop(latestText, true, "", savedId ? [savedId] : null);
       return;
     }
-    // A take that was staying on the phone (added to a note, or keep-on-phone
-    // mode), or any take on a solo phone: the note in the list is the
-    // deliverable — the copy is a convenience, one tap on the note's Copy away.
-    if (hold || bigButtonActive()) {
+    // On the phone layout (a take that was staying on the phone, or any take
+    // on a solo phone) the note in the list is the deliverable — the copy is a
+    // convenience, one tap on the note's Copy away. A save that failed is not
+    // a SAVED outcome: that stays loud.
+    if (bigButtonActive() && savedId) {
       setStatus((target ? "Recovered and added to the note" : "Recovered dictation saved as a note") +
         (joinedSessionCode ? " — NOT sent to the desktop yet." : ".") +
-        (copied ? " Copied here too." : "") + " Verify it.", "ok", "SAVED");
+        (copied ? " Copied here too." : (joinedSessionCode ? "" : " NOT copied — tap Copy on the note.")) + " Verify it.", "ok", "SAVED");
       doneBeep();
       updateAppendChip();
       return;
@@ -3341,7 +3396,7 @@ right lower quadrant"></textarea>
         all[i].editedAt = new Date().toISOString();
         // Persist directly (not setHistory) so the live re-render can't tear down
         // this row mid-interaction; reflect the "edited" marker in place instead.
-        localStorage.setItem(STORE_KEY, JSON.stringify(all.slice(0, 100)));
+        saveHistoryItems(all);
         meta.textContent = new Date(item.createdAt).toLocaleString() +
           (item.engine ? " · " + item.engine : "") + " · edited";
         original = newText;
@@ -3366,7 +3421,7 @@ right lower quadrant"></textarea>
         const send = document.createElement("button");
         send.textContent = "📤 Send to desktop";
         send.title = "Send this note to the desktop clipboard (a fresh delivery)";
-        send.onclick = () => sendTextToDesktop(text.textContent, [item.createdAt]);
+        send.onclick = () => sendTextToDesktop(text.textContent, [item.createdAt], null, { texts: [cleanTranscript(text.textContent)] });
         row.append(send);
       }
 
@@ -4703,6 +4758,15 @@ right lower quadrant"></textarea>
 
   async function startRecording() {
     if (recording || stopping || finishing) return;
+    if (recovering) {
+      // A saved recording is being re-uploaded and is about to write its note
+      // and the clipboard: a take started now would race both. Refuse LOUDLY
+      // (like every pre-capture refusal) — nothing is recorded, nothing lost.
+      await writeSentinel();
+      setStatus("Recording did NOT start — the saved recording is still being retried (nothing was lost). Dictate again when it finishes.", "err");
+      failBeep();
+      return;
+    }
     if (bigButtonActive()) blurEditingNote(); // a note mid-edit is saved before the take (it may add to it)
     stopRequested = false;
     pendingStart = false;
@@ -5275,6 +5339,7 @@ right lower quadrant"></textarea>
     await deliverFinalText(cleanTranscript(latestText), {
       unexpected: unexpected, label: "Transcript", note: note,
       degraded: degraded, unfilteredText: degraded ? r.unfilteredText : "",
+      takeText: r.text, // this take's own words: an add-to-note lands them on the note's CURRENT text
     });
   }
 
@@ -5357,12 +5422,27 @@ right lower quadrant"></textarea>
     let noteId = null;
     let addedToNote = false;
     try {
-      const addFields = { appendedAt: new Date().toISOString() };
-      if (opts.unfilteredText) addFields.unfiltered = opts.unfilteredText;
-      if (sessionNoteTargetId && updateNoteText(sessionNoteTargetId, cleaned, addFields)) {
-        noteId = sessionNoteTargetId;
-        addedToNote = true;
-      } else {
+      const target = sessionNoteTargetId ? noteById(sessionNoteTargetId) : null;
+      if (target) {
+        // Land the take's words on the note's CURRENT saved text, not on the
+        // copy taken when the take started: anything that wrote the note in
+        // between (a retried recording) must never be overwritten.
+        if (typeof opts.takeText === "string" && opts.takeText.trim()) {
+          const cur = (target.text || "").trim();
+          cleaned = cleanTranscript((cur ? cur + " " : "") + opts.takeText);
+          finalizedSegments = [cleaned.trim()];
+          currentPartial = "";
+          updateLiveDisplay();
+        }
+        const addFields = { appendedAt: new Date().toISOString() };
+        if (opts.unfilteredText) addFields.unfiltered = opts.unfilteredText;
+        if (joinedSessionCode && phoneLayout) addFields.sendable = true; // built while paired: meant for the desktop
+        if (updateNoteText(target.createdAt, cleaned, addFields)) {
+          noteId = target.createdAt;
+          addedToNote = true;
+        }
+      }
+      if (!noteId) {
         noteId = addHistory(cleaned, { language_code: "en", engine: sessionEngine, unfiltered: opts.unfilteredText || "",
           sendable: Boolean(joinedSessionCode && phoneLayout) }).createdAt;
       }
@@ -5396,7 +5476,7 @@ right lower quadrant"></textarea>
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
       if (keptOnPhone) {
-        announceKeptNote(copied, addedToNote, cleanOutcome, opts, noteSuffix);
+        announceKeptNote(copied, addedToNote, cleanOutcome, opts, noteSuffix, Boolean(noteId));
       } else if (announceRelayOutcome) {
         // Don't claim it went to the desktop when we already know none is there:
         // this line is what the phone's big screen shows while the relay runs.
@@ -5426,7 +5506,7 @@ right lower quadrant"></textarea>
       }
     } else {
       if (keptOnPhone) {
-        announceKeptNote(null, addedToNote, cleanOutcome, opts, noteSuffix);
+        announceKeptNote(null, addedToNote, cleanOutcome, opts, noteSuffix, Boolean(noteId));
       } else if (announceRelayOutcome) {
         setStatus((desktopKnownAtStart === false
           ? "Transcript saved — queueing for the desktop…"
@@ -5458,15 +5538,24 @@ right lower quadrant"></textarea>
     // failure was ever shown.
     if (relayCarries) {
       relayDeliveryToDesktop(cleaned, announceRelayOutcome, opts.degraded ? (opts.note || "Verify the transcript.") : "",
-        noteId ? [noteId] : null).finally(maybePendingStart);
+        noteId ? [noteId] : null, noteId ? { texts: [cleaned] } : null).finally(maybePendingStart);
     } else {
       maybePendingStart();
     }
   }
 
   // The single outcome cue for a take whose note STAYS on the phone (see
-  // deliverFinalText). copied: true / false / null (auto-copy off).
-  function announceKeptNote(copied, added, clean, opts, noteSuffix) {
+  // deliverFinalText). copied: true / false / null (auto-copy off). saved:
+  // the note really was written — when it was not (storage full), the list
+  // does not have the text, so this is a loud failure, never SAVED.
+  function announceKeptNote(copied, added, clean, opts, noteSuffix, saved) {
+    if (!saved) {
+      setStatus("⚠ The note could NOT be saved on this phone (storage full?). " +
+        (copied === true ? "It IS on this phone's clipboard — paste it somewhere safe now."
+                         : "Open Settings: the text is in the transcript box there — copy it now."), "err");
+      failBeep();
+      return;
+    }
     const what = added ? "Added to the note" : (joinedSessionCode ? "Saved on this phone" : "Saved as a note");
     if (!clean) {
       // Partial text (connection lost) or a mic that dropped out: loud, as ever.
@@ -6305,7 +6394,7 @@ right lower quadrant"></textarea>
 
   // Deliver text that arrived from the phone to this desktop's clipboard.
   // degraded = live-text fallback (the authoritative delivery never came).
-  function deliverRemoteText(text, degraded) {
+  function deliverRemoteText(text, degraded, replace) {
     // The desktop OWNS the note when a phone is the mic, so it honors THIS
     // device's append mode / one-shot box-click arm: a phone dictation extends
     // the current note instead of replacing it — mirroring single-desktop
@@ -6313,8 +6402,11 @@ right lower quadrant"></textarea>
     // joined phone delivers single segments (see startRecording) and the caller
     // dedupes by delivery_id BEFORE us, so a replayed/retried delivery can never
     // double-append. A one-shot arm is consumed here.
+    // replace: the phone re-sent a WHOLE note the desktop already had (a
+    // correction, or a deliberate re-send) — appending it would repeat that
+    // text, so it takes the note's place instead.
     var base = (latestText || "").trim();
-    var wantAppend = Boolean(base) && (appendModeEl.checked || appendArmed);
+    var wantAppend = !replace && Boolean(base) && (appendModeEl.checked || appendArmed);
     appendArmed = false;
     var combined = wantAppend ? cleanTranscript(base + " " + text) : text;
     latestText = combined;
@@ -6324,14 +6416,14 @@ right lower quadrant"></textarea>
     addHistory(combined, { language_code: "en", engine: "remote" });
     if (!autoCopyEl.checked) {
       if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript saved, not copied. Verify it!", "warn"); warnBeep(); }
-      else          { setStatus(wantAppend ? "Phone transcript appended." : "Phone transcript received.", "ok"); doneBeep(); }
+      else          { setStatus(replace ? "The phone re-sent a whole note — it REPLACED the note here." : (wantAppend ? "Phone transcript appended." : "Phone transcript received."), "ok"); doneBeep(); }
       return;
     }
     copyText(combined).then(function(ok) {
       if (ok) {
         pendingCopyText = "";
         if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript copied instead (less accurate). Verify it!", "warn"); warnBeep(); }
-        else          { setStatus(wantAppend ? "Phone transcript appended & copied. Done!" : "Phone transcript copied. Done!", "ok"); doneBeep(); }
+        else          { setStatus(replace ? "The phone re-sent a whole note — it REPLACED the note here and is copied. Done!" : (wantAppend ? "Phone transcript appended & copied. Done!" : "Phone transcript copied. Done!"), "ok"); doneBeep(); }
       } else {
         // Clipboard writes need document focus, and this tab is usually behind
         // Citrix/Cerner when a delivery lands. Hold the text; retry on refocus.
@@ -6441,7 +6533,7 @@ right lower quadrant"></textarea>
       if (phoneFallbackTimer) { clearTimeout(phoneFallbackTimer); phoneFallbackTimer = null; }
       remoteHasDelivery = true;
       var final = (msg.text || "").trim();
-      if (final) deliverRemoteText(final, false);
+      if (final) deliverRemoteText(final, false, msg.replace === true);
       remoteCommitted   = "";
       remoteHasDelivery = false;
       return;
@@ -6482,7 +6574,11 @@ right lower quadrant"></textarea>
      can never re-copy stale text. This narrows the never-lose-a-dictation gap;
      it never widens it. */
 
-  function enqueueDelivery(text, noteIds) {
+  // extra (optional): texts — each note's full text now (parallel to noteIds),
+  // recorded as what the desktop has once a listener acks; replace — the
+  // desktop swaps this in for its current note instead of appending (a
+  // re-sent or corrected phone note); deliveredMsg — the success wording.
+  function enqueueDelivery(text, noteIds, extra) {
     var item = {
       id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
       text: text,
@@ -6496,7 +6592,11 @@ right lower quadrant"></textarea>
     };
     // The phone notes this delivery carries (createdAt ids): a listener ack
     // marks them sent, and while queued they read "waiting to send".
-    if (noteIds && noteIds.length) item.notes = noteIds.slice(0, 100);
+    if (noteIds && noteIds.length) {
+      item.notes = noteIds.slice(0, 100);
+      if (extra && Array.isArray(extra.texts) && extra.texts.length === noteIds.length) item.noteTexts = extra.texts.slice(0, 100);
+    }
+    if (extra && extra.replace) item.replace = true;
     deliveryQueue.push(item);
     // An unbounded retry buffer is its own failure mode: drop the OLDEST
     // undelivered item (it stays in this device's history). The just-enqueued
@@ -6538,7 +6638,9 @@ right lower quadrant"></textarea>
     // legacy item that somehow lost its stamp).
     var code = item.code || joinedSessionCode;
     if (!code) return "failed";
-    var payload = JSON.stringify({ message_type: "phone_delivery", text: item.text, delivery_id: item.id });
+    var msg = { message_type: "phone_delivery", text: item.text, delivery_id: item.id };
+    if (item.replace) msg.replace = true; // the desktop swaps it in instead of appending (deliverRemoteText)
+    var payload = JSON.stringify(msg);
     // A black-holed POST must still produce an outcome: without a deadline a
     // hung relay reports nothing at all (and would stall a queued session).
     var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
@@ -6601,7 +6703,7 @@ right lower quadrant"></textarea>
       var result = await postDelivery(item);
       if (result === "delivered") {
         if (isCurrent) reachedCurrent = true;
-        try { markNotesSent(item.notes, item.ts); } catch (e) {} // the phone list shows these notes as sent
+        try { markNotesSent(item.notes, item.ts, item.noteTexts); } catch (e) {} // the phone list shows these notes as sent
         // Remove by identity — the splice keeps foreign-code items ahead of us
         // intact (flushChain serializes mutation, so the index is still valid).
         var idx = deliveryQueue.indexOf(item);
@@ -6651,13 +6753,15 @@ right lower quadrant"></textarea>
   // explicit re-send SHOULD deliver again — the desktop dedupe ring only
   // blocks unintentional replays (and the desktop's append mode applies, as
   // with any delivery).
-  function sendTextToDesktop(text, noteIds, sendingMsg) {
+  // extra (optional): { texts, replace, deliveredMsg } — see enqueueDelivery
+  // and relayDeliveryToDesktop.
+  function sendTextToDesktop(text, noteIds, sendingMsg, extra) {
     if (!joinedSessionCode) return;
     if (recording || stopping || finishing) return;
     var t = cleanTranscript(String(text || ""));
     if (!t.trim()) return;
     setStatus(sendingMsg || "Sending to the desktop…", "warn");
-    relayDeliveryToDesktop(t, true, "", noteIds);
+    relayDeliveryToDesktop(t, true, "", noteIds, extra);
   }
 
   // Undelivered notes must be VISIBLE, never just silently retried: a tappable
@@ -6703,8 +6807,8 @@ right lower quadrant"></textarea>
   // the queue flush returns this item's fate and we translate it here.
   // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
   // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
-  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote, noteIds) {
-    var item = enqueueDelivery(text, noteIds); // durable BEFORE the network call: a phone that dies now recovers at boot
+  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote, noteIds, extra) {
+    var item = enqueueDelivery(text, noteIds, extra); // durable BEFORE the network call: a phone that dies now recovers at boot
     var outcome = await flushDeliveryQueue({ currentId: item.id });
     // announceOutcome FALSE ⇒ an unexpected/mic-alarm joined dictation:
     // deliverFinalText already played the loud local cue (fail beep + red
@@ -6725,7 +6829,7 @@ right lower quadrant"></textarea>
         return;
       }
       // The deferred outcome cue: the desktop received it — the success moment.
-      setStatus("Delivered to the desktop clipboard. Done!", "ok");
+      setStatus((extra && extra.deliveredMsg) || "Delivered to the desktop clipboard. Done!", "ok");
       doneBeep();
     } else if (outcome === "buffered") {
       // POST ok but nobody is listening: the desktop does not have it yet.
@@ -6976,15 +7080,43 @@ right lower quadrant"></textarea>
      note. Paired, each note says whether the desktop has it. */
   function isoMs(x) { var t = x ? Date.parse(x) : 0; return isFinite(t) ? t : 0; }
 
+  // How this note compares with what the desktop has of it (sentText):
+  //   never  — no delivery carrying it was ever acked
+  //   sent   — the desktop has exactly this text
+  //   grown  — only words ADDED since ("Add to this"): tail = the new words
+  //   edited — changed some other way: only the whole note can bring the
+  //            desktop up to date (sent as a replace)
+  function noteSendState(it) {
+    if (!it.sentAt) return { kind: "never" };
+    var t = cleanTranscript(it.text || "").trim();
+    if (typeof it.sentText !== "string") {
+      // No record of the sent text: all the timestamps can say is changed or not.
+      return Math.max(isoMs(it.editedAt), isoMs(it.appendedAt)) > isoMs(it.sentAt) ? { kind: "edited" } : { kind: "sent" };
+    }
+    var sent = cleanTranscript(it.sentText).trim();
+    if (t === sent) return { kind: "sent" };
+    // Grown only when the sent text is a whole-word prefix ("The patient" is
+    // not a prefix of "The patients…").
+    if (sent && t.indexOf(sent) === 0 && t.charAt(sent.length) === " ") return { kind: "grown", tail: t.slice(sent.length).trim() };
+    return { kind: "edited" };
+  }
+
+  // A note that must not be lost before the desktop has it (see trimHistory).
+  function noteNeedsSending(it) {
+    if (!it) return false;
+    var kind = noteSendState(it).kind;
+    return kind === "never" ? Boolean(it.sendable) : kind !== "sent";
+  }
+
   // What the desktop has of this note (paired only). null = nothing to say
   // (a solo note, or one from before the phone layout tracked sending).
   function noteTag(item, queued) {
-    if (!joinedSessionCode) return item.sentAt ? { text: "✓ Sent", cls: "sent" } : null;
+    var st = noteSendState(item);
+    if (!joinedSessionCode) return st.kind === "sent" ? { text: "✓ Sent", cls: "sent" } : null;
     if (queued[item.createdAt]) return { text: "⏳ Waiting to send", cls: "queued" };
-    var sentMs = isoMs(item.sentAt);
-    var changedMs = Math.max(isoMs(item.editedAt), isoMs(item.appendedAt));
-    if (sentMs && changedMs <= sentMs) return { text: "✓ Sent", cls: "sent" };
-    if (sentMs) return { text: "Changed since sent", cls: "unsent" };
+    if (st.kind === "sent") return { text: "✓ Sent", cls: "sent" };
+    if (st.kind === "grown") return { text: "New words not sent", cls: "unsent" };
+    if (st.kind === "edited") return { text: "Edited since sent", cls: "unsent" };
     if (item.sendable) return { text: "Not sent", cls: "unsent" };
     return null;
   }
@@ -7020,6 +7152,9 @@ right lower quadrant"></textarea>
     for (var i = 0; i < items.length; i++) {
       var tag = noteTag(items[i], queued);
       if (!tag || tag.cls !== "unsent") break;
+      // An edited sent note can only go on its own (as a replace), so it ends
+      // the run rather than making "Send as one" refuse.
+      if (noteSendState(items[i]).kind === "edited") break;
       run.push(items[i].createdAt);
     }
     return run;
@@ -7043,7 +7178,8 @@ right lower quadrant"></textarea>
     return t.length > 60 ? t.slice(0, 60) + "…" : t;
   }
 
-  function sessionBusy() { return recording || stopping || finishing; }
+  // A take in flight, or a saved recording being retried (it writes a note too).
+  function sessionBusy() { return recording || stopping || finishing || recovering; }
 
   // A note being edited must be saved before anything else touches it — the
   // blur handler persists it. The floating button's pointerdown is
@@ -7156,8 +7292,8 @@ right lower quadrant"></textarea>
       var send = document.createElement("button");
       send.className = "bnote-send";
       send.textContent = "📤 Send";
-      send.title = "Send this note to the desktop clipboard";
-      send.onclick = function () { sendTextToDesktop(text.textContent, [id]); };
+      send.title = "Send this note to the desktop clipboard (only its new words, when the desktop already has the rest)";
+      send.onclick = function () { sendPhoneNote(id); };
       actions.append(send);
     }
     var del = document.createElement("button");
@@ -7183,14 +7319,35 @@ right lower quadrant"></textarea>
         var items = getHistory();
         var i = items.findIndex(function (it) { return it.createdAt === id; });
         if (i >= 0) {
+          var stored = items[i].text || "";
+          var note = "";
+          if (stored !== original) {
+            // Something else wrote this note while it was being edited (every
+            // writer locks the notes, so this is a backstop). Never overwrite
+            // it blind: a pure addition is carried over onto the edit; anything
+            // else keeps the stored text and saves the edit as a note of its own.
+            var so = cleanTranscript(original).trim(), ss = cleanTranscript(stored).trim();
+            if (so && ss.indexOf(so) === 0 && ss.charAt(so.length) === " ") {
+              newText = cleanTranscript(newText.trim() + " " + ss.slice(so.length).trim());
+              note = " (Words added meanwhile were kept at the end.)";
+            } else {
+              items.unshift({ text: newText, createdAt: new Date(Math.max(Date.now(), isoMs(items[0] && items[0].createdAt) + 1)).toISOString(),
+                              engine: items[i].engine, sendable: items[i].sendable, editedAt: new Date().toISOString() });
+              saveHistoryItems(items);
+              setStatus("That note changed while you were editing it — your edit was saved as a NEW note; check both.", "warn");
+              renderHistory();
+              setTimeout(function () { renderPhoneNotes(); }, 0);
+              return;
+            }
+          }
           items[i].text = newText;
           items[i].editedAt = new Date().toISOString();
           // Direct write, then one re-render below (not setHistory: the blur
           // may be followed straight away by a tap on another note).
-          localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
+          saveHistoryItems(items);
           // Neutral, not "ok": the green DONE is for text reaching a clipboard.
-          setStatus("Saved your edit to the note." +
-            (items[i].sentAt && joinedSessionCode ? " It changed after it was sent — send it again if the desktop needs the new text." : ""), "");
+          setStatus("Saved your edit to the note." + note +
+            (items[i].sentAt && joinedSessionCode ? " It changed after it was sent — tap 📤 Send to update the desktop (the whole note replaces its copy)." : ""), "");
           renderHistory();
         }
       }
@@ -7242,17 +7399,70 @@ right lower quadrant"></textarea>
     setStatus("Note deleted.", "");
   }
 
+  // One tap on a note's 📤: send what the desktop does not have yet.
+  //   never  → the whole note (the desktop's append mode applies, as for any take)
+  //   grown  → ONLY the new words — the desktop already has the rest, so the
+  //            whole note would repeat it (appended onto what it holds)
+  //   sent / edited → the whole note as a REPLACE: the desktop swaps it in
+  //            instead of appending (a re-send or a correction, never a repeat)
+  //   queued → it is already on its way: retry the queue now, never a 2nd copy
+  function sendPhoneNote(id) {
+    if (!joinedSessionCode || sessionBusy()) return;
+    var note = noteById(id);
+    if (!note) return;
+    if (queuedNoteIds()[id]) {
+      setStatus("That note is already waiting to send — retrying now.", "warn");
+      backgroundFlush();
+      return;
+    }
+    var full = cleanTranscript(note.text || "");
+    if (!full.trim()) return;
+    var st = noteSendState(note);
+    if (st.kind === "grown") {
+      sendTextToDesktop(st.tail, [id], "Sending the new words to the desktop (it already has the rest)…",
+        { texts: [full], deliveredMsg: "The new words reached the desktop clipboard (it already had the rest). Done!" });
+    } else if (st.kind === "sent" || st.kind === "edited") {
+      sendTextToDesktop(full, [id], "Sending the whole note — it REPLACES the desktop's current note…",
+        { texts: [full], replace: true, deliveredMsg: "The note reached the desktop and REPLACED its current note. Done!" });
+    } else {
+      sendTextToDesktop(full, [id], null, { texts: [full] });
+    }
+  }
+
+  // "Send as one": the checked notes, oldest first, as ONE delivery of what
+  // the desktop does not have yet — a note's new words if it grew, nothing if
+  // the desktop already has it (left out), and a refusal for a note edited
+  // after it was sent (only a whole-note replace can fix that; send it alone).
   function sendSelectedNotes() {
     if (!joinedSessionCode || sessionBusy()) return;
-    var ids = selectedNoteIds.filter(function (id) { return noteById(id); });
-    if (!ids.length) return;
-    var text = combinedNotesText(ids);
-    if (!text.trim()) return;
+    var picked = getHistory().filter(function (it) { return selectedNoteIds.indexOf(it.createdAt) !== -1; });
+    if (!picked.length) return;
+    picked.sort(function (a, b) { return isoMs(a.createdAt) - isoMs(b.createdAt); });
+    var queued = queuedNoteIds();
+    var parts = [], ids = [], texts = [], left = 0;
+    for (var i = 0; i < picked.length; i++) {
+      var it = picked[i];
+      var st = noteSendState(it);
+      if (st.kind === "edited") {
+        setStatus("“" + notePreview(it.text) + "” was edited after it was sent — send it on its own with its 📤 (it replaces the desktop's copy). Nothing was sent.", "warn");
+        return;
+      }
+      if (st.kind === "sent" || queued[it.createdAt]) { left++; continue; } // already there / already on its way
+      var full = cleanTranscript(it.text || "");
+      parts.push(st.kind === "grown" ? st.tail : full.trim());
+      ids.push(it.createdAt);
+      texts.push(full);
+    }
+    if (!parts.length) {
+      setStatus("The desktop already has " + (picked.length === 1 ? "that note" : "those notes") + " (or they are waiting to send) — nothing new to send.", "");
+      return;
+    }
     selectedNoteIds = [];
     renderPhoneNotes();
-    sendTextToDesktop(text, ids, ids.length > 1
-      ? "Sending " + ids.length + " notes to the desktop as one note…"
-      : "Sending to the desktop…");
+    sendTextToDesktop(cleanTranscript(parts.join(" ")), ids,
+      (ids.length > 1 ? "Sending " + ids.length + " notes to the desktop as one note…" : "Sending to the desktop…") +
+      (left ? " (" + left + " left out — the desktop already has " + (left === 1 ? "it" : "them") + ")" : ""),
+      { texts: texts });
   }
 
   async function copySelectedNotes() {

@@ -11,18 +11,6 @@
 // custom terms win, then checked presets, then `always` lists.
 export const KEYTERM_PRESETS = [
   {
-    id: "standard",
-    label: "Standard medical",
-    always: true,
-    terms: [
-      "afebrile", "auscultation",
-      "alert and oriented", "no acute distress",
-      "paronychia", "melena", "hematochezia", "HEART score", "MVC",
-      "COPD", "nonspecific", "ascites", "syncopal", "CVA", "CABG", "pilonidal", "CT angio", "post-discharge clinic", "hematemesis", "epistaxis", "AAA", 
-      "ureterolithiasis", "biliary colic", "syncope", "syncopal", "UAB", "Kirklin", "UED", "ureteral colic",
-    ],
-  },
-  {
     id: "wound",
     label: "Wound care clinic",
     always: false,

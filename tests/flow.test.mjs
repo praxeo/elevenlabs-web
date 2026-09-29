@@ -1944,23 +1944,22 @@ console.log('--- scenario 25: big-button layout ---');
   await sleep(400);
   check('s25b: owning finger release stops + delivers', (B.win._clip || '').includes('Multi note.'), JSON.stringify(B.win._clip));
 
-  // peek strip: collapsed mirror, tap to expand. Append is the DESKTOP's job in
-  // the phone-link flow (this device is only a mic), so click-to-append is a
-  // no-op while joined and a dictation delivers a SINGLE segment — never a
-  // locally-accumulated note, which would double-append on the desktop.
-  const peekB = dB.getElementById('bigPeek');
-  check('s25b: peek strip mirrors the latest transcript', dB.getElementById('bigPeekText').textContent.includes('Multi note.'), dB.getElementById('bigPeekText').textContent);
-  check('s25b: peek starts collapsed', !peekB.classList.contains('expanded'));
-  dB.getElementById('bigPeekBar').click();
-  check('s25b: tapping the bar expands the peek', peekB.classList.contains('expanded'));
-  dB.getElementById('bigPeekText').click(); // arming is suppressed while joined
-  check('s25b: click-to-append is a no-op while joined (desktop owns append)', dB.getElementById('appendChip').style.display === 'none' && !peekB.classList.contains('armed'), dB.getElementById('appendChip').style.display);
+  // The notes list replaced the peek strip: the newest note is the first card.
+  // Append stays the DESKTOP's job for a plain paired take (this device is only
+  // a mic), so a dictation delivers a SINGLE segment — never a locally-
+  // accumulated note, which would double-append on the desktop. (Adding to a
+  // note on the phone is a separate path that stays on the phone — s52.)
+  const firstNoteB = () => (dB.querySelector('#bigNotes .bnote .bnote-text') || {}).textContent || '';
+  check('s25b: the newest note heads the phone notes list', firstNoteB().includes('Multi note.'), firstNoteB());
+  check('s25b: the old peek strip is gone', !dB.getElementById('bigPeek'));
+  check('s25b: the record control is the floating button', !!dB.getElementById('bigBtn') && html.includes('#bigBtn {\n      position: fixed;'));
   B.batchText = 'Single seg.';
   pev(B.win, bigBtnB, 'pointerdown', 7);
   await sleep(550);
   pev(B.win, bigBtnB, 'pointerup', 7);
   await sleep(400);
   check('s25b: a joined dictation delivers a single segment (no local accumulation)', (B.win._clip || '').includes('Single seg.') && !(B.win._clip || '').includes('Multi note.'), JSON.stringify(B.win._clip));
+  check('s25b: and it is its own note, not merged into the previous one', firstNoteB().trim() === 'Single seg.', firstNoteB());
 
   // relay outcome is part of the screen: a zero-listener ack reddens it even
   // though the local delivery already succeeded (and beeped done)
@@ -3339,11 +3338,10 @@ console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
   await sleep(250);
   check('s34c: the history-row send delivers that row\'s text', deliveries34().length === n2 + 1, (deliveries34().length - n2) + ' posts');
 
-  // (d) The expanded big-peek offers the send button on the phone surface.
-  doc34.getElementById('bigPeekBar').click(); // expand
-  await sleep(30);
-  const bigSend = doc34.getElementById('bigSendBtn');
-  check('s34d: the expanded big-peek shows Send to desktop again', bigSend.style.display !== 'none', bigSend.style.display);
+  // (d) On the phone layout (the overlay covers the box) every note card
+  //     offers its own Send while joined.
+  const cardSend34 = doc34.querySelector('#bigNotes .bnote .bnote-send');
+  check('s34d: phone note cards offer Send while joined', !!cardSend34, doc34.getElementById('bigNotes').innerHTML.slice(0, 200));
 
   // (e) A failed delivery queues + the chip shows; a tap retries and clears it.
   deliver34 = 'fail';
@@ -5373,6 +5371,449 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   check('s51h: the timing log records a stream timeout', e51h.path === 'stream' && e51h.errKind === 'timeout', e51h.path + ' ' + e51h.errKind);
   dom51h.window.close();
   mode51 = 'ok';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 52. [UX] The phone notes layout. The full-screen big button took the whole
+//     phone; the phone now shows its dictations as a notes list with a small
+//     floating record button, so the clinician can:
+//       - see earlier notes and ADD a take to one ("Add to this", one-shot) —
+//         that note is rewritten in place and stays on the phone (held), so the
+//         desktop's own append can never double it;
+//       - keep takes on the phone ("Keep on phone" mode) and send them later,
+//         one at a time or several as ONE note (oldest first);
+//       - see which notes the desktop has ("✓ Sent" only on a listener ack);
+//       - copy, edit and (two-tap) delete notes;
+//       - on a SOLO phone, get a note (SAVED) instead of a red FAILED on every
+//         take just because iOS refused the post-upload clipboard write.
+//     A plain paired take in send mode is unchanged: relayed, desktop owns append.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 52: phone notes layout ---');
+  const mk52 = (opts) => {
+    opts = opts || {};
+    const st = {
+      fetches: [], vibes: [], win: null,
+      deliverListeners: 1, batchText: 'Note.', batchFail: false, clipFail: false, batchDelayMs: 0,
+    };
+    st.dom = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        st.win = win;
+        win.isSecureContext = true;
+        Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+        win.navigator.clipboard = { writeText: (t) => { if (st.clipFail) return Promise.reject(new Error('NotAllowedError')); win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock';
+        win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.vibrate = (p) => { st.vibes.push(p); return true; };
+        const track = { readyState: 'live', muted: false, addEventListener() {}, stop() { this.readyState = 'ended'; } };
+        const stream = { getAudioTracks: () => [track], getTracks: () => [track] };
+        win.navigator.mediaDevices = { getUserMedia: () => { track.readyState = 'live'; return Promise.resolve(stream); }, addEventListener: () => {} };
+        win.fetch = (url, fOpts) => {
+          const u = String(url);
+          st.fetches.push({ url: u, body: fOpts && fOpts.body });
+          if (u.includes('/status')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"listeners":' + st.deliverListeners + ',"buffered":0}') });
+          if (u.includes('/deliver')) return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"ok":true,"listeners":' + st.deliverListeners + '}') });
+          const fail = st.batchFail, text = st.batchText;
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ok: !fail, status: fail ? 500 : 200, headers: { get: () => null },
+            text: () => Promise.resolve(JSON.stringify(fail ? { error: 'upload exploded' } : { text: text })),
+          }), st.batchDelayMs || 0));
+        };
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; }
+          static isTypeSupported() { return false; }
+          start() { this.state = 'recording'; }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+        };
+        const Sock = class extends MockWS {}; Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+        win.WebSocket = Sock;
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(Object.assign({ micGranted: true, saveApiKey: true, micTipsSeen: true }, opts.settings || {})));
+        win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-52');
+        if (opts.history) win.localStorage.setItem('scribe_v2_transcripts_v9', JSON.stringify(opts.history));
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (52):', e.message); failures++; });
+      },
+    });
+    st.doc = st.dom.window.document;
+    return st;
+  };
+  const pev52 = (st, el, type, id) => { const ev = new st.win.Event(type, { bubbles: true, cancelable: true }); ev.pointerId = id; el.dispatchEvent(ev); };
+  let pid52 = 100;
+  const take52 = async (st, text) => {
+    st.batchText = text;
+    const id = ++pid52;
+    pev52(st, st.doc.getElementById('bigBtn'), 'pointerdown', id);
+    await sleep(550); // a hold past HOTKEY_TAP_MS
+    pev52(st, st.doc.getElementById('bigBtn'), 'pointerup', id);
+    await sleep(450);
+  };
+  const cards = (st) => Array.from(st.doc.querySelectorAll('#bigNotes .bnote'));
+  const cardText = (c) => c ? c.querySelector('.bnote-text').textContent : '';
+  const cardTag = (c) => (c && c.querySelector('.bnote-tag')) ? c.querySelector('.bnote-tag').textContent : '';
+  const hist52 = (st) => JSON.parse(st.win.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  const posts = (st, kind) => st.fetches.filter((f) => f.url.includes('/deliver') && String(f.body || '').includes(kind));
+  const deliveries52 = (st) => posts(st, 'phone_delivery').map((f) => JSON.parse(f.body));
+  const status52 = (st) => st.doc.getElementById('status').textContent;
+  const outcomes52 = (vibes) => vibes.filter((v) => { const s = JSON.stringify(v); return s === '[40,60,40]' || s === '[90,90,90]' || s === '[220,90,220]'; });
+  const DONE52 = '[40,60,40]';
+
+  // --- 52a: the layout, and a plain paired take (unchanged: relayed) --------
+  const A = mk52({ settings: { joinedSessionCode: 'NOTE01' } });
+  await sleep(250);
+  check('s52a: a paired phone boots into the notes layout', A.doc.body.classList.contains('bigbtn'), A.doc.body.className);
+  check('s52a: no notes yet -> an empty-list hint, not a blank screen', !!A.doc.getElementById('bigNotesEmpty'));
+  check('s52a: the floating button reads HOLD', A.doc.getElementById('bigBtn').textContent === 'HOLD', A.doc.getElementById('bigBtn').textContent);
+  check('s52a: paired -> the "Each take" mode row shows, Send is on', A.doc.getElementById('bigModeRow').style.display !== 'none' && A.doc.getElementById('bigModeSendBtn').classList.contains('on'));
+  await take52(A, 'First note.');
+  check('s52a: the take became the first note card', cards(A).length === 1 && cardText(cards(A)[0]) === 'First note. ', JSON.stringify(cardText(cards(A)[0])));
+  check('s52a: a plain paired take is still relayed (one phone_delivery)', deliveries52(A).length === 1 && deliveries52(A)[0].text === 'First note. ', JSON.stringify(deliveries52(A)));
+  check('s52a: and the desktop still gets the recording pings', posts(A, 'phone_recording').length === 2, posts(A, 'phone_recording').length);
+  check('s52a: the listener ack marks the note Sent', cardTag(cards(A)[0]).includes('Sent') && !!hist52(A)[0].sentAt, cardTag(cards(A)[0]));
+  check('s52a: a paired phone note is tracked for sending', hist52(A)[0].sendable === true);
+
+  // --- 52b: "Add to this" — the next take extends THAT note, on the phone ---
+  cards(A)[0].querySelector('.bnote-add').click();
+  check('s52b: arming shows the target bar', A.doc.getElementById('bigTargetBar').style.display !== 'none' && A.doc.getElementById('bigTargetText').textContent.includes('First note.'), A.doc.getElementById('bigTargetText').textContent);
+  check('s52b: the floating button reads ADD', A.doc.getElementById('bigBtn').textContent === 'ADD', A.doc.getElementById('bigBtn').textContent);
+  check('s52b: the targeted card is highlighted', cards(A)[0].classList.contains('target'));
+  const delivB = deliveries52(A).length, pingB = posts(A, 'phone_recording').length, vibB = A.vibes.length;
+  await take52(A, 'Added words.');
+  check('s52b: the take was ADDED to the same note (no new note)', hist52(A).length === 1 && cardText(cards(A)[0]) === 'First note. Added words. ', JSON.stringify(hist52(A).map((h) => h.text)));
+  check('s52b: an added-to note is NOT auto-sent (the desktop would double it)', deliveries52(A).length === delivB, deliveries52(A).length - delivB);
+  check('s52b: nor does the desktop get recording pings for it', posts(A, 'phone_recording').length === pingB, posts(A, 'phone_recording').length - pingB);
+  check('s52b: the outcome says added + not sent', status52(A).includes('Added to the note') && status52(A).includes('NOT sent'), status52(A));
+  check('s52b: it is a success that reads SAVED, not DONE', A.doc.getElementById('status').className.includes('ok') && A.doc.getElementById('bigState').textContent === 'SAVED', A.doc.getElementById('bigState').textContent);
+  check('s52b: exactly one outcome cue, the done cue', outcomes52(A.vibes.slice(vibB)).length === 1 && JSON.stringify(outcomes52(A.vibes.slice(vibB))[0]) === DONE52, JSON.stringify(A.vibes.slice(vibB)));
+  check('s52b: the grown note reads "New words not sent"', cardTag(cards(A)[0]).includes('New words not sent'), cardTag(cards(A)[0]));
+  check('s52b: the arm is one-shot (button back to HOLD, bar gone)', A.doc.getElementById('bigBtn').textContent === 'HOLD' && A.doc.getElementById('bigTargetBar').style.display === 'none');
+  check('s52b: the not-sent reminder counts it', A.doc.getElementById('bigSelBar').style.display !== 'none' && A.doc.getElementById('bigSelInfo').textContent.includes('1 note not sent'), A.doc.getElementById('bigSelInfo').textContent);
+
+  // --- 52c: Send on a GROWN note sends only its new words -------------------
+  // The desktop already has "First note." — the whole note would repeat it
+  // (appended onto what the desktop holds). Only the added words go.
+  cards(A)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  const sentC = deliveries52(A);
+  const lastC = sentC[sentC.length - 1];
+  check('s52c: Send posts ONLY the new words (the desktop has the rest)', sentC.length === delivB + 1 && lastC.text === 'Added words. ' && !lastC.replace, JSON.stringify(lastC));
+  check('s52c: as a fresh delivery', lastC.delivery_id !== sentC[0].delivery_id);
+  check('s52c: the ack marks it Sent again', cardTag(cards(A)[0]).includes('✓ Sent'), cardTag(cards(A)[0]));
+  check('s52c: the ack records the whole note as what the desktop has', hist52(A)[0].sentText === 'First note. Added words. ', JSON.stringify(hist52(A)[0].sentText));
+  check('s52c: the delivery says only the new words went', status52(A).includes('new words reached the desktop'), status52(A));
+  check('s52c: nothing left unsent -> the reminder hides', A.doc.getElementById('bigSelBar').style.display === 'none');
+
+  // --- 52i: editing a sent note flags it as changed -------------------------
+  const txtI = cards(A)[0].querySelector('.bnote-text');
+  txtI.dispatchEvent(new A.win.Event('focus', { bubbles: true }));
+  txtI.textContent = 'First note, corrected.';
+  txtI.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+  check('s52i: the edit is saved to the note', hist52(A)[0].text === 'First note, corrected.' && !!hist52(A)[0].editedAt, JSON.stringify(hist52(A)[0]));
+  check('s52i: an edited sent note reads "Edited since sent"', cardTag(cards(A)[0]).includes('Edited since sent'), cardTag(cards(A)[0]));
+  const txtI2 = cards(A)[0].querySelector('.bnote-text');
+  txtI2.dispatchEvent(new A.win.Event('focus', { bubbles: true }));
+  txtI2.textContent = '   ';
+  txtI2.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+  check('s52i: emptying a note is refused (Delete is the way)', hist52(A)[0].text === 'First note, corrected.', JSON.stringify(hist52(A)[0].text));
+  // Sending an edited note sends the WHOLE note as a replace: the desktop swaps
+  // it in instead of appending (appending would repeat the old version).
+  const nI = deliveries52(A).length;
+  cards(A)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  const lastI = deliveries52(A)[deliveries52(A).length - 1];
+  check('s52i: an edited note goes whole, marked replace', deliveries52(A).length === nI + 1 && lastI.text === 'First note, corrected. ' && lastI.replace === true, JSON.stringify(lastI));
+  check('s52i: the phone says it replaced the desktop copy', status52(A).includes('REPLACED'), status52(A));
+  check('s52i: and the note is Sent again', cardTag(cards(A)[0]).includes('✓ Sent'), cardTag(cards(A)[0]));
+  // Edit it once more so the next legs still have an edited note to count.
+  const txtI3 = cards(A)[0].querySelector('.bnote-text');
+  txtI3.dispatchEvent(new A.win.Event('focus', { bubbles: true }));
+  txtI3.textContent = 'First note, corrected twice.';
+  txtI3.dispatchEvent(new A.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+
+  // --- 52d: Keep on phone, then send the set as ONE note --------------------
+  A.doc.getElementById('bigModeKeepBtn').click();
+  check('s52d: Keep on phone is persisted per device', JSON.parse(A.win.localStorage.getItem('scribe_v2_settings_v9')).phoneKeepMode === true);
+  const delivD = deliveries52(A).length, pingD = posts(A, 'phone_recording').length;
+  await take52(A, 'Kept one.');
+  await take52(A, 'Kept two.');
+  check('s52d: kept takes become new notes, newest first', cardText(cards(A)[0]) === 'Kept two. ' && cardText(cards(A)[1]) === 'Kept one. ', cards(A).map(cardText).join(' | '));
+  check('s52d: nothing was sent to the desktop', deliveries52(A).length === delivD && posts(A, 'phone_recording').length === pingD, (deliveries52(A).length - delivD) + ' deliveries');
+  check('s52d: the outcome says kept on the phone', status52(A).includes('Saved on this phone') && status52(A).includes('NOT sent'), status52(A));
+  check('s52d: headline SAVED', A.doc.getElementById('bigState').textContent === 'SAVED', A.doc.getElementById('bigState').textContent);
+  check('s52d: both read "Not sent"', cardTag(cards(A)[0]) === 'Not sent' && cardTag(cards(A)[1]) === 'Not sent', cardTag(cards(A)[0]) + '/' + cardTag(cards(A)[1]));
+  check('s52d: the reminder counts all three unsent notes', A.doc.getElementById('bigSelInfo').textContent.includes('3 notes not sent'), A.doc.getElementById('bigSelInfo').textContent);
+  // Select just the two kept notes (the checkboxes), send them as one.
+  cards(A)[0].querySelector('.bnote-sel').click();
+  cards(A)[1].querySelector('.bnote-sel').click();
+  check('s52d: the bar switches to the selection', A.doc.getElementById('bigSelInfo').textContent === '2 selected' && A.doc.getElementById('bigSelSendBtn').style.display !== 'none', A.doc.getElementById('bigSelInfo').textContent);
+  A.doc.getElementById('bigSelSendBtn').click();
+  await sleep(250);
+  const setD = deliveries52(A).slice(delivD);
+  check('s52d: the set goes as ONE delivery', setD.length === 1, setD.length);
+  check('s52d: oldest first, joined like an append', setD[0] && setD[0].text === 'Kept one. Kept two. ', JSON.stringify(setD[0] && setD[0].text));
+  check('s52d: the ack marks both notes Sent', cardTag(cards(A)[0]).includes('✓ Sent') && cardTag(cards(A)[1]).includes('✓ Sent'), cardTag(cards(A)[0]) + '/' + cardTag(cards(A)[1]));
+  check('s52d: the selection is cleared', !cards(A).some((c) => c.classList.contains('selected')));
+
+  // --- 52e: Copy as one, and the two-tap delete ------------------------------
+  cards(A)[0].querySelector('.bnote-sel').click();
+  cards(A)[1].querySelector('.bnote-sel').click();
+  A.doc.getElementById('bigSelCopyBtn').click();
+  await sleep(30);
+  check('s52e: Copy as one puts the set on the clipboard, oldest first', A.win._clip === 'Kept one. Kept two. ', JSON.stringify(A.win._clip));
+  A.doc.getElementById('bigSelClearBtn').click();
+  check('s52e: clearing the selection', !cards(A).some((c) => c.classList.contains('selected')));
+  const nE = hist52(A).length;
+  cards(A)[0].querySelector('.bnote-del').click();
+  check('s52e: the first Delete tap only arms it', hist52(A).length === nE && cards(A)[0].querySelector('.bnote-del').textContent === 'Delete?', cards(A)[0].querySelector('.bnote-del').textContent);
+  cards(A)[0].querySelector('.bnote-del').click();
+  check('s52e: the second tap deletes the note', hist52(A).length === nE - 1 && cardText(cards(A)[0]) === 'Kept one. ', cards(A).map(cardText).join(' | '));
+
+  // --- 52f: nothing on a note moves while a take is in flight ----------------
+  const idF = ++pid52;
+  A.batchText = 'Mid note.';
+  pev52(A, A.doc.getElementById('bigBtn'), 'pointerdown', idF);
+  await sleep(200);
+  check('s52f: the layout knows a take is in flight', A.doc.getElementById('bigUi').classList.contains('in-session'));
+  check('s52f: note text is locked mid-take', cards(A)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'false');
+  const nF = hist52(A).length;
+  cards(A)[0].querySelector('.bnote-del').click();
+  cards(A)[0].querySelector('.bnote-del').click();
+  cards(A)[0].querySelector('.bnote-add').click();
+  check('s52f: Delete / Add are ignored mid-take', hist52(A).length === nF && A.doc.getElementById('bigBtn').textContent === 'STOP', hist52(A).length + ' / ' + A.doc.getElementById('bigBtn').textContent);
+  await sleep(400);
+  pev52(A, A.doc.getElementById('bigBtn'), 'pointerup', idF);
+  await sleep(450);
+  check('s52f: the take landed as its own note (keep mode)', cardText(cards(A)[0]) === 'Mid note. ', cardText(cards(A)[0]));
+  check('s52f: notes are editable again afterwards', cards(A)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'true');
+  A.dom.window.close();
+
+  // --- 52g: a SOLO phone: a denied copy is a SAVED note, not a red FAILED ---
+  const G = mk52({ settings: { bigButtonMode: 'always' } });
+  await sleep(250);
+  G.clipFail = true;
+  check('s52g: a solo phone gets the notes layout without the mode row', G.doc.body.classList.contains('bigbtn') && G.doc.getElementById('bigModeRow').style.display === 'none');
+  const vibG = G.vibes.length;
+  await take52(G, 'Solo note.');
+  check('s52g: the note is saved', cardText(cards(G)[0]) === 'Solo note. ', cardText(cards(G)[0]));
+  check('s52g: a denied copy is stated, not a failure', status52(G).includes('Saved as a note') && status52(G).includes('NOT copied') && G.doc.getElementById('status').className.includes('ok'), status52(G));
+  check('s52g: headline SAVED, done cue, no fail cue', G.doc.getElementById('bigState').textContent === 'SAVED' && JSON.stringify(outcomes52(G.vibes.slice(vibG))) === '[[40,60,40]]', G.doc.getElementById('bigState').textContent + ' ' + JSON.stringify(G.vibes.slice(vibG)));
+  check('s52g: solo notes have no Send button', !G.doc.querySelector('#bigNotes .bnote-send'));
+  G.clipFail = false;
+  cards(G)[0].querySelector('.bnote-copy').click();
+  await sleep(30);
+  check('s52g: the note\'s own Copy copies it (a tap iOS allows)', G.win._clip === 'Solo note. ', JSON.stringify(G.win._clip));
+  await take52(G, 'Copied solo.');
+  check('s52g: when the copy works it is a plain Done!', status52(G).includes('Saved as a note and copied. Done!') && G.doc.getElementById('bigState').textContent === 'DONE', status52(G) + ' / ' + G.doc.getElementById('bigState').textContent);
+  check('s52g: every solo take is its own note (no local accumulation)', cardText(cards(G)[0]) === 'Copied solo. ' && hist52(G).length === 2, cards(G).map(cardText).join(' | '));
+  G.dom.window.close();
+
+  // --- 52h: a failed upload while adding to a note: the retry lands ON the note, held
+  const baseAt = new Date(Date.now() - 60000).toISOString();
+  const H = mk52({ settings: { joinedSessionCode: 'NOTE02' }, history: [{ text: 'Base note. ', createdAt: baseAt, sendable: true, sentAt: new Date(Date.now() - 50000).toISOString() }] });
+  await sleep(250);
+  cards(H)[0].querySelector('.bnote-add').click();
+  H.batchFail = true;
+  await take52(H, 'Rescued words.');
+  check('s52h: the failed take is loud (sentinel)', H.win._clip === '##DICTATION_FAILED##', JSON.stringify(H.win._clip));
+  check('s52h: the note is untouched by the failure', hist52(H).length === 1 && hist52(H)[0].text === 'Base note. ', JSON.stringify(hist52(H)));
+  check('s52h: the retry chip is on the phone screen', H.doc.getElementById('bigRecoverChip').style.display !== 'none');
+  H.batchFail = false;
+  const delivH = deliveries52(H).length;
+  H.doc.getElementById('bigRecoverChip').click();
+  await sleep(300);
+  check('s52h: the retry is added to the SAME note', hist52(H).length === 1 && hist52(H)[0].text === 'Base note. Rescued words. ', JSON.stringify(hist52(H).map((h) => h.text)));
+  check('s52h: and stays on the phone (never auto-sent)', deliveries52(H).length === delivH, deliveries52(H).length - delivH);
+  check('s52h: the retry says so', status52(H).includes('Recovered and added to the note') && status52(H).includes('NOT sent'), status52(H));
+  H.dom.window.close();
+
+  // --- 52j: "Sent" means the desktop has THIS text ---------------------------
+  // A note waiting in the queue reads "Waiting to send"; if it is edited while
+  // it waits, the later ack must not call the edited text "Sent" (the desktop
+  // got the version that was queued).
+  const J = mk52({ settings: { joinedSessionCode: 'NOTE03', phoneKeepMode: true } });
+  await sleep(250);
+  await take52(J, 'Queued note.');
+  J.deliverListeners = 0; // no desktop listening: the send stays queued
+  cards(J)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  check('s52j: a queued note reads "Waiting to send"', cardTag(cards(J)[0]).includes('Waiting to send'), cardTag(cards(J)[0]));
+  const txtJ = cards(J)[0].querySelector('.bnote-text');
+  txtJ.dispatchEvent(new J.win.Event('focus', { bubbles: true }));
+  txtJ.textContent = 'Queued note, edited after sending.';
+  txtJ.dispatchEvent(new J.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+  J.deliverListeners = 1; // the desktop comes back; the queue chip retries now
+  J.doc.getElementById('bigQueueChip').click();
+  await sleep(300);
+  check('s52j: the queued text was delivered', deliveries52(J).some((d) => d.text === 'Queued note. '), JSON.stringify(deliveries52(J).map((d) => d.text)));
+  check('s52j: an edit made while it waited still reads "Edited since sent"', cardTag(cards(J)[0]).includes('Edited since sent'), cardTag(cards(J)[0]));
+
+  // --- 52k: "Select" sweeps only the set just dictated -----------------------
+  // An older unsent note behind a sent one (say, another patient's) is counted
+  // and tagged, but one tap never folds it into a combined send.
+  await take52(J, 'Sent between.');
+  cards(J)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  await take52(J, 'Newest.');
+  check('s52k: the reminder counts every unsent note', J.doc.getElementById('bigSelInfo').textContent.includes('2 notes not sent'), J.doc.getElementById('bigSelInfo').textContent);
+  check('s52k: but the one-tap select offers only the latest run', J.doc.getElementById('bigSelPickBtn').textContent === 'Select the latest', J.doc.getElementById('bigSelPickBtn').textContent);
+  J.doc.getElementById('bigSelPickBtn').click();
+  const selK = cards(J).filter((c) => c.classList.contains('selected')).map(cardText);
+  check('s52k: it selected only the newest note', selK.length === 1 && selK[0] === 'Newest. ', JSON.stringify(selK));
+  J.dom.window.close();
+
+  // --- 52l: the DESKTOP honors a replace -------------------------------------
+  {
+    const socksL = [];
+    let wL;
+    const domL = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        wL = win;
+        win.isSecureContext = true;
+        win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx;
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+        win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"ok":true,"listeners":1}') });
+        win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() {} stop() {} };
+        const Sock = class extends MockWS { constructor(url) { super(url); socksL.push(this); } };
+        Sock.CONNECTING = 0; Sock.OPEN = 1; Sock.CLOSING = 2; Sock.CLOSED = 3;
+        win.WebSocket = Sock;
+      },
+    });
+    await sleep(80);
+    const docL = domL.window.document;
+    docL.getElementById('appendMode').checked = true; // the desktop appends phone takes
+    docL.getElementById('phoneStartBtn').click();
+    await sleep(20);
+    const sockL = socksL.find((x) => x.url.includes('/api/session/'));
+    sockL.open();
+    await sleep(10);
+    sockL.msg({ message_type: 'phone_delivery', text: 'First part.', delivery_id: 'L1' });
+    await sleep(30);
+    sockL.msg({ message_type: 'phone_delivery', text: 'New words.', delivery_id: 'L2' });
+    await sleep(30);
+    check('s52l: a plain delivery still appends on an append-mode desktop', docL.getElementById('latest').textContent === 'First part. New words. ', JSON.stringify(docL.getElementById('latest').textContent));
+    sockL.msg({ message_type: 'phone_delivery', text: 'First part, corrected. New words.', delivery_id: 'L3', replace: true });
+    await sleep(30);
+    check('s52l: a replace delivery takes the note\'s place (no repeat)', docL.getElementById('latest').textContent === 'First part, corrected. New words.' && wL._clip === 'First part, corrected. New words.', JSON.stringify(docL.getElementById('latest').textContent));
+    check('s52l: and says so', docL.getElementById('status').textContent.includes('REPLACED'), docL.getElementById('status').textContent);
+    domL.window.close();
+  }
+
+  // --- 52m: a note already waiting to send is never sent twice ---------------
+  const M = mk52({ settings: { joinedSessionCode: 'NOTE04', phoneKeepMode: true } });
+  await sleep(250);
+  await take52(M, 'Waiting note.');
+  M.deliverListeners = 0;
+  cards(M)[0].querySelector('.bnote-send').click();
+  await sleep(250);
+  cards(M)[0].querySelector('.bnote-send').click(); // tapped again while it waits
+  await sleep(250);
+  const idsM = new Set(deliveries52(M).filter((d) => d.text === 'Waiting note. ').map((d) => d.delivery_id));
+  check('s52m: a second Send on a waiting note retries it, never a second copy', idsM.size === 1, JSON.stringify([...idsM]));
+  check('s52m: and says it is retrying', status52(M).includes('already waiting'), status52(M));
+  M.dom.window.close();
+
+  // --- 52n: "Send as one" sends only what the desktop does not have ----------
+  const N = mk52({ settings: { joinedSessionCode: 'NOTE05', phoneKeepMode: true } });
+  await sleep(250);
+  await take52(N, 'Note one.');
+  await take52(N, 'Note two.');
+  cards(N)[1].querySelector('.bnote-send').click(); // "Note one." goes on its own
+  await sleep(250);
+  cards(N)[0].querySelector('.bnote-sel').click();
+  cards(N)[1].querySelector('.bnote-sel').click();
+  const nN = deliveries52(N).length;
+  N.doc.getElementById('bigSelSendBtn').click();
+  await sleep(250);
+  const setN = deliveries52(N).slice(nN);
+  check('s52n: a note the desktop already has is left out of the set', setN.length === 1 && setN[0].text === 'Note two. ', JSON.stringify(setN.map((d) => d.text)));
+  check('s52n: the set was delivered', status52(N).includes('Delivered to the desktop'), status52(N));
+  // An edited sent note cannot join a set (only a whole-note replace fixes it).
+  const txtN = cards(N)[1].querySelector('.bnote-text');
+  txtN.dispatchEvent(new N.win.Event('focus', { bubbles: true }));
+  txtN.textContent = 'Note one, corrected.';
+  txtN.dispatchEvent(new N.win.Event('blur', { bubbles: true }));
+  await sleep(30);
+  await take52(N, 'Note three.');
+  cards(N)[0].querySelector('.bnote-sel').click();  // Note three
+  cards(N)[2].querySelector('.bnote-sel').click();  // Note one, corrected
+  const nN2 = deliveries52(N).length;
+  N.doc.getElementById('bigSelSendBtn').click();
+  await sleep(250);
+  check('s52n: a set with an edited sent note is refused — nothing sent', deliveries52(N).length === nN2 && status52(N).includes('edited after it was sent'), status52(N));
+  N.dom.window.close();
+
+  // --- 52o: a retry owns its note while it uploads ---------------------------
+  const O = mk52({ settings: { joinedSessionCode: 'NOTE06' }, history: [{ text: 'Base note. ', createdAt: new Date(Date.now() - 60000).toISOString(), sendable: true, sentAt: new Date(Date.now() - 50000).toISOString(), sentText: 'Base note. ' }] });
+  await sleep(250);
+  cards(O)[0].querySelector('.bnote-add').click();
+  O.batchFail = true;
+  await take52(O, 'Rescued words.');
+  O.batchFail = false;
+  O.batchDelayMs = 500; // a slow retry
+  const transcribes = () => O.fetches.filter((f) => f.url.includes('/api/transcribe')).length;
+  const nO = transcribes();
+  O.doc.getElementById('bigRecoverChip').click();
+  await sleep(50);
+  O.doc.getElementById('bigRecoverChip').click(); // double tap
+  await sleep(50);
+  check('s52o: the notes are locked while the retry uploads', cards(O)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'false');
+  check('s52o: the chip says the retry is running', O.doc.getElementById('bigRecoverChip').textContent.includes('Retrying'), O.doc.getElementById('bigRecoverChip').textContent);
+  O.win._clip = 'UNTOUCHED';
+  const idO = ++pid52;
+  pev52(O, O.doc.getElementById('bigBtn'), 'pointerdown', idO);
+  await sleep(100);
+  check('s52o: a take cannot start during the retry — refused LOUDLY', O.win._clip === '##DICTATION_FAILED##' && status52(O).includes('did NOT start') && O.doc.getElementById('recordBtn').textContent.includes('Start'), status52(O));
+  pev52(O, O.doc.getElementById('bigBtn'), 'pointerup', idO);
+  await sleep(700); // the retry lands
+  check('s52o: a double tap never starts a second upload', transcribes() === nO + 1, (transcribes() - nO) + ' uploads');
+  check('s52o: the rescued words land on the note', hist52(O).length === 1 && hist52(O)[0].text === 'Base note. Rescued words. ', JSON.stringify(hist52(O).map((h) => h.text)));
+  check('s52o: the notes unlock afterwards', cards(O)[0].querySelector('.bnote-text').getAttribute('contenteditable') === 'true');
+  O.dom.window.close();
+
+  // --- 52p: a note that could not be saved is a FAILURE, never SAVED --------
+  const P = mk52({ settings: { bigButtonMode: 'always' } });
+  await sleep(250);
+  P.clipFail = true;
+  const origSetP = P.win.Storage.prototype.setItem;
+  P.win.Storage.prototype.setItem = function (k, v) {
+    if (k === 'scribe_v2_transcripts_v9') throw new Error('QuotaExceededError');
+    return origSetP.call(this, k, v);
+  };
+  const vibP = P.vibes.length;
+  await take52(P, 'Unsaved note.');
+  check('s52p: a failed save is loud', status52(P).includes('could NOT be saved') && P.doc.getElementById('status').className.includes('err'), status52(P));
+  check('s52p: FAILED, with the fail cue — never SAVED + done', P.doc.getElementById('bigState').textContent === 'FAILED' && JSON.stringify(outcomes52(P.vibes.slice(vibP))) === '[[220,90,220]]', P.doc.getElementById('bigState').textContent + ' ' + JSON.stringify(P.vibes.slice(vibP)));
+  P.win.Storage.prototype.setItem = origSetP;
+  P.dom.window.close();
+
+  // --- 52q: the 100-entry cap never trims a note the desktop does not have ---
+  const histQ = [];
+  for (let i = 0; i < 99; i++) histQ.push({ text: 'Old untracked ' + i + '. ', createdAt: new Date(Date.now() - (i + 2) * 60000).toISOString() });
+  histQ.push({ text: 'Oldest unsent. ', createdAt: new Date(Date.now() - 500 * 60000).toISOString(), sendable: true });
+  const Q = mk52({ settings: { joinedSessionCode: 'NOTE07', phoneKeepMode: true }, history: histQ });
+  await sleep(250);
+  await take52(Q, 'Newest kept.');
+  const hq = hist52(Q);
+  check('s52q: the history stays capped at 100', hq.length === 100, hq.length);
+  check('s52q: the oldest UNSENT note survived the trim', hq.some((h) => h.text === 'Oldest unsent. '), hq.slice(-2).map((h) => h.text).join(' | '));
+  check('s52q: an untracked old entry went instead', !hq.some((h) => h.text === 'Old untracked 98. '), hq.slice(-3).map((h) => h.text).join(' | '));
+  Q.dom.window.close();
+
+  // --- 52r: a note added to while paired is tracked for sending --------------
+  const R = mk52({ settings: { joinedSessionCode: 'NOTE08' }, history: [{ text: 'Solo-era note. ', createdAt: new Date(Date.now() - 60000).toISOString() }] });
+  await sleep(250);
+  check('s52r: an old untracked note has no send tag', cardTag(cards(R)[0]) === '', cardTag(cards(R)[0]));
+  cards(R)[0].querySelector('.bnote-add').click();
+  await take52(R, 'More words.');
+  check('s52r: once added to while paired it reads "Not sent"', cardText(cards(R)[0]) === 'Solo-era note. More words. ' && cardTag(cards(R)[0]) === 'Not sent', cardText(cards(R)[0]) + ' / ' + cardTag(cards(R)[0]));
+  R.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

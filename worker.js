@@ -1087,22 +1087,24 @@ const INDEX_HTML = `<!doctype html>
       details.help { margin-top: 8px; }
       .status { margin-top: 6px; }
     }
-    /* Big-button dictation layout. Active only while body carries .bigbtn
-       (joined to a desktop session, or forced by the per-device override) —
-       NEVER keyed on screen size. Additive: a fixed overlay above the normal
-       page, so the desktop layout and its tiny-window compactness rules above
-       are untouched. */
+    /* Phone notes layout (the "big-button" surface; the code keeps the bigbtn
+       names). Active only while body carries .bigbtn (joined to a desktop
+       session, or forced by the per-device override) — NEVER keyed on screen
+       size. Additive: a fixed overlay above the normal page, so the desktop
+       layout and its tiny-window compactness rules above are untouched. The
+       phone's dictations are a scrolling notes list, and the record control is
+       a floating button, so earlier notes stay in view and can be added to. */
     #bigUi, #bigReturnBtn { display: none; }
     body.bigbtn main > h1, body.bigbtn main > .grid { display: none; }
     body.bigbtn #bigUi {
       display: flex; flex-direction: column; position: fixed; inset: 0;
-      z-index: 40; padding: 14px; gap: 10px; align-items: center;
+      z-index: 40; padding: 10px 12px 0; gap: 8px;
       background: var(--bg); transition: background-color 0.25s;
     }
     body.bigbtn.bigbtn-settings #bigUi { display: none; }
     body.bigbtn.bigbtn-settings main > .grid { display: grid; }
-    /* Inside the big-button Settings view the big button is the record control;
-       the card's "Start recording" only invites a second, confusing way in. */
+    /* Inside the phone layout's Settings view the floating button is the record
+       control; the card's "Start recording" only invites a second, confusing way in. */
     body.bigbtn.bigbtn-settings #recordBtn { display: none; }
     body.bigbtn.bigbtn-settings #bigReturnBtn {
       display: block; position: fixed; right: 12px; bottom: 12px; z-index: 41;
@@ -1112,7 +1114,7 @@ const INDEX_HTML = `<!doctype html>
        (Settings unreachable) once the Pair/Leave button joined the row. */
     #bigTopRow { width: 100%; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; flex: 0 0 auto; }
     #bigJoinedBadge { font-family: monospace; letter-spacing: 1px; color: var(--accent); font-size: 13px; flex: 1 1 auto; min-width: 0; }
-    #bigTopRow button { flex: 0 0 auto; white-space: nowrap; }
+    #bigTopRow button { flex: 0 0 auto; white-space: nowrap; padding: 7px 10px; font-size: 13px; }
     #bigMicPill, #bigDesktopPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
     #bigMicPill.ok, #bigDesktopPill.ok { color: var(--muted); }
     #bigMicPill.bad, #bigDesktopPill.bad { color: var(--danger); font-weight: 600; }
@@ -1121,51 +1123,100 @@ const INDEX_HTML = `<!doctype html>
       color: var(--warn); border: 1px solid var(--warn); border-radius: 10px;
       padding: 2px 10px; font-size: 12.5px; cursor: pointer; user-select: none;
     }
-    #bigQueueChip { flex: 0 0 auto; text-align: center; margin: 6px auto 0; max-width: 92%; }
+    #bigQueueChip { flex: 0 0 auto; text-align: center; }
     /* Saved-recording retry: the crash/upload recovery banner lives in the primary
        card, which this overlay COVERS — on the phone (where the timeouts actually
        happen) the rescue has to be reachable here or it may as well not exist. */
     #bigRecoverChip {
       color: var(--danger); border: 1px solid var(--danger); border-radius: 10px;
       padding: 4px 10px; font-size: 12.5px; cursor: pointer; user-select: none;
-      flex: 0 0 auto; text-align: center; margin: 6px auto 0; max-width: 92%;
-      font-weight: 600;
+      flex: 0 0 auto; text-align: center; font-weight: 600;
     }
-    #bigSendBtn { margin-top: 8px; width: 100%; }
-    #bigCenter {
-      flex: 1 1 auto; min-height: 0; width: 100%; display: flex;
-      flex-direction: column; align-items: center; justify-content: center; gap: 14px;
+    /* The state headline + status line: compact, but the headline is still
+       readable at arm's length, and the whole overlay (plus the frame below)
+       carries the colour. */
+    #bigHead { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; }
+    #bigStateRow { display: flex; align-items: baseline; gap: 10px; min-height: 28px; }
+    #bigState { font-size: 22px; font-weight: 800; letter-spacing: 1.5px; }
+    #bigRecInfo { font-size: 14px; font-variant-numeric: tabular-nums; color: var(--text); }
+    #bigStatus {
+      font-size: 13px; color: var(--text); min-height: 18px;
+      max-height: 4.4em; overflow: auto; white-space: pre-wrap;
     }
-    #bigState { font-size: 30px; font-weight: 800; letter-spacing: 2px; min-height: 36px; text-align: center; }
+    /* What happens to each take while paired: straight to the desktop (the phone
+       as a microphone), or kept here to review and send later. */
+    #bigModeRow { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); }
+    #bigModeRow button { padding: 6px 12px; font-size: 13px; border-radius: 999px; }
+    #bigModeRow button.on { background: #0c4a6e; border-color: #0369a1; color: #fff; font-weight: 600; }
+    /* Selection / not-sent bar: sits above the list, never under the button. */
+    #bigSelBar {
+      flex: 0 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 6px 8px;
+    }
+    #bigSelBar.selecting { border-color: #0369a1; }
+    #bigSelInfo { flex: 1 1 auto; font-size: 13px; min-width: 0; }
+    #bigSelBar button { padding: 6px 9px; font-size: 13px; white-space: nowrap; }
+    #bigNotes {
+      flex: 1 1 auto; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch;
+      display: flex; flex-direction: column; gap: 8px;
+      /* Room to scroll the last note clear of the floating button + target bar. */
+      padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 170px);
+    }
+    .bnote { flex: 0 0 auto; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; }
+    .bnote.selected { border-color: #0369a1; background: #0f1d2b; }
+    .bnote.target { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .bnote-head { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .bnote-head input[type="checkbox"] { width: 20px; height: 20px; margin: 0; flex: 0 0 auto; padding: 0; accent-color: #0369a1; }
+    .bnote-time { flex: 1 1 auto; min-width: 0; }
+    .bnote-tag { white-space: nowrap; }
+    .bnote-tag.sent { color: var(--ok); }
+    .bnote-tag.queued { color: var(--warn); }
+    .bnote-tag.unsent { color: var(--warn); font-weight: 700; }
+    .bnote-text {
+      white-space: pre-wrap; font-size: 15px; margin: 6px 0; padding: 4px 6px;
+      border-radius: 8px; min-height: 1.4em; caret-color: var(--accent); overflow-wrap: anywhere;
+    }
+    .bnote-text[contenteditable="true"]:focus { outline: none; box-shadow: inset 0 0 0 1px var(--accent); background: var(--panel2); }
+    .bnote-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .bnote-actions button { padding: 6px 10px; font-size: 13px; }
+    .bnote-actions button.on { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); color: var(--accent); }
+    .bnote-actions button.confirm { background: #5f1717; border-color: #991b1b; }
+    /* A take is in flight: note actions wait (the handlers guard too). */
+    #bigUi.in-session .bnote-actions button,
+    #bigUi.in-session #bigSelBar button,
+    #bigUi.in-session #bigModeRow button { opacity: 0.45; pointer-events: none; }
+    #bigNotesEmpty { color: var(--muted); font-size: 14px; text-align: center; padding: 28px 12px; }
+    #bigMoreBtn { align-self: center; flex: 0 0 auto; }
+    /* "Next take adds to …" — just above the floating button. */
+    #bigTargetBar {
+      position: fixed; left: 12px; right: 12px; z-index: 42;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 114px);
+      display: flex; align-items: center; gap: 8px;
+      background: #0c2536; border: 1px solid var(--accent); border-radius: 12px;
+      padding: 6px 8px 6px 12px; font-size: 13px;
+    }
+    #bigTargetText { flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    #bigTargetBar button { flex: 0 0 auto; padding: 6px 10px; font-size: 13px; }
+    /* The floating record button: hold = push-to-talk, tap = start/stop. */
     #bigBtn {
-      width: min(64vw, 52vh); height: min(64vw, 52vh); border-radius: 50%;
-      font-size: 20px; font-weight: 700; letter-spacing: 1px;
-      border: 6px solid var(--line); background: var(--panel); color: var(--text);
+      position: fixed; left: 50%; transform: translateX(-50%); z-index: 42;
+      bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
+      width: 86px; height: 86px; border-radius: 50%; padding: 0;
+      font-size: 16px; font-weight: 800; letter-spacing: 1px;
+      border: 4px solid var(--line); background: #1e293b; color: var(--text);
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
       touch-action: none; user-select: none; -webkit-user-select: none;
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
     }
-    #bigHint { font-size: 12px; color: var(--muted); }
-    #bigStatus {
-      font-size: 14px; color: var(--text); text-align: center;
-      min-height: 18px; max-height: 18vh; overflow: auto; white-space: pre-wrap;
-    }
-    #bigPeek {
-      flex: 0 0 auto; width: 100%; background: var(--panel2);
-      border: 1px solid var(--line); border-radius: 12px; overflow: hidden;
-    }
-    #bigPeek.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-    /* Accent the peek strip while it shows live text. */
-    #bigPeek.live { border-color: var(--accent); }
-    #bigPeekBar { padding: 8px 12px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; -webkit-user-select: none; }
-    #bigPeek.live #bigPeekBar { color: var(--accent); }
-    #bigPeekText { padding: 0 12px 8px; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 20px; }
-    #bigPeek.expanded #bigPeekText { white-space: pre-wrap; overflow: auto; text-overflow: clip; max-height: 38vh; cursor: pointer; }
-    /* Live view: wrap and grow so the newest words stay on-screen instead of
-       scrolling off the right edge of a head-truncated one-liner (the strip
-       looked frozen as the note grew). updateBigPeek pins the scroll to the tail. */
-    #bigPeek.live #bigPeekText { white-space: pre-wrap; overflow-y: auto; text-overflow: clip; max-height: 30vh; min-height: 48px; }
+    #bigUi.targeting #bigBtn { border-color: var(--accent); }
     /* Whole-screen status: the overlay background IS the at-arm's-length
-       indicator, derived from the same transitions that drive the pills. */
+       indicator, derived from the same transitions that drive the pills. The
+       notes cover most of it now, so a frame at the screen edge carries the
+       colour too (pointer-events: none — it never eats a tap). */
+    #bigUi::after {
+      content: ""; position: fixed; inset: 0; z-index: 43; pointer-events: none;
+      border: 0 solid transparent;
+    }
     body.bigbtn #bigUi[data-screen="connecting"] { background: #3d3008; }
     body.bigbtn #bigUi[data-screen="rec"]        { background: #420d0d; }
     body.bigbtn #bigUi[data-screen="busy"]       { background: #3d3008; }
@@ -1173,6 +1224,13 @@ const INDEX_HTML = `<!doctype html>
     body.bigbtn #bigUi[data-screen="warn"]       { background: #78350f; }
     body.bigbtn #bigUi[data-screen="fail"]       { background: #7f1d1d; }
     body.bigbtn #bigUi[data-screen="alarm"]      { background: #7f1d1d; animation: bigAlarm 0.5s linear infinite alternate; }
+    #bigUi[data-screen="rec"]::after        { border: 5px solid #ef4444; }
+    #bigUi[data-screen="connecting"]::after,
+    #bigUi[data-screen="busy"]::after,
+    #bigUi[data-screen="warn"]::after       { border: 5px solid #f59e0b; }
+    #bigUi[data-screen="ok"]::after         { border: 5px solid #22c55e; }
+    #bigUi[data-screen="fail"]::after,
+    #bigUi[data-screen="alarm"]::after      { border: 5px solid #ef4444; }
     #bigUi[data-screen="rec"] #bigBtn        { border-color: #ef4444; background: #b91c1c; color: #fff; animation: bigPulse 1.2s ease-in-out infinite; }
     #bigUi[data-screen="connecting"] #bigBtn { border-color: var(--warn); }
     #bigUi[data-screen="busy"] #bigBtn       { border-color: var(--warn); }
@@ -1180,7 +1238,7 @@ const INDEX_HTML = `<!doctype html>
     #bigUi[data-screen="warn"] #bigBtn       { border-color: var(--warn); }
     #bigUi[data-screen="fail"] #bigBtn       { border-color: var(--danger); }
     #bigUi[data-screen="alarm"] #bigBtn      { border-color: var(--danger); }
-    @keyframes bigPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); } 50% { box-shadow: 0 0 0 24px rgba(239,68,68,0); } }
+    @keyframes bigPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); } 50% { box-shadow: 0 0 0 18px rgba(239,68,68,0); } }
     @keyframes bigFlash { from { background: #22c55e; } }
     @keyframes bigAlarm { from { background: #7f1d1d; } to { background: #450a0a; } }
   </style>
@@ -1373,14 +1431,14 @@ const INDEX_HTML = `<!doctype html>
             on success, red on failure. The tab title, favicon and taskbar badge follow too.
           </div>
 
-          <label for="bigButtonMode">Big-button layout (per device)</label>
+          <label for="bigButtonMode">Phone layout (per device)</label>
           <select id="bigButtonMode">
             <option value="joined" selected>Automatic — when this device is paired to a desktop</option>
             <option value="always">Always — this is the phone I dictate on</option>
             <option value="never">Never — keep the full page even when paired</option>
           </select>
           <div class="hint" style="margin: 6px 0 4px;">
-            Turns this device into a one-button dictation surface. Stored on this device only.
+            Turns this device into the phone dictation screen: your notes, with a floating record button. Stored on this device only.
           </div>
 
           <div class="row" style="margin-top: 10px;">
@@ -1519,35 +1577,52 @@ right lower quadrant"></textarea>
 
   <div id="stateEdge" aria-hidden="true"></div>
 
-  <!-- Big-button dictation layout: hidden unless body.bigbtn (see CSS).
-       A fixed overlay — the normal page above stays untouched for desktops. -->
+  <!-- Phone notes layout (the "big-button" surface): hidden unless
+       body.bigbtn (see CSS). A fixed overlay — the normal page above stays
+       untouched for desktops. The phone's dictations are a notes list; the
+       record control floats at the bottom so earlier notes stay in view. -->
   <div id="bigUi" data-screen="idle">
     <div id="bigTopRow">
       <span id="bigJoinedBadge"></span>
       <span id="bigMicPill" style="display:none"></span>
       <span id="bigDesktopPill" style="display:none"></span>
       <button id="bigTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips</button>
-      <!-- Solo big-button phone (override "always", not joined): the way to a
-           desktop must be on THIS surface — the overlay covers the card. -->
+      <!-- Solo phone (override "always", not joined): the way to a desktop
+           must be on THIS surface — the overlay covers the card. -->
       <button id="bigPairBtn" title="Enter the code the desktop shows — what you dictate here lands on that desktop's clipboard" style="display:none">🖥 Pair to a desktop</button>
       <button id="bigLeaveBtn" title="Stop sending to the desktop — notes stay on this phone; anything undelivered is kept and sends when you pair again with the same code">Leave desktop</button>
       <button id="bigSettingsBtn" title="Credentials, keyterms, mic tuning and all other settings">Settings</button>
     </div>
-    <div id="bigQueueChip" style="display:none" role="button"></div>
-    <div id="bigRecoverChip" style="display:none" role="button"></div>
-    <div id="bigCenter">
-      <div id="bigState">READY</div>
-      <button id="bigBtn">HOLD TO TALK</button>
-      <div id="bigHint">hold = push‑to‑talk &middot; tap = start/stop</div>
+    <div id="bigHead">
+      <div id="bigStateRow"><span id="bigState">READY</span><span id="bigRecInfo"></span></div>
       <div id="bigStatus"></div>
     </div>
-    <div id="bigPeek">
-      <div id="bigPeekBar">Latest transcript — tap to expand</div>
-      <div id="bigPeekText"></div>
-      <button id="bigSendBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery">📤 Send to desktop again</button>
+    <!-- Paired only: what each take does. -->
+    <div id="bigModeRow" style="display:none">
+      <span>Each take:</span>
+      <button id="bigModeSendBtn" title="Each dictation goes straight to the desktop clipboard — the phone as a microphone">📤 Send to desktop</button>
+      <button id="bigModeKeepBtn" title="Each dictation stays here as a note until you send it — review, add to or combine notes first">📥 Keep on phone</button>
     </div>
+    <div id="bigQueueChip" style="display:none" role="button"></div>
+    <div id="bigRecoverChip" style="display:none" role="button"></div>
+    <!-- Selection bar: "N selected" (send/copy them as ONE note) or, with
+         nothing selected, "N not sent" (tap to select them). -->
+    <div id="bigSelBar" style="display:none">
+      <span id="bigSelInfo"></span>
+      <button id="bigSelPickBtn" title="Select every note that has not been sent">Select them</button>
+      <button id="bigSelSendBtn" class="primary" title="Send the selected notes to the desktop as ONE note, oldest first">📤 Send as one note</button>
+      <button id="bigSelCopyBtn" title="Copy the selected notes as ONE note, oldest first">Copy as one</button>
+      <button id="bigSelClearBtn" title="Clear the selection">✕</button>
+    </div>
+    <div id="bigNotes"></div>
+    <!-- Shown while the next take will ADD to an existing note. -->
+    <div id="bigTargetBar" style="display:none">
+      <span id="bigTargetText"></span>
+      <button id="bigTargetCancelBtn" title="Start a new note instead">Cancel</button>
+    </div>
+    <button id="bigBtn" title="Hold to talk, or tap to start and tap again to stop">HOLD</button>
   </div>
-  <button id="bigReturnBtn">&#8592; Back to the button</button>
+  <button id="bigReturnBtn">&#8592; Back to notes</button>
 
   <!-- Phone-pairing overlay: the desktop's front-and-center QR. Shown on demand
        from the compact "Pair a phone" button; auto-closes when a phone joins
@@ -1652,7 +1727,6 @@ right lower quadrant"></textarea>
   const queueChipEl      = document.getElementById("queueChip");
   const bigQueueChipEl   = document.getElementById("bigQueueChip");
   const bigRecoverChipEl = document.getElementById("bigRecoverChip");
-  const bigSendBtnEl     = document.getElementById("bigSendBtn");
   const appendToggleBtn  = document.getElementById("appendToggleBtn");
   const freshBtn         = document.getElementById("freshBtn");
   const lastDictationEl     = document.getElementById("lastDictation");
@@ -1772,9 +1846,20 @@ right lower quadrant"></textarea>
   const bigLeaveBtnEl    = document.getElementById("bigLeaveBtn");
   const bigSettingsBtnEl = document.getElementById("bigSettingsBtn");
   const bigReturnBtnEl   = document.getElementById("bigReturnBtn");
-  const bigPeekEl        = document.getElementById("bigPeek");
-  const bigPeekBarEl     = document.getElementById("bigPeekBar");
-  const bigPeekTextEl    = document.getElementById("bigPeekText");
+  const bigRecInfoEl     = document.getElementById("bigRecInfo");
+  const bigModeRowEl     = document.getElementById("bigModeRow");
+  const bigModeSendBtnEl = document.getElementById("bigModeSendBtn");
+  const bigModeKeepBtnEl = document.getElementById("bigModeKeepBtn");
+  const bigSelBarEl      = document.getElementById("bigSelBar");
+  const bigSelInfoEl     = document.getElementById("bigSelInfo");
+  const bigSelPickBtnEl  = document.getElementById("bigSelPickBtn");
+  const bigSelSendBtnEl  = document.getElementById("bigSelSendBtn");
+  const bigSelCopyBtnEl  = document.getElementById("bigSelCopyBtn");
+  const bigSelClearBtnEl = document.getElementById("bigSelClearBtn");
+  const bigNotesEl       = document.getElementById("bigNotes");
+  const bigTargetBarEl   = document.getElementById("bigTargetBar");
+  const bigTargetTextEl  = document.getElementById("bigTargetText");
+  const bigTargetCancelBtnEl = document.getElementById("bigTargetCancelBtn");
   const bigButtonModeEl  = document.getElementById("bigButtonMode");
 
   // Crash-recovery (dictation journal) banner
@@ -1903,7 +1988,23 @@ right lower quadrant"></textarea>
   let bigBtnEngaged   = false;  // current button press started/queued a dictation
   let bigBtnDownAt    = 0;
   let bigBtnPointerId = null;   // owning pointer; other touches are ignored
-  let bigPeekExpanded = false;
+
+  // Phone notes layout state (the notes themselves ARE the history entries —
+  // the list adds no second store). Everything here is per-device and, apart
+  // from phoneKeepMode, in-memory only.
+  let phoneKeepMode       = false; // per-device: keep each paired take on the phone instead of sending it
+  let noteTargetId        = null;  // createdAt of the note the NEXT take adds to (one-shot, like appendArmed)
+  let sessionNoteTargetId = null;  // the target this take was started with (snapshot at startRecording)
+  let sessionHold         = false; // this take stays on the phone (add-to-note / keep mode): never auto-relayed
+  let selectedNoteIds     = [];    // notes checked for "send / copy as one" (createdAt ids)
+  let phoneNotesExpanded  = false; // show every note, not just the newest PHONE_NOTES_PAGE
+  let phoneNotesDirty     = false; // a re-render was deferred because a note is being edited
+  let phoneNewestRendered = "";    // createdAt of the newest note last rendered (scroll to it when a new one lands)
+  let pendingDeleteId     = null;  // two-tap delete: the note whose Delete was tapped once
+  let pendingDeleteTimer  = null;
+  let lastStatusHeadline  = "";    // optional headline for an ok status ("SAVED" when a note stayed on the phone)
+  let lastQueuedSig       = "";    // which notes the delivery queue carries (re-render the tags when it changes)
+  let lastChromeBusy      = null;  // session busy state last mirrored into the notes (editable or not)
 
   // In-app push-to-talk hotkey (F13/F14 via AHK always work in addition)
   const DEFAULT_HOTKEY = { ctrl: true, alt: false, shift: false, meta: false, code: "Space" };
@@ -1955,6 +2056,7 @@ right lower quadrant"></textarea>
   let historyVisible = false;
   let historyExpanded = false; // session-only: false = show the last HISTORY_PAGE, true = show all
   const HISTORY_PAGE = 10;     // newest-N shown by default so the list stays compact
+  const PHONE_NOTES_PAGE = 20; // phone notes layout: newest-N notes rendered ("Show N more" reveals the rest)
   let appendArmed = false; // one-shot: clicking the transcript box arms "append the next dictation"
 
   // Engine: batch-only. sessionEngine is snapshotted at session start.
@@ -2190,7 +2292,7 @@ right lower quadrant"></textarea>
     const cleaned = cleanTranscript(combined);
     latestText = cleaned;
     latestEl.textContent = cleaned;
-    updateBigPeek();
+    updatePhoneChrome();
     renderLastDictation();
   }
 
@@ -2278,11 +2380,16 @@ right lower quadrant"></textarea>
   }
 
   let statusIsBootHint = true; // the HTML boot hint is still showing (no setStatus yet)
-  function setStatus(msg, cls) {
+  // headline (optional): what the phone layout's headline says for an "ok"
+  // status instead of DONE — "SAVED" when the note stayed on the phone, which
+  // is a success but not a delivery. Tied to THIS status: any later setStatus
+  // without one drops it.
+  function setStatus(msg, cls, headline) {
     statusIsBootHint = false;
     statusEl.className = "status " + (cls || "");
     statusEl.textContent = msg;
     lastStatusCls = cls || "";
+    lastStatusHeadline = headline || "";
     updateBigScreen();
   }
 
@@ -2330,7 +2437,7 @@ right lower quadrant"></textarea>
       sendDesktopBtn.style.display = joinedSessionCode ? "" : "none";
       sendDesktopBtn.disabled = !hasText || busy;
     }
-    updateBigPeek(); // big layout mirrors the text + armed state (1s interval keeps it honest)
+    updatePhoneChrome(); // the phone layout mirrors session state (1s interval keeps it honest)
     if (!hasText || busy) {
       appendChipEl.style.display = "none";
       return;
@@ -2531,6 +2638,7 @@ right lower quadrant"></textarea>
     if (on === recFeedbackOn) return;
     recFeedbackOn = on;
     recFeedbackEl.style.display = on ? "" : "none";
+    if (bigRecInfoEl) bigRecInfoEl.textContent = "";
     if (!on) return;
     waveLevels = [];
     recTimerLastSec = -1;
@@ -2562,6 +2670,12 @@ right lower quadrant"></textarea>
     if (recStateEl) {
       if (gateIsOpen) { recStateEl.textContent = "Hearing you"; recStateEl.className = "live"; }
       else { recStateEl.textContent = "Listening…"; recStateEl.className = ""; }
+    }
+    // The phone layout covers the card: mirror the timer + speech state beside
+    // its ● REC headline so the take visibly proves it is capturing there too.
+    if (bigRecInfoEl) {
+      var info = (recTimerEl ? recTimerEl.textContent : "") + " · " + (gateIsOpen ? "Hearing you" : "Listening…");
+      if (bigRecInfoEl.textContent !== info) bigRecInfoEl.textContent = info;
     }
     waveLevels.push(Math.min(1, rms / METER_MAX));
     drawWave();
@@ -2639,6 +2753,9 @@ right lower quadrant"></textarea>
       bigButtonMode:     bigButtonModeEl ? bigButtonModeEl.value : "joined",
       // Per-device: the "keep other voices out" onboarding nudge was dismissed.
       micTipsSeen:       micTipsSeen,
+      // Per-device: a paired phone keeps each take as a note (sent later, on
+      // demand) instead of sending it straight to the desktop.
+      phoneKeepMode:     phoneKeepMode,
     };
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
 
@@ -2722,10 +2839,15 @@ right lower quadrant"></textarea>
         // and keeps a stranded note flushable after this update lands.
         deliveryQueue.forEach(function (it) {
           if (typeof it.code !== "string") it.code = joinedSessionCode || "";
+          // Additive: the phone-note ids a delivery carries (marks them sent).
+          if (it.notes !== undefined) {
+            it.notes = Array.isArray(it.notes) ? it.notes.filter(function (x) { return typeof x === "string"; }) : [];
+          }
         });
       }
       if (s.micGranted === true) micEverGranted = true;
       if (s.micTipsSeen === true) micTipsSeen = true;
+      if (typeof s.phoneKeepMode === "boolean") phoneKeepMode = s.phoneKeepMode;
       if (bigButtonModeEl && (s.bigButtonMode === "joined" || s.bigButtonMode === "always" || s.bigButtonMode === "never")) {
         bigButtonModeEl.value = s.bigButtonMode;
       }
@@ -2750,20 +2872,83 @@ right lower quadrant"></textarea>
   function setHistory(items) {
     localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
     renderHistory();
+    renderPhoneNotes(); // the phone layout's notes ARE these entries
   }
 
+  // Returns the saved entry (its createdAt is the note's id on the phone layout).
   function addHistory(text, meta) {
     const items = getHistory();
-    const entry = { text: text, createdAt: new Date().toISOString() };
+    // createdAt is the note's id (edits, sends and add-to-note all key off it),
+    // so two notes must never share one — two saves in the same millisecond
+    // would otherwise alias.
+    let created = new Date();
+    if (items[0] && items[0].createdAt && Date.parse(items[0].createdAt) >= created.getTime()) {
+      created = new Date(Date.parse(items[0].createdAt) + 1);
+    }
+    const entry = { text: text, createdAt: created.toISOString() };
     if (meta) {
       if (meta.language_code !== undefined) entry.language_code = meta.language_code;
       if (meta.engine) entry.engine = meta.engine;
       if (meta.liveText) entry.liveText = meta.liveText; // hybrid: the realtime rendering, kept for comparison
       if (meta.unfiltered) entry.unfiltered = meta.unfiltered; // diarization: the pre-filter text, for recovering wrongly dropped speech
       if (meta.recovered) entry.recovered = true; // came back via the crash-recovery journal
+      // Phone notes layout: dictated while paired, so it is meant for the
+      // desktop — the list tracks whether it got there ("Not sent" until a
+      // listener acks a delivery that carried it, which stamps sentAt).
+      if (meta.sendable) entry.sendable = true;
     }
     items.unshift(entry);
     setHistory(items);
+    return entry;
+  }
+
+  // ---- Phone notes (history entries seen as notes, keyed by createdAt) ----
+  function noteById(id) {
+    if (!id) return null;
+    const items = getHistory();
+    for (let i = 0; i < items.length; i++) if (items[i].createdAt === id) return items[i];
+    return null;
+  }
+
+  // Replace a note's text in place (a take added to it). Returns false when the
+  // note is gone (deleted, or aged out of the 100-entry history), so the caller
+  // can save the text as a new note instead of losing it.
+  function updateNoteText(id, text, fields) {
+    const items = getHistory();
+    const i = items.findIndex((it) => it.createdAt === id);
+    if (i < 0) return false;
+    items[i].text = text;
+    if (fields) for (const k in fields) items[i][k] = fields[k];
+    setHistory(items);
+    return true;
+  }
+
+  // A desktop listener acked a delivery that carried these notes. sentAt is
+  // when that delivery was QUEUED (atMs), not when it was acked: the desktop
+  // got the text as it was then, so an edit made while it waited must still
+  // read "Changed since sent".
+  function markNotesSent(ids, atMs) {
+    if (!ids || !ids.length) return;
+    const items = getHistory();
+    const at = new Date(atMs || Date.now()).toISOString();
+    let changed = false;
+    for (const it of items) {
+      if (ids.indexOf(it.createdAt) !== -1 && isoMs(at) > isoMs(it.sentAt)) { it.sentAt = at; changed = true; }
+    }
+    if (!changed) return;
+    // Direct write + the phone list only: the full-page History rows do not
+    // show sent state, and re-rendering them here (an ack can land any time)
+    // could tear down a row someone is editing.
+    localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
+    renderPhoneNotes();
+  }
+
+  // Several notes as ONE note, oldest first (the order they were dictated),
+  // each cleaned and joined with a space — the same shape an append produces.
+  function combinedNotesText(ids) {
+    const picked = getHistory().filter((it) => ids.indexOf(it.createdAt) !== -1);
+    picked.sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+    return cleanTranscript(picked.map((it) => it.text || "").join(" "));
   }
 
   /* ───── Dictation journal (crash-safe audio recovery) ─────
@@ -2824,6 +3009,10 @@ right lower quadrant"></textarea>
         mimeType: mimeType || "audio/webm",
         joined: Boolean(joinedSessionCode),
         base: sessionBaseText || "",
+        // Phone notes layout: the note this take adds to, and whether it stays
+        // on the phone — so a recovered take lands where the live one would have.
+        noteId: sessionNoteTargetId || null,
+        hold: Boolean(sessionHold),
         state: "recording",
       });
       if (await jTxDone(tx)) journalSessionId = id;
@@ -2957,6 +3146,8 @@ right lower quadrant"></textarea>
         session: {
           id: journalSessionId, // may be null (no IndexedDB) => this session only
           base: sessionBaseText || "",
+          noteId: sessionNoteTargetId || null, // phone layout: the note this take was adding to
+          hold: Boolean(sessionHold),          // phone layout: it stays on the phone (never auto-sent)
           createdAt: new Date().toISOString(),
           mimeType: blob.type || "audio/webm",
         },
@@ -3011,11 +3202,30 @@ right lower quadrant"></textarea>
     }
     const text = cleanTranscript(r.text);
     const base = rec.session.base || "";
-    finalizedSegments = base ? [base, text] : [text];
+    // Phone notes layout: a take that was ADDING to a note goes back onto that
+    // note — onto its CURRENT text, which may have been edited since — and a
+    // take meant to stay on the phone stays there. If the note is gone, the
+    // old base+text shape is saved as a new note instead, so nothing is lost.
+    const target = rec.session.noteId ? noteById(rec.session.noteId) : null;
+    const hold = Boolean(rec.session.hold);
+    let savedId = null;
+    if (target) {
+      const current = (target.text || "").trim();
+      finalizedSegments = [cleanTranscript((current ? current + " " : "") + text).trim()];
+    } else {
+      finalizedSegments = base ? [base, text] : [text];
+    }
     currentPartial = "";
     latestText = finalizedSegments.join(" ");
     updateLiveDisplay();
-    try { addHistory(latestText, { language_code: "en", engine: "batch", recovered: true }); } catch (e) {}
+    try {
+      if (target && updateNoteText(target.createdAt, cleanTranscript(latestText), { appendedAt: new Date().toISOString() })) {
+        savedId = target.createdAt;
+      } else {
+        savedId = addHistory(latestText, { language_code: "en", engine: "batch", recovered: true,
+          sendable: Boolean(joinedSessionCode && bigButtonActive()) }).createdAt;
+      }
+    } catch (e) {}
     const copied = await copyText(latestText);
     try { await journalClear(rec.session.id); } catch (e) {}
     hideJournalRecover();
@@ -3024,10 +3234,21 @@ right lower quadrant"></textarea>
     // path owns the cue (done on a listener ack, loud on zero listeners / a dead
     // relay), exactly as in sendTextToDesktop. Without this a retry succeeded
     // "locally" on a phone that cannot even write its own clipboard.
-    if (joinedSessionCode) {
+    if (joinedSessionCode && !hold) {
       setStatus("Recovered dictation transcribed — sending to the desktop…", "warn");
       updateAppendChip();
-      relayDeliveryToDesktop(latestText, true);
+      relayDeliveryToDesktop(latestText, true, "", savedId ? [savedId] : null);
+      return;
+    }
+    // A take that was staying on the phone (added to a note, or keep-on-phone
+    // mode), or any take on a solo phone: the note in the list is the
+    // deliverable — the copy is a convenience, one tap on the note's Copy away.
+    if (hold || bigButtonActive()) {
+      setStatus((target ? "Recovered and added to the note" : "Recovered dictation saved as a note") +
+        (joinedSessionCode ? " — NOT sent to the desktop yet." : ".") +
+        (copied ? " Copied here too." : "") + " Verify it.", "ok", "SAVED");
+      doneBeep();
+      updateAppendChip();
       return;
     }
     if (copied) { setStatus("Recovered dictation transcribed & copied. Verify it before pasting!", "ok"); doneBeep(); }
@@ -3145,7 +3366,7 @@ right lower quadrant"></textarea>
         const send = document.createElement("button");
         send.textContent = "📤 Send to desktop";
         send.title = "Send this note to the desktop clipboard (a fresh delivery)";
-        send.onclick = () => sendTextToDesktop(text.textContent);
+        send.onclick = () => sendTextToDesktop(text.textContent, [item.createdAt]);
         row.append(send);
       }
 
@@ -3199,7 +3420,8 @@ right lower quadrant"></textarea>
   async function copyText(text) {
     const ok = await clipboardWrite(text);
     setStatus(ok ? "Copied to clipboard."
-                 : "Clipboard copy failed — keep this tab focused, then click 'Copy & clear'.",
+                 : (bigButtonActive() ? "Clipboard copy failed — tap Copy again."
+                                      : "Clipboard copy failed — keep this tab focused, then click 'Copy & clear'."),
               ok ? "ok" : "err");
     return ok;
   }
@@ -4481,6 +4703,7 @@ right lower quadrant"></textarea>
 
   async function startRecording() {
     if (recording || stopping || finishing) return;
+    if (bigButtonActive()) blurEditingNote(); // a note mid-edit is saved before the take (it may add to it)
     stopRequested = false;
     pendingStart = false;
     // Zero the capture peak + probe reading UP FRONT, not just in the per-take
@@ -4653,7 +4876,28 @@ right lower quadrant"></textarea>
     // (one-shot), or when append mode is on. Otherwise start fresh. The
     // decision is explicit — no time window — so the same action always
     // gives the same result (append vs. fresh is never clock-dependent).
-    if (joinedSessionCode) {
+    //
+    // The phone notes layout decides per NOTE instead: a take adds to the note
+    // armed with "Add to this" (one-shot), otherwise it becomes a new note.
+    // Either way it is a single segment on its own: a take that adds to a note,
+    // or any take in keep-on-phone mode, stays on the phone (sessionHold) —
+    // never auto-sent — so the desktop's own append can never double it. A
+    // plain paired take in send mode still goes to the desktop as one segment
+    // and the desktop owns append (below), exactly as before.
+    const phoneLayout = bigButtonActive();
+    const targetNote = phoneLayout ? noteById(noteTargetId) : null;
+    noteTargetId = null; // one-shot: consumed by this take (a missing note just starts a new one)
+    sessionNoteTargetId = targetNote ? targetNote.createdAt : null;
+    sessionHold = Boolean(targetNote) || Boolean(phoneLayout && joinedSessionCode && phoneKeepMode);
+    if (targetNote) {
+      appendArmed = false;
+      finalizedSegments = (targetNote.text || "").trim() ? [(targetNote.text || "").trim()] : [];
+    } else if (phoneLayout && !joinedSessionCode) {
+      // A solo phone: every take is its own note (the list is the history);
+      // the box's append arm/mode belong to the full-page layout.
+      appendArmed = false;
+      finalizedSegments = [];
+    } else if (joinedSessionCode) {
       // Joined to a desktop: THIS device is only the microphone — the desktop
       // owns the note and its append mode (see deliverRemoteText). Always deliver
       // a single dictation; accumulating here too would double-append on the
@@ -4733,7 +4977,10 @@ right lower quadrant"></textarea>
     updateAppendChip();
     setStatus("Recording — release to upload for transcription…", "ok");
     startBeep();
-    notifyDesktopRecording("start"); // joined phone: light the desktop's "recording" indicator (no-op if unpaired)
+    // Joined phone: light the desktop's "recording" indicator (no-op if unpaired).
+    // Not for a take that stays on the phone — the desktop would sit on
+    // "transcribing…" for a note that is never coming.
+    if (!sessionHold) notifyDesktopRecording("start");
 
     if (stopRequested) {
       stopRequested = false;
@@ -4840,7 +5087,7 @@ right lower quadrant"></textarea>
     // is left fast — it does not suffer the iOS corpse-mic gap between takes.
     if (bigButtonActive()) audioSuspect = true;
     if (!unexpected) setLinkPill("idle");
-    notifyDesktopRecording("stop"); // joined phone: flip the desktop indicator to "transcribing" while the upload runs (no-op if unpaired)
+    if (!sessionHold) notifyDesktopRecording("stop"); // joined phone: flip the desktop indicator to "transcribing" while the upload runs (no-op if unpaired or held)
 
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
       try { mediaRecorder.stop(); } catch (e) {}
@@ -5101,8 +5348,24 @@ right lower quadrant"></textarea>
 
     // Save final clean output to browser storage. A storage failure (quota)
     // must not block the actual deliverable — the clipboard write and beep.
+    // Phone notes layout: a take that ADDS to a note rewrites that note in
+    // place (it keeps its id and its place in the list); any other take is a
+    // new note. A note gone missing mid-take falls back to a new note, so the
+    // text is never dropped.
+    const phoneLayout = bigButtonActive();
+    const held = sessionHold; // this take stays on the phone (add-to-note / keep mode)
+    let noteId = null;
+    let addedToNote = false;
     try {
-      addHistory(cleaned, { language_code: "en", engine: sessionEngine, unfiltered: opts.unfilteredText || "" });
+      const addFields = { appendedAt: new Date().toISOString() };
+      if (opts.unfilteredText) addFields.unfiltered = opts.unfilteredText;
+      if (sessionNoteTargetId && updateNoteText(sessionNoteTargetId, cleaned, addFields)) {
+        noteId = sessionNoteTargetId;
+        addedToNote = true;
+      } else {
+        noteId = addHistory(cleaned, { language_code: "en", engine: sessionEngine, unfiltered: opts.unfilteredText || "",
+          sendable: Boolean(joinedSessionCode && phoneLayout) }).createdAt;
+      }
     } catch (e) {}
 
     // Joined + clean: the DESKTOP clipboard is the deliverable, so the relay
@@ -5116,14 +5379,25 @@ right lower quadrant"></textarea>
     // here. iOS denies that copy outright; an Android/desktop join may succeed —
     // both defer to the relay. Unexpected/mic-alarm joined dictations are NOT
     // clean, so they keep the loud local fail cue and the relay stays silent.
-    const relayCarries = Boolean(joinedSessionCode && cleaned.trim());
+    //
+    // A take that STAYS ON THE PHONE (added to a note, keep-on-phone mode, or
+    // any take on a solo phone layout) is different again: the note in the list
+    // is the deliverable, so the local copy is a convenience — iOS denies it
+    // after the upload anyway, and the note's own Copy is one tap (a gesture
+    // iOS allows). A denied copy is stated in words, never a red failure on
+    // every take (the scenario-48 lesson: an alarm on every normal take teaches
+    // the user to ignore red). Degraded / partial / mic-alarm outcomes stay loud.
+    const relayCarries = Boolean(joinedSessionCode && cleaned.trim()) && !held;
     const cleanOutcome = !opts.unexpected && !micAlarmFired;
     let announceRelayOutcome = relayCarries && cleanOutcome;
+    const keptOnPhone = phoneLayout && (held || !joinedSessionCode);
     const noteSuffix = opts.note ? " " + opts.note : ""; // diarization "removed N words" note (no beep)
 
     if (autoCopyEl.checked) {
       const copied = await copyText(cleaned);
-      if (announceRelayOutcome) {
+      if (keptOnPhone) {
+        announceKeptNote(copied, addedToNote, cleanOutcome, opts, noteSuffix);
+      } else if (announceRelayOutcome) {
         // Don't claim it went to the desktop when we already know none is there:
         // this line is what the phone's big screen shows while the relay runs.
         var queueing = desktopKnownAtStart === false;
@@ -5131,7 +5405,8 @@ right lower quadrant"></textarea>
           ? (copied ? "Transcript copied here — queueing for the desktop…"
                     : "Transcript saved — queueing for the desktop…")
           : (copied ? "Transcript copied here and sent to the desktop — confirming delivery…"
-                    : "Transcript sent to the desktop — confirming delivery… (no local phone copy; tap 'Copy & clear' if you need it here)")) + noteSuffix, "warn");
+                    : "Transcript sent to the desktop — confirming delivery… (no local phone copy; " +
+                      (phoneLayout ? "tap Copy on the note" : "tap 'Copy & clear'") + " if you need it here)")) + noteSuffix, "warn");
       } else if (!copied) {
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy & clear'.", "err");
         failBeep();
@@ -5150,7 +5425,9 @@ right lower quadrant"></textarea>
         doneBeep();
       }
     } else {
-      if (announceRelayOutcome) {
+      if (keptOnPhone) {
+        announceKeptNote(null, addedToNote, cleanOutcome, opts, noteSuffix);
+      } else if (announceRelayOutcome) {
         setStatus((desktopKnownAtStart === false
           ? "Transcript saved — queueing for the desktop…"
           : "Transcript sent to the desktop — confirming delivery…") + noteSuffix, "warn");
@@ -5179,11 +5456,49 @@ right lower quadrant"></textarea>
     // loud here, never a false success. A queued next session waits for the
     // ack: its REC screen must not paint over a relay failure before the
     // failure was ever shown.
-    if (joinedSessionCode && cleaned.trim()) {
-      relayDeliveryToDesktop(cleaned, announceRelayOutcome, opts.degraded ? (opts.note || "Verify the transcript.") : "").finally(maybePendingStart);
+    if (relayCarries) {
+      relayDeliveryToDesktop(cleaned, announceRelayOutcome, opts.degraded ? (opts.note || "Verify the transcript.") : "",
+        noteId ? [noteId] : null).finally(maybePendingStart);
     } else {
       maybePendingStart();
     }
+  }
+
+  // The single outcome cue for a take whose note STAYS on the phone (see
+  // deliverFinalText). copied: true / false / null (auto-copy off).
+  function announceKeptNote(copied, added, clean, opts, noteSuffix) {
+    const what = added ? "Added to the note" : (joinedSessionCode ? "Saved on this phone" : "Saved as a note");
+    if (!clean) {
+      // Partial text (connection lost) or a mic that dropped out: loud, as ever.
+      setStatus("⚠ " + (opts.unexpected ? "Connection lost mid-dictation — PARTIAL transcript. " : "Mic signal dropped during this dictation. ") +
+        what + ". VERIFY it before using it!", "err");
+      failBeep();
+      return;
+    }
+    let msg = what;
+    // Solo + copied is a full delivery (the text IS on this phone's clipboard):
+    // it reads DONE like any copied dictation. Otherwise the headline is SAVED —
+    // a success, but one that has not reached a clipboard.
+    let headline = "SAVED";
+    let done = "";
+    if (joinedSessionCode) {
+      msg += " — NOT sent to the desktop yet. Tap 📤 Send on the note" + (added ? "" : ", or select several and send them as one,") + " when it's ready.";
+    } else if (copied === true) {
+      msg += " and copied.";
+      headline = "";
+      done = " Done!";
+    } else if (copied === false) {
+      msg += " — NOT copied (this phone blocks copying after the upload): tap Copy on the note.";
+    } else {
+      msg += ".";
+    }
+    if (opts.degraded) {
+      setStatus(msg + noteSuffix, "warn"); // verify first: never a Done!
+      warnBeep();
+      return;
+    }
+    setStatus(msg + done + noteSuffix, "ok", headline);
+    doneBeep();
   }
 
   function maybePendingStart() {
@@ -6167,7 +6482,7 @@ right lower quadrant"></textarea>
      can never re-copy stale text. This narrows the never-lose-a-dictation gap;
      it never widens it. */
 
-  function enqueueDelivery(text) {
+  function enqueueDelivery(text, noteIds) {
     var item = {
       id: Date.now().toString(36) + "-" + Math.floor(Math.random() * 0xffffffff).toString(36),
       text: text,
@@ -6179,6 +6494,9 @@ right lower quadrant"></textarea>
       // onto a different clinic's desktop.
       code: joinedSessionCode,
     };
+    // The phone notes this delivery carries (createdAt ids): a listener ack
+    // marks them sent, and while queued they read "waiting to send".
+    if (noteIds && noteIds.length) item.notes = noteIds.slice(0, 100);
     deliveryQueue.push(item);
     // An unbounded retry buffer is its own failure mode: drop the OLDEST
     // undelivered item (it stays in this device's history). The just-enqueued
@@ -6283,6 +6601,7 @@ right lower quadrant"></textarea>
       var result = await postDelivery(item);
       if (result === "delivered") {
         if (isCurrent) reachedCurrent = true;
+        try { markNotesSent(item.notes, item.ts); } catch (e) {} // the phone list shows these notes as sent
         // Remove by identity — the splice keeps foreign-code items ahead of us
         // intact (flushChain serializes mutation, so the index is still valid).
         var idx = deliveryQueue.indexOf(item);
@@ -6332,13 +6651,13 @@ right lower quadrant"></textarea>
   // explicit re-send SHOULD deliver again — the desktop dedupe ring only
   // blocks unintentional replays (and the desktop's append mode applies, as
   // with any delivery).
-  function sendTextToDesktop(text) {
+  function sendTextToDesktop(text, noteIds, sendingMsg) {
     if (!joinedSessionCode) return;
     if (recording || stopping || finishing) return;
     var t = cleanTranscript(String(text || ""));
     if (!t.trim()) return;
-    setStatus("Sending to the desktop…", "warn");
-    relayDeliveryToDesktop(t, true);
+    setStatus(sendingMsg || "Sending to the desktop…", "warn");
+    relayDeliveryToDesktop(t, true, "", noteIds);
   }
 
   // Undelivered notes must be VISIBLE, never just silently retried: a tappable
@@ -6366,6 +6685,7 @@ right lower quadrant"></textarea>
       el.style.display = "";
       el.textContent = label;
     }
+    refreshQueuedNoteTags(); // the phone notes a queued delivery carries read "waiting to send"
   }
 
   function queueChipTapped() {
@@ -6383,8 +6703,8 @@ right lower quadrant"></textarea>
   // the queue flush returns this item's fate and we translate it here.
   // announceOutcome: the local phone copy was denied (iOS, no gesture) on an
   // otherwise-clean outcome, so this ack carries the dictation's outcome cue.
-  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote) {
-    var item = enqueueDelivery(text); // durable BEFORE the network call: a phone that dies now recovers at boot
+  async function relayDeliveryToDesktop(text, announceOutcome, degradedNote, noteIds) {
+    var item = enqueueDelivery(text, noteIds); // durable BEFORE the network call: a phone that dies now recovers at boot
     var outcome = await flushDeliveryQueue({ currentId: item.id });
     // announceOutcome FALSE ⇒ an unexpected/mic-alarm joined dictation:
     // deliverFinalText already played the loud local cue (fail beep + red
@@ -6480,7 +6800,10 @@ right lower quadrant"></textarea>
     }
     if (!active) {
       document.body.classList.remove("bigbtn-settings");
-      bigPeekExpanded = false;
+      // Leaving the phone layout drops its in-memory note choices.
+      noteTargetId = null;
+      selectedNoteIds = [];
+      pendingDeleteId = null;
     }
     if (bigJoinedBadgeEl) {
       // Short on purpose: the top row has to hold this plus two pills and up to
@@ -6494,6 +6817,7 @@ right lower quadrant"></textarea>
     if (bigPairBtnEl) bigPairBtnEl.style.display = joinedSessionCode ? "none" : ""; // solo phone: the way to a desktop lives here
     updateQueueChip(); // the big-layout chip needs a paint when the surface flips
     updateRecoverChip(); // ditto the saved-recording retry chip
+    renderPhoneNotes(); // tags + Send buttons depend on the link state
     updateBigScreen();
     maybeAutoShowMicTips(); // first time on the phone surface: nudge about other-voice rejection
   }
@@ -6508,6 +6832,7 @@ right lower quadrant"></textarea>
       optionsSectionEl.open = true;
       try { if (typeof optionsSectionEl.scrollIntoView === "function") optionsSectionEl.scrollIntoView({ block: "start" }); } catch (_) {}
     }
+    if (!on) renderPhoneNotes(); // History may have been edited in the settings view
   }
 
   // Whole-screen state, derived from the SAME transitions that drive the
@@ -6622,14 +6947,11 @@ right lower quadrant"></textarea>
         state === "rec" ? "● REC" :
         state === "connecting" ? "CONNECTING…" :
         state === "busy" ? "WORKING…" :
-        state === "ok" ? "DONE" :
+        // "SAVED" when the take stayed on the phone as a note: a success, but
+        // DONE would read as "it reached a clipboard".
+        state === "ok" ? (lastStatusHeadline || "DONE") :
         state === "warn" ? "⚠ CHECK" :
         state === "fail" ? "FAILED" : "READY";
-    }
-    if (bigBtnEl) {
-      bigBtnEl.textContent =
-        (recording && !stopping) ? "STOP" :
-        (stopping || finishing) ? "…" : "HOLD TO TALK";
     }
     if (bigStatusEl) {
       // The boot hint is desktop copy (Ctrl+Space, Ctrl+V, "keep this tab
@@ -6637,42 +6959,396 @@ right lower quadrant"></textarea>
       // replaces it, say what THIS surface does.
       bigStatusEl.textContent = statusIsBootHint
         ? (joinedSessionCode
-            ? "Hold the button and speak. The text lands on the desktop's clipboard."
-            : "Hold the button and speak. The text is copied on this phone.")
+            ? (phoneKeepMode
+                ? "Hold the round button and speak. Each take is kept here as a note until you send it."
+                : "Hold the round button and speak. The text lands on the desktop's clipboard.")
+            : "Hold the round button and speak. Each take is saved here as a note.")
         : statusEl.textContent;
     }
-    updateBigPeek();
+    updatePhoneChrome();
   }
 
-  // The latest transcript collapses to a one-line peek strip; tap to expand.
-  function updateBigPeek() {
-    if (!bigPeekEl) return;
-    bigPeekTextEl.textContent = latestText || "No dictation yet."; // an empty strip looked broken when expanded
-    // While a dictation is live, show the realtime words wrapped and pinned to the
-    // newest line — a collapsed one-liner truncates from the end, so the latest
-    // recognized words scroll off-screen and the strip looks frozen (the realtime
-    // feedback the mobile/joined user actually needs). Batch has no live text, so
-    // gate on latestText: nothing to show until delivery.
-    var live = (recording || stopping) && !!latestText;
-    bigPeekEl.classList.toggle("live", live);
-    bigPeekEl.classList.toggle("expanded", bigPeekExpanded);
-    bigPeekEl.classList.toggle("armed", appendArmed && !recording);
-    bigPeekBarEl.textContent = live
-      ? "Live transcript"
-      : bigPeekExpanded
-        // A joined phone is a dumb mic — the DESKTOP owns append, so the
-        // "tap the text to append" promise would be a silent no-op there.
-        ? (joinedSessionCode
-            ? "Latest transcript — tap here to collapse · append is decided on the desktop"
-            : "Latest transcript — tap here to collapse · tap the text to append the next dictation")
-        : "Latest transcript — tap to expand";
-    if (live) bigPeekTextEl.scrollTop = bigPeekTextEl.scrollHeight;
-    // Manual re-send from the phone surface (the overlay covers the normal
-    // card, so the expanded peek is where the note is reachable): joined +
-    // idle + something to send.
-    if (bigSendBtnEl) {
-      bigSendBtnEl.style.display =
-        (bigPeekExpanded && joinedSessionCode && latestText && !recording && !stopping && !finishing) ? "" : "none";
+  /* ───── Phone notes list ─────
+     The phone layout's main content: this device's dictations (the history
+     entries — no second store) as editable notes, newest first. A note can be
+     added to by the next take ("Add to this"), copied, sent to the desktop,
+     deleted (two taps), or checked with others to send / copy them as ONE
+     note. Paired, each note says whether the desktop has it. */
+  function isoMs(x) { var t = x ? Date.parse(x) : 0; return isFinite(t) ? t : 0; }
+
+  // What the desktop has of this note (paired only). null = nothing to say
+  // (a solo note, or one from before the phone layout tracked sending).
+  function noteTag(item, queued) {
+    if (!joinedSessionCode) return item.sentAt ? { text: "✓ Sent", cls: "sent" } : null;
+    if (queued[item.createdAt]) return { text: "⏳ Waiting to send", cls: "queued" };
+    var sentMs = isoMs(item.sentAt);
+    var changedMs = Math.max(isoMs(item.editedAt), isoMs(item.appendedAt));
+    if (sentMs && changedMs <= sentMs) return { text: "✓ Sent", cls: "sent" };
+    if (sentMs) return { text: "Changed since sent", cls: "unsent" };
+    if (item.sendable) return { text: "Not sent", cls: "unsent" };
+    return null;
+  }
+
+  // Notes carried by a queued (not yet acked) delivery: they read "waiting".
+  function queuedNoteIds() {
+    var out = {};
+    for (var i = 0; i < deliveryQueue.length; i++) {
+      var ids = deliveryQueue[i].notes || [];
+      for (var j = 0; j < ids.length; j++) out[ids[j]] = true;
+    }
+    return out;
+  }
+
+  function unsentNoteIds() {
+    if (!joinedSessionCode) return [];
+    var queued = queuedNoteIds();
+    return getHistory().filter(function (it) {
+      var tag = noteTag(it, queued);
+      return tag && tag.cls === "unsent";
+    }).map(function (it) { return it.createdAt; });
+  }
+
+  // The notes "Select them" picks: the newest unbroken run of unsent notes —
+  // the set just dictated. An older unsent note behind a sent one (another
+  // patient, earlier in the day) is still counted and tagged, but never swept
+  // into a combined send by one tap; tick it by hand if it belongs.
+  function latestUnsentRun() {
+    if (!joinedSessionCode) return [];
+    var queued = queuedNoteIds();
+    var items = getHistory();
+    var run = [];
+    for (var i = 0; i < items.length; i++) {
+      var tag = noteTag(items[i], queued);
+      if (!tag || tag.cls !== "unsent") break;
+      run.push(items[i].createdAt);
+    }
+    return run;
+  }
+
+  function formatNoteTime(item) {
+    var d = new Date(item.createdAt);
+    if (isNaN(d.getTime())) return "";
+    var time = "";
+    try { time = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); } catch (e) { time = d.toTimeString().slice(0, 5); }
+    var sameDay = d.toDateString() === new Date().toDateString();
+    var day = "";
+    if (!sameDay) {
+      try { day = d.toLocaleDateString([], { month: "short", day: "numeric" }) + ", "; } catch (e) { day = d.toDateString() + ", "; }
+    }
+    return day + time + (item.recovered ? " · recovered" : "");
+  }
+
+  function notePreview(text) {
+    var t = String(text || "").replace(/\\s+/g, " ").trim();
+    return t.length > 60 ? t.slice(0, 60) + "…" : t;
+  }
+
+  function sessionBusy() { return recording || stopping || finishing; }
+
+  // A note being edited must be saved before anything else touches it — the
+  // blur handler persists it. The floating button's pointerdown is
+  // preventDefault-ed (so it never moves focus), hence the explicit blur.
+  function blurEditingNote() {
+    var ae = document.activeElement;
+    if (ae && ae.classList && ae.classList.contains("bnote-text")) { try { ae.blur(); } catch (e) {} }
+  }
+
+  function renderPhoneNotes() {
+    if (!bigNotesEl || !bigButtonActive()) return;
+    // Never rebuild under a caret: that would drop the keyboard mid-word. The
+    // blur handler re-renders once the edit is saved.
+    var ae = document.activeElement;
+    if (ae && ae.classList && ae.classList.contains("bnote-text") && bigNotesEl.contains(ae)) {
+      phoneNotesDirty = true;
+      updatePhoneChrome();
+      return;
+    }
+    phoneNotesDirty = false;
+    var items = getHistory();
+    var alive = {};
+    for (var k = 0; k < items.length; k++) alive[items[k].createdAt] = true;
+    selectedNoteIds = selectedNoteIds.filter(function (id) { return alive[id]; });
+    if (noteTargetId && !alive[noteTargetId]) noteTargetId = null;
+    var scroll = bigNotesEl.scrollTop;
+    var newest = items[0] ? items[0].createdAt : "";
+    bigNotesEl.innerHTML = "";
+    if (!items.length) {
+      var empty = document.createElement("div");
+      empty.id = "bigNotesEmpty";
+      empty.textContent = "No notes yet. Hold the round button and speak — or tap it once to start and again to stop.";
+      bigNotesEl.appendChild(empty);
+    }
+    var queued = queuedNoteIds();
+    var busy = sessionBusy();
+    var limit = phoneNotesExpanded ? items.length : PHONE_NOTES_PAGE;
+    for (var i = 0; i < items.length && i < limit; i++) bigNotesEl.appendChild(buildNoteCard(items[i], queued, busy));
+    if (items.length > PHONE_NOTES_PAGE) {
+      var more = document.createElement("button");
+      more.id = "bigMoreBtn";
+      more.textContent = phoneNotesExpanded ? "Show fewer" : "Show " + (items.length - PHONE_NOTES_PAGE) + " older notes";
+      more.onclick = function () { phoneNotesExpanded = !phoneNotesExpanded; renderPhoneNotes(); };
+      bigNotesEl.appendChild(more);
+    }
+    // A new note landed: bring it into view. Otherwise keep the reader's place.
+    bigNotesEl.scrollTop = (newest && newest !== phoneNewestRendered) ? 0 : scroll;
+    phoneNewestRendered = newest;
+    lastChromeBusy = busy;
+    updatePhoneChrome();
+  }
+
+  function buildNoteCard(item, queued, busy) {
+    var id = item.createdAt;
+    var card = document.createElement("div");
+    card.className = "bnote";
+    card.setAttribute("data-id", id);
+    var selected = selectedNoteIds.indexOf(id) !== -1;
+    if (selected) card.classList.add("selected");
+    if (id === noteTargetId || (busy && id === sessionNoteTargetId)) card.classList.add("target");
+
+    var head = document.createElement("div");
+    head.className = "bnote-head";
+    var sel = document.createElement("input");
+    sel.type = "checkbox";
+    sel.className = "bnote-sel";
+    sel.checked = selected;
+    sel.title = "Select — to send or copy several notes as one";
+    sel.addEventListener("change", function () { toggleNoteSelected(id, sel.checked); });
+    var time = document.createElement("span");
+    time.className = "bnote-time";
+    time.textContent = formatNoteTime(item) + (item.editedAt ? " · edited" : "");
+    head.append(sel, time);
+    var tag = noteTag(item, queued);
+    if (tag) {
+      var tagEl = document.createElement("span");
+      tagEl.className = "bnote-tag " + tag.cls;
+      tagEl.textContent = tag.text;
+      head.append(tagEl);
+    }
+
+    // Hand-editable in place, like every other transcript surface: tap to
+    // place the caret, saved on blur, Escape reverts. Locked while a take is in
+    // flight (the take may be about to rewrite this very note).
+    var text = document.createElement("div");
+    text.className = "bnote-text";
+    text.setAttribute("contenteditable", busy ? "false" : "true");
+    text.textContent = item.text || "";
+    text.addEventListener("paste", plainTextPaste);
+    var original = item.text || "";
+    text.addEventListener("focus", function () { original = text.textContent; });
+    text.addEventListener("keydown", function (e) {
+      if (e.key === "Escape") { text.textContent = original; text.blur(); }
+    });
+    text.addEventListener("blur", function () { savePhoneNoteEdit(id, text, original); });
+
+    var actions = document.createElement("div");
+    actions.className = "bnote-actions";
+    var add = document.createElement("button");
+    add.className = "bnote-add" + (id === noteTargetId ? " on" : "");
+    add.textContent = id === noteTargetId ? "➕ Adding next take" : "➕ Add to this";
+    add.title = "Your next take is added to the end of this note (tap again to cancel)";
+    add.onclick = function () { toggleNoteTarget(id); };
+    var copy = document.createElement("button");
+    copy.className = "bnote-copy";
+    copy.textContent = "Copy";
+    copy.onclick = function () { if (!sessionBusy()) copyText(text.textContent); };
+    actions.append(add, copy);
+    if (joinedSessionCode) {
+      var send = document.createElement("button");
+      send.className = "bnote-send";
+      send.textContent = "📤 Send";
+      send.title = "Send this note to the desktop clipboard";
+      send.onclick = function () { sendTextToDesktop(text.textContent, [id]); };
+      actions.append(send);
+    }
+    var del = document.createElement("button");
+    del.className = "bnote-del" + (pendingDeleteId === id ? " confirm" : "");
+    del.textContent = pendingDeleteId === id ? "Delete?" : "🗑";
+    del.title = "Delete this note (tap twice)";
+    del.onclick = function () { deleteNoteTap(id); };
+    actions.append(del);
+
+    card.append(head, text, actions);
+    return card;
+  }
+
+  function savePhoneNoteEdit(id, el, original) {
+    var newText = el.textContent;
+    if (newText !== original) {
+      if (!newText.trim()) {
+        // An emptied note is not saved (a blank card helps nobody); Delete is
+        // the way to remove one.
+        el.textContent = original;
+        setStatus("A note can't be empty — use 🗑 to delete it.", "warn");
+      } else {
+        var items = getHistory();
+        var i = items.findIndex(function (it) { return it.createdAt === id; });
+        if (i >= 0) {
+          items[i].text = newText;
+          items[i].editedAt = new Date().toISOString();
+          // Direct write, then one re-render below (not setHistory: the blur
+          // may be followed straight away by a tap on another note).
+          localStorage.setItem(STORE_KEY, JSON.stringify(items.slice(0, 100)));
+          // Neutral, not "ok": the green DONE is for text reaching a clipboard.
+          setStatus("Saved your edit to the note." +
+            (items[i].sentAt && joinedSessionCode ? " It changed after it was sent — send it again if the desktop needs the new text." : ""), "");
+          renderHistory();
+        }
+      }
+    }
+    // Re-render once the caret is really gone (activeElement settles after blur).
+    setTimeout(function () { renderPhoneNotes(); }, 0);
+  }
+
+  function toggleNoteSelected(id, on) {
+    var i = selectedNoteIds.indexOf(id);
+    if (on && i === -1) selectedNoteIds.push(id);
+    if (!on && i !== -1) selectedNoteIds.splice(i, 1);
+    renderPhoneNotes();
+  }
+
+  function selectUnsentNotes() {
+    selectedNoteIds = latestUnsentRun();
+    // Every selected note must be on screen to be checked by eye before it goes.
+    if (selectedNoteIds.length > PHONE_NOTES_PAGE) phoneNotesExpanded = true;
+    renderPhoneNotes();
+  }
+
+  // "Add to this": the NEXT take is added to the end of this note — one-shot,
+  // like the desktop's Append next. The result stays on the phone (never
+  // auto-sent), so the desktop's own append can never double it.
+  function toggleNoteTarget(id) {
+    if (sessionBusy()) return;
+    noteTargetId = (noteTargetId === id) ? null : id;
+    renderPhoneNotes();
+    setStatus(noteTargetId
+      ? "Your next take will be ADDED to this note" + (joinedSessionCode ? ". It stays on the phone until you tap Send." : ".")
+      : "Your next take starts a new note.", "");
+  }
+
+  function deleteNoteTap(id) {
+    if (sessionBusy()) return;
+    if (pendingDeleteTimer) { clearTimeout(pendingDeleteTimer); pendingDeleteTimer = null; }
+    if (pendingDeleteId !== id) {
+      // First tap only arms it: one stray tap must never delete a note.
+      pendingDeleteId = id;
+      pendingDeleteTimer = setTimeout(function () { pendingDeleteTimer = null; pendingDeleteId = null; renderPhoneNotes(); }, 4000);
+      renderPhoneNotes();
+      return;
+    }
+    pendingDeleteId = null;
+    if (noteTargetId === id) noteTargetId = null;
+    selectedNoteIds = selectedNoteIds.filter(function (x) { return x !== id; });
+    setHistory(getHistory().filter(function (it) { return it.createdAt !== id; }));
+    setStatus("Note deleted.", "");
+  }
+
+  function sendSelectedNotes() {
+    if (!joinedSessionCode || sessionBusy()) return;
+    var ids = selectedNoteIds.filter(function (id) { return noteById(id); });
+    if (!ids.length) return;
+    var text = combinedNotesText(ids);
+    if (!text.trim()) return;
+    selectedNoteIds = [];
+    renderPhoneNotes();
+    sendTextToDesktop(text, ids, ids.length > 1
+      ? "Sending " + ids.length + " notes to the desktop as one note…"
+      : "Sending to the desktop…");
+  }
+
+  async function copySelectedNotes() {
+    if (sessionBusy()) return;
+    var ids = selectedNoteIds.filter(function (id) { return noteById(id); });
+    if (!ids.length) return;
+    var ok = await copyText(combinedNotesText(ids));
+    if (ok && ids.length > 1) setStatus("Copied " + ids.length + " notes as one note.", "ok");
+  }
+
+  function setPhoneKeepMode(on) {
+    if (sessionBusy()) return;
+    on = Boolean(on);
+    if (phoneKeepMode === on) return;
+    phoneKeepMode = on;
+    saveSettingsNow();
+    renderPhoneNotes();
+    setStatus(on
+      ? "Keeping each take on this phone. Send notes when they're ready — one at a time, or select several and send them as one."
+      : "Each take goes straight to the desktop again.", "");
+  }
+
+  // The queue's contents changed: re-tag the notes it carries (cheap check first).
+  function refreshQueuedNoteTags() {
+    var sig = deliveryQueue.map(function (it) { return (it.notes || []).join(","); }).join("|");
+    if (sig === lastQueuedSig) return;
+    lastQueuedSig = sig;
+    renderPhoneNotes();
+  }
+
+  // Everything around the list that follows session state — cheap, so it runs
+  // from updateBigScreen and the 1 s tick without rebuilding the notes.
+  function updatePhoneChrome() {
+    if (!bigUiEl) return;
+    var busy = sessionBusy();
+    bigUiEl.classList.toggle("in-session", busy);
+    if (busy !== lastChromeBusy && bigNotesEl) {
+      lastChromeBusy = busy;
+      var texts = bigNotesEl.querySelectorAll(".bnote-text");
+      for (var i = 0; i < texts.length; i++) texts[i].setAttribute("contenteditable", busy ? "false" : "true");
+    }
+    var active = bigButtonActive();
+    if (bigModeRowEl) bigModeRowEl.style.display = (active && joinedSessionCode) ? "" : "none";
+    if (bigModeSendBtnEl) bigModeSendBtnEl.classList.toggle("on", !phoneKeepMode);
+    if (bigModeKeepBtnEl) bigModeKeepBtnEl.classList.toggle("on", phoneKeepMode);
+
+    // The note the current / next take adds to.
+    var tid = busy ? sessionNoteTargetId : noteTargetId;
+    var tnote = (active && tid) ? noteById(tid) : null;
+    bigUiEl.classList.toggle("targeting", Boolean(tnote));
+    if (bigTargetBarEl) {
+      if (tnote) {
+        bigTargetBarEl.style.display = "";
+        bigTargetTextEl.textContent = (busy ? "➕ Adding to: “" : "➕ Next take adds to: “") + notePreview(tnote.text) + "”";
+        if (bigTargetCancelBtnEl) bigTargetCancelBtnEl.style.display = busy ? "none" : "";
+      } else {
+        bigTargetBarEl.style.display = "none";
+      }
+    }
+
+    // Selection bar, or — with nothing selected — the not-sent reminder.
+    if (bigSelBarEl) {
+      var nSel = selectedNoteIds.length;
+      var nUnsent = (active && !nSel) ? unsentNoteIds().length : 0;
+      if (active && nSel) {
+        bigSelBarEl.style.display = "";
+        bigSelBarEl.classList.add("selecting");
+        bigSelInfoEl.textContent = nSel + " selected";
+        bigSelPickBtnEl.style.display = "none";
+        bigSelSendBtnEl.style.display = joinedSessionCode ? "" : "none";
+        bigSelSendBtnEl.textContent = nSel > 1 ? "📤 Send as one" : "📤 Send";
+        bigSelCopyBtnEl.style.display = "";
+        bigSelCopyBtnEl.textContent = nSel > 1 ? "Copy as one" : "Copy";
+        bigSelClearBtnEl.style.display = "";
+      } else if (nUnsent) {
+        var nRun = latestUnsentRun().length;
+        bigSelBarEl.style.display = "";
+        bigSelBarEl.classList.remove("selecting");
+        bigSelInfoEl.textContent = nUnsent + (nUnsent === 1 ? " note" : " notes") + " not sent yet";
+        // Only the newest unbroken run is one tap away (see latestUnsentRun).
+        bigSelPickBtnEl.style.display = nRun ? "" : "none";
+        bigSelPickBtnEl.textContent = nRun === nUnsent
+          ? (nUnsent === 1 ? "Select it" : "Select them")
+          : (nRun === 1 ? "Select the latest" : "Select the latest " + nRun);
+        bigSelSendBtnEl.style.display = "none";
+        bigSelCopyBtnEl.style.display = "none";
+        bigSelClearBtnEl.style.display = "none";
+      } else {
+        bigSelBarEl.style.display = "none";
+      }
+    }
+
+    if (bigBtnEl) {
+      bigBtnEl.textContent =
+        (recording && !stopping) ? "STOP" :
+        (stopping || finishing) ? "…" : (tnote ? "ADD" : "HOLD");
     }
   }
 
@@ -6683,6 +7359,7 @@ right lower quadrant"></textarea>
   function bigBtnPress(e) {
     if (e.preventDefault) e.preventDefault();
     if (bigBtnPointerId !== null) return; // a second finger never steals the press
+    blurEditingNote(); // save a note mid-edit first (the take may add to it); drops the keyboard too
     bigBtnPointerId = e.pointerId !== undefined ? e.pointerId : -1;
     try { bigBtnEl.setPointerCapture(e.pointerId); } catch (err) {}
     if (!recording && !stopping && !finishing) {
@@ -6732,17 +7409,14 @@ right lower quadrant"></textarea>
     document.addEventListener("pointercancel", bigBtnRelease);
   }
 
-  if (bigPeekBarEl) bigPeekBarEl.addEventListener("click", () => {
-    bigPeekExpanded = !bigPeekExpanded;
-    updateBigPeek();
-  });
-  if (bigPeekTextEl) bigPeekTextEl.addEventListener("click", () => {
-    if (!bigPeekExpanded) { bigPeekExpanded = true; updateBigPeek(); return; }
-    // Expanded: tapping the text arms append. Call the shared arm helper so the
-    // one-shot rules live in exactly one place (the box click now edits, not arms).
-    toggleAppendArm();
-  });
-  if (bigSendBtnEl) bigSendBtnEl.onclick = () => sendTextToDesktop(latestText);
+  // Phone notes layout controls (the per-note buttons are wired in buildNoteCard).
+  if (bigModeSendBtnEl) bigModeSendBtnEl.onclick = () => setPhoneKeepMode(false);
+  if (bigModeKeepBtnEl) bigModeKeepBtnEl.onclick = () => setPhoneKeepMode(true);
+  if (bigSelPickBtnEl) bigSelPickBtnEl.onclick = () => selectUnsentNotes();
+  if (bigSelSendBtnEl) bigSelSendBtnEl.onclick = () => sendSelectedNotes();
+  if (bigSelCopyBtnEl) bigSelCopyBtnEl.onclick = () => copySelectedNotes();
+  if (bigSelClearBtnEl) bigSelClearBtnEl.onclick = () => { selectedNoteIds = []; renderPhoneNotes(); };
+  if (bigTargetCancelBtnEl) bigTargetCancelBtnEl.onclick = () => { if (noteTargetId) toggleNoteTarget(noteTargetId); };
   if (sendDesktopBtn) sendDesktopBtn.onclick = () => sendTextToDesktop(latestText);
   if (queueChipEl) queueChipEl.onclick = () => queueChipTapped();
   if (bigQueueChipEl) bigQueueChipEl.onclick = () => queueChipTapped();
@@ -6784,7 +7458,10 @@ right lower quadrant"></textarea>
     currentPartial = "";
     archivedText = ""; // the slot mirrors history — wiping history empties it too
     archivedCreatedAt = null;
+    noteTargetId = null;
+    selectedNoteIds = [];
     renderHistory();
+    renderPhoneNotes();
     updateAppendChip();
     setStatus("History cleared.");
   };

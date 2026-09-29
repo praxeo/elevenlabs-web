@@ -163,7 +163,7 @@ writeFileSync('/tmp/served.js', js);"
 node --check /tmp/served.js
 
 # Full session-flow simulation — batch-only product, 47 numbered scenario
-# groups, 898 checks as of 2026-09-29
+# groups, 955 checks as of 2026-09-29
 # (numbered 0,3,4,7,9,10,11,17,18,19,20,21,22,23,24,25,25w,29,30,31,31m,32,32j,
 # 33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56; the gaps are the deleted
 # realtime/hybrid/translator/pump/direct scenarios — numbering kept so git

@@ -6706,6 +6706,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   const selF = F.doc.getElementById('sttBackup');
   selF.value = 'soniox';
   selF.dispatchEvent(new (F.win().Event)('change'));
+  await sleep(400); // saveSettings is debounced (250 ms)
   const savedF = JSON.parse(F.win().localStorage.getItem('scribe_v2_settings_v9') || '{}');
   check('s56b: picking Soniox by hand is remembered as a choice', savedF.sttBackup === 'soniox' && savedF.sttBackupSet === true, JSON.stringify({ b: savedF.sttBackup, set: savedF.sttBackupSet }));
   Object.assign(store, { scribe_v2_settings_v9: F.win().localStorage.getItem('scribe_v2_settings_v9') });

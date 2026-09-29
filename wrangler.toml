@@ -2,19 +2,29 @@ name = "eleven"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
-# Deploy: npx wrangler deploy
-# Deploys over the existing `eleven` worker; its secrets persist across deploys.
+# Deploy = push to main (Cloudflare Workers Builds runs `wrangler deploy`).
+# `npx wrangler deploy` also works. Deploys over the existing `eleven` worker.
 #
-# Shared mode (optional): set secrets and users only need the passphrase.
-#   npx wrangler secret put ELEVENLABS_API_KEY   (batch / hybrid refine — ElevenLabs)
-#   npx wrangler secret put APP_PASSPHRASE        (gates shared access)
-# Realtime is Deepgram Nova-3 on Workers AI via the [ai] binding below — no STT
-# key/secret: it uses the account's Workers AI. In shared mode the passphrase
-# still gates it (so the billed AI binding can't be used anonymously).
+# Secrets — set them in the Cloudflare dashboard: Workers & Pages → eleven →
+# Settings → Variables and Secrets → Add, type **Secret**, then Deploy. Not
+# under Settings → Build: those are build-time variables the running Worker
+# never sees. The local wrangler token cannot write secrets.
+#   ELEVENLABS_API_KEY  ElevenLabs Scribe v2 Medical (the default service)
+#   APP_PASSPHRASE      the access code; with ELEVENLABS_API_KEY it turns on
+#                       shared mode, and only shared mode can use the two below
+#   SONIOX_API_KEY      Soniox, as the main service or the backup (optional)
+#   OPENAI_API_KEY      OpenAI gpt-transcribe, likewise (optional)
+# A service without its key is greyed out in Options. Secrets survive every
+# deploy.
+#
+# Optional plain variable (type Text):
+#   SONIOX_FALLBACK_AFTER_MS  overrides every service's wait before the
+#                             backup is asked (see FALLBACK_AFTER_MS)
 
-# Workers AI binding (realtime STT: @cf/deepgram/nova-3). One [ai] binding per Worker.
-[ai]
-binding = "AI"
+# Keep variables set in the dashboard when this file is deployed. Without it,
+# every push to main deletes any plain-text (Text) variable set in the dashboard,
+# e.g. SONIOX_FALLBACK_AFTER_MS or a key saved as Text instead of Secret.
+keep_vars = true
 
 [[durable_objects.bindings]]
 name = "SESSION_ROOM"

@@ -708,7 +708,11 @@ check('preset definitions injected into the page', !!presetSrc);
 const PRESETS = JSON.parse(presetSrc[1]);
 const alwaysTerms = PRESETS.filter((p) => p.always).flatMap((p) => p.terms);
 const optional = PRESETS.filter((p) => !p.always);
-check('ships an always-on list and at least one optional preset', alwaysTerms.length > 0 && optional.length > 0);
+// The always-on tier is optional: none ships since 2026-09-29 (Scribe v2
+// Medical got the clinical clips right without the old standard list). The
+// always-on checks below hold either way; with none shipped they reduce to
+// "nothing checked + empty box sends no keyterms at all" (no surcharge).
+check('ships at least one optional preset', optional.length > 0, optional.length);
 const preset1 = optional[0];
 const p1Term = preset1.terms.find((t) => !alwaysTerms.includes(t));
 check('optional preset has a distinct term', typeof p1Term === 'string', p1Term);
@@ -782,6 +786,8 @@ await sleep(300);
 const ktD = JSON.parse(fetchCalls[fetchCalls.length - 1].form.get('keyterms_json'));
 check('unchecking removes preset terms from the next call', !ktD.includes(p1Term));
 check('always-on terms survive with box empty and nothing checked', alwaysTerms.every((t) => ktD.includes(t)), ktD.length + ' terms');
+check('box empty + nothing checked sends ONLY the always-on terms (none shipped = no keyterms, no surcharge)',
+  ktD.length === new Set(alwaysTerms.map((t) => t.toLowerCase())).size, ktD.length + ' terms');
 
 // ===== Scenario 19: phone mic session =====
 console.log('--- scenario 19: phone mic session ---');

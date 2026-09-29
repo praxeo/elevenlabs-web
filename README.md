@@ -63,7 +63,7 @@ For setups where the desktop can't get a good mic. Pairing is named from both en
 
 ## Keyterms
 
-Bias the transcription toward my vocabulary — drugs, anatomy, eponyms, names. Three tiers, merged and deduped per dictation (my terms > checked presets > the always-on standard list), capped at 1000 terms under 50 chars. Edit the lists in `keyterms.js`; they reach every device on the next deploy. Keyterms add ~20% to cost, so the always-on list stays small.
+Bias the transcription toward my vocabulary — drugs, anatomy, eponyms, names. Merged and deduped per dictation (my terms > checked presets), capped at 1000 terms under 50 chars. Edit the lists in `keyterms.js`; they reach every device on the next deploy. Keyterms add ~20% to cost, and over 100 terms every dictation bills as at least 20 s, so nothing rides by default: the always-on standard list was dropped on 2026-09-29 after WhisperInk testing showed Scribe v2 Medical doesn't need it. I check Wound care (145 terms) or ER shift (69) when the shift calls for it.
 
 ## Settings & storage
 

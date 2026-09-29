@@ -2156,6 +2156,18 @@ right lower quadrant"></textarea>
   const UPLOAD_MS_PER_KB         = 60;     // upload allowance per KB of audio
   const UPLOAD_BUDGET_MAX_MS     = 90000;  // cap on that byte-scaled part alone
   const UPLOAD_DEADLINE_MAX_MS   = 150000; // hard cap on the WHOLE deadline (hotkey.ahk CLIP_TIMEOUT must cover it)
+  // While ElevenLabs itself is slow, a 15 s floor fails takes that WOULD have
+  // come back: the field log of 2026-09-29 had 3-4 s takes waiting 3.3 s and
+  // 16.8 s at ElevenLabs (normally 0.3-0.8 s) with our own network at 0.1-0.3 s,
+  // and the next takes timed out. So when this device's timing ring shows a
+  // recent take that timed out or waited long at ElevenLabs, the floor rises,
+  // and stays up until that take is out of the last few / the last 30 minutes
+  // (a slowdown comes in bursts; the longer wait costs nothing on a fast take).
+  // Healthy, a hung request still fails in 15 s.
+  const SLOW_SERVICE_FLOOR_MS   = 45000;   // the floor while ElevenLabs is being slow
+  const SLOW_SERVICE_EL_MS      = 8000;    // an ElevenLabs wait this long counts as slow
+  const SLOW_SERVICE_LOOKBACK   = 5;       // how many recent takes to look at
+  const SLOW_SERVICE_WINDOW_MS  = 30 * 60 * 1000; // and only takes this recent
   // [LATENCY] Streamed upload (see openTakeStream): the audio goes up while the
   // clinician is still talking. Past the length cap the stream is given up and
   // the take uploads the ordinary way at release; after this many consecutive
@@ -3550,11 +3562,13 @@ right lower quadrant"></textarea>
     try {
       const t0 = Date.now();
       const cap = Math.round((deadlineMs || 0) / 1000);
+      const slow = serviceSlowRecently(); // say WHY the wait may run long
       uploadTicker = setInterval(function () {
         try {
           const secs = Math.round((Date.now() - t0) / 1000);
           if (secs < 2) return; // don't clutter a fast take
-          setStatus(label + "… " + secs + "s" + (cap ? " (allowing up to " + cap + "s)" : ""), "warn");
+          setStatus(label + "… " + secs + "s" + (cap ? " (allowing up to " + cap + "s" +
+            (slow ? " — ElevenLabs has been slow" : "") + ")" : ""), "warn");
         } catch (e) {}
       }, 1000);
     } catch (e) { uploadTicker = null; }
@@ -5171,13 +5185,36 @@ right lower quadrant"></textarea>
   // Upload deadline for a take of recMs: floor + a duration-proportional extra,
   // capped. Also used for the journal recovery re-upload (duration estimated
   // from the blob size at 64 kbps = 8 bytes/ms).
+  // The deadline floor: BATCH_UPLOAD_TIMEOUT_MS normally, SLOW_SERVICE_FLOOR_MS
+  // while the service has been slow — one of the last few takes (within the
+  // window) timed out or waited more than SLOW_SERVICE_EL_MS at ElevenLabs. A
+  // timed-out take's own "Retry the upload" therefore gets the longer wait.
+  function serviceSlowRecently() {
+    try {
+      var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+      if (!Array.isArray(log)) return false;
+      var now = Date.now();
+      for (var i = 0; i < log.length && i < SLOW_SERVICE_LOOKBACK; i++) {
+        var e = log[i] || {};
+        var at = Date.parse(e.at || "");
+        if (!isFinite(at) || now - at > SLOW_SERVICE_WINDOW_MS) break; // newest first: the rest are older
+        if (e.errKind === "timeout") return true;
+        if (typeof e.elMs === "number" && e.elMs > SLOW_SERVICE_EL_MS) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  function deadlineFloorMs() {
+    return serviceSlowRecently() ? SLOW_SERVICE_FLOOR_MS : BATCH_UPLOAD_TIMEOUT_MS;
+  }
+
   function batchUploadTimeoutMs(recMs, bytes) {
     var extra = Math.min(UPLOAD_TIMEOUT_EXTRA_MAX_MS, Math.round(Math.max(0, recMs || 0) * UPLOAD_TIMEOUT_REC_FRAC));
     // Byte-scaled upload allowance: the phone-link failures were the UPLOAD leg,
     // not transcription (see the constants above). Zero/unknown bytes keeps the
     // old take-only deadline, so no caller is worse off than before.
     var up = Math.min(UPLOAD_BUDGET_MAX_MS, Math.round(Math.max(0, bytes || 0) / 1024 * UPLOAD_MS_PER_KB));
-    return Math.min(UPLOAD_DEADLINE_MAX_MS, BATCH_UPLOAD_TIMEOUT_MS + extra + up);
+    return Math.min(UPLOAD_DEADLINE_MAX_MS, deadlineFloorMs() + extra + up);
   }
 
   function fmtMinSec(sec) {
@@ -5993,7 +6030,7 @@ right lower quadrant"></textarea>
     // Auto-clear: a long-but-bounded window for recording (a missed "stop" must
     // not leave the dot pulsing forever); a tight one for transcribing (the
     // batch upload deadline plus margin) so a missed delivery clears it too.
-    var ttl = state === "transcribing" ? (BATCH_UPLOAD_TIMEOUT_MS + UPLOAD_TIMEOUT_EXTRA_MAX_MS + 8000) : 600000;
+    var ttl = state === "transcribing" ? (SLOW_SERVICE_FLOOR_MS + UPLOAD_TIMEOUT_EXTRA_MAX_MS + 8000) : 600000; // the phone may be allowing the slow-service floor
     phoneRecTimer = setTimeout(function () { setPhoneRecIndicator("off"); }, ttl);
   }
 

@@ -751,7 +751,7 @@ function streamFrameReader(body) {
 // (voxtral-mini-latest). The client picks
 // the MAIN service and a BACKUP (Options, per device, sent as stt_primary /
 // stt_backup; an old client that sends neither gets ElevenLabs backed up by
-// Soniox). The main service is asked first; the backup is sent the SAME audio
+// Mistral, else Soniox). The main service is asked first; the backup is sent the SAME audio
 // when the main one returns an error, or has not answered after
 // sttFallbackAfterMs (ElevenLabs normally answers in 0.3–0.8 s; on 2026-09-29
 // it took 16.8 s and then stopped answering). The first good transcript wins;
@@ -774,6 +774,9 @@ function streamFrameReader(body) {
 //   - Both failing is still one loud failure, naming both.
 const STT_SERVICES = ["elevenlabs", "soniox", "openai", "mistral"];
 const STT_SERVICE_NAMES = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI", mistral: "Mistral" };
+// The backup when the client names none: the first of these this deployment
+// has a key for (Mistral replaced Soniox as the default on 2026-09-29).
+const STT_DEFAULT_BACKUPS = ["mistral", "soniox", "openai"];
 const SONIOX_API_URL = "https://api.soniox.com/v1";
 const SONIOX_MODEL = "stt-async-v5";
 const OPENAI_STT_URL = "https://api.openai.com/v1/audio/transcriptions";
@@ -821,7 +824,9 @@ function sttPlan(get, env, sharedKey, streamed) {
     primary = "elevenlabs";
   }
   const asked = get("stt_backup");
-  let backup = asked === null || asked === undefined || asked === "" ? "soniox" : String(asked);
+  let backup = asked === null || asked === undefined || asked === ""
+    ? (STT_DEFAULT_BACKUPS.find((b) => b !== primary && avail[b]) || "")
+    : String(asked);
   if (!STT_SERVICES.includes(backup) || backup === primary || !avail[backup]) backup = "";
   return { primary, backup, note };
 }
@@ -1942,9 +1947,9 @@ const INDEX_HTML = `<!doctype html>
           </select>
           <label for="sttBackup">Backup when it is slow or failing</label>
           <select id="sttBackup">
-            <option value="soniox" selected>Soniox</option>
+            <option value="mistral" selected>Mistral Voxtral</option>
+            <option value="soniox">Soniox</option>
             <option value="openai">OpenAI gpt-transcribe</option>
-            <option value="mistral">Mistral Voxtral</option>
             <option value="elevenlabs">ElevenLabs</option>
             <option value="none">None</option>
           </select>
@@ -2612,6 +2617,7 @@ right lower quadrant"></textarea>
   // seed must never overwrite a hand-tuned device.
   let audioSeedVersion = 0;
   let audioUserTuned   = false;
+  let sttBackupSet     = false; // additive, per device: the backup was picked by hand (a default never overrides it)
 
   let historyVisible = false;
   let historyExpanded = false; // session-only: false = show the last HISTORY_PAGE, true = show all
@@ -3304,7 +3310,8 @@ right lower quadrant"></textarea>
       // Which service transcribes, and which backs it up (per device for now;
       // a portable-settings candidate once settings sync).
       sttPrimary:     sttPrimaryEl ? sttPrimaryEl.value : "elevenlabs",
-      sttBackup:      sttBackupEl ? sttBackupEl.value : "soniox",
+      sttBackup:      sttBackupEl ? sttBackupEl.value : "mistral",
+      sttBackupSet:   sttBackupSet,
       streamUpload:   streamUploadEl ? streamUploadEl.checked : true, // per-device: this network may not stream
       audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
       audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
@@ -3381,8 +3388,13 @@ right lower quadrant"></textarea>
       if (sttPrimaryEl && (s.sttPrimary === "elevenlabs" || s.sttPrimary === "soniox" || s.sttPrimary === "openai" || s.sttPrimary === "mistral")) {
         sttPrimaryEl.value = s.sttPrimary;
       }
+      if (s.sttBackupSet === true) sttBackupSet = true;
       if (sttBackupEl && (s.sttBackup === "elevenlabs" || s.sttBackup === "soniox" || s.sttBackup === "openai" || s.sttBackup === "mistral" || s.sttBackup === "none")) {
-        sttBackupEl.value = s.sttBackup;
+        // Soniox was the default backup behind ElevenLabs until Mistral took
+        // over (2026-09-29): a saved "soniox" nobody picked by hand is that old
+        // default, so it gives way to the new one. A hand-picked backup stays.
+        var oldDefaultBackup = s.sttBackup === "soniox" && !sttBackupSet && sttPrimaryEl && sttPrimaryEl.value === "elevenlabs";
+        if (!oldDefaultBackup) sttBackupEl.value = s.sttBackup;
       }
       if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
         windowTintEl.value = s.windowTint;
@@ -4134,8 +4146,17 @@ right lower quadrant"></textarea>
     var p = sttPrimaryEl ? sttPrimaryEl.value : "elevenlabs";
     return sttUsable(p) ? p : "elevenlabs";
   }
+  // The backup a device gets until someone picks one: Mistral, else Soniox,
+  // else OpenAI (whichever the server has a key for), never the main service.
+  function defaultBackupFor(p) {
+    var order = ["mistral", "soniox", "openai"];
+    for (var i = 0; i < order.length; i++) {
+      if (order[i] !== p && sttUsable(order[i])) return order[i];
+    }
+    return "none";
+  }
   function sttBackup() {
-    var b = sttBackupEl ? sttBackupEl.value : "soniox";
+    var b = sttBackupEl ? sttBackupEl.value : "mistral";
     if (b === "none" || b === sttPrimary() || !sttUsable(b)) return "none";
     return b;
   }
@@ -4152,6 +4173,14 @@ right lower quadrant"></textarea>
   }
   function refreshSttUi() {
     try {
+      // A default backup the server has no key for gives way to the next one
+      // (a hand-picked choice is left alone and shows as not set up).
+      // Never swapped to "none": with no key for any backup there is nothing
+      // to move to, and "none" saved here would outlast a key added later.
+      if (sttBackupEl && !sttBackupSet && sttBackupEl.value !== "none" && !sttUsable(sttBackupEl.value)) {
+        var nextBackup = defaultBackupFor(sttPrimary());
+        if (nextBackup !== "none") sttBackupEl.value = nextBackup;
+      }
       [sttPrimaryEl, sttBackupEl].forEach(function (sel) {
         if (!sel) return;
         for (var i = 0; i < sel.options.length; i++) {
@@ -8724,8 +8753,7 @@ right lower quadrant"></textarea>
   if (sttPrimaryEl) sttPrimaryEl.addEventListener("change", () => {
     // The backup can never be the main service: move it off the new choice.
     if (sttBackupEl && sttBackupEl.value === sttPrimaryEl.value) {
-      sttBackupEl.value = sttPrimaryEl.value !== "elevenlabs" ? "elevenlabs"
-        : (sttUsable("soniox") ? "soniox" : (sttUsable("openai") ? "openai" : (sttUsable("mistral") ? "mistral" : "none")));
+      sttBackupEl.value = sttPrimaryEl.value !== "elevenlabs" ? "elevenlabs" : defaultBackupFor("elevenlabs");
     }
     refreshSttUi();
     saveSettings();
@@ -8733,6 +8761,7 @@ right lower quadrant"></textarea>
       (sttBackup() === "none" ? ", no backup." : ", backed up by " + sttName(sttBackup()) + "."), "");
   });
   if (sttBackupEl) sttBackupEl.addEventListener("change", () => {
+    sttBackupSet = true; // picked by hand: no later default replaces it
     refreshSttUi();
     saveSettings();
   });

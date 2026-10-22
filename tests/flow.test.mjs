@@ -90,10 +90,13 @@
 //  restored from history, and the auth section's open/collapse behavior)
 //  29. batch-only product: saved Hybrid->Batch migration, no engine selector,
 //      live capture feedback shows/hides, batch text reaches the clipboard
-//  30. diarization keep-primary-speaker: default-on toggle sends diarize=true, a
-//      two-speaker words[] drops the bystander with a no-beep "removed N words"
-//      status note, a single speaker is a no-op, and toggling off sends
-//      diarize=false + skips client filtering + persists per-device
+//  30. diarization keep-primary-speaker: default-on toggle sends diarize=true on
+//      the phone surface (and on a desktop that opted in), the clearly LOUDER
+//      voice is kept however few words it said (a small confirmed cut is a clean
+//      Done!; a long cut, or a pick loudness could not make, warns), every cut
+//      keeps the unfiltered text and History / phone notes show it, a retried
+//      take is delivered whole, a single speaker is a no-op, and toggling off
+//      sends diarize=false + skips client filtering + persists per-device
 //  25w. joined + degraded outcome: a large speaker-filter cut delivered over the
 //      relay gets warnBeep + VERIFY on the delivered ack — never doneBeep
 //  23p. phone corpse-mic probe (every press): a dead analyser read forces ONE
@@ -2770,11 +2773,13 @@ console.log('--- scenario 29: batch-only product ---');
 
 // ===== Scenario 30: diarization — keep-primary-speaker filters bystander voices =====
 // Background voices the mic catches land as a SECOND Scribe speaker. The
-// (default-on, per-device) "Filter out other speakers" toggle keeps only the
-// dominant speaker — but ONLY on the phone / big-button surface (a plain desktop
-// keeps the proven single-speaker config), ONLY when one speaker clearly
-// dominates (the minority guard), and a LARGE removal is a degraded warn (not a
-// clean Done!) with the unfiltered text stashed in history for recovery.
+// (default-on, per-device) "Filter out other speakers" toggle keeps one speaker
+// — on the phone / big-button surface, and on a plain desktop only when
+// "…also on this desktop" is checked. The kept speaker is the one clearly
+// LOUDEST at the mic (the take's level trace against the word timings); when
+// loudness can't tell, the most-words speaker IF they clearly dominate (the
+// minority guard), and that unconfirmed pick warns on any cut. A LARGE removal
+// is a degraded warn too, and every cut keeps the unfiltered text in history.
 console.log('--- scenario 30: diarization keep-primary-speaker ---');
 doc.getElementById('apiKey').value = 'test-key';
 doc.getElementById('freshBtn').click();
@@ -2799,20 +2804,115 @@ check('s30: desktop surface delivers the full unfiltered text', clipboard.includ
 doc.getElementById('bigButtonMode').value = 'always';
 doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubbles: true }));
 
-// Leg A: a CLEAR minority bystander (1 of 9 words) — small removal, clean Done!.
+// Words with timings (seconds of RECORDING time) spread evenly over [start, end].
+const mkTimed = (sid, start, end, ws) => ws.map((t, i) => {
+  const step = (end - start) / ws.length;
+  return { text: t, type: 'word', speaker_id: sid, start: +(start + i * step).toFixed(3), end: +(start + (i + 1) * step - 0.005).toFixed(3) };
+});
+const ring30 = () => { try { return JSON.parse(w.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+// One take whose first ~400 ms are at level `first` and the rest at `second`.
+// The level trace runs in recording time, which is the analyser's time plus the
+// 120 ms look-ahead, so `first` covers ~0.12-0.52 s and `second` ~0.52-1.12 s
+// (400 ms + the 200 ms capture tail). Words are placed well inside each window.
+async function twoLevelTake(first, second) {
+  micRms = first;
+  doc.getElementById('recordBtn').click();
+  for (let i = 0; i < 200 && !doc.getElementById('recordBtn').textContent.includes('Stop'); i++) await sleep(5);
+  await sleep(400);
+  micRms = second;
+  await sleep(400);
+  doc.getElementById('recordBtn').click();
+  await sleep(500);
+  micRms = 0.05;
+}
+
+// Leg A: a quieter bystander (1 of 9 words) that LOUDNESS confirms — small
+// removal, clean Done!, and the unfiltered text is still kept (every cut).
 doc.getElementById('freshBtn').click();
-const wordsA = mkWords([['speaker_0', 'Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'], ['speaker_1', 'okay']]);
+const wordsA = mkTimed('speaker_0', 0.20, 0.45, ['Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'])
+  .concat(mkTimed('speaker_1', 0.72, 0.95, ['okay']));
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
+await twoLevelTake(0.2, 0.01);
 const upA = fetchCalls[fetchCalls.length - 1];
 check('s30: phone surface sends diarize=true', upA.form.get('diarize') === 'true', upA.form.get('diarize'));
 check('s30: primary speaker kept on the clipboard', clipboard.includes('Patient is stable and resting comfortably this morning'), JSON.stringify(clipboard));
 check('s30: clear-minority bystander dropped', !clipboard.includes('okay'), JSON.stringify(clipboard));
-check('s30: small removal stays a clean success (Done!)', status().includes('Done!') && statusCls().includes('ok'), status());
-check('s30: small removal reports the count', status().includes('Filtered out 1 word from other speakers'), status());
+check('s30: a small cut loudness confirmed stays a clean success (Done!)', status().includes('Done!') && statusCls().includes('ok'), status());
+check('s30: small removal reports the count + that the voice was quieter', status().includes('Filtered out 1 word from quieter voices'), status());
+check('s30: even a small clean cut keeps the unfiltered text in history', (hist0().unfiltered || '').includes('okay'), JSON.stringify(hist0()));
+check('s30: the timing log records the pick by loudness', ring30()[0] && ring30()[0].spk === 2 && ring30()[0].spkBy === 'level' && ring30()[0].spkRatio >= 2 && ring30()[0].spkCut === 1, JSON.stringify(ring30()[0]));
+check('s30: the phone note shows the removed voices, collapsed', (doc.querySelector('#bigNotes .bnote .unfiltered .unfiltered-text') || {}).textContent === 'Patient is stable and resting comfortably this morning okay' && doc.querySelector('#bigNotes .bnote .unfiltered').open === false,
+  (doc.getElementById('bigNotes').innerHTML || '').slice(0, 300));
+
+// Leg edge: the bystander's word starts right where the loud stretch ends, so
+// its (padded) span overlaps a few of the clinician's samples — trace and word
+// timings never line up to the millisecond. A word's level is the MEDIAN of its
+// samples, so the overlap cannot lend it the clinician's level.
+doc.getElementById('freshBtn').click();
+const wordsEdge = mkTimed('speaker_0', 0.15, 0.45, ['Abdomen', 'soft', 'nontender', 'and', 'not', 'distended', 'on', 'exam'])
+  .concat(mkTimed('speaker_1', 0.50, 0.85, ['okay']));
+fetchQueue.push({ status: 200, body: { text: 'Abdomen soft nontender and not distended on exam okay', words: wordsEdge } });
+await twoLevelTake(0.2, 0.01);
+check('s30: an edge-overlapping bystander word is still read as quieter (clean cut)', clipboard.includes('not distended on exam') && !clipboard.includes('okay') && status().includes('Done!'), status() + ' / ' + JSON.stringify(clipboard));
+check('s30: (edge) picked by loudness', ring30()[0] && ring30()[0].spkBy === 'level', JSON.stringify(ring30()[0]));
+
+// Leg gap: a SHORT dictation beside a long nearby conversation. By word count
+// the bystander (28 words) wins and the clinician's 4 words are 12.5% — under
+// DIARIZE_WARN_SHARE, so a clean "Done!" with the WRONG text before this change. Loudness keeps the
+// clinician; cutting 88% of the words is still a warn (a long cut).
+doc.getElementById('freshBtn').click();
+const chatter = 'so anyway i told her that we would have to wait until the results came back before we could decide anything about the discharge plan for him today'.split(' ');
+const wordsGap = mkTimed('speaker_0', 0.20, 0.45, ['Negative', 'for', 'chest', 'pain'])
+  .concat(mkTimed('speaker_1', 0.70, 1.00, chatter));
+check('s30: (gap setup) the clinician is under the 15% warn line by word count', 4 / (4 + chatter.length) < 0.15, chatter.length);
+fetchQueue.push({ status: 200, body: { text: 'Negative for chest pain ' + chatter.join(' '), words: wordsGap } });
+await twoLevelTake(0.2, 0.01);
+check('s30: loudness keeps the clinician who said FEWER words', clipboard.includes('Negative for chest pain'), JSON.stringify(clipboard));
+check('s30: the louder-voice pick drops the long conversation', !clipboard.includes('discharge'), JSON.stringify(clipboard));
+check('s30: a long cut is still a degraded WARN with VERIFY', statusCls().includes('warn') && status().includes('VERIFY') && !status().includes('Done!'), status());
+check('s30: the long cut keeps the conversation in history', (hist0().unfiltered || '').includes('discharge plan'), JSON.stringify(hist0()));
+
+// Leg level-tie: both voices at the SAME level (constant mic). Loudness cannot
+// tell them apart, so the word-count rule picks — and any cut it makes is a
+// warn, however small, because nothing confirmed the pick.
+doc.getElementById('freshBtn').click();
+const wordsTie = mkTimed('speaker_0', 0.20, 0.45, ['Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'])
+  .concat(mkTimed('speaker_1', 0.72, 0.95, ['okay']));
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsTie } });
+await twoLevelTake(0.05, 0.05);
+check('s30: same level => the word-count pick still drops the minority', clipboard.includes('this morning') && !clipboard.includes('okay'), JSON.stringify(clipboard));
+check('s30: same level => even a 1-word cut is a degraded WARN', statusCls().includes('warn') && status().includes('VERIFY') && !status().includes('Done!'), status());
+check('s30: same level => the status says loudness could not tell them apart', status().includes('could not tell the voices apart by loudness'), status());
+check('s30: the timing log records a word-count pick with the near-1 ratio', ring30()[0] && ring30()[0].spkBy === 'words' && ring30()[0].spkRatio > 0 && ring30()[0].spkRatio < 2, JSON.stringify(ring30()[0]));
+
+// Leg A-untimed: words with NO timings (no loudness reading at all) — the old
+// word-count behaviour, but a small cut is no longer a clean Done!.
+doc.getElementById('freshBtn').click();
+const wordsA0 = mkWords([['speaker_0', 'Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'], ['speaker_1', 'okay']]);
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA0 } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: no loudness reading => minority still dropped by word count', !clipboard.includes('okay') && clipboard.includes('this morning'), JSON.stringify(clipboard));
+check('s30: no loudness reading => a small cut is a degraded WARN, not Done!', statusCls().includes('warn') && !status().includes('Done!'), status());
+check('s30: the timing log records no reading (ratio 0)', ring30()[0] && ring30()[0].spkBy === 'words' && ring30()[0].spkRatio === 0, JSON.stringify(ring30()[0]));
+
+// Leg R: a RETRIED upload has no loudness trace of its own, so it is delivered
+// WHOLE (never filtered blind) and the status says other voices are still in it.
+doc.getElementById('freshBtn').click();
+fetchQueue.push({ status: 500, body: { error: 'upstream exploded' } });
+doc.getElementById('recordBtn').click();
+await sleep(120);
+doc.getElementById('recordBtn').click();
+await sleep(300);
+check('s30: (retry setup) the failed upload offers a retry', doc.getElementById('journalRecover').style.display !== 'none', doc.getElementById('journalRecover').style.display);
+await sleep(1600); // let the failure outcome's queued-start window pass
+fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA0 } });
+doc.getElementById('journalRecoverBtn').click();
+await sleep(300);
+check('s30: a retried take keeps every voice (no blind filter)', clipboard.includes('this morning okay'), JSON.stringify(clipboard));
+check('s30: the retry says other speakers were NOT removed', status().includes('other speakers were NOT removed'), status());
 
 // Leg A2: a LARGE removal (3 of 9 words) — degraded WARN, not Done!, and the
 // unfiltered transcript is stashed in history for recovery.
@@ -2886,6 +2986,37 @@ doc.getElementById('diarize').checked = true; // restore default for any later r
 doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
 doc.getElementById('bigButtonMode').value = 'joined'; // leave the surface as it was
 doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubbles: true }));
+
+// Leg D: the DESKTOP opt-in. Off by default (Leg 0 above proved the desktop
+// sends diarize=false); checked, a plain desktop sends diarize=true and keeps
+// the louder voice, and History shows what was removed.
+check('s30: "also on this desktop" defaults OFF', doc.getElementById('diarizeDesktop').checked === false);
+doc.getElementById('diarizeDesktop').checked = true;
+doc.getElementById('diarizeDesktop').dispatchEvent(new w.Event('change'));
+await sleep(300); // the settings save is debounced (250 ms)
+check('s30: the desktop opt-in persists (per-device)', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).diarizeDesktop === true, w.localStorage.getItem('scribe_v2_settings_v9'));
+doc.getElementById('freshBtn').click();
+const wordsD = mkTimed('speaker_0', 0.20, 0.45, ['Lungs', 'clear', 'bilaterally'])
+  .concat(mkTimed('speaker_1', 0.72, 0.95, ['bed', 'four']));
+fetchQueue.push({ status: 200, body: { text: 'Lungs clear bilaterally bed four', words: wordsD } });
+await twoLevelTake(0.2, 0.01);
+const upD = fetchCalls[fetchCalls.length - 1];
+check('s30: desktop opt-in sends diarize=true', upD.form.get('diarize') === 'true', upD.form.get('diarize'));
+check('s30: desktop opt-in keeps the louder voice', clipboard.includes('Lungs clear bilaterally') && !clipboard.includes('bed four'), JSON.stringify(clipboard));
+const histWasHidden = doc.getElementById('history').style.display === 'none';
+if (histWasHidden) doc.getElementById('toggleHistoryBtn').click();
+const unfD = doc.querySelector('#history .history-item .unfiltered');
+check('s30: History shows "Other voices were removed" on the cut take', !!unfD && unfD.querySelector('summary').textContent.includes('Other voices were removed'), (doc.getElementById('history').innerHTML || '').slice(0, 300));
+check('s30: History holds the unfiltered text for that take', !!unfD && unfD.querySelector('.unfiltered-text').textContent === 'Lungs clear bilaterally bed four', unfD && unfD.textContent);
+clipboard = '';
+if (unfD) unfD.querySelector('button').click();
+await sleep(20);
+check('s30: "Copy unfiltered" copies what was heard before the cut', clipboard === 'Lungs clear bilaterally bed four', JSON.stringify(clipboard));
+const rowsNoUnf = [...doc.querySelectorAll('#history .history-item')].filter((r) => !r.querySelector('.unfiltered')).length;
+check('s30: rows with nothing removed show no unfiltered block', rowsNoUnf > 0, rowsNoUnf);
+if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it again
+doc.getElementById('diarizeDesktop').checked = false; // back to the default
+doc.getElementById('diarizeDesktop').dispatchEvent(new w.Event('change'));
 
 // ===== Scenario 31m: mic capture levers + silent-capture telemetry =====
 // The per-device echo-cancellation / makeup-gain / auto-gain levers that the

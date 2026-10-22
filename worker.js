@@ -1454,6 +1454,9 @@ const INDEX_HTML = `<!doctype html>
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .history-text { white-space: pre-wrap; font-size: 14px; }
     .history-text[contenteditable="true"] { outline: none; border: 1px solid var(--accent); border-radius: 8px; padding: 6px; background: var(--panel2); }
+    .unfiltered { margin-top: 6px; font-size: 12px; color: var(--muted); }
+    .unfiltered > summary { cursor: pointer; color: var(--warn); }
+    .unfiltered-text { white-space: pre-wrap; margin: 6px 0; padding: 6px; border: 1px dashed var(--line); border-radius: 8px; color: var(--text); }
     button.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .checkbox {
       display: flex; gap: 8px; align-items: center;
@@ -2068,7 +2071,11 @@ right lower quadrant"></textarea>
 
           <label class="checkbox">
             <input type="checkbox" id="diarize" checked />
-            Filter out other speakers <span class="hint">(on by default, but applies only on the phone / big-button surface — a plain desktop keeps the proven single-speaker config. Keeps only the dominant voice when it clearly dominates; a big cut warns + saves the unfiltered version to history. Noise suppression can't do this — another person's voice is speech.)</span>
+            Filter out other speakers <span class="hint">(on by default on the phone layout. Keeps the voice that is clearly LOUDEST at the mic (yours, if the mic is close); when loudness cannot tell the voices apart it falls back to who said the most and warns on any cut. A big cut warns too, and every cut keeps the unfiltered text in History. Noise suppression can't do this — another person's voice is speech. ElevenLabs and Soniox label speakers; a take written by OpenAI or Mistral is never filtered.)</span>
+          </label>
+          <label class="checkbox" style="margin-left:22px">
+            <input type="checkbox" id="diarizeDesktop" />
+            …also on this desktop <span class="hint">(off by default: a desktop otherwise sends the proven single-speaker request. Turn on if you dictate in a room where other people talk; works best with a headset or close mic.)</span>
           </label>
 
           <div id="batchOptsSection">
@@ -2313,6 +2320,7 @@ right lower quadrant"></textarea>
   const streamUploadEl   = document.getElementById("streamUpload");
   const echoCancelEl     = document.getElementById("echoCancel");
   const diarizeEl        = document.getElementById("diarize");
+  const diarizeDesktopEl = document.getElementById("diarizeDesktop");
   const startBeepEl      = document.getElementById("startBeep");
 
   const gateOpenEl       = document.getElementById("gateOpen");
@@ -2502,6 +2510,12 @@ right lower quadrant"></textarea>
   let gateOpenMs = 0;        // ms the gate spent open this take
   let lastGateOpenAtMs = 0;  // wall-clock ms when the gate was last open
   let deadBandMs = 0;        // ms gate-closed with RMS in [FLATLINE_RMS, gateOpen)
+  // The speaker filter's loudness evidence: the pre-gate level each gate-loop
+  // tick read during a diarized take, stamped in RECORDING time (ms from the
+  // recorder's start, plus the look-ahead delay — the recorded audio runs that
+  // far behind the analyser), so it lines up with the service's word timings.
+  // null when the take is not diarized. Bound to its take: never reused.
+  let takeLevels = null;     // { t0, offsetMs, t: [ms], v: [rms] }
   let micAlarmFired = false;
   let mutedSince = 0;
   let ctxNotRunningSince = 0; // ms the AudioContext has been non-"running" mid-dictation; debounces the interruption alarm so a transient iOS blip doesn't fail a healthy take
@@ -2701,6 +2715,17 @@ right lower quadrant"></textarea>
   // unfiltered transcript stashed in history for recovery.
   const DIARIZE_PRIMARY_MIN_SHARE = 0.6;  // dominant speaker must hold ≥60% of words to filter at all
   const DIARIZE_WARN_SHARE        = 0.15; // dropping ≥15% of words is degraded, not a clean "Done!"
+  // Who is "you": the speaker whose words came in clearly LOUDEST at the mic
+  // (the clinician is the one closest to it), read from the pre-gate level the
+  // gate loop measures every 30 ms. Word count alone kept the wrong voice when
+  // a few words of dictation sat beside a long nearby conversation — and with
+  // the clinician's words under WARN_SHARE that was a clean "Done!". Loudness
+  // decides only when it is clear; otherwise the word-count rule above decides
+  // and ANY cut it makes is degraded (nothing confirmed the pick).
+  const DIARIZE_LEVEL_CLEAR     = 2.0;  // kept speaker ≥ 2× (~6 dB) louder than every other speaker
+  const DIARIZE_LEVEL_PAD_S     = 0.04; // widen each word's span by this when reading levels (alignment slack)
+  const DIARIZE_LEVEL_MIN_COVER = 0.5;  // a speaker needs a level reading for at least half its words
+  const LEVEL_TRACE_MAX         = 40000; // ~20 min of 30 ms samples; later words get no reading ⇒ word-count fallback
 
   const BATCH_UPLOAD_TIMEOUT_MS = 15000; // [LATENCY] pure batch: 15s deadline FLOOR fails fast on a hung request (was 30s); long takes extend it via batchUploadTimeoutMs
   // The transcription deadline scales with the take length: a flat 15 s starves
@@ -3296,6 +3321,7 @@ right lower quadrant"></textarea>
       noiseSuppress:  noiseSuppressEl.checked,
       echoCancel:     echoCancelEl.checked,
       diarize:        diarizeEl.checked, // per-device: keep-primary-speaker filter (on by default)
+      diarizeDesktop: diarizeDesktopEl ? diarizeDesktopEl.checked : false, // per-device: the filter on a plain desktop too (off by default)
       startBeep:      startBeepEl.checked,
       gateOpen:       gateOpenEl.value,
       gateClose:       gateCloseEl.value,
@@ -3377,6 +3403,7 @@ right lower quadrant"></textarea>
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
       if (typeof s.echoCancel === "boolean") echoCancelEl.checked = s.echoCancel;
       if (typeof s.diarize       === "boolean") diarizeEl.checked       = s.diarize; // default stays ON (checked in HTML) when unset
+      if (typeof s.diarizeDesktop === "boolean" && diarizeDesktopEl) diarizeDesktopEl.checked = s.diarizeDesktop; // default OFF
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
       if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
       if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
@@ -3849,7 +3876,12 @@ right lower quadrant"></textarea>
     const text = cleanTranscript(r.text);
     const base = rec.session.base || "";
     const viaNote = sttOutcomeNote(r);
-    const viaText = viaNote ? " " + viaNote : "";
+    // A recovered take has no loudness trace to pick the clinician by, so it is
+    // delivered WHOLE (never filtered blind) — and says so when it holds more
+    // than one voice, so the "verify it" below knows what to look for.
+    const otherVoices = diarizeActive() && speakerCount(r.words) > 1
+      ? " It has more than one voice — other speakers were NOT removed from a recovered take." : "";
+    const viaText = (viaNote ? " " + viaNote : "") + otherVoices;
     const viaService = r.provider && r.provider !== "elevenlabs" ? r.provider : "";
     // Phone notes layout: a take that was ADDING to a note goes back onto that
     // note — onto its CURRENT text, which may have been edited since — and a
@@ -3941,6 +3973,24 @@ right lower quadrant"></textarea>
       " (" + items.length + ")";
   }
 
+  // A take the speaker filter cut keeps what the service heard BEFORE the cut
+  // (the entry's "unfiltered"), so a word of the clinician's that was wrongly
+  // dropped is one click away. Collapsed by default: a note, not a second copy.
+  function unfilteredBlock(unfiltered) {
+    const box = document.createElement("details");
+    box.className = "unfiltered";
+    const sum = document.createElement("summary");
+    sum.textContent = "Other voices were removed — show what was heard before the cut";
+    const body = document.createElement("div");
+    body.className = "unfiltered-text";
+    body.textContent = unfiltered;
+    const copy = document.createElement("button");
+    copy.textContent = "Copy unfiltered";
+    copy.onclick = () => copyText(unfiltered);
+    box.append(sum, body, copy);
+    return box;
+  }
+
   function renderHistory() {
     applyHistoryVisibility();
     if (!historyVisible) return;
@@ -4025,7 +4075,9 @@ right lower quadrant"></textarea>
         row.append(send);
       }
 
-      div.append(meta, text, row);
+      div.append(meta, text);
+      if (item.unfiltered) div.append(unfilteredBlock(item.unfiltered));
+      div.append(row);
       historyEl.append(div);
     }
 
@@ -4085,58 +4137,156 @@ right lower quadrant"></textarea>
     await clipboardWrite(DICTATION_SENTINEL);
   }
 
-  // Keep-primary-speaker: when diarization is on, Scribe returns a words[] array
-  // with a speaker_id per token. Background voices the mic picked up land as a
-  // SECOND speaker — drop them and keep only the dominant (most-words) speaker.
-  // Returns null when there is nothing to filter (a single speaker, or no
-  // labels), so the caller falls back to the unfiltered text — never silently
-  // empties a note. removedWords lets finalize surface what was dropped.
-  function keepPrimarySpeaker(words) {
+  function speakerCount(words) {
+    var seen = {};
+    var n = 0;
+    if (!Array.isArray(words)) return 0;
+    for (var i = 0; i < words.length; i++) {
+      var w = words[i];
+      if (w && w.type === "word" && w.speaker_id != null && !seen[w.speaker_id]) { seen[w.speaker_id] = true; n++; }
+    }
+    return n;
+  }
+
+  function medianLevel(a) {
+    var s = a.slice().sort(function (x, y) { return x - y; });
+    var m = s.length >> 1;
+    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+  }
+
+  // The level a word was spoken at: the MEDIAN reading the level trace holds
+  // inside the word's time span (widened by DIARIZE_LEVEL_PAD_S), or -1 when
+  // there is no reading there (no trace, no timings, or a throttled gate loop).
+  // The median, not the peak: the trace and the word timings can sit tens of
+  // ms apart (the recorder starts a moment after it is asked to), and a peak
+  // would let a bystander's word that follows the clinician borrow the
+  // clinician's level from the overlapping edge.
+  function wordLevel(levels, w) {
+    if (!levels || !levels.t.length || typeof w.start !== "number" || typeof w.end !== "number") return -1;
+    var a = (w.start - DIARIZE_LEVEL_PAD_S) * 1000;
+    var b = (w.end + DIARIZE_LEVEL_PAD_S) * 1000;
+    var lo = 0, hi = levels.t.length;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (levels.t[mid] < a) lo = mid + 1; else hi = mid; }
+    var got = [];
+    for (var i = lo; i < levels.t.length && levels.t[i] <= b; i++) got.push(levels.v[i]);
+    return got.length ? medianLevel(got) : -1;
+  }
+
+  // Keep-primary-speaker: when diarization is on, the service returns a words[]
+  // array with a speaker_id per token, and background voices the mic picked up
+  // land as another speaker. Which one is the clinician:
+  //   1. LOUDNESS, when it is clear: the speaker whose words came in at least
+  //      DIARIZE_LEVEL_CLEAR× louder (median word level) than every other is
+  //      the one at the mic — kept however few words they said. This is what
+  //      stops a long nearby conversation out-voting a short dictation.
+  //   2. Otherwise WORD COUNT, as before: the most-words speaker, and only when
+  //      they hold ≥ DIARIZE_PRIMARY_MIN_SHARE of the words (a roughly-even
+  //      split — two real speakers, or one voice the service split in two —
+  //      keeps EVERYTHING). Nothing confirmed this pick, so the caller treats
+  //      any cut it makes as degraded.
+  // Returns null with fewer than two labeled speakers (nothing to filter), so
+  // the caller keeps the unfiltered text — it never silently empties a note.
+  // Otherwise: by "level" / "words" / "" (kept everything), the kept text, how
+  // many words went, and the loudness ratio (0 when it could not be read).
+  function keepPrimarySpeaker(words, levels) {
     if (!Array.isArray(words) || !words.length) return null;
     var counts = {};
+    var heard = {}; // speaker -> word levels that had a reading
     for (var i = 0; i < words.length; i++) {
       var w = words[i];
       if (w && w.type === "word" && w.speaker_id != null) {
         counts[w.speaker_id] = (counts[w.speaker_id] || 0) + 1;
+        var lv = wordLevel(levels, w);
+        if (lv >= 0) (heard[w.speaker_id] = heard[w.speaker_id] || []).push(lv);
       }
     }
     var ids = Object.keys(counts);
     if (ids.length <= 1) return null; // single (or unlabeled) speaker: nothing to drop
     var totalLabeled = 0;
     for (var c = 0; c < ids.length; c++) totalLabeled += counts[ids[c]];
-    var dominant = ids[0];
-    for (var j = 1; j < ids.length; j++) {
-      if (counts[ids[j]] > counts[dominant]) dominant = ids[j];
+
+    // 1. Loudness — only when EVERY speaker has a reading for enough words.
+    var keep = "";
+    var by = "";
+    var ratio = 0;
+    var level = {};
+    var readable = true;
+    for (var r = 0; r < ids.length; r++) {
+      var got = heard[ids[r]] || [];
+      if (!got.length || got.length < counts[ids[r]] * DIARIZE_LEVEL_MIN_COVER) { readable = false; break; }
+      level[ids[r]] = medianLevel(got);
     }
-    var dominantShare = totalLabeled ? counts[dominant] / totalLabeled : 0;
-    // No clear majority ⇒ we cannot safely tell the clinician from a bystander
-    // (or Scribe split one continuous voice ~evenly). Dropping the wrong speaker
-    // would delete real clinical content, so keep EVERYTHING and let the
-    // unfiltered text stand — the filter only ever acts on a clear minority.
-    if (dominantShare < DIARIZE_PRIMARY_MIN_SHARE) return null;
+    if (readable) {
+      var loud = ids[0];
+      for (var j = 1; j < ids.length; j++) if (level[ids[j]] > level[loud]) loud = ids[j];
+      var next = 0;
+      for (var n = 0; n < ids.length; n++) if (ids[n] !== loud && level[ids[n]] > next) next = level[ids[n]];
+      ratio = next > 0 ? level[loud] / next : 99;
+      if (ratio >= DIARIZE_LEVEL_CLEAR) { keep = loud; by = "level"; }
+    }
+
+    // 2. Word count — the clear-majority guard still applies.
+    if (!keep) {
+      var dominant = ids[0];
+      for (var d = 1; d < ids.length; d++) if (counts[ids[d]] > counts[dominant]) dominant = ids[d];
+      if (counts[dominant] / totalLabeled >= DIARIZE_PRIMARY_MIN_SHARE) { keep = dominant; by = "words"; }
+    }
+
+    var out = { text: "", removedWords: 0, totalWords: totalLabeled, speakers: ids.length, by: by,
+                ratio: Math.round(Math.min(ratio, 99) * 10) / 10 };
+    // No clear pick ⇒ we cannot safely tell the clinician from a bystander, so
+    // keep EVERYTHING — dropping the wrong speaker would delete clinical content.
+    if (!keep) return out;
     var kept = [];
-    var removed = 0;
     for (var k = 0; k < words.length; k++) {
       var t = words[k];
       if (!t) continue;
       var sid = t.speaker_id;
-      // Keep the dominant speaker's tokens plus any unlabeled spacing; drop the
+      // Keep the chosen speaker's tokens plus any unlabeled spacing; drop the
       // other speakers. cleanTranscript collapses the join spacing downstream.
-      if (sid == null || String(sid) === String(dominant)) {
+      if (sid == null || String(sid) === String(keep)) {
         if (t.text) kept.push(t.text);
       } else if (t.type === "word") {
-        removed++;
+        out.removedWords++;
       }
     }
-    return { text: kept.join(" "), removedWords: removed, totalWords: totalLabeled, dominantShare: dominantShare, speakers: ids.length };
+    out.text = kept.join(" ");
+    return out;
   }
 
-  // Diarization applies only on the phone / big-button surface, where bystanders
-  // are the real risk. A plain desktop keeps the proven single-speaker config
-  // (num_speakers=1 / diarize=false) regardless of the checkbox — flipping the
-  // default STT shape for all desktop users with no measured accuracy backing
-  // is a risk the prime directive (never wrong/missing chart text) doesn't take.
-  function diarizeActive() { return Boolean(diarizeEl.checked && bigButtonActive()); }
+  // Apply the speaker filter to a live take's result. levels is THIS take's
+  // trace (null for none). Sets text (filtered), unfilteredText (the service's
+  // whole text — kept on EVERY cut, so a wrongly dropped word is recoverable
+  // from History), removedWords/removedShare, and spk (the decision, for the
+  // status and the timing log). A cut is degraded — warn beep + VERIFY — when
+  // it is LONG (≥ DIARIZE_WARN_SHARE of the words) or when loudness did not
+  // pick the speaker (a dropped voice as loud as the kept one, or no reading).
+  function applySpeakerFilter(r, levels) {
+    r.removedWords = 0; r.removedShare = 0; r.unfilteredText = ""; r.spk = null; r.spkDegraded = false;
+    if (!diarizeActive() || !r.words) return r;
+    var prim = keepPrimarySpeaker(r.words, levels);
+    if (!prim) return r;
+    r.spk = prim;
+    if (prim.removedWords > 0 && prim.text.trim()) {
+      r.unfilteredText = r.text;
+      r.text = prim.text;
+      r.removedWords = prim.removedWords;
+      r.removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
+      r.spkDegraded = r.removedShare >= DIARIZE_WARN_SHARE || prim.by !== "level";
+    }
+    return r;
+  }
+
+  // Diarization applies on the phone / big-button surface, where bystanders are
+  // the everyday risk, and on a desktop only when "…also on this desktop" is
+  // checked. An unchecked desktop keeps the proven single-speaker config
+  // (num_speakers=1 / diarize=false) — flipping the default STT shape for every
+  // desktop user with no measured accuracy backing is a risk the prime
+  // directive (never wrong/missing chart text) doesn't take; a clinician who
+  // dictates among other voices opts in on that device.
+  function diarizeActive() {
+    return Boolean(diarizeEl.checked && (bigButtonActive() || (diarizeDesktopEl && diarizeDesktopEl.checked)));
+  }
 
   // Which service transcribes this device's takes, and which backs it up when
   // the main one errors or stalls (Options). A service the server has no key
@@ -4313,31 +4463,16 @@ right lower quadrant"></textarea>
     var fallbackReason = data.stt_fallback ? String(data.stt_fallback).slice(0, 160) : "";
     var sttNote = data.stt_note ? String(data.stt_note).slice(0, 200) : "";
     try { if (takeTimings) { takeTimings.provider = provider; takeTimings.fallback = Boolean(fallbackReason); } } catch (e) {}
-    var removedWords = 0;
-    var removedShare = 0;
-    var unfilteredText = "";
     // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
     // measures what the service transcribed, not what the filter kept) and the
     // decoded audio duration. Both null when absent so the guard can only ever
-    // no-op on missing data, never false-warn.
+    // no-op on missing data, never false-warn. The speaker filter itself runs in
+    // finishBatchSession (applySpeakerFilter), which holds the take's own level
+    // trace; a recovered take is delivered whole, never filtered blind.
     var words = (Array.isArray(data.words) && data.words.length) ? data.words : null;
     var audioDurationSecs = (typeof data.audio_duration_secs === "number" && isFinite(data.audio_duration_secs))
       ? data.audio_duration_secs : null;
-    // Keep only the primary speaker when diarization is active. A failure to find
-    // a clear-minority second speaker (or any words[]) leaves the full text
-    // untouched — the filter can only ever REMOVE a clear bystander, never empty
-    // a clean note. When it does cut, keep the unfiltered text so a wrongly
-    // dropped clinician utterance is recoverable from history.
-    if (diarizeActive() && words) {
-      var prim = keepPrimarySpeaker(words);
-      if (prim && prim.text.trim() && prim.removedWords > 0) {
-        unfilteredText = text;
-        text = prim.text;
-        removedWords = prim.removedWords;
-        removedShare = prim.totalWords ? prim.removedWords / prim.totalWords : 0;
-      }
-    }
-    return { ok: true, text: text, error: "", removedWords: removedWords, removedShare: removedShare, unfilteredText: unfilteredText, words: words, audioDurationSecs: audioDurationSecs,
+    return { ok: true, text: text, error: "", words: words, audioDurationSecs: audioDurationSecs,
              provider: provider, fallbackReason: fallbackReason, sttNote: sttNote };
   }
 
@@ -4794,6 +4929,14 @@ right lower quadrant"></textarea>
         fallback: Boolean(t.fallback),
         hedgeMs:  (typeof t.serverHedgeMs === "number") ? t.serverHedgeMs : null,
         backupMs: (typeof t.serverBackupMs === "number") ? t.serverBackupMs : null,
+        // The speaker filter's decision on a take with 2+ voices: how many,
+        // how the kept one was picked (level / words / kept-all), the loudness
+        // ratio it read (0 = no reading), and how many words it cut — the field
+        // data DIARIZE_LEVEL_CLEAR gets tuned on.
+        spk:      (typeof t.spk === "number") ? t.spk : null,
+        spkBy:    t.spkBy || "",
+        spkRatio: (typeof t.spkRatio === "number") ? t.spkRatio : null,
+        spkCut:   (typeof t.spkCut === "number") ? t.spkCut : null,
         // Why a stream fell back: a class of error, never a URL or body. One
         // line, bounded, so it can never break a TSV row.
         pathNote: String(t.pathNote || "").replace(/\\s+/g, " ").slice(0, 160),
@@ -4858,6 +5001,13 @@ right lower quadrant"></textarea>
         (entry.path === "stream" ? ", uploaded while dictating" : "") +
         (entry.path === "stream>batch" ? ", stream fell back (" + (entry.pathNote || "?") + ")" : "") +
         (entry.path === "batch" && entry.pathNote ? ", " + entry.pathNote : "") + "]" +
+        (entry.spk
+          ? "  " + entry.spk + " voices: " +
+            (entry.spkBy === "level" ? "kept the loudest (" + entry.spkRatio + "× the next)"
+              : entry.spkBy === "words" ? "kept the one who said the most" + (entry.spkRatio ? " (loudness " + entry.spkRatio + "×, too close to call)" : " (no loudness reading)")
+              : "kept everyone (no clear pick)") +
+            (entry.spkCut ? ", cut " + entry.spkCut + " word" + (entry.spkCut === 1 ? "" : "s") : "") + "."
+          : "") +
         (entry.fallback
           ? "  TRANSCRIBED BY " + sttName(entry.provider).toUpperCase() + " (the backup): " + sttName(entry.primary || "elevenlabs") +
             " was given " + fmtMs(entry.hedgeMs) + ", " + sttName(entry.provider) + " took " + fmtMs(entry.backupMs) + "."
@@ -4908,7 +5058,7 @@ right lower quadrant"></textarea>
   function timingLogTsv() {
     var cols = ["at","outcome","stage","errKind","deadline","total","flush","upload","service","net","elMs","parseMs","workerMs",
                 "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize","path","pathNote",
-                "primary","provider","fallback","hedgeMs","backupMs"];
+                "primary","provider","fallback","hedgeMs","backupMs","spk","spkBy","spkRatio","spkCut"];
     var out = [cols.join("\\t")];
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
@@ -5351,6 +5501,13 @@ right lower quadrant"></textarea>
         }
       }
 
+      // Speaker-filter loudness evidence (diarized takes only). Kept through the
+      // capture tail too (stopping), since the recorder is still writing then.
+      if (recording && takeLevels && takeLevels.t.length < LEVEL_TRACE_MAX) {
+        takeLevels.t.push(Date.now() - takeLevels.t0 + takeLevels.offsetMs);
+        takeLevels.v.push(rms);
+      }
+
       // Recording health watchdog: catch the "dictated into a dead mic"
       // disaster while it is happening, not after.
       if (recording && !stopping) {
@@ -5742,6 +5899,11 @@ right lower quadrant"></textarea>
       if (sessionFinalized) return;
       finalizeSession(false);
     };
+    // Loudness evidence for the speaker filter, in the recording's own time:
+    // the audio the recorder writes runs the look-ahead behind the analyser.
+    takeLevels = diarizeActive()
+      ? { t0: Date.now(), offsetMs: lookaheadNode ? gateLookaheadMs() : 0, t: [], v: [] }
+      : null;
     mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
     journalStart(preferred || "audio/webm"); // begin the crash-recovery journal for this take (fire-and-forget)
     openTakeStream(mediaRecorder.mimeType || preferred || "audio/webm"); // [LATENCY] upload while the take is spoken (best-effort)
@@ -5975,6 +6137,10 @@ right lower quadrant"></textarea>
     // claim it in the same synchronous step, so no later chunk can reach it.
     const blobChunks = chunks.length;
     const streamed = claimTakeStream();
+    // This take's loudness trace for the speaker filter — taken now, so nothing
+    // a later take records can ever be read against these words.
+    const levels = takeLevels;
+    takeLevels = null;
 
     // Classify the empty outcomes by the captured peak so the loud failure names
     // the real cause instead of a generic "no speech":
@@ -6029,6 +6195,13 @@ right lower quadrant"></textarea>
     }
 
     setLinkPill("idle");
+    applySpeakerFilter(r, levels);
+    if (takeTimings && r.spk) {
+      takeTimings.spk = r.spk.speakers;
+      takeTimings.spkBy = r.spk.by || "kept-all";
+      takeTimings.spkRatio = r.spk.ratio;
+      takeTimings.spkCut = r.removedWords;
+    }
 
     if (r.text && r.text.trim()) {
       finalizedSegments = sessionBaseText ? [sessionBaseText, r.text] : [r.text];
@@ -6043,16 +6216,23 @@ right lower quadrant"></textarea>
       return;
     }
 
-    // Surface diarization removals. A small trim is a clean success with a quiet
-    // note; a LARGE removal (≥ DIARIZE_WARN_SHARE of the take) is treated as
-    // degraded — the primary-speaker pick could be wrong, so it gets a warn beep,
-    // a "verify" status, and the unfiltered transcript stashed in history so a
-    // wrongly dropped clinician utterance can be recovered.
-    var degraded = r.removedWords > 0 && r.removedShare >= DIARIZE_WARN_SHARE;
-    var note = r.removedWords
-      ? ("Filtered out " + r.removedWords + " word" + (r.removedWords === 1 ? "" : "s") + " from other speakers." +
-         (degraded ? " VERIFY nothing of yours was dropped — the unfiltered version is saved in history." : ""))
-      : "";
+    // Surface diarization removals. A small cut that loudness confirmed (the
+    // dropped voices were clearly quieter than the kept one) is a clean success
+    // with a quiet note. A cut that is LONG, or that loudness did not confirm,
+    // is degraded — warn beep + VERIFY. Every cut keeps the unfiltered text in
+    // History ("Show the removed voices"), so a wrongly dropped word of the
+    // clinician's is one click away either way.
+    var degraded = r.removedWords > 0 && r.spkDegraded;
+    var note = "";
+    if (r.removedWords) {
+      var nw = r.removedWords + " word" + (r.removedWords === 1 ? "" : "s");
+      note = r.spk && r.spk.by === "level"
+        ? "Filtered out " + nw + " from quieter voices."
+        : "Filtered out " + nw + " from other speakers (could not tell the voices apart by loudness — kept whoever said the most).";
+      note += degraded
+        ? " VERIFY nothing of yours was dropped — the unfiltered version is in History."
+        : " The unfiltered version is in History.";
+    }
     // Another service wrote this take: the one chosen in Options, or the
     // backup the Worker asked because the main one was slow or failing. A real
     // transcript, so a clean success (during an outage every take would
@@ -6083,7 +6263,7 @@ right lower quadrant"></textarea>
 
     await deliverFinalText(cleanTranscript(latestText), {
       unexpected: unexpected, label: "Transcript", note: note,
-      degraded: degraded, unfilteredText: degraded ? r.unfilteredText : "",
+      degraded: degraded, unfilteredText: r.unfilteredText || "",
       takeText: r.text, // this take's own words: an add-to-note lands them on the note's CURRENT text
       provider: r.provider,
     });
@@ -8052,7 +8232,9 @@ right lower quadrant"></textarea>
     del.onclick = function () { deleteNoteTap(id); };
     actions.append(del);
 
-    card.append(head, text, actions);
+    card.append(head, text);
+    if (item.unfiltered) card.append(unfilteredBlock(item.unfiltered));
+    card.append(actions);
     return card;
   }
 
@@ -8820,7 +9002,7 @@ right lower quadrant"></textarea>
 
   for (const el of [
     apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
-    autoCopyEl, appendModeEl, startBeepEl, diarizeEl, streamUploadEl,
+    autoCopyEl, appendModeEl, startBeepEl, diarizeEl, diarizeDesktopEl, streamUploadEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);

@@ -748,7 +748,7 @@ function streamFrameReader(body) {
 // ───── Choosing the service, and backing it up when it is slow or failing ─────
 // Four services can transcribe a take: ElevenLabs Scribe v2 Medical (the
 // default), Soniox (stt-async-v5), OpenAI gpt-transcribe and Mistral Voxtral
-// Mini Transcribe 3 (voxtral-mini-transcribe-3-0). The client picks
+// Small Transcribe 3 (voxtral-small-transcribe-3-0). The client picks
 // the MAIN service and a BACKUP (Options, per device, sent as stt_primary /
 // stt_backup; an old client that sends neither gets ElevenLabs backed up by
 // Mistral, else Soniox). The main service is asked first; the backup is sent the SAME audio
@@ -786,10 +786,12 @@ const OPENAI_STT_MODEL = "gpt-transcribe";
 // is the failure WhisperInk measured on Qwen3. Keyterms stay ElevenLabs/Soniox/Mistral.
 const OPENAI_STT_PROMPT = "A clinician dictating a medical note for a patient chart.";
 const MISTRAL_STT_URL = "https://api.mistral.ai/v1/audio/transcriptions";
-// Voxtral Mini Transcribe 3 (2026-10-20), pinned rather than an alias: an
-// alias that moves to a new model can change the request it accepts (Voxtral 3
-// dropped word timestamps), and a note must not change model unannounced.
-const MISTRAL_STT_MODEL = "voxtral-mini-transcribe-3-0";
+// Voxtral Small Transcribe 3 (2026-10-20), Mistral's most accurate
+// transcription model (Mini Transcribe 3 is the cheaper 4B one; same request).
+// Pinned rather than an alias: an alias that moves to a new model can change
+// the request it accepts (Voxtral 3 dropped word timestamps), and a note must
+// not change model unannounced.
+const MISTRAL_STT_MODEL = "voxtral-small-transcribe-3-0";
 // Voxtral 3 sets no count on context_bias, but the entries share the model's
 // context window with the audio (over it is a 400, nothing cut), so we keep the
 // list short ourselves.
@@ -1090,7 +1092,7 @@ function mistralText(text) {
   return String(text || "").replace(/_+/g, " ").replace(/ {2,}/g, " ").trim();
 }
 
-// One take through Mistral Voxtral Mini Transcribe 3: English, temperature 0,
+// One take through Mistral Voxtral Small Transcribe 3: English, temperature 0,
 // the take's keyterms as context_bias (one field per term, as Mistral's docs
 // send them). Voxtral 3 has no word timestamps at all (segment only; asking for
 // words is a 400), and none are asked for, so it returns text only (no word
@@ -1951,7 +1953,7 @@ const INDEX_HTML = `<!doctype html>
             <option value="elevenlabs" selected>ElevenLabs Scribe v2 Medical</option>
             <option value="soniox">Soniox (stt-async-v5)</option>
             <option value="openai">OpenAI gpt-transcribe</option>
-            <option value="mistral">Mistral Voxtral Mini Transcribe 3</option>
+            <option value="mistral">Mistral Voxtral Small Transcribe 3</option>
           </select>
           <label for="sttBackup">Backup when it is slow or failing</label>
           <select id="sttBackup">
@@ -2280,7 +2282,7 @@ right lower quadrant"></textarea>
   // time; ElevenLabs is always there). Booleans only.
   const STT_AVAILABLE    = (__STT_AVAILABLE__);
   const STT_NAMES        = { elevenlabs: "ElevenLabs", soniox: "Soniox", openai: "OpenAI", mistral: "Mistral" };
-  const STT_LONG_NAMES   = { elevenlabs: "ElevenLabs Scribe v2 Medical", soniox: "Soniox (stt-async-v5)", openai: "OpenAI gpt-transcribe", mistral: "Mistral Voxtral Mini Transcribe 3" };
+  const STT_LONG_NAMES   = { elevenlabs: "ElevenLabs Scribe v2 Medical", soniox: "Soniox (stt-async-v5)", openai: "OpenAI gpt-transcribe", mistral: "Mistral Voxtral Small Transcribe 3" };
   // Deployer-curated keyterm lists (pre-sanitized), injected at serve time.
   const KEYTERM_PRESETS  = (__KEYTERM_PRESETS__);
 

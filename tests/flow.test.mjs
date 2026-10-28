@@ -6108,7 +6108,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
           if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('aborted', 'AbortError')); });
         });
       }
-      return jsonRes({ model: 'voxtral-mini-transcribe-3-0', text: mi.text || ' Patient on metoprolol, start negative_pressure_wound_therapy. ', language: null, segments: [],
+      return jsonRes({ model: 'voxtral-small-transcribe-3-0', text: mi.text || ' Patient on metoprolol, start negative_pressure_wound_therapy. ', language: null, segments: [],
         usage: { prompt_audio_seconds: 3, prompt_tokens: 4, total_tokens: 40, completion_tokens: 12 } });
     }
     if (url.startsWith(SX)) {
@@ -6396,7 +6396,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       r.status === 200 && body.text === 'ElevenLabs text.' && /OpenAI is not set up on the server/.test(body.stt_note || '') && oaCalls().length === 0,
       r.status + ' ' + JSON.stringify(body));
 
-    // (x) Mistral Voxtral Mini Transcribe 3 as the MAIN service: English, the
+    // (x) Mistral Voxtral Small Transcribe 3 as the MAIN service: English, the
     //     keyterms as context_bias (one field per term, phrases with their
     //     spaces), text only
     reset({ mode: 'ok' });
@@ -6409,8 +6409,8 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     check('s54x: ...in ElevenLabs\' shape with no word timings (the guards no-op)', Array.isArray(body.words) && body.words.length === 0 && !('audio_duration_secs' in body), JSON.stringify(body));
     check('s54x: ...and neither ElevenLabs nor Soniox is contacted', elCalls().length === 0 && sxCalls().length === 0, elCalls().length + '/' + sxCalls().length);
     const miReq = (miCalls()[0] || {}).mi || {};
-    check('s54x: the request is the pinned voxtral-mini-transcribe-3-0, English, temperature 0, no timestamps (Voxtral 3 has no word timestamps)',
-      miReq.model === 'voxtral-mini-transcribe-3-0' && miReq.language === 'en' && miReq.temperature === '0' &&
+    check('s54x: the request is the pinned voxtral-small-transcribe-3-0, English, temperature 0, no timestamps (Voxtral 3 has no word timestamps)',
+      miReq.model === 'voxtral-small-transcribe-3-0' && miReq.language === 'en' && miReq.temperature === '0' &&
       !(miReq.fields || []).some((f) => /timestamp|diarize/.test(f)), JSON.stringify({ model: miReq.model, language: miReq.language, t: miReq.temperature, fields: miReq.fields }));
     check('s54x: the keyterms go as context_bias, one field per term, in order, a phrase with its spaces (no Voxtral 2 underscores)',
       JSON.stringify(miReq.bias) === '["metoprolol","negative pressure wound therapy","hematochezia"]', JSON.stringify(miReq.bias));
@@ -6740,7 +6740,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     !opt(A, 'sttPrimary', 'soniox').disabled && opt(A, 'sttBackup', 'openai').disabled, opt(A, 'sttPrimary', 'openai').textContent);
   check('s56: Mistral Voxtral is offered as main and backup, greyed out with no MISTRAL_API_KEY',
     opt(A, 'sttPrimary', 'mistral') && opt(A, 'sttBackup', 'mistral') && opt(A, 'sttPrimary', 'mistral').disabled && opt(A, 'sttBackup', 'mistral').disabled &&
-    /^Mistral Voxtral Mini Transcribe 3 — not set up on the server$/.test(opt(A, 'sttPrimary', 'mistral').textContent),
+    /^Mistral Voxtral Small Transcribe 3 — not set up on the server$/.test(opt(A, 'sttPrimary', 'mistral').textContent),
     opt(A, 'sttPrimary', 'mistral') && opt(A, 'sttPrimary', 'mistral').textContent);
   check('s56: the hint names the current setup', /Now: ElevenLabs Scribe v2 Medical, backed up by Soniox/.test(A.doc.getElementById('sttHint').textContent), A.doc.getElementById('sttHint').textContent);
   await take56(A);
@@ -6808,7 +6808,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   selD.dispatchEvent(new (D.win().Event)('change'));
   check('s56m: choosing Mistral as the main service moves the backup off it (to ElevenLabs) and says so',
     D.doc.getElementById('sttBackup').value === 'elevenlabs' &&
-    /Transcription service: Mistral Voxtral Mini Transcribe 3, backed up by ElevenLabs\./.test(D.doc.getElementById('status').textContent), D.doc.getElementById('status').textContent);
+    /Transcription service: Mistral Voxtral Small Transcribe 3, backed up by ElevenLabs\./.test(D.doc.getElementById('status').textContent), D.doc.getElementById('status').textContent);
   check('s56m: the hint says Mistral gets the first 100 keyterms and returns text only',
     /Mistral gets your keyterms \(the first 100/.test(D.doc.getElementById('sttHint').textContent) && /no speaker filter and no incomplete-transcript check/.test(D.doc.getElementById('sttHint').textContent),
     D.doc.getElementById('sttHint').textContent);
@@ -6816,7 +6816,7 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   await take56(D);
   check('s56m: the take asks for Mistral, backed up by ElevenLabs', D.sent[1] && D.sent[1].primary === 'mistral' && D.sent[1].backup === 'elevenlabs', JSON.stringify(D.sent));
   const stD = D.doc.getElementById('status');
-  check('s56m: a Mistral take says so, as a clean success', /Transcribed by Mistral Voxtral Mini Transcribe 3\./.test(stD.textContent) && stD.className.includes('ok') && stD.textContent.includes('Done!'),
+  check('s56m: a Mistral take says so, as a clean success', /Transcribed by Mistral Voxtral Small Transcribe 3\./.test(stD.textContent) && stD.className.includes('ok') && stD.textContent.includes('Done!'),
     stD.className + ' | ' + stD.textContent);
   const histD = JSON.parse(D.win().localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
   check('s56m: the note is tagged mistral', histD[0] && histD[0].stt === 'mistral', JSON.stringify(histD[0]));

@@ -568,9 +568,15 @@ async function handleTranscribeStream(request, env, ctx) {
 
   const frames = streamFrameReader(request.body);
   let writer = null;
+  let elCtrl = null;
+  // Abort BOTH the body and the request itself: a writer whose last write is
+  // stuck behind an upstream that stopped reading may never finish aborting,
+  // and resetting the request is what guarantees ElevenLabs never gets a
+  // complete one.
   const abortUpstream = (why) => {
     if (writer) writer.abort(new Error(why)).catch(() => {});
     writer = null;
+    if (elCtrl) { try { elCtrl.abort(); } catch {} }
   };
 
   try {
@@ -611,7 +617,7 @@ async function handleTranscribeStream(request, env, ctx) {
     // be sent the same take if ElevenLabs errors or stalls.
     const plan = sttPlan(get, env, sharedKey, true);
     const kept = plan.backup ? [] : null;
-    const elCtrl = new AbortController();
+    elCtrl = new AbortController();
 
     const pipe = new TransformStream();
     writer = pipe.writable.getWriter();
@@ -626,15 +632,24 @@ async function handleTranscribeStream(request, env, ctx) {
     // will never read must not stall the stream) but keep reading the client's
     // frames, so the client can finish its body and receive the answer.
     let answered = false;
-    const settled = upstream.then(() => { answered = true; }, () => { answered = true; });
-    const relay = async (bytes) => {
+    upstream.then(() => { answered = true; }, () => { answered = true; });
+    // Relay WITHOUT waiting for ElevenLabs to take the bytes. The writer queues
+    // them in order; the client's frames are read at the client's own pace.
+    // Waiting here (as this used to) handed ElevenLabs the stream's clock: when
+    // its intake stalled — connection open, body not being read — the Worker
+    // stopped reading the client, never reached the end frame, and so never
+    // started the backup either. The take then sat until the client's deadline
+    // and failed, although the backup was ready and the ordinary upload would
+    // have been rescued in about 4 s (2026-11-10 field failure). The queued
+    // bytes are bounded by the take's own size cap, and they are the same
+    // buffers the backup copy holds.
+    const relay = (bytes) => {
       if (answered || !writer) return;
-      const write = writer.write(bytes).catch(() => {});
-      await Promise.race([write, settled]);
+      writer.write(bytes).catch(() => {});
     };
 
     const enc = new TextEncoder();
-    await relay(enc.encode(head));
+    relay(enc.encode(head));
     let bytes = 0;
     let count = 0;
     let end = null;
@@ -650,7 +665,7 @@ async function handleTranscribeStream(request, env, ctx) {
           return json({ error: "Recording too large." }, 413);
         }
         if (kept) kept.push(frame.payload);
-        await relay(frame.payload);
+        relay(frame.payload);
       } else if (frame.type === STREAM_FRAME_END) {
         try {
           end = JSON.parse(new TextDecoder().decode(frame.payload));
@@ -682,15 +697,15 @@ async function handleTranscribeStream(request, env, ctx) {
       return json({ error: "Recording too short or empty." }, 400);
     }
 
-    // Verified: now, and only now, end the upstream body.
-    await relay(enc.encode("\r\n--" + boundary + "--\r\n"));
-    if (!answered && writer) {
-      await Promise.race([writer.close().catch(() => {}), settled]);
-    }
+    // Verified: now, and only now, end the upstream body. Not awaited: the
+    // race below starts NOW, so a backlog ElevenLabs is slow to take counts
+    // against its wait and the backup is asked on time.
+    relay(enc.encode("\r\n--" + boundary + "--\r\n"));
+    if (!answered && writer) writer.close().catch(() => {});
 
     const out = await sttRace({
       env, plan,
-      tStart: tEnd, // ElevenLabs has had the audio all along: its wait starts at the release
+      tStart: tEnd, // the release: ElevenLabs' wait starts here whether or not it has taken every byte yet
       primary: jobFromFetch(upstream, elCtrl, 502),
       startBackup: kept
         ? () => startSttJob(plan.backup, { env, ctx, file: new Blob(kept, { type: mime }), fileName, get })
@@ -977,6 +992,13 @@ async function sttRace(o) {
   const job = o.startBackup();
   let b = null;
   const bDone = job.result.then((r) => { b = r; return "b"; });
+  // A backup that answered with NO TEXT has not rescued anything: the take
+  // was sent to it because the main service was slow or failing, not because
+  // the clinician said nothing. Letting "" win stopped the main service and
+  // turned a real dictation into "No speech detected" with the recording
+  // thrown away. So it never wins: the main service keeps going, and if that
+  // fails too the take is one loud, RETRYABLE failure naming both.
+  const bGood = () => Boolean(b && b.ok && b.body && String(b.body.text || "").trim());
   const hedge = () => ({ hedgeMs: tB - o.tStart, backupMs: Date.now() - tB });
   const fromBackup = () => ({
     status: 200,
@@ -988,7 +1010,7 @@ async function sttRace(o) {
   });
 
   const next = p ? await bDone : await Promise.race([pDone, bDone]);
-  if (next === "b" && b.ok) {
+  if (next === "b" && bGood()) {
     o.primary.abandon(); // stop waiting on the main service
     return fromBackup();
   }
@@ -996,9 +1018,10 @@ async function sttRace(o) {
     job.abandon(); // the main service answered first after all
     return { ...primaryResponse(p, plan, o.tStart), ...hedge() };
   }
-  // One of the two failed: the other is the last chance.
+  // One of the two failed (or the backup heard nothing): the other is the
+  // last chance.
   if (!b) await bDone;
-  if (b.ok) return fromBackup();
+  if (bGood()) return fromBackup();
   if (!p) await pDone;
   if (!worthFallingBack(p)) return { ...primaryResponse(p, plan, o.tStart), ...hedge() };
   return {
@@ -1008,7 +1031,7 @@ async function sttRace(o) {
     ctype: JSON_CT,
     body: JSON.stringify({
       error: STT_SERVICE_NAMES[plan.primary] + " " + p.error + "; the " +
-             STT_SERVICE_NAMES[plan.backup] + " fallback failed too (" + b.error + ").",
+             STT_SERVICE_NAMES[plan.backup] + " fallback failed too (" + (b.ok ? "it returned no text" : b.error) + ").",
     }),
     waitMs: p.at - o.tStart,
     ...hedge(),
@@ -2652,6 +2675,7 @@ right lower quadrant"></textarea>
   let sessionEngine = DEFAULT_ENGINE;
   let sessionBaseText = "";  // note text this session appends onto (batch splices into it)
   let finishing = false;     // a finalize is still uploading; serializes sessions
+  let takeDeliveryStarted = false; // this take reached deliverFinalText (the finalize safety net reads it)
   let precomputedBatchKeyterms = null; // [LATENCY] batch keyterms JSON snapshotted at session start, off the stop-to-upload critical path
 
   const METER_MAX    = 0.12;
@@ -5792,6 +5816,7 @@ right lower quadrant"></textarea>
     // harness's queue-driven fetch mock.
     try { new Image().src = "/favicon.ico?warm=" + Date.now(); } catch (e) {}
     sessionFinalized = false;
+    takeDeliveryStarted = false;
     userStopped = false;
     stopPhase = null;
     lastWsError = "";
@@ -5998,8 +6023,61 @@ right lower quadrant"></textarea>
     }
   }
 
+  // Every take must END: one loud outcome, never a status frozen on
+  // "Transcribing…" with nothing on the clipboard. The finalize chain is a
+  // long run of awaits with no catch of its own, and the recorder's onstop
+  // calls it bare, so a single exception anywhere in it used to end the take
+  // with NO outcome at all — no sentinel, no fail beep, no timing row — and
+  // left finishing=true, so every later press queued behind it in silence
+  // until a reload. The safety net turns any such exception into the loud
+  // failure it is, keeping the recording for a retry.
   async function finalizeSession(unexpected) {
     if (sessionFinalized) return;
+    try {
+      await finalizeSessionWork(unexpected);
+    } catch (err) {
+      await finalizeCrashed(err);
+    }
+  }
+
+  async function finalizeCrashed(err) {
+    var why = "an internal error (" + String((err && err.message) || err || "unknown").slice(0, 120) + ")";
+    try { if (typeof console !== "undefined" && console.error) console.error("[finalize]", err); } catch (e) {}
+    // Whatever point the take had reached, it is over: no recording, no stream,
+    // no timers left running for it.
+    recording = false;
+    stopping = false;
+    stopRequested = false;
+    try { clearSessionTimers(); } catch (e) {}
+    try { stopUploadTicker(); } catch (e) {}
+    try { abortTakeStream("internal error"); } catch (e) {}
+    try { if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop(); } catch (e) {}
+    try { showRecFeedback(false); } catch (e) {}
+    try { recordBtn.textContent = "Start recording"; recordBtn.classList.remove("danger"); } catch (e) {}
+    if (!takeDeliveryStarted) {
+      // Nothing reached the clipboard yet: deliver the loud failure, keeping
+      // the audio (it is still in memory, and in the journal).
+      try {
+        lastWsError = why;
+        if (takeTimings) takeTimings.errKind = "internal";
+        var blob = chunks.length ? new Blob(chunks, { type: (chunks[0] && chunks[0].type) || "audio/webm" }) : null;
+        var kept = armUploadRecovery(blob, why);
+        await deliverFinalText("", { unexpected: true, keepJournal: kept, recoverable: kept });
+        return;
+      } catch (e2) { /* fall through to the last resort below */ }
+    }
+    // The delivery itself broke partway, so the clipboard may or may not hold
+    // this take's text: never overwrite it, but say so loudly and free the app.
+    if (finishing || !takeDeliveryStarted) {
+      try { setStatus("⚠ Dictation may NOT have been delivered — " + why + ". VERIFY the clipboard before pasting; redictate if it is wrong.", "err"); } catch (e) {}
+      try { failBeep(); } catch (e) {}
+      finishing = false;
+      try { updateBigScreen(); updateAppendChip(); refreshLatestEditable(); } catch (e) {}
+      try { maybePendingStart(); } catch (e) {}
+    }
+  }
+
+  async function finalizeSessionWork(unexpected) {
     sessionFinalized = true;
     recEndedAt = Date.now(); // take length for the coverage guard + the duration-aware upload deadline
     stampTake("onstop"); // [PERF] recorder flushed; the upload leg starts next
@@ -6283,6 +6361,7 @@ right lower quadrant"></textarea>
   //   unexpectedMsg — override for the unexpected status line
   async function deliverFinalText(cleaned, opts) {
     opts = opts || {};
+    takeDeliveryStarted = true; // past here the clipboard may hold this take's outcome (see finalizeCrashed)
     // The take reached its single, cued outcome (success or loud failure), so
     // the crash-recovery journal for it is no longer needed — clear it (best-
     // effort). A crash BEFORE this point still leaves the journal for boot to

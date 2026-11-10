@@ -83,6 +83,7 @@ ShowState(msg, bg) {
     global StateGui, StateTxt, SHOW_STATE_BAR, STATE_BAR_W, STATE_BAR_H, STATE_BAR_MARGIN
     if (!SHOW_STATE_BAR || !IsObject(StateGui))
         return
+    SetTimer(HideState, 0)             ; a new state cancels an earlier flash's pending hide
     try {
         StateGui.BackColor := bg
         StateTxt.Value := msg
@@ -104,6 +105,13 @@ HideState() {
 FlashState(msg, bg, ms) {
     ShowState(msg, bg)
     SetTimer(HideState, -ms)
+}
+
+; A FAILED take's state stays up until the next press. It used to flash for
+; 2.5 s, so a clinician who looked back at Cerner during a long wait saw the
+; bar vanish and an empty clipboard: a failure that read as nothing at all.
+FailState(msg) {
+    ShowState(msg, "B91C1C")
 }
 
 InitStateBar()
@@ -280,8 +288,8 @@ ActivateWindow(hwnd) {
 
     ; --- Wait for transcript OR failure sentinel on the clipboard ---
     if !ClipWait(CLIP_TIMEOUT, 1) {
-        FlashState("⚠ TIMED OUT", "B91C1C", 2500)
-        Fail("No transcript (timeout).")
+        FailState("⚠ TIMED OUT")
+        Fail("Dictation FAILED: no transcript after " CLIP_TIMEOUT " s. Nothing was pasted. Check the dictation window.")
         ReturnFocus()
         BUSY := false
         return
@@ -292,8 +300,8 @@ ActivateWindow(hwnd) {
     ; Browser signalled a failed / empty transcription — bail fast, don't paste.
     if (txt = SENTINEL) {
         A_Clipboard := ""
-        FlashState("⚠ FAILED", "B91C1C", 2500)
-        Fail("No speech detected / transcription failed.")
+        FailState("⚠ FAILED")
+        Fail("Dictation FAILED: nothing was pasted. The dictation window says why (and offers Retry when the recording was kept).")
         ReturnFocus()
         BUSY := false
         return
@@ -305,8 +313,8 @@ ActivateWindow(hwnd) {
     cleaned := Trim(RegExReplace(cleaned, " +", " "))
     if (cleaned = "") {
         A_Clipboard := ""
-        FlashState("⚠ EMPTY", "B91C1C", 2500)
-        Fail("Empty transcript.")
+        FailState("⚠ EMPTY")
+        Fail("Dictation FAILED: the transcript was empty. Nothing was pasted.")
         ReturnFocus()
         BUSY := false
         return

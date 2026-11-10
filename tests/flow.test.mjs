@@ -6066,6 +6066,13 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     calls.push(rec);
     if (url === EL_URL) {
       if (el.mode === 'status' && el.early) return jsonRes(el.body, el.status);
+      if (el.mode === 'noread') {
+        // A stalled intake: the connection is open but ElevenLabs neither
+        // reads the body nor answers (the 2026-11-10 field failure).
+        return new Promise((resolve, reject) => {
+          if (init.signal) init.signal.addEventListener('abort', () => { rec.aborted = true; reject(new DOMException('aborted', 'AbortError')); });
+        });
+      }
       if (init.body && typeof init.body.getReader === 'function') {
         const reader = init.body.getReader();
         const parts = [];
@@ -6542,6 +6549,78 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       await settle();
     }
 
+    // (m3) [RELIABILITY] ElevenLabs stalls while the take is still streaming
+    //      IN: the connection is open but it never reads the body. The Worker
+    //      used to wait on every relayed write, so it stopped reading the
+    //      client, never reached the end frame and never asked the backup: the
+    //      take sat until the client's deadline and failed (2026-11-10). The
+    //      client's frames must be read at the client's pace, the backup asked
+    //      on time with the streamed audio, and the stalled request reset.
+    reset({ mode: 'noread' });
+    {
+      const { ctl, resP } = openStream54();
+      ctl.enqueue(streamJson(STREAM_O, { ...opts54, stt_backup: 'mistral' }));
+      for (let i = 0; i < 6; i++) ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(4096).fill(i + 1)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 6 * 4096, chunks: 6, rec_ms: 3000 }));
+      ctl.close();
+      const t0 = Date.now();
+      r = await Promise.race([resP, sleep(5000).then(() => null)]);
+      check('s54m3: a take whose ElevenLabs upload STALLED mid-stream is still answered (it used to hang until the client gave up)', r !== null, 'no answer after 5 s');
+      if (!r) r = new Response('{}', { status: 599 });
+      body = await r.json();
+      const miS = (miCalls()[0] || {}).mi || {};
+      const sent = Buffer.concat([...Array(6)].map((_, i) => Buffer.alloc(4096, i + 1)));
+      check('s54m3: ...transcribed by the backup, on the normal schedule',
+        r.status === 200 && body.stt_provider === 'mistral' && /^ElevenLabs had not answered/.test(body.stt_fallback || '') && Date.now() - t0 < 2000,
+        r.status + ' ' + (Date.now() - t0) + 'ms ' + JSON.stringify(body).slice(0, 160));
+      check('s54m3: ...with exactly the audio that was streamed', Buffer.compare(miS.fileBytes || Buffer.alloc(0), sent) === 0, miS.fileBytes && miS.fileBytes.length);
+      check('s54m3: ...and the stalled ElevenLabs request is reset, not left open', elCalls().length === 1 && elCalls()[0].aborted === true, JSON.stringify(elCalls().map((c) => c.aborted)));
+      await settle();
+    }
+    // (m4) the same stall with an integrity mismatch: refused, and the stalled
+    //      request is reset (its body never got the closing boundary)
+    reset({ mode: 'noread' });
+    {
+      const { ctl, resP } = openStream54();
+      ctl.enqueue(streamJson(STREAM_O, { ...opts54, stt_backup: 'mistral' }));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(4096).fill(1)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 9999, chunks: 1 }));
+      ctl.close();
+      r = (await Promise.race([resP, sleep(3000).then(() => null)])) || new Response('{}', { status: 599 });
+      check('s54m4: a stalled take that fails its integrity check is refused at once, nothing sent to the backup',
+        r.status === 400 && miCalls().length === 0, r.status + ' mi=' + miCalls().length);
+      check('s54m4: ...and the stalled ElevenLabs request is reset', elCalls().length === 1 && elCalls()[0].aborted === true, JSON.stringify(elCalls().map((c) => c.aborted)));
+    }
+
+    // (eb) [RELIABILITY] a backup that answers with NO TEXT has rescued nothing.
+    //     It used to win the race: the main service was stopped and a real
+    //     dictation became "No speech detected" with the recording discarded.
+    reset({ mode: 'late', delayMs: 600 }, null, null, { mode: 'ok', text: '   ' });
+    r = await worker.default.fetch(mkUpload54({ backup: 'mistral' }), env54, ctx);
+    body = await r.json();
+    check('s54eb: an EMPTY backup answer does not win: the slow main service still delivers',
+      r.status === 200 && body.text === 'Late ElevenLabs text.' && !body.stt_provider && miCalls().length === 1,
+      r.status + ' ' + JSON.stringify(body).slice(0, 160));
+    check('s54eb: ...and ElevenLabs was not stopped', elCalls().length === 1 && !elCalls()[0].aborted, JSON.stringify(elCalls().map((c) => c.aborted)));
+    reset({ mode: 'status', status: 500, body: { detail: { message: 'internal error' } } }, null, null, { mode: 'ok', text: '   ' });
+    r = await worker.default.fetch(mkUpload54({ backup: 'mistral' }), env54, ctx);
+    body = await r.json();
+    check('s54eb: a failed main service + an EMPTY backup is ONE loud failure naming both (never an empty "success")',
+      r.status === 500 && /^ElevenLabs HTTP 500/.test(body.error || '') && /Mistral fallback failed too \(it returned no text\)/.test(body.error || '') && body.text === undefined,
+      r.status + ' ' + JSON.stringify(body).slice(0, 200));
+    reset({ mode: 'status', status: 500, body: { detail: { message: 'internal error' } } }, null, null, { mode: 'ok', text: '   ' });
+    {
+      const { ctl, resP } = openStream54();
+      ctl.enqueue(streamJson(STREAM_O, { ...opts54, stt_backup: 'mistral' }));
+      ctl.enqueue(streamFrame(STREAM_A, new Uint8Array(4096).fill(2)));
+      ctl.enqueue(streamJson(STREAM_E, { bytes: 4096, chunks: 1 }));
+      ctl.close();
+      r = (await Promise.race([resP, sleep(5000).then(() => null)])) || new Response('{}', { status: 599 });
+      body = await r.json();
+      check('s54eb: ...the same on the streamed route (a retryable failure, not an empty transcript)',
+        r.status === 500 && /it returned no text/.test(body.error || ''), r.status + ' ' + JSON.stringify(body).slice(0, 200));
+    }
+
     // (n) ElevenLabs refuses a streamed take early (401 on our master key): Soniox carries it
     reset({ mode: 'status', early: true, status: 401, body: { detail: { message: 'invalid api key' } } });
     {
@@ -6853,6 +6932,197 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   check('s56b: behind a Mistral main service a saved Soniox backup is left alone', H.doc.getElementById('sttPrimary').value === 'mistral' && H.doc.getElementById('sttBackup').value === 'soniox',
     H.doc.getElementById('sttPrimary').value + '/' + H.doc.getElementById('sttBackup').value);
   H.dom.window.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 57. [RELIABILITY] Every take ENDS with one loud outcome. The finalize chain
+//     is a long run of awaits that the recorder's onstop calls bare, so one
+//     exception anywhere in it used to end the take with NO outcome: no
+//     sentinel, no fail beep, no timing row, a status frozen on the last
+//     "Transcribing…" line — and finishing stuck true, so every later press
+//     queued behind it in silence until a reload. Now the safety net makes it
+//     the loud failure it is, keeps the recording for a retry, and frees the
+//     app for the next take.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 57: a crash in the finalize chain still ends the take loudly ---');
+  let throwOnce = false;
+  let posts57 = 0;
+  const dom57 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      // The crash: the preview URL, built in the middle of the finalize chain.
+      win.URL.createObjectURL = () => { if (throwOnce) { throwOnce = false; throw new Error('simulated finalize crash'); } return 'blob:mock'; };
+      win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() { if (this.state === 'inactive') return; this.state = 'inactive'; if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) }); if (this.onstop) this.onstop(); }
+      };
+      win.fetch = () => { posts57++; return new Promise((r) => setTimeout(() => r({
+        ok: true, status: 200, headers: { get: () => null },
+        text: () => Promise.resolve(JSON.stringify({ text: 'Rescued note.' })),
+      }), 20)); };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-57');
+    },
+  });
+  const win57 = dom57.window;
+  const doc57 = win57.document;
+  const st57 = () => doc57.getElementById('status');
+  await sleep(150);
+  micRms = 0.05;
+  throwOnce = true;
+  doc57.getElementById('recordBtn').click();
+  await sleep(140);
+  doc57.getElementById('recordBtn').click();
+  await sleep(600);
+  check('s57: the crashed take still ENDS loud: the sentinel is on the clipboard', win57._clip === '##DICTATION_FAILED##', JSON.stringify(win57._clip));
+  check('s57: ...the status is a red failure that names the internal error', st57().className.includes('err') && /Dictation FAILED/.test(st57().textContent) && /internal error/.test(st57().textContent),
+    st57().className + ' | ' + st57().textContent);
+  check('s57: ...it says the RECORDING was kept, and offers the retry', /RECORDING was saved/.test(st57().textContent) && doc57.getElementById('journalRecover').style.display !== 'none',
+    doc57.getElementById('journalRecover').style.display);
+  check('s57: ...nothing was uploaded by the crashed take', posts57 === 0, posts57);
+  let ring57 = [];
+  try { ring57 = JSON.parse(win57.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) {}
+  check('s57: ...and the timing log has a row for it (errKind internal)', ring57.length === 1 && ring57[0].errKind === 'internal', JSON.stringify(ring57[0] || null).slice(0, 160));
+  doc57.getElementById('journalRecoverBtn').click();
+  await sleep(400);
+  check('s57: the retry delivers the note the crash would have lost', (win57._clip || '').includes('Rescued note.') && posts57 === 1, JSON.stringify(win57._clip) + ' posts=' + posts57);
+  doc57.getElementById('recordBtn').click();
+  await sleep(140);
+  doc57.getElementById('recordBtn').click();
+  await sleep(500);
+  check('s57: the app is free afterwards: the next take records and delivers normally', posts57 === 2 && st57().className.includes('ok') && /Done!/.test(st57().textContent),
+    'posts=' + posts57 + ' ' + st57().className + ' | ' + st57().textContent);
+  dom57.window.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 58. [RELIABILITY] EVERY failed take keeps its recording — not just the last.
+//     There used to be ONE saved-recording slot: a second failed take replaced
+//     the first one's recording, and a reload deleted every saved recording but
+//     the newest. On 2026-11-10 ElevenLabs stalled, each failed take said "Your
+//     RECORDING was saved", the clinician (in Cerner, seeing only a FAILED
+//     flash) redictated, and every recording but the last was destroyed. Now
+//     each one waits its turn in the banner, survives a reload, and is retried
+//     or discarded on its own.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 58: every failed take keeps its recording ---');
+  const idb58 = new IDBFactory();
+  let reply58 = { status: 500, body: { error: 'ElevenLabs HTTP 500: overloaded' } };
+  let chunk58 = 2048;
+  const uploads58 = [];
+  const mk58 = () => {
+    let win58;
+    const d = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        win58 = win;
+        win.isSecureContext = true;
+        win.AudioContext = MockAudioCtx;
+        win.WebSocket = MockWS;
+        win.indexedDB = idb58;
+        win.URL.createObjectURL = () => 'blob:mock';
+        win.URL.revokeObjectURL = () => {};
+        Object.defineProperty(win.navigator, 'clipboard', {
+          value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true,
+        });
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; this._iv = null; }
+          static isTypeSupported() { return false; }
+          _emit() { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(chunk58)], { type: 'audio/webm' }) }); }
+          start() { this.state = 'recording'; this._iv = win.setInterval(() => this._emit(), 40); }
+          stop() {
+            if (this.state === 'inactive') return;
+            this.state = 'inactive';
+            if (this._iv) { win.clearInterval(this._iv); this._iv = null; }
+            this._emit();
+            if (this.onstop) this.onstop();
+          }
+        };
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+        win.fetch = (url, opts) => {
+          const f = opts && opts.body && opts.body.get ? opts.body.get('file') : null;
+          uploads58.push(f ? f.size : -1);
+          const m = reply58;
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ok: m.status >= 200 && m.status < 300, status: m.status, headers: { get: () => null },
+            text: () => Promise.resolve(JSON.stringify(m.body)),
+          }), 20));
+        };
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-58');
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (58):', e.message); failures++; });
+      },
+    });
+    return { dom: d, win: () => win58, doc: d.window.document };
+  };
+  const take58 = async (d) => {
+    micRms = 0.05;
+    d.doc.getElementById('recordBtn').click();
+    await sleep(220);
+    d.doc.getElementById('recordBtn').click();
+    await sleep(700);
+  };
+  const msg58 = (d) => d.doc.getElementById('journalRecoverMsg').textContent;
+  const shown58 = (d) => d.doc.getElementById('journalRecover').style.display !== 'none';
+
+  // Two takes in a row fail (the service is down), as on 2026-11-10.
+  const A = mk58();
+  await sleep(250);
+  chunk58 = 2048;
+  await take58(A);
+  const size1 = uploads58[uploads58.length - 1];
+  check('s58: the first failed take is loud and keeps its recording', A.win()._clip === '##DICTATION_FAILED##' && shown58(A) && !/more saved recording/.test(msg58(A)), msg58(A));
+  chunk58 = 3001;
+  await take58(A);
+  const size2 = uploads58[uploads58.length - 1];
+  check('s58: the two takes uploaded different recordings', size1 > 1024 && size2 > 1024 && size1 !== size2, size1 + ' / ' + size2);
+  check('s58: after a SECOND failure the first recording is still there ("1 more saved recording")',
+    shown58(A) && /1 more saved recording/.test(msg58(A)), msg58(A));
+  A.dom.window.close();
+
+  // Relaunch: BOTH recordings come back (the old boot kept only the newest).
+  const B = mk58();
+  await sleep(600);
+  check('s58: after a relaunch both saved recordings are offered', shown58(B) && /1 more saved recording/.test(msg58(B)), msg58(B));
+  reply58 = { status: 200, body: { text: 'Second note.' } };
+  B.doc.getElementById('journalRecoverBtn').click();
+  await sleep(500);
+  check('s58: the first retry delivers the NEWEST take (its own recording)', (B.win()._clip || '').includes('Second note.') && uploads58[uploads58.length - 1] === size2,
+    JSON.stringify(B.win()._clip) + ' uploaded ' + uploads58[uploads58.length - 1]);
+  check('s58: ...and the banner moves on to the older one, not away', shown58(B) && !/more saved recording/.test(msg58(B)), msg58(B));
+  reply58 = { status: 200, body: { text: 'First note.' } };
+  B.doc.getElementById('journalRecoverBtn').click();
+  await sleep(500);
+  check('s58: the second retry delivers the FIRST take — nothing was lost', (B.win()._clip || '').includes('First note.') && uploads58[uploads58.length - 1] === size1,
+    JSON.stringify(B.win()._clip) + ' uploaded ' + uploads58[uploads58.length - 1]);
+  check('s58: with both delivered the banner is gone', !shown58(B), msg58(B));
+  B.dom.window.close();
+
+  // Another relaunch: nothing left over (both records were cleared).
+  const C = mk58();
+  await sleep(600);
+  check('s58: a relaunch after both retries offers nothing', !shown58(C), msg58(C));
+
+  // Discard takes only the recording on the banner.
+  reply58 = { status: 500, body: { error: 'ElevenLabs HTTP 500: overloaded' } };
+  chunk58 = 2048; await take58(C);
+  chunk58 = 3001; await take58(C);
+  C.doc.getElementById('journalDiscardBtn').click();
+  await sleep(200);
+  check('s58: Discard drops only the recording on the banner; the other one stays offered', shown58(C) && !/more saved recording/.test(msg58(C)), msg58(C));
+  C.doc.getElementById('journalDiscardBtn').click();
+  await sleep(200);
+  check('s58: ...and the second Discard empties it', !shown58(C), msg58(C));
+  C.dom.window.close();
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');

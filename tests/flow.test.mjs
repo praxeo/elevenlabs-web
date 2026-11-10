@@ -7003,5 +7003,127 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   dom57.window.close();
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 58. [RELIABILITY] EVERY failed take keeps its recording — not just the last.
+//     There used to be ONE saved-recording slot: a second failed take replaced
+//     the first one's recording, and a reload deleted every saved recording but
+//     the newest. On 2026-11-10 ElevenLabs stalled, each failed take said "Your
+//     RECORDING was saved", the clinician (in Cerner, seeing only a FAILED
+//     flash) redictated, and every recording but the last was destroyed. Now
+//     each one waits its turn in the banner, survives a reload, and is retried
+//     or discarded on its own.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 58: every failed take keeps its recording ---');
+  const idb58 = new IDBFactory();
+  let reply58 = { status: 500, body: { error: 'ElevenLabs HTTP 500: overloaded' } };
+  let chunk58 = 2048;
+  const uploads58 = [];
+  const mk58 = () => {
+    let win58;
+    const d = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        win58 = win;
+        win.isSecureContext = true;
+        win.AudioContext = MockAudioCtx;
+        win.WebSocket = MockWS;
+        win.indexedDB = idb58;
+        win.URL.createObjectURL = () => 'blob:mock';
+        win.URL.revokeObjectURL = () => {};
+        Object.defineProperty(win.navigator, 'clipboard', {
+          value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true,
+        });
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; this._iv = null; }
+          static isTypeSupported() { return false; }
+          _emit() { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(chunk58)], { type: 'audio/webm' }) }); }
+          start() { this.state = 'recording'; this._iv = win.setInterval(() => this._emit(), 40); }
+          stop() {
+            if (this.state === 'inactive') return;
+            this.state = 'inactive';
+            if (this._iv) { win.clearInterval(this._iv); this._iv = null; }
+            this._emit();
+            if (this.onstop) this.onstop();
+          }
+        };
+        win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener() {} };
+        win.fetch = (url, opts) => {
+          const f = opts && opts.body && opts.body.get ? opts.body.get('file') : null;
+          uploads58.push(f ? f.size : -1);
+          const m = reply58;
+          return new Promise((resolve) => setTimeout(() => resolve({
+            ok: m.status >= 200 && m.status < 300, status: m.status, headers: { get: () => null },
+            text: () => Promise.resolve(JSON.stringify(m.body)),
+          }), 20));
+        };
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-58');
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (58):', e.message); failures++; });
+      },
+    });
+    return { dom: d, win: () => win58, doc: d.window.document };
+  };
+  const take58 = async (d) => {
+    micRms = 0.05;
+    d.doc.getElementById('recordBtn').click();
+    await sleep(220);
+    d.doc.getElementById('recordBtn').click();
+    await sleep(700);
+  };
+  const msg58 = (d) => d.doc.getElementById('journalRecoverMsg').textContent;
+  const shown58 = (d) => d.doc.getElementById('journalRecover').style.display !== 'none';
+
+  // Two takes in a row fail (the service is down), as on 2026-11-10.
+  const A = mk58();
+  await sleep(250);
+  chunk58 = 2048;
+  await take58(A);
+  const size1 = uploads58[uploads58.length - 1];
+  check('s58: the first failed take is loud and keeps its recording', A.win()._clip === '##DICTATION_FAILED##' && shown58(A) && !/more saved recording/.test(msg58(A)), msg58(A));
+  chunk58 = 3001;
+  await take58(A);
+  const size2 = uploads58[uploads58.length - 1];
+  check('s58: the two takes uploaded different recordings', size1 > 1024 && size2 > 1024 && size1 !== size2, size1 + ' / ' + size2);
+  check('s58: after a SECOND failure the first recording is still there ("1 more saved recording")',
+    shown58(A) && /1 more saved recording/.test(msg58(A)), msg58(A));
+  A.dom.window.close();
+
+  // Relaunch: BOTH recordings come back (the old boot kept only the newest).
+  const B = mk58();
+  await sleep(600);
+  check('s58: after a relaunch both saved recordings are offered', shown58(B) && /1 more saved recording/.test(msg58(B)), msg58(B));
+  reply58 = { status: 200, body: { text: 'Second note.' } };
+  B.doc.getElementById('journalRecoverBtn').click();
+  await sleep(500);
+  check('s58: the first retry delivers the NEWEST take (its own recording)', (B.win()._clip || '').includes('Second note.') && uploads58[uploads58.length - 1] === size2,
+    JSON.stringify(B.win()._clip) + ' uploaded ' + uploads58[uploads58.length - 1]);
+  check('s58: ...and the banner moves on to the older one, not away', shown58(B) && !/more saved recording/.test(msg58(B)), msg58(B));
+  reply58 = { status: 200, body: { text: 'First note.' } };
+  B.doc.getElementById('journalRecoverBtn').click();
+  await sleep(500);
+  check('s58: the second retry delivers the FIRST take — nothing was lost', (B.win()._clip || '').includes('First note.') && uploads58[uploads58.length - 1] === size1,
+    JSON.stringify(B.win()._clip) + ' uploaded ' + uploads58[uploads58.length - 1]);
+  check('s58: with both delivered the banner is gone', !shown58(B), msg58(B));
+  B.dom.window.close();
+
+  // Another relaunch: nothing left over (both records were cleared).
+  const C = mk58();
+  await sleep(600);
+  check('s58: a relaunch after both retries offers nothing', !shown58(C), msg58(C));
+
+  // Discard takes only the recording on the banner.
+  reply58 = { status: 500, body: { error: 'ElevenLabs HTTP 500: overloaded' } };
+  chunk58 = 2048; await take58(C);
+  chunk58 = 3001; await take58(C);
+  C.doc.getElementById('journalDiscardBtn').click();
+  await sleep(200);
+  check('s58: Discard drops only the recording on the banner; the other one stays offered', shown58(C) && !/more saved recording/.test(msg58(C)), msg58(C));
+  C.doc.getElementById('journalDiscardBtn').click();
+  await sleep(200);
+  check('s58: ...and the second Discard empties it', !shown58(C), msg58(C));
+  C.dom.window.close();
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

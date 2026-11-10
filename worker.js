@@ -3645,6 +3645,8 @@ right lower quadrant"></textarea>
      no-ops if IndexedDB is missing or fails, so a journal problem never touches
      the live capture/upload path — it can only ever NARROW the loss window. */
   const JOURNAL_DB_NAME   = "scribe_v2_journal";
+  const RECOVERY_KEEP_MS = 24 * 3600 * 1000; // saved recordings older than a shift are dropped at boot (a recovery is always by hand, labelled with its time)
+  const RECOVERY_KEEP_MAX = 20;               // ...and at most this many are kept (oldest dropped first)
   const JOURNAL_MAX_CHUNKS = 1800; // soft cap (~30 min @ 1s timeslice ≈ 14 MB IDB) — bound the write cost; the in-memory path is unaffected past this; a capped recovery SAYS so (showJournalRecover)
   let journalDb = null;
   let uploadTicker = null;       // interval id for the "uploading… Ns" status counter
@@ -3654,7 +3656,14 @@ right lower quadrant"></textarea>
   let journalDisabled = (typeof indexedDB === "undefined");
   let journalSessionId = null;   // id of the in-flight take's journal record (null = not journaling)
   let journalChunkCount = 0;
-  let pendingRecovery = null;    // { session, blob } awaiting the user's Recover/Discard
+  let pendingRecovery = null;    // { session, blob } awaiting the user's Recover/Discard (the one the banner offers)
+  // Every OTHER saved recording, newest first, each waiting its turn in the
+  // banner. There used to be one slot: a second failed take replaced the
+  // first one's recording, and a reload deleted all but the newest — so a run
+  // of failures (2026-11-10: ElevenLabs stalling, the clinician redictating
+  // each time) destroyed every recording but the last while each failure
+  // promised "Your RECORDING was saved".
+  let recoveryBacklog = [];
 
   function journalOpen() {
     if (journalDisabled) return Promise.resolve(null);
@@ -3764,32 +3773,64 @@ right lower quadrant"></textarea>
       const sessions = await jReq(db.transaction("sessions", "readonly").objectStore("sessions").getAll());
       if (!Array.isArray(sessions) || !sessions.length) return;
       sessions.sort(function (a, b) { return (b.createdAt || "").localeCompare(a.createdAt || ""); });
-      const newest = sessions[0];
-      for (let i = 1; i < sessions.length; i++) { try { await journalClear(sessions[i].id); } catch (e) {} }
-      if (!newest || newest.state !== "recording") { try { await journalClear(newest.id); } catch (e) {} return; }
-      const rows = await jReq(db.transaction("chunks", "readonly").objectStore("chunks").index("sid").getAll(newest.id));
-      const bufs = (Array.isArray(rows) ? rows : []).map(function (r) { return r && r.buf; }).filter(Boolean);
-      const blob = bufs.length ? new Blob(bufs, { type: newest.mimeType || "audio/webm" }) : null;
-      if (!blob || blob.size < 1024) { try { await journalClear(newest.id); } catch (e) {} return; }
-      pendingRecovery = { session: newest, blob: blob };
-      // At the cap the journal stopped mirroring mid-take: the recovery is real
-      // but PARTIAL — the banner must say so (a silently half-recovered note is
-      // the same wrong-text failure the journal exists to prevent).
-      showJournalRecover(newest, bufs.length >= JOURNAL_MAX_CHUNKS);
+      // EVERY recent saved recording comes back, newest first — not just the
+      // newest one (that deleted the earlier takes of a run of failures).
+      // Only one older than a shift, or past the count cap, is dropped.
+      const now = Date.now();
+      const found = [];
+      for (let i = 0; i < sessions.length; i++) {
+        const sess = sessions[i];
+        const at = Date.parse((sess && sess.createdAt) || "");
+        const keep = sess && sess.state === "recording" && isFinite(at) && now - at < RECOVERY_KEEP_MS && found.length < RECOVERY_KEEP_MAX;
+        if (keep) {
+          const rows = await jReq(db.transaction("chunks", "readonly").objectStore("chunks").index("sid").getAll(sess.id));
+          const bufs = (Array.isArray(rows) ? rows : []).map(function (r) { return r && r.buf; }).filter(Boolean);
+          const blob = bufs.length ? new Blob(bufs, { type: sess.mimeType || "audio/webm" }) : null;
+          // At the cap the journal stopped mirroring mid-take: the recovery is
+          // real but PARTIAL — the banner must say so (a silently half-recovered
+          // note is the same wrong-text failure the journal exists to prevent).
+          if (blob && blob.size >= 1024) { found.push({ session: sess, blob: blob, capped: bufs.length >= JOURNAL_MAX_CHUNKS }); continue; }
+        }
+        try { await journalClear(sess && sess.id); } catch (e) {}
+      }
+      if (!found.length) return;
+      pendingRecovery = found[0];
+      recoveryBacklog = found.slice(1);
+      showJournalRecover(found[0].session, found[0].capped);
     } catch (e) {}
   }
 
-  function showJournalRecover(session, capped) {
+  // How many more saved recordings wait behind the one the banner offers.
+  function recoveryMoreNote() {
+    var n = recoveryBacklog.length;
+    return n ? " " + n + " more saved recording" + (n === 1 ? "" : "s") + " after this one (newest first) — each one is a separate dictation." : "";
+  }
+
+  function recoveryWhen(rec) {
+    try { return rec && rec.session && rec.session.createdAt ? new Date(rec.session.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""; } catch (e) { return ""; }
+  }
+
+  // The banner's recording was retried or discarded: offer the next one, if
+  // any (silently — the outcome that got us here already had its cue).
+  function advanceRecovery() {
+    pendingRecovery = recoveryBacklog.length ? recoveryBacklog.shift() : null;
+    if (!pendingRecovery) { hideJournalRecover(); return; }
+    if (pendingRecovery.fromUpload) showUploadRecover(pendingRecovery.reason || "", Boolean(pendingRecovery.session && pendingRecovery.session.id), pendingRecovery);
+    else showJournalRecover(pendingRecovery.session, pendingRecovery.capped, true);
+  }
+
+  function showJournalRecover(session, capped, silent) {
     if (!journalRecoverEl) return;
     let when = "";
     try { when = new Date(session.createdAt).toLocaleString(); } catch (e) {}
     if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
       "⚠ A dictation" + (when ? " from " + when : "") + " was interrupted before it finished — its audio was saved. Recover it to transcribe + copy, or discard it." +
-      (capped ? " NOTE: only about the first " + Math.round(JOURNAL_MAX_CHUNKS / 60) + " minutes of audio were saved — the recovered text will be incomplete." : "");
+      (capped ? " NOTE: only about the first " + Math.round(JOURNAL_MAX_CHUNKS / 60) + " minutes of audio were saved — the recovered text will be incomplete." : "") +
+      recoveryMoreNote();
     if (journalRecoverBtn) journalRecoverBtn.textContent = "Recover the interrupted dictation";
     journalRecoverEl.style.display = "";
     updateRecoverChip();
-    warnBeep(); // loud: an un-recovered dictation is a potentially lost note
+    if (!silent) warnBeep(); // loud: an un-recovered dictation is a potentially lost note
   }
 
   function hideJournalRecover() {
@@ -3811,9 +3852,10 @@ right lower quadrant"></textarea>
     bigRecoverChipEl.style.display = "";
     bigRecoverChipEl.textContent = recovering
       ? "⏳ Retrying the saved recording…"
-      : pendingRecovery.fromUpload
+      : (pendingRecovery.fromUpload
         ? "⚠ Upload failed — recording SAVED. Tap to retry"
-        : "⚠ Interrupted dictation saved. Tap to recover";
+        : "⚠ Interrupted dictation saved. Tap to recover") +
+        (recoveryBacklog.length ? " (+" + recoveryBacklog.length + " more)" : "");
   }
 
   // RELIABILITY: a failed/timed-out UPLOAD used to cost the whole dictation —
@@ -3829,6 +3871,15 @@ right lower quadrant"></textarea>
   function armUploadRecovery(blob, reason) {
     try {
       if (!blob || blob.size < 1024) return false;
+      // A recording already waiting for its retry is NEVER dropped to make room:
+      // it moves behind this one (it is a different dictation, and the only copy).
+      if (pendingRecovery) {
+        recoveryBacklog.unshift(pendingRecovery);
+        while (recoveryBacklog.length > RECOVERY_KEEP_MAX - 1) {
+          const dropped = recoveryBacklog.pop();
+          try { if (dropped && dropped.session) journalClear(dropped.session.id).catch(function () {}); } catch (e) {}
+        }
+      }
       pendingRecovery = {
         session: {
           id: journalSessionId, // may be null (no IndexedDB) => this session only
@@ -3840,19 +3891,22 @@ right lower quadrant"></textarea>
         },
         blob: blob,
         fromUpload: true,
+        reason: reason || "",
       };
-      showUploadRecover(reason, Boolean(journalSessionId));
+      showUploadRecover(reason, Boolean(journalSessionId), pendingRecovery);
       return true;
     } catch (e) { return false; }
   }
 
-  function showUploadRecover(reason, persisted) {
+  function showUploadRecover(reason, persisted, rec) {
     if (!journalRecoverEl) return;
+    var when = recoveryWhen(rec);
     if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
-      "⚠ The transcription upload FAILED (" + (reason || "upload failed") + ") — but your RECORDING was saved. " +
+      "⚠ The transcription upload FAILED" + (when ? " for your " + when + " dictation" : "") + " (" + (reason || "upload failed") + ") — but your RECORDING was saved. " +
       "Retry the upload instead of redictating." +
       (persisted ? " It also survives a reload, so you can retry after relaunching the app." : "") +
-      (joinedSessionCode ? " A successful retry is sent to the desktop like any other dictation." : "");
+      (joinedSessionCode ? " A successful retry is sent to the desktop like any other dictation." : "") +
+      recoveryMoreNote();
     if (journalRecoverBtn) journalRecoverBtn.textContent = "Retry the upload";
     journalRecoverEl.style.display = "";
     updateRecoverChip();
@@ -3943,7 +3997,7 @@ right lower quadrant"></textarea>
     } catch (e) {}
     const copied = await copyText(latestText);
     try { await journalClear(rec.session.id); } catch (e) {}
-    hideJournalRecover();
+    advanceRecovery(); // the next saved recording, if any, takes the banner
     // On a JOINED phone the desktop clipboard is the deliverable, so a rescued
     // note has to travel the same road as any dictation: the normal queue + ack
     // path owns the cue (done on a listener ack, loud on zero listeners / a dead
@@ -3974,7 +4028,7 @@ right lower quadrant"></textarea>
 
   async function discardPendingDictation() {
     const rec = pendingRecovery;
-    hideJournalRecover();
+    advanceRecovery(); // only THIS recording goes; the next saved one takes the banner
     if (rec) { try { await journalClear(rec.session.id); } catch (e) {} }
     setStatus((rec && rec.fromUpload) ? "Saved recording discarded." : "Interrupted recording discarded.", "");
   }

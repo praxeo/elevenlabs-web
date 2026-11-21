@@ -246,6 +246,11 @@ export default {
       return new Response("Expected POST", { status: 400 });
     }
 
+    // Mistake / missed-word reports (stored in D1, read from any device).
+    if (url.pathname === "/api/report" || url.pathname === "/api/reports" || url.pathname.startsWith("/api/reports/")) {
+      return handleReports(request, env, url);
+    }
+
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Shared mode is on when both the master API key and a passphrase are set
       const sharedMode = Boolean(env && env.ELEVENLABS_API_KEY && env.APP_PASSPHRASE);
@@ -1322,6 +1327,101 @@ function sonioxToElevenShape(t, audioMs) {
   return out;
 }
 
+// ───── Mistake / missed-word reports (2026-11-21) ─────
+// A clinician flags a take ("it wrote X, I said Y", or any other problem). The
+// owner chose cloud storage ("reports to cloud") so reports from every device
+// land in one place and a maintainer can query them directly:
+//   wrangler d1 execute eleven-reports --remote --command "SELECT ..."
+// D1 database eleven-reports, binding REPORTS_DB (wrangler.toml). A report
+// carries the note's text, so: shared mode only, the access code (x-app-auth
+// header, constant-time) gates every verb, failed auth spends the same fail
+// budget as the phone link, rows older than REPORTS_RETAIN_MS are pruned on
+// every insert, and the Worker never logs a URL, header or body.
+const REPORT_MAX_BYTES  = 64 * 1024;
+const REPORTS_RETAIN_MS = 90 * 24 * 3600 * 1000; // 90 days
+const REPORTS_LIST_MAX  = 200;
+let reportsTableReady = false;
+
+async function ensureReportsTable(db) {
+  if (reportsTableReady) return;
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, kind TEXT NOT NULL, " +
+    "details TEXT, expected TEXT, note_text TEXT, note_created_at INTEGER, service TEXT, device TEXT, user_agent TEXT, timing TEXT)"
+  ).run();
+  await db.prepare("CREATE INDEX IF NOT EXISTS reports_created ON reports(created_at)").run();
+  reportsTableReady = true;
+}
+
+function reportStr(v, max) {
+  if (typeof v !== "string") return null;
+  const t = v.trim();
+  return t ? t.slice(0, max) : null;
+}
+
+async function handleReports(request, env, url) {
+  const pass = ((env && env.APP_PASSPHRASE) || "").trim();
+  if (!pass) return json({ error: "Reports need the shared access code, and this server has none." }, 403);
+  const ip = request.headers.get("cf-connecting-ip") || "?";
+  const given = String(request.headers.get("x-app-auth") || "").trim();
+  if (!given || !safeEqual(given, pass)) {
+    const bucket = linkRateBucket(ip);
+    bucket.fails++;
+    if (await overGlobalRateLimit(env && env.SESSION_FAIL_RL, ip) || bucket.fails > LINK_RL_FAILS_PER_IP) {
+      return rateLimited429();
+    }
+    return json({ error: "Invalid or missing access code." }, 401);
+  }
+  const db = env && env.REPORTS_DB;
+  if (!db || typeof db.prepare !== "function") {
+    return json({ error: "Report storage is not set up on the server." }, 503);
+  }
+  try {
+    await ensureReportsTable(db);
+    if (url.pathname === "/api/report" && request.method === "POST") {
+      const raw = await request.text();
+      if (raw.length > REPORT_MAX_BYTES) return json({ error: "Report too large." }, 413);
+      let r;
+      try { r = JSON.parse(raw); } catch { return json({ error: "Report is not valid JSON." }, 400); }
+      const details  = reportStr(r && r.details, 4000);
+      const expected = reportStr(r && r.expected, 200);
+      if (!details && !expected) return json({ error: "Say what went wrong (or the word it missed)." }, 400);
+      const now = Date.now();
+      const id = now.toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+      const kind = r.kind === "word" ? "word" : "problem";
+      const noteAt = Number(r.noteCreatedAt);
+      let timing = null;
+      try { if (r.timing && typeof r.timing === "object") timing = JSON.stringify(r.timing).slice(0, 4000); } catch {}
+      await db.prepare(
+        "INSERT INTO reports (id, created_at, kind, details, expected, note_text, note_created_at, service, device, user_agent, timing) " +
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+      ).bind(
+        id, now, kind, details, expected,
+        reportStr(r.noteText, 20000),
+        isFinite(noteAt) && noteAt > 0 ? Math.round(noteAt) : null,
+        reportStr(r.service, 40), reportStr(r.device, 40), reportStr(r.userAgent, 300), timing
+      ).run();
+      try { await db.prepare("DELETE FROM reports WHERE created_at < ?1").bind(now - REPORTS_RETAIN_MS).run(); } catch {}
+      return json({ ok: true, id });
+    }
+    if (url.pathname === "/api/reports" && request.method === "GET") {
+      const res = await db.prepare(
+        "SELECT id, created_at, kind, details, expected, note_text, note_created_at, service, device FROM reports " +
+        "ORDER BY created_at DESC LIMIT ?1"
+      ).bind(REPORTS_LIST_MAX).all();
+      return json({ reports: (res && res.results) || [] });
+    }
+    if (url.pathname.startsWith("/api/reports/") && request.method === "DELETE") {
+      const id = decodeURIComponent(url.pathname.slice("/api/reports/".length)).replace(/[^a-z0-9-]/gi, "");
+      if (!id) return json({ error: "Which report?" }, 400);
+      await db.prepare("DELETE FROM reports WHERE id = ?1").bind(id).run();
+      return json({ ok: true });
+    }
+    return json({ error: "Not found" }, 404);
+  } catch (e) {
+    return json({ error: "Report storage failed: " + String((e && e.message) || e).slice(0, 200) }, 500);
+  }
+}
+
 function safeEqual(a, b) {
   if (typeof a !== "string" || typeof b !== "string" || a.length !== b.length) return false;
   let out = 0;
@@ -1663,6 +1763,30 @@ const INDEX_HTML = `<!doctype html>
     #joinStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
     #joinStatus.ok { color: var(--ok); }
     #joinStatus.err { color: var(--danger); }
+    /* Report a mistake: same shape as the pairing cards, above the phone layout. */
+    #reportOverlay { display: none; position: fixed; inset: 0; z-index: 53;
+      background: rgba(10, 13, 16, 0.85); align-items: center; justify-content: center; padding: 16px; }
+    #reportOverlay.show { display: flex; }
+    #reportCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+      padding: 20px 22px; max-width: 440px; width: 100%; max-height: 92vh; overflow-y: auto; }
+    #reportTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin-bottom: 10px; }
+    #reportNote { font-size: 14px; color: var(--muted); border-left: 3px solid var(--line); padding: 2px 0 2px 10px;
+      max-height: 5.6em; overflow: auto; white-space: pre-wrap; }
+    #reportNote:empty { display: none; }
+    #reportDetails { min-height: 84px; }
+    #reportStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
+    #reportStatus.ok { color: var(--ok); }
+    #reportStatus.err { color: var(--danger); }
+    .report-actions { margin-top: 10px; }
+    /* The note's header: label left, a quiet text action right. */
+    .notehead { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .notehead .notelabel { margin-bottom: 6px; }
+    button.quietbtn { background: none; border: 0; padding: 2px 0; color: var(--muted); font-size: 12.5px; text-decoration: underline; text-underline-offset: 3px; }
+    button.quietbtn:hover { background: none; color: var(--accent); }
+    .report-item { border-top: 1px solid var(--line); padding: 10px 0; font-size: 13px; }
+    .report-meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+    .report-note { color: var(--muted); white-space: pre-wrap; margin-top: 4px; max-height: 4.4em; overflow: hidden; }
+    #reportsList > .row { margin-top: 8px; }
     /* Desktop indicator that the paired phone is actively dictating. */
     #phoneRecBadge.rec { color: var(--danger); }
     #phoneRecBadge.xcribe { color: var(--muted); }
@@ -1937,7 +2061,10 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
 
-      <label class="notelabel">Note <span id="appendChip" class="pill" style="display:none;"></span></label>
+      <div class="notehead">
+        <label class="notelabel">Note <span id="appendChip" class="pill" style="display:none;"></span></label>
+        <button id="reportBtn" class="quietbtn" title="Report a missed word or other mistake in this note">Report a mistake</button>
+      </div>
       <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
       <div class="row noteactions">
@@ -2129,6 +2256,13 @@ right lower quadrant"></textarea>
             <button id="clearTimingBtn" title="Clear the stored timing log for this device">Clear timing log</button>
           </div>
 
+          <label>Reports</label>
+          <div class="row">
+            <button id="reportProblemBtn" title="Report a problem that is not about one note">Report a problem</button>
+            <button id="showReportsBtn" title="Reports from every device, newest first">Show sent reports</button>
+          </div>
+          <div id="reportsList" style="display:none"></div>
+
           <label>Last recording</label>
           <audio id="audioPreview" controls></audio>
           <div class="row" style="margin-top: 8px;">
@@ -2241,6 +2375,30 @@ right lower quadrant"></textarea>
       <div class="row" style="justify-content: center; margin-top: 12px;">
         <button id="joinLeaveBtn" style="display:none;">Leave this desktop</button>
         <button id="joinCloseBtn">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Report a mistake (2026-11-21): a missed word or any other problem,
+       sent to the cloud log (D1 via /api/report) so reports from every device
+       are in one place. Not hidden under body.bigbtn (phone notes open it). -->
+  <div id="reportOverlay" role="dialog" aria-modal="true" aria-labelledby="reportTitle">
+    <div id="reportCard">
+      <div id="reportTitle">Report a mistake</div>
+      <div id="reportNote"></div>
+      <label for="reportExpected">The word it missed or got wrong <span class="hint">(optional)</span></label>
+      <input id="reportExpected" type="text" maxlength="60" autocomplete="off" spellcheck="false" placeholder="e.g. metoprolol" />
+      <label class="checkbox" id="reportVocabRow">
+        <input type="checkbox" id="reportAddVocab" checked />
+        <span>Add it to my vocabulary<small class="hint">So the next take gets it right. Vocabulary adds about 20% to the transcription cost.</small></span>
+      </label>
+      <label for="reportDetails">What went wrong?</label>
+      <textarea id="reportDetails" placeholder="e.g. I said “metoprolol”, it wrote “metro pole”."></textarea>
+      <div class="hint" id="reportPrivacy">The report and the note's text go to the app's cloud log for review, kept 90 days.</div>
+      <div id="reportStatus"></div>
+      <div class="row report-actions">
+        <button id="reportSendBtn" class="primary">Send report</button>
+        <button id="reportCancelBtn">Cancel</button>
       </div>
     </div>
   </div>
@@ -2396,6 +2554,21 @@ right lower quadrant"></textarea>
   const joinStatusEl     = document.getElementById("joinStatus");
   const joinLeaveBtnEl   = document.getElementById("joinLeaveBtn");
   const joinCloseBtnEl   = document.getElementById("joinCloseBtn");
+  // Report a mistake (cloud log)
+  const reportOverlayEl   = document.getElementById("reportOverlay");
+  const reportTitleEl     = document.getElementById("reportTitle");
+  const reportNoteEl      = document.getElementById("reportNote");
+  const reportExpectedEl  = document.getElementById("reportExpected");
+  const reportAddVocabEl  = document.getElementById("reportAddVocab");
+  const reportVocabRowEl  = document.getElementById("reportVocabRow");
+  const reportDetailsEl   = document.getElementById("reportDetails");
+  const reportStatusEl    = document.getElementById("reportStatus");
+  const reportSendBtnEl   = document.getElementById("reportSendBtn");
+  const reportCancelBtnEl = document.getElementById("reportCancelBtn");
+  const reportBtnEl       = document.getElementById("reportBtn");
+  const reportProblemBtnEl = document.getElementById("reportProblemBtn");
+  const showReportsBtnEl  = document.getElementById("showReportsBtn");
+  const reportsListEl     = document.getElementById("reportsList");
 
   // Mic-tips onboarding (keep other voices out)
   const micTipsEl        = document.getElementById("micTips");
@@ -4059,6 +4232,12 @@ right lower quadrant"></textarea>
       copy.onclick = () => copyText(text.textContent);
 
       row.append(copy);
+
+      const report = document.createElement("button");
+      report.textContent = "Report";
+      report.title = "Report a missed word or other mistake in this note";
+      report.onclick = () => openReport({ noteText: text.textContent, noteCreatedAt: item.createdAt, service: item.stt || "elevenlabs" });
+      row.append(report);
 
       // Joined: any past note can be pushed to the desktop clipboard — the
       // recovery for a note stranded by a link outage (even one that aged past
@@ -6798,6 +6977,226 @@ right lower quadrant"></textarea>
     if (joinCodeInputEl && !joinedSessionCode) { try { joinCodeInputEl.focus(); } catch (_) {} }
   }
 
+  /* ───── Report a mistake (2026-11-21, "reports to cloud") ─────
+     A missed word or any other problem goes to the Worker's /api/report, which
+     stores it in D1 (eleven-reports) so reports from every device are in one
+     place and can be queried directly. A report is NOT a dictation: it never
+     touches the status line, the clipboard or a beep, so the one-outcome rule
+     for takes is untouched. A missed word can also be added to this device's
+     vocabulary in the same step — that happens locally, before the upload, so
+     the fix does not depend on the network. Shared mode only (the access code
+     authorizes the write; a BYO-key device is told so). */
+  let reportCtx = null;   // { noteText, noteCreatedAt, service } or null for a general problem
+  let reportClosing = null;
+
+  function openReport(ctx) {
+    if (!reportOverlayEl) return;
+    if (reportClosing) { clearTimeout(reportClosing); reportClosing = null; }
+    reportCtx = ctx || null;
+    var hasNote = Boolean(reportCtx && reportCtx.noteText && reportCtx.noteText.trim());
+    if (reportTitleEl) reportTitleEl.textContent = hasNote ? "Report a mistake" : "Report a problem";
+    if (reportNoteEl) reportNoteEl.textContent = hasNote ? reportCtx.noteText.trim() : "";
+    if (reportExpectedEl) reportExpectedEl.value = "";
+    if (reportDetailsEl) reportDetailsEl.value = "";
+    if (reportAddVocabEl) reportAddVocabEl.checked = true;
+    if (reportStatusEl) { reportStatusEl.textContent = ""; reportStatusEl.className = ""; }
+    if (reportSendBtnEl) reportSendBtnEl.disabled = !SHARED_MODE;
+    if (!SHARED_MODE && reportStatusEl) {
+      reportStatusEl.textContent = "Reports need the shared access code; this device uses its own ElevenLabs key. A missed word can still be added to the vocabulary in Vocabulary.";
+      reportStatusEl.className = "err";
+    }
+    reportOverlayEl.classList.add("show");
+    try { (hasNote ? reportExpectedEl : reportDetailsEl).focus(); } catch (e) {}
+  }
+
+  function closeReport() {
+    if (reportClosing) { clearTimeout(reportClosing); reportClosing = null; }
+    if (reportOverlayEl) reportOverlayEl.classList.remove("show");
+    reportCtx = null;
+  }
+
+  // The note the box shows, with the history entry it came from when it is
+  // the newest one (that entry knows which service wrote it). An empty box
+  // reports the newest saved note instead; nothing at all = a general report.
+  function currentNoteForReport() {
+    var items = getHistory();
+    var newest = items[0] || null;
+    var boxText = (latestText || "").trim();
+    if (boxText) {
+      var match = newest && cleanTranscript(newest.text || "").trim() === cleanTranscript(boxText).trim() ? newest : null;
+      return { noteText: boxText, noteCreatedAt: match ? match.createdAt : null, service: match ? (match.stt || "elevenlabs") : "" };
+    }
+    if (newest && (newest.text || "").trim()) {
+      return { noteText: newest.text.trim(), noteCreatedAt: newest.createdAt, service: newest.stt || "elevenlabs" };
+    }
+    return null;
+  }
+
+  // The timing row of the take that wrote the note (the nearest within two
+  // minutes), trimmed to what helps a diagnosis. Durations and classes only.
+  function timingRowFor(createdAt) {
+    try {
+      var at = new Date(createdAt).getTime();
+      if (!isFinite(at)) return null;
+      var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+      var best = null, bestGap = 120000;
+      for (var i = 0; i < log.length; i++) {
+        var gap = Math.abs(new Date(log[i].at).getTime() - at);
+        if (isFinite(gap) && gap <= bestGap) { best = log[i]; bestGap = gap; }
+      }
+      if (!best) return null;
+      var keep = ["at", "outcome", "recMs", "total", "elMs", "kb", "keyterms", "diarize", "path", "primary", "provider", "fallback", "spk", "spkBy", "spkCut", "errKind"];
+      var out = {};
+      keep.forEach(function (k) { if (best[k] !== undefined) out[k] = best[k]; });
+      return out;
+    } catch (e) { return null; }
+  }
+
+  // Add one term to this device's custom vocabulary (once, case-insensitively).
+  function addVocabularyTerm(term) {
+    var t = String(term || "").replace(/\\s+/g, " ").trim().slice(0, 49);
+    if (!t || !keytermsEl) return false;
+    var lines = keytermsEl.value.split("\\n").map(function (l) { return l.trim(); }).filter(Boolean);
+    if (lines.some(function (l) { return l.toLowerCase() === t.toLowerCase(); })) return false;
+    lines.push(t);
+    keytermsEl.value = lines.join("\\n");
+    saveSettings();
+    try { updateKeytermHint(); } catch (e) {}
+    return true;
+  }
+
+  async function sendReport() {
+    if (!reportSendBtnEl || reportSendBtnEl.disabled) return;
+    var expected = (reportExpectedEl ? reportExpectedEl.value : "").trim();
+    var details = (reportDetailsEl ? reportDetailsEl.value : "").trim();
+    if (!expected && !details) {
+      reportStatusEl.textContent = "Say what went wrong, or type the word it missed.";
+      reportStatusEl.className = "err";
+      return;
+    }
+    var added = false;
+    if (expected && reportAddVocabEl && reportAddVocabEl.checked) added = addVocabularyTerm(expected);
+    var ctx = reportCtx || {};
+    var body = {
+      kind: expected ? "word" : "problem",
+      expected: expected,
+      details: details,
+      noteText: ctx.noteText || "",
+      noteCreatedAt: ctx.noteCreatedAt ? new Date(ctx.noteCreatedAt).getTime() : null,
+      service: ctx.service || "",
+      device: bigButtonActive() ? "phone" : "desktop",
+      userAgent: (navigator.userAgent || "").slice(0, 300),
+      timing: ctx.noteCreatedAt ? timingRowFor(ctx.noteCreatedAt) : null,
+    };
+    reportSendBtnEl.disabled = true;
+    reportStatusEl.textContent = "Sending…";
+    reportStatusEl.className = "";
+    var ctrl = new AbortController();
+    var timer = setTimeout(function () { ctrl.abort(); }, 15000);
+    try {
+      var r = await fetch("/api/report", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-app-auth": passphraseEl.value.trim() },
+        body: JSON.stringify(body),
+        signal: ctrl.signal,
+      });
+      var j = {};
+      try { j = JSON.parse(await r.text()); } catch (e) {}
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      reportStatusEl.textContent = "Report sent." + (added ? " “" + expected + "” is now in your vocabulary." : "");
+      reportStatusEl.className = "ok";
+      reportClosing = setTimeout(closeReport, 1600);
+    } catch (e) {
+      var why = (e && e.name === "AbortError") ? "no answer in 15 s" : String((e && e.message) || e);
+      reportStatusEl.textContent = "Not sent (" + why + "). Your text is still here, so try again." +
+        (added ? " “" + expected + "” was added to your vocabulary." : "");
+      reportStatusEl.className = "err";
+    } finally {
+      clearTimeout(timer);
+      reportSendBtnEl.disabled = !SHARED_MODE;
+    }
+  }
+
+  function reportAsText(r) {
+    return new Date(r.created_at).toLocaleString() + " · " + (r.kind === "word" ? "missed word" : "problem") +
+      (r.service ? " · " + r.service : "") + (r.device ? " · " + r.device : "") + "\\n" +
+      (r.expected ? "Word: " + r.expected + "\\n" : "") +
+      (r.details ? "What went wrong: " + r.details + "\\n" : "") +
+      (r.note_text ? "Note: " + r.note_text + "\\n" : "");
+  }
+
+  async function showReports() {
+    if (!reportsListEl) return;
+    if (reportsListEl.style.display !== "none") {
+      reportsListEl.style.display = "none";
+      if (showReportsBtnEl) showReportsBtnEl.textContent = "Show sent reports";
+      return;
+    }
+    reportsListEl.style.display = "";
+    if (showReportsBtnEl) showReportsBtnEl.textContent = "Hide reports";
+    if (!SHARED_MODE) { reportsListEl.innerHTML = '<div class="hint">Reports need the shared access code.</div>'; return; }
+    reportsListEl.innerHTML = '<div class="hint">Loading…</div>';
+    try {
+      var r = await fetch("/api/reports", { headers: { "x-app-auth": passphraseEl.value.trim() } });
+      var j = {};
+      try { j = JSON.parse(await r.text()); } catch (e) {}
+      if (!r.ok) throw new Error((j && j.error) || ("HTTP " + r.status));
+      renderReports(j.reports || []);
+    } catch (e) {
+      reportsListEl.innerHTML = "";
+      var err = document.createElement("div");
+      err.className = "status err";
+      err.textContent = "Could not load reports (" + String((e && e.message) || e) + ").";
+      reportsListEl.append(err);
+    }
+  }
+
+  function renderReports(list) {
+    reportsListEl.innerHTML = "";
+    if (!list.length) { reportsListEl.innerHTML = '<div class="hint">No reports yet.</div>'; return; }
+    var top = document.createElement("div");
+    top.className = "row";
+    var all = document.createElement("button");
+    all.textContent = "Copy all " + list.length;
+    all.title = "Copy every report as text, to paste where it will be fixed";
+    all.onclick = function () { copyText(list.map(reportAsText).join("\\n")); };
+    top.append(all);
+    reportsListEl.append(top);
+    list.forEach(function (rep) {
+      var item = document.createElement("div");
+      item.className = "report-item";
+      var meta = document.createElement("div");
+      meta.className = "report-meta";
+      meta.textContent = new Date(rep.created_at).toLocaleString() + " · " + (rep.kind === "word" ? "missed word" : "problem") +
+        (rep.service ? " · " + rep.service : "") + (rep.device ? " · " + rep.device : "");
+      var body = document.createElement("div");
+      body.textContent = (rep.expected ? "“" + rep.expected + "”" + (rep.details ? ": " : "") : "") + (rep.details || "");
+      item.append(meta, body);
+      if (rep.note_text) {
+        var note = document.createElement("div");
+        note.className = "report-note";
+        note.textContent = rep.note_text;
+        item.append(note);
+      }
+      var row = document.createElement("div");
+      row.className = "row";
+      row.style.marginTop = "6px";
+      var del = document.createElement("button");
+      del.textContent = "Delete";
+      del.onclick = async function () {
+        del.disabled = true;
+        try {
+          var r = await fetch("/api/reports/" + encodeURIComponent(rep.id), { method: "DELETE", headers: { "x-app-auth": passphraseEl.value.trim() } });
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          item.remove();
+        } catch (e) { del.disabled = false; del.textContent = "Delete failed, retry"; }
+      };
+      row.append(del);
+      item.append(row);
+      reportsListEl.append(item);
+    });
+  }
+
   function closeJoinOverlay() {
     if (joinOverlayEl) joinOverlayEl.classList.remove("show");
   }
@@ -8205,6 +8604,12 @@ right lower quadrant"></textarea>
       send.onclick = function () { sendPhoneNote(id); };
       actions.append(send);
     }
+    var rep = document.createElement("button");
+    rep.className = "bnote-report";
+    rep.textContent = "Report";
+    rep.title = "Report a missed word or other mistake in this note";
+    rep.onclick = function () { if (!sessionBusy()) openReport({ noteText: text.textContent, noteCreatedAt: item.createdAt, service: item.stt || "elevenlabs" }); };
+    actions.append(rep);
     var del = document.createElement("button");
     del.className = "bnote-del" + (pendingDeleteId === id ? " confirm" : "");
     del.textContent = pendingDeleteId === id ? "Delete?" : "🗑";
@@ -8739,6 +9144,16 @@ right lower quadrant"></textarea>
   };
   if (joinCodeInputEl) joinCodeInputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && joinGoBtnEl) { e.preventDefault(); joinGoBtnEl.click(); } });
   if (joinCloseBtnEl) joinCloseBtnEl.onclick = () => closeJoinOverlay();
+  if (reportBtnEl) reportBtnEl.onclick = () => openReport(currentNoteForReport());
+  if (reportProblemBtnEl) reportProblemBtnEl.onclick = () => openReport(null);
+  if (showReportsBtnEl) showReportsBtnEl.onclick = () => { showReports(); };
+  if (reportSendBtnEl) reportSendBtnEl.onclick = () => { sendReport(); };
+  if (reportCancelBtnEl) reportCancelBtnEl.onclick = () => closeReport();
+  if (reportOverlayEl) reportOverlayEl.addEventListener("keydown", (e) => { if (e.key === "Escape") closeReport(); });
+  if (reportExpectedEl) reportExpectedEl.addEventListener("input", () => {
+    // The vocabulary choice only means something once a word is typed.
+    if (reportVocabRowEl) reportVocabRowEl.style.opacity = reportExpectedEl.value.trim() ? "1" : "0.55";
+  });
   if (joinLeaveBtnEl) joinLeaveBtnEl.onclick = () => { leaveDesktopSession(); closeJoinOverlay(); };
   // Tapping the dark backdrop closes the card (nothing is lost — a join persists).
   if (joinOverlayEl) joinOverlayEl.addEventListener("click", (e) => { if (e.target === joinOverlayEl) closeJoinOverlay(); });

@@ -55,3 +55,12 @@ simple = { limit = 600, period = 60 }
 name = "SESSION_FAIL_RL"
 namespace_id = "1002"
 simple = { limit = 20, period = 60 }
+
+# Mistake / missed-word reports (2026-11-21): D1 database "eleven-reports".
+# Read them with: npx -y wrangler@4 d1 execute eleven-reports --remote \
+#   --command "SELECT created_at, kind, expected, details, service FROM reports ORDER BY created_at DESC LIMIT 20"
+# Rows hold note text (PHI): kept 90 days, pruned on every insert.
+[[d1_databases]]
+binding = "REPORTS_DB"
+database_name = "eleven-reports"
+database_id = "9e654567-1706-4fb7-9fb7-e3f51e8cefec"

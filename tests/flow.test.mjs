@@ -7114,5 +7114,189 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   C.dom.window.close();
 }
 
+// ===== Scenario 59: report a mistake (cloud log, 2026-11-21) =====
+// A missed word or other problem goes to /api/report -> D1 (eleven-reports).
+// Server: shared mode only, the access code gates every verb, nothing is
+// written without it, empty / oversized reports are refused, the list is
+// newest first, delete works, and a deploy without the D1 binding says so.
+// Client: the note's Report opens the box with the note, an empty report is
+// refused locally, a missed word is added to the vocabulary before the upload,
+// the POST carries the access code + the note + which service wrote it, a
+// failed send keeps the text and says so, a report never touches the take's
+// status line, history rows open it too, the sent list loads, and a BYO-key
+// device is told reports need the shared access code.
+console.log('--- scenario 59: report a mistake ---');
+{
+  const mkD1 = () => {
+    const db = { rows: [], calls: [] };
+    db.prepare = (sql) => {
+      const st = { sql, args: [] };
+      st.bind = (...a) => { st.args = a; return st; };
+      st.run = async () => {
+        db.calls.push(sql);
+        if (/^INSERT INTO reports/.test(sql)) {
+          const [id, created_at, kind, details, expected, note_text, note_created_at, service, device, user_agent, timing] = st.args;
+          db.rows.push({ id, created_at, kind, details, expected, note_text, note_created_at, service, device, user_agent, timing });
+        } else if (/^DELETE FROM reports WHERE id/.test(sql)) {
+          db.rows = db.rows.filter((r) => r.id !== st.args[0]);
+        } else if (/^DELETE FROM reports WHERE created_at/.test(sql)) {
+          db.rows = db.rows.filter((r) => r.created_at >= st.args[0]);
+        }
+        return { success: true };
+      };
+      st.all = async () => ({ results: [...db.rows].sort((a, b) => b.created_at - a.created_at).slice(0, st.args[0] || 200) });
+      return st;
+    };
+    return db;
+  };
+  const db59 = mkD1();
+  const env59 = { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame', REPORTS_DB: db59 };
+  const post59 = (body, auth) => worker.default.fetch(new Request('https://dictation.test/api/report', {
+    method: 'POST', headers: Object.assign({ 'content-type': 'application/json' }, auth ? { 'x-app-auth': auth } : {}), body: typeof body === 'string' ? body : JSON.stringify(body),
+  }), env59);
+
+  let r = await post59({ details: 'x' }, '');
+  check('s59: no access code -> 401, nothing written', r.status === 401 && db59.rows.length === 0, r.status);
+  r = await post59({ details: 'x' }, 'wrong');
+  check('s59: a wrong access code -> 401', r.status === 401 && db59.rows.length === 0, r.status);
+  r = await post59({ details: '  ', expected: '' }, 'sesame');
+  check('s59: an empty report is refused (400)', r.status === 400 && db59.rows.length === 0, r.status);
+  r = await post59('x'.repeat(70 * 1024), 'sesame');
+  check('s59: an oversized report is refused (413)', r.status === 413, r.status);
+  r = await post59({ kind: 'word', expected: 'metoprolol', details: 'wrote metro pole', noteText: 'Start metro pole 25 mg.', noteCreatedAt: 1700000000000, service: 'elevenlabs', device: 'desktop', timing: { elMs: 400 } }, 'sesame');
+  const j59 = await r.json();
+  check('s59: a good report is stored', r.status === 200 && j59.ok && db59.rows.length === 1, r.status + ' ' + JSON.stringify(j59));
+  const row59 = db59.rows[0] || {};
+  check('s59: the row keeps the word, the details, the note and who wrote it',
+    row59.kind === 'word' && row59.expected === 'metoprolol' && row59.details === 'wrote metro pole' && row59.note_text === 'Start metro pole 25 mg.' &&
+    row59.service === 'elevenlabs' && row59.note_created_at === 1700000000000 && row59.timing === '{"elMs":400}', JSON.stringify(row59));
+  check('s59: the table is created if missing and old rows are pruned', db59.calls.some((c) => /CREATE TABLE IF NOT EXISTS reports/.test(c)) && db59.calls.some((c) => /DELETE FROM reports WHERE created_at/.test(c)));
+  await post59({ details: 'the second one' }, 'sesame');
+  r = await worker.default.fetch(new Request('https://dictation.test/api/reports', { headers: { 'x-app-auth': 'sesame' } }), env59);
+  const list59 = (await r.json()).reports || [];
+  check('s59: the list comes back newest first', r.status === 200 && list59.length === 2 && list59[0].created_at >= list59[1].created_at, JSON.stringify(list59.map((x) => x.details)));
+  r = await worker.default.fetch(new Request('https://dictation.test/api/reports'), env59);
+  check('s59: listing without the access code -> 401', r.status === 401, r.status);
+  r = await worker.default.fetch(new Request('https://dictation.test/api/reports/' + row59.id, { method: 'DELETE', headers: { 'x-app-auth': 'sesame' } }), env59);
+  check('s59: delete removes that report', r.status === 200 && db59.rows.length === 1 && !db59.rows.some((x) => x.id === row59.id), db59.rows.length);
+  r = await worker.default.fetch(new Request('https://dictation.test/api/report', { method: 'POST', headers: { 'x-app-auth': 'sesame' }, body: '{"details":"x"}' }), { ELEVENLABS_API_KEY: 'k', APP_PASSPHRASE: 'sesame' });
+  check('s59: no D1 binding -> 503 that says storage is not set up', r.status === 503 && /not set up/.test((await r.json()).error), r.status);
+  r = await worker.default.fetch(new Request('https://dictation.test/api/report', { method: 'POST', body: '{"details":"x"}' }), { REPORTS_DB: mkD1() });
+  check('s59: a deploy with no access code refuses reports (403)', r.status === 403, r.status);
+
+  // ── the client ──
+  const html59 = await (await worker.default.fetch(new Request('https://dictation.test/'), { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame' })).text();
+  const fetch59 = [];
+  let reply59 = { status: 200, body: { ok: true, id: 'r1' } };
+  const dom59 = new JSDOM(html59, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.navigator.clipboard = { writeText: (t) => { win._clip = t; return Promise.resolve(); } };
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.MediaRecorder = class { constructor() { this.state = 'inactive'; } static isTypeSupported() { return false; } start() { this.state = 'recording'; } stop() { this.state = 'inactive'; if (this.onstop) this.onstop(); } };
+      win.fetch = (url, opts) => {
+        fetch59.push({ url: String(url), opts: opts || {} });
+        if (String(url).includes('/api/reports') && !(opts && opts.method === 'DELETE')) {
+          return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify({ reports: [
+            { id: 'a', created_at: Date.now(), kind: 'word', expected: 'metoprolol', details: 'wrote metro pole', note_text: 'Start metro pole.', service: 'elevenlabs', device: 'desktop' }] })) });
+        }
+        const rep = reply59;
+        return Promise.resolve({ ok: rep.status >= 200 && rep.status < 300, status: rep.status, text: () => Promise.resolve(JSON.stringify(rep.body)) });
+      };
+      win.localStorage.setItem('scribe_v2_passphrase_v9', 'sesame');
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, historyVisible: true }));
+      win.localStorage.setItem('scribe_v2_transcripts_v9', JSON.stringify([
+        { text: 'Start metro pole 25 mg twice daily. ', createdAt: new Date(Date.now() - 30000).toISOString(), engine: 'batch' },
+        { text: 'Older note about the knee. ', createdAt: new Date(Date.now() - 900000).toISOString(), engine: 'batch', stt: 'soniox' }]));
+    },
+  });
+  await sleep(200);
+  const d59 = dom59.window.document;
+  const ov59 = () => d59.getElementById('reportOverlay').classList.contains('show');
+  const rs59 = () => d59.getElementById('reportStatus').textContent;
+  const statusBefore = d59.getElementById('status').textContent;
+
+  d59.getElementById('reportBtn').click();
+  check('s59: the note\'s Report opens the box', ov59());
+  check('s59: the box shows the note it is about', d59.getElementById('reportNote').textContent.includes('metro pole'), d59.getElementById('reportNote').textContent);
+  check('s59: the box is enabled in shared mode', !d59.getElementById('reportSendBtn').disabled);
+
+  const n0 = fetch59.length;
+  d59.getElementById('reportSendBtn').click();
+  await sleep(30);
+  check('s59: an empty report is refused before any upload', fetch59.length === n0 && /Say what went wrong/.test(rs59()), rs59());
+
+  d59.getElementById('reportExpected').value = 'metoprolol';
+  d59.getElementById('reportDetails').value = 'I said metoprolol';
+  d59.getElementById('reportSendBtn').click();
+  await sleep(60);
+  const call59 = fetch59.filter((c) => c.url.endsWith('/api/report')).pop();
+  const sent59 = call59 ? JSON.parse(call59.opts.body) : {};
+  check('s59: the report is POSTed to /api/report with the access code in a header',
+    !!call59 && call59.opts.method === 'POST' && call59.opts.headers['x-app-auth'] === 'sesame' && !call59.url.includes('sesame'), call59 && JSON.stringify(call59.opts.headers));
+  check('s59: it carries the word, the details, the note, the device and who wrote it',
+    sent59.kind === 'word' && sent59.expected === 'metoprolol' && sent59.details === 'I said metoprolol' &&
+    /metro pole/.test(sent59.noteText) && sent59.device === 'desktop' && sent59.service === 'elevenlabs' && typeof sent59.noteCreatedAt === 'number', JSON.stringify(sent59).slice(0, 200));
+  check('s59: the missed word is added to the vocabulary', d59.getElementById('keyterms').value.split('\n').includes('metoprolol'), d59.getElementById('keyterms').value);
+  check('s59: success is said in the box', /Report sent/.test(rs59()) && /vocabulary/.test(rs59()), rs59());
+  check('s59: a report never touches the take\'s status line', d59.getElementById('status').textContent === statusBefore, d59.getElementById('status').textContent);
+  await sleep(1700);
+  check('s59: the box closes itself after a sent report', !ov59());
+
+  // A failed send keeps the text and says so; the vocabulary is not doubled.
+  reply59 = { status: 500, body: { error: 'Report storage failed: D1 down' } };
+  d59.getElementById('reportBtn').click();
+  d59.getElementById('reportExpected').value = 'Metoprolol';
+  d59.getElementById('reportDetails').value = 'again';
+  d59.getElementById('reportSendBtn').click();
+  await sleep(60);
+  check('s59: a failed send is said in red, naming the reason', /Not sent/.test(rs59()) && /D1 down/.test(rs59()) && d59.getElementById('reportStatus').className === 'err', rs59());
+  check('s59: ...the box stays open with the text kept', ov59() && d59.getElementById('reportDetails').value === 'again');
+  check('s59: the same word is not added to the vocabulary twice', d59.getElementById('keyterms').value.split('\n').filter((l) => l.toLowerCase() === 'metoprolol').length === 1, d59.getElementById('keyterms').value);
+  d59.getElementById('reportCancelBtn').click();
+  check('s59: Cancel closes the box', !ov59());
+
+  // History rows open it too, with that row's note and service.
+  const rows59 = [...d59.querySelectorAll('#history .history-item')];
+  const repBtn = rows59[1] && [...rows59[1].querySelectorAll('button')].find((b) => b.textContent === 'Report');
+  check('s59: each history row has a Report button', !!repBtn);
+  if (repBtn) repBtn.click();
+  check('s59: a history row reports ITS note', ov59() && d59.getElementById('reportNote').textContent.includes('knee'), d59.getElementById('reportNote').textContent);
+  reply59 = { status: 200, body: { ok: true, id: 'r2' } };
+  d59.getElementById('reportDetails').value = 'missed a word';
+  d59.getElementById('reportSendBtn').click();
+  await sleep(60);
+  const sent59b = JSON.parse((fetch59.filter((c) => c.url.endsWith('/api/report')).pop() || { opts: { body: '{}' } }).opts.body);
+  check('s59: a row\'s report names the service that wrote it (Soniox) and is a "problem" without a word', sent59b.service === 'soniox' && sent59b.kind === 'problem', JSON.stringify(sent59b).slice(0, 160));
+  await sleep(1700);
+
+  // The sent list.
+  d59.getElementById('showReportsBtn').click();
+  await sleep(60);
+  check('s59: Show sent reports loads the list with the access code', fetch59.some((c) => c.url.endsWith('/api/reports') && c.opts.headers && c.opts.headers['x-app-auth'] === 'sesame'));
+  check('s59: the list shows each report', d59.querySelectorAll('#reportsList .report-item').length === 1 && d59.getElementById('reportsList').textContent.includes('metoprolol'), d59.getElementById('reportsList').textContent.slice(0, 120));
+  dom59.window.close();
+
+  // A BYO-key device (no shared mode) is told reports need the access code.
+  const dom59b = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+      win.navigator.mediaDevices = { getUserMedia: () => Promise.resolve(mockStream), addEventListener: () => {} };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{}') });
+    },
+  });
+  await sleep(150);
+  const d59b = dom59b.window.document;
+  d59b.getElementById('reportProblemBtn').click();
+  check('s59: on a BYO-key device the box opens as a general problem report', d59b.getElementById('reportOverlay').classList.contains('show') && d59b.getElementById('reportTitle').textContent === 'Report a problem');
+  check('s59: ...with Send disabled and the reason said', d59b.getElementById('reportSendBtn').disabled && /shared access code/.test(d59b.getElementById('reportStatus').textContent), d59b.getElementById('reportStatus').textContent);
+  dom59b.window.close();
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

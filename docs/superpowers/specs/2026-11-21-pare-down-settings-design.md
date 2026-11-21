@@ -82,3 +82,39 @@ Also removed:
   - the speaker-filter text about the desktop single-speaker default
   - the tuning table rows
 - README (settings and Roadmap) in the same change.
+
+## Visual design (added 2026-11-21: "lets make it functional and beautiful")
+
+A bedside monitor, because the job is the same: state readable at a glance from the corner of an eye, beside Cerner, on a machine with no speakers.
+
+**Tokens**
+
+| Token | Value | Use |
+|---|---|---|
+| bezel | `#1a1f24` | background |
+| raised surface | `#232a31` | overlay cards, phone notes |
+| glass | `#12161a` | the note, inputs, the trace |
+| text | `#e8edef` | body text |
+| secondary | `#8e99a1` | labels and hints |
+| green | `#5fe08f` | the live trace, done |
+| amber | `#f2b640` | working, check |
+| red | `#ff5b52` | recording, failure |
+| cyan | `#5cc6e6` | anything you can act on |
+
+**Type.** Readouts (the record band, the timer, section names) use Bahnschrift on Windows and DIN Alternate on Apple. Both ship with the system, so nothing is downloaded; a hospital machine may block font CDNs. The note and the hints use the system UI face.
+
+**The one bold element** is the record band:
+- idle: graphite with a red dot
+- recording: solid red with a stop square
+- uploading: amber outline
+- failed: red outline
+
+While a take runs, a green trace sweeps across a faint grid under the band, like a monitor lead, with a large timer.
+
+**Everything else is quiet:**
+- one column, with settings as plain rows behind hairlines and a turning chevron (no boxed cards)
+- sentence-case labels
+- one-line hints
+- the window-wide state wash is unchanged
+
+**Rejected in self-review:** keeping the two bordered cards and only recolouring them. That is the generic dashboard kit, and it would have looked like any other settings page.

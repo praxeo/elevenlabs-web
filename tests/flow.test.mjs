@@ -463,7 +463,7 @@ fetchQueue.push({ status: 200, body: { text: 'Batch note dictated.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
 check('batch recording started', doc.getElementById('recordBtn').textContent.includes('Stop'));
-check('batch status mentions upload-on-release', status().includes('release to upload'), status());
+check('batch status says recording and that stopping transcribes (works for tap and hold)', status().includes('Recording') && status().includes('transcribed'), status());
 doc.getElementById('recordBtn').click(); // stop -> recorder flush -> upload
 await sleep(300);
 check('no WebSocket opened in batch mode', sockets.length === sCountBatch, sockets.length - sCountBatch);
@@ -542,16 +542,17 @@ check('Append-next button shows the active state', doc.getElementById('appendTog
 doc.getElementById('appendToggleBtn').click(); // second click cancels
 check('second click disarms', doc.getElementById('appendChip').style.display === 'none');
 
-// Clicking into the box arms append too (focus handler), so the box lighting up
-// and "next dictation appends" are the same gesture.
+// Clicking into the box is for EDITING only (2026-11-21). It used to arm
+// append as well, and a browser re-fires focus on the box whenever the window
+// comes back to the front, so append switched itself on: "it both auto
+// appends and deletes my old text". Append is only ever the button or the
+// append-mode checkbox now.
 doc.getElementById('latest').dispatchEvent(new w.Event('focus', { bubbles: false }));
-check('focusing the box arms append',
-  doc.getElementById('appendChip').style.display !== 'none' &&
-  doc.getElementById('latest').className.includes('armed') &&
-  doc.getElementById('appendToggleBtn').className.includes('active'),
+check('focusing the box does NOT arm append',
+  doc.getElementById('appendChip').style.display === 'none' &&
+  !doc.getElementById('latest').className.includes('armed') &&
+  !doc.getElementById('appendToggleBtn').className.includes('active'),
   doc.getElementById('appendChip').textContent);
-doc.getElementById('appendToggleBtn').click(); // disarm to reset state
-check('box focus-arm can be cancelled by the button', doc.getElementById('appendChip').style.display === 'none');
 
 doc.getElementById('appendToggleBtn').click(); // re-arm for the real run
 
@@ -1041,6 +1042,12 @@ console.log('--- scenario 20: phone link resilience ---');
   sockB.msg({ message_type: 'phone_delivery', text: 'Fresh replace.', delivery_id: 'd6' });
   await sleep(40);
   check('s20: append mode off => delivery replaces', (w20._clip || '').includes('Fresh replace.') && !(w20._clip || '').includes('Plus one.'), JSON.stringify(w20._clip));
+  // ...and the note it replaced is NOT just gone from view: like a take
+  // dictated here, it moves into "Last dictation" (2026-11-21: "it deletes my
+  // old text").
+  check('s20: a replacing phone delivery files the old note into Last dictation',
+    doc20.getElementById('lastDictation').style.display !== 'none' && doc20.getElementById('lastDictationText').textContent.includes('Plus one.'),
+    doc20.getElementById('lastDictation').style.display + ' | ' + doc20.getElementById('lastDictationText').textContent);
 
   // End session: everything closes and stays closed (no reconnect loop)
   doc20.getElementById('phoneStopBtn').click();
@@ -5583,7 +5590,9 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   await sleep(250);
   check('s52a: a paired phone boots into the notes layout', A.doc.body.classList.contains('bigbtn'), A.doc.body.className);
   check('s52a: no notes yet -> an empty-list hint, not a blank screen', !!A.doc.getElementById('bigNotesEmpty'));
-  check('s52a: the floating button reads HOLD', A.doc.getElementById('bigBtn').textContent === 'HOLD', A.doc.getElementById('bigBtn').textContent);
+  // The button is an icon since 2026-11-21 ("it says HOLD. The button is
+  // weird"): its mode is data-mode, its words are aria-label.
+  check('s52a: the floating button is a record icon (no word on it)', A.doc.getElementById('bigBtn').getAttribute('data-mode') === 'record' && A.doc.getElementById('bigBtn').textContent === '' && /tap to start and stop/.test(A.doc.getElementById('bigBtn').getAttribute('aria-label')), A.doc.getElementById('bigBtn').getAttribute('data-mode') + ' | ' + A.doc.getElementById('bigBtn').textContent);
   check('s52a: paired -> the "Each take" mode row shows, Send is on', A.doc.getElementById('bigModeRow').style.display !== 'none' && A.doc.getElementById('bigModeSendBtn').classList.contains('on'));
   await take52(A, 'First note.');
   check('s52a: the take became the first note card', cards(A).length === 1 && cardText(cards(A)[0]) === 'First note. ', JSON.stringify(cardText(cards(A)[0])));
@@ -5595,7 +5604,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   // --- 52b: "Add to this" — the next take extends THAT note, on the phone ---
   cards(A)[0].querySelector('.bnote-add').click();
   check('s52b: arming shows the target bar', A.doc.getElementById('bigTargetBar').style.display !== 'none' && A.doc.getElementById('bigTargetText').textContent.includes('First note.'), A.doc.getElementById('bigTargetText').textContent);
-  check('s52b: the floating button reads ADD', A.doc.getElementById('bigBtn').textContent === 'ADD', A.doc.getElementById('bigBtn').textContent);
+  check('s52b: the floating button shows the add badge', A.doc.getElementById('bigBtn').getAttribute('data-mode') === 'add', A.doc.getElementById('bigBtn').getAttribute('data-mode'));
   check('s52b: the targeted card is highlighted', cards(A)[0].classList.contains('target'));
   const delivB = deliveries52(A).length, pingB = posts(A, 'phone_recording').length, vibB = A.vibes.length;
   await take52(A, 'Added words.');
@@ -5606,7 +5615,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   check('s52b: it is a success that reads SAVED, not DONE', A.doc.getElementById('status').className.includes('ok') && A.doc.getElementById('bigState').textContent === 'SAVED', A.doc.getElementById('bigState').textContent);
   check('s52b: exactly one outcome cue, the done cue', outcomes52(A.vibes.slice(vibB)).length === 1 && JSON.stringify(outcomes52(A.vibes.slice(vibB))[0]) === DONE52, JSON.stringify(A.vibes.slice(vibB)));
   check('s52b: the grown note reads "New words not sent"', cardTag(cards(A)[0]).includes('New words not sent'), cardTag(cards(A)[0]));
-  check('s52b: the arm is one-shot (button back to HOLD, bar gone)', A.doc.getElementById('bigBtn').textContent === 'HOLD' && A.doc.getElementById('bigTargetBar').style.display === 'none');
+  check('s52b: the arm is one-shot (button back to record, bar gone)', A.doc.getElementById('bigBtn').getAttribute('data-mode') === 'record' && A.doc.getElementById('bigTargetBar').style.display === 'none');
   check('s52b: the not-sent reminder counts it', A.doc.getElementById('bigSelBar').style.display !== 'none' && A.doc.getElementById('bigSelInfo').textContent.includes('1 note not sent'), A.doc.getElementById('bigSelInfo').textContent);
 
   // --- 52c: Send on a GROWN note sends only its new words -------------------
@@ -5702,7 +5711,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   cards(A)[0].querySelector('.bnote-del').click();
   cards(A)[0].querySelector('.bnote-del').click();
   cards(A)[0].querySelector('.bnote-add').click();
-  check('s52f: Delete / Add are ignored mid-take', hist52(A).length === nF && A.doc.getElementById('bigBtn').textContent === 'STOP', hist52(A).length + ' / ' + A.doc.getElementById('bigBtn').textContent);
+  check('s52f: Delete / Add are ignored mid-take', hist52(A).length === nF && A.doc.getElementById('bigBtn').getAttribute('data-mode') === 'stop', hist52(A).length + ' / ' + A.doc.getElementById('bigBtn').getAttribute('data-mode'));
   await sleep(400);
   pev52(A, A.doc.getElementById('bigBtn'), 'pointerup', idF);
   await sleep(450);

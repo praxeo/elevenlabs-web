@@ -1803,15 +1803,15 @@ const INDEX_HTML = `<!doctype html>
     #micTips { display: none; position: fixed; inset: 0; z-index: 60;
       background: rgba(10, 13, 16, 0.85); align-items: center; justify-content: center; padding: 16px; }
     #micTips.show { display: flex; }
-    #micTipsCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
+    #micTipsCard { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
       padding: 22px; max-width: 380px; width: 100%; max-height: 86vh; overflow-y: auto; }
-    #micTipsTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin-bottom: 6px; }
-    #micTipsLede { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
-    #micTipsCard .mt-h { font-size: 13px; color: var(--accent); font-weight: 600; margin: 14px 0 6px; }
+    #micTipsCloseBtn { position: absolute; top: 10px; right: 10px; width: 36px; height: 36px; padding: 0;
+      border-radius: 50%; background: transparent; color: var(--muted); font-size: 18px; line-height: 1; }
+    #micTipsCloseBtn:hover { color: var(--text); background: var(--raised); }
+    #micTipsTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin: 0 40px 10px 0; }
     #micTipsCard ol, #micTipsCard ul { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.55; }
     #micTipsCard li { margin: 5px 0; }
     #micTipsCard .mt-key { color: var(--text); font-weight: 600; }
-    #micTipsCard .mt-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
     /* [UI] Window-wide state cue for a shrunk PWA window on a machine with no
        speakers. "full" repaints the whole window so any visible sliver of it
        reads at a glance; "border" draws an edge frame only; "off" disables it.
@@ -1980,12 +1980,33 @@ const INDEX_HTML = `<!doctype html>
     #bigBtn {
       position: fixed; left: 50%; transform: translateX(-50%); z-index: 42;
       bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
-      width: 86px; height: 86px; border-radius: 50%; padding: 0;
-      font-family: var(--font-readout); font-size: 17px; font-weight: 700; letter-spacing: 1px;
-      border: 4px solid var(--line); background: var(--panel); color: var(--text);
+      width: 84px; height: 84px; border-radius: 50%; padding: 0;
+      border: 4px solid #46525d; background: var(--panel); color: var(--text);
       box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
       touch-action: none; user-select: none; -webkit-user-select: none;
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
+    }
+    /* The button is an icon, like a voice recorder's (2026-11-21: "it says
+       HOLD. The button is weird"): a red dot to record, a white square to
+       stop, an amber ring while working, a "+" badge when the take will be
+       added to a note. The mode is data-mode; aria-label says it in words. */
+    #bigBtn::before {
+      content: ""; position: absolute; inset: 0; margin: auto;
+      width: 34px; height: 34px; border-radius: 50%; background: var(--danger);
+    }
+    #bigBtn[data-mode="stop"]::before { width: 26px; height: 26px; border-radius: 5px; background: #fff; }
+    #bigBtn[data-mode="busy"]::before {
+      width: 30px; height: 30px; background: transparent; box-sizing: border-box;
+      border: 4px solid var(--warn); border-top-color: transparent; animation: bigSpin 0.8s linear infinite;
+    }
+    #bigBtn[data-mode="add"]::after {
+      content: "+"; position: absolute; top: -4px; right: -4px; width: 28px; height: 28px; border-radius: 50%;
+      background: var(--accent); color: var(--bg); font: 700 22px/27px var(--font-readout); text-align: center;
+    }
+    @keyframes bigSpin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      #bigBtn::before { animation: none !important; }
+      #bigUi[data-screen="ok"]::after { animation: none !important; opacity: 0; } /* the headline + beep carry success */
     }
     #bigUi.targeting #bigBtn { border-color: var(--accent); }
     /* Whole-screen status: the overlay background IS the at-arm's-length
@@ -1999,7 +2020,9 @@ const INDEX_HTML = `<!doctype html>
     body.bigbtn #bigUi[data-screen="connecting"] { background: #3d3008; }
     body.bigbtn #bigUi[data-screen="rec"]        { background: #420d0d; }
     body.bigbtn #bigUi[data-screen="busy"]       { background: #3d3008; }
-    body.bigbtn #bigUi[data-screen="ok"]         { background: #14532d; animation: bigFlash 0.7s ease-out; }
+    /* Success flashes green and settles back (2026-11-21: "this weird persistent
+       green box"); the DONE/SAVED headline stays. Failures stay red. */
+    body.bigbtn #bigUi[data-screen="ok"]         { animation: bigFlash 1.6s ease-out; }
     body.bigbtn #bigUi[data-screen="warn"]       { background: #78350f; }
     body.bigbtn #bigUi[data-screen="fail"]       { background: #7f1d1d; }
     body.bigbtn #bigUi[data-screen="alarm"]      { background: #7f1d1d; animation: bigAlarm 0.5s linear infinite alternate; }
@@ -2007,7 +2030,7 @@ const INDEX_HTML = `<!doctype html>
     #bigUi[data-screen="connecting"]::after,
     #bigUi[data-screen="busy"]::after,
     #bigUi[data-screen="warn"]::after       { border: 5px solid #f59e0b; }
-    #bigUi[data-screen="ok"]::after         { border: 5px solid #22c55e; }
+    #bigUi[data-screen="ok"]::after         { border: 5px solid #22c55e; animation: bigOkFade 2.2s ease-out forwards; }
     #bigUi[data-screen="fail"]::after,
     #bigUi[data-screen="alarm"]::after      { border: 5px solid #ef4444; }
     #bigUi[data-screen="rec"] #bigBtn        { border-color: #ef4444; background: #b91c1c; color: #fff; animation: bigPulse 1.2s ease-in-out infinite; }
@@ -2018,7 +2041,8 @@ const INDEX_HTML = `<!doctype html>
     #bigUi[data-screen="fail"] #bigBtn       { border-color: var(--danger); }
     #bigUi[data-screen="alarm"] #bigBtn      { border-color: var(--danger); }
     @keyframes bigPulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.55); } 50% { box-shadow: 0 0 0 18px rgba(239,68,68,0); } }
-    @keyframes bigFlash { from { background: #22c55e; } }
+    @keyframes bigFlash { from { background: #1f7a45; } }
+    @keyframes bigOkFade { 0%, 45% { opacity: 1; } 100% { opacity: 0; } }
     @keyframes bigAlarm { from { background: #7f1d1d; } to { background: #450a0a; } }
   </style>
 </head>
@@ -2336,7 +2360,7 @@ right lower quadrant"></textarea>
       <span id="bigTargetText"></span>
       <button id="bigTargetCancelBtn" title="Start a new note instead">Cancel</button>
     </div>
-    <button id="bigBtn" title="Hold to talk, or tap to start and tap again to stop">HOLD</button>
+    <button id="bigBtn" data-mode="record" aria-label="Record: tap to start and stop, or hold while you talk" title="Record: tap to start and stop, or hold while you talk"></button>
   </div>
   <button id="bigReturnBtn">&#8592; Back to notes</button>
 
@@ -2406,38 +2430,16 @@ right lower quadrant"></textarea>
   <!-- Mic tips: a one-time onboarding nudge for keeping other people's voices
        out of the notes. Auto-shows once on the phone (big-button) surface;
        reopenable from the top row / Options. -->
-  <div id="micTips">
+  <div id="micTips" role="dialog" aria-modal="true" aria-labelledby="micTipsTitle">
     <div id="micTipsCard">
-      <div id="micTipsTitle">Keep other voices out of your notes</div>
-      <div id="micTipsLede">Dictation can pick up people talking near you. Two habits keep your notes clean:</div>
-
-      <div id="micTipsIos">
-        <div class="mt-h">On iPhone: turn on Voice Isolation — the single best fix</div>
-        <ol>
-          <li>Start a dictation (hold the button) so iPhone shows the mic control.</li>
-          <li>Swipe down from the top‑right corner to open Control Center.</li>
-          <li>Tap <span class="mt-key">Mic Mode</span> (it appears only while an app is using the mic).</li>
-          <li>Choose <span class="mt-key">Voice Isolation</span>.</li>
-        </ol>
-        <div class="mt-note">You set it once — it sticks for this app. iOS removes other voices before they ever reach the page.</div>
-      </div>
-
-      <div id="micTipsAndroid" style="display:none">
-        <div class="mt-h">On Android</div>
-        <ul>
-          <li>Turn on any <span class="mt-key">Voice Focus</span> / noise‑reduction option in your phone's mic or call settings.</li>
-        </ul>
-      </div>
-
-      <div class="mt-h">Always</div>
+      <button id="micTipsCloseBtn" aria-label="Close" title="Close">✕</button>
+      <div id="micTipsTitle">Keep other voices out</div>
       <ul>
-        <li>Hold the phone <span class="mt-key">close to your mouth</span>, like a walkie‑talkie — this is the single biggest fix. The closer your voice, the more it drowns out the room, and the harder a distant talker is to pick up.</li>
-        <li>Push‑to‑talk records <span class="mt-key">only while you hold</span> the button — let go the moment someone else speaks.</li>
-        <li>Face away from other conversations, or step somewhere quieter, when you can.</li>
+        <li><span class="mt-key">Hold the phone close to your mouth.</span> It's the biggest fix.</li>
+        <li id="micTipsIos">On iPhone, turn on <span class="mt-key">Voice Isolation</span>: start a recording, open Control Center, tap Mic Mode.</li>
+        <li id="micTipsAndroid" style="display:none">On Android, turn on your phone's voice focus or noise reduction if it has one.</li>
+        <li>The app also drops quieter voices on its own (Options → Filter out other speakers).</li>
       </ul>
-
-      <div class="mt-note">Voice Isolation and noise suppression remove background <em>noise</em> — fans, hums, clicks — but another person's voice is speech, so it can slip through even with them on. That's why a close mic matters. As a backstop this app also <span class="mt-key">automatically filters out other speakers</span> (keeps only the main voice) and tells you when it removed something — leave it on (Advanced) unless you have a reason not to.</div>
-
       <div class="row" style="justify-content: center; margin-top: 16px;">
         <button id="micTipsDoneBtn" class="primary">Got it</button>
       </div>
@@ -2575,6 +2577,7 @@ right lower quadrant"></textarea>
   const micTipsIosEl     = document.getElementById("micTipsIos");
   const micTipsAndroidEl = document.getElementById("micTipsAndroid");
   const micTipsDoneBtnEl = document.getElementById("micTipsDoneBtn");
+  const micTipsCloseBtnEl = document.getElementById("micTipsCloseBtn");
   const bigTipsBtnEl     = document.getElementById("bigTipsBtn");
 
   // Big-button dictation layout elements
@@ -6050,7 +6053,7 @@ right lower quadrant"></textarea>
     recordBtn.classList.add("danger");
     setMicPill("rec");
     updateAppendChip();
-    setStatus("Recording — release to upload for transcription…", "ok");
+    setStatus("Recording… stop when you are done and it will be transcribed.", "ok");
     startBeep();
     // Joined phone: light the desktop's "recording" indicator (no-op if unpaired).
     // Not for a take that stays on the phone — the desktop would sit on
@@ -7721,6 +7724,10 @@ right lower quadrant"></textarea>
     var base = (latestText || "").trim();
     var wantAppend = !replace && Boolean(base) && (appendModeEl.checked || appendArmed);
     appendArmed = false;
+    // A delivery that does not append takes the box: file the note it replaces
+    // into "Last dictation" first, exactly as a fresh take dictated here does
+    // (it used to vanish from view, surviving only in History).
+    if (!wantAppend && base && !replace) fileToSlot(base);
     var combined = wantAppend ? cleanTranscript(base + " " + text) : text;
     latestText = combined;
     latestEl.textContent = combined;
@@ -8372,9 +8379,9 @@ right lower quadrant"></textarea>
       bigStatusEl.textContent = statusIsBootHint
         ? (joinedSessionCode
             ? (phoneKeepMode
-                ? "Hold the round button and speak. Each take is kept here as a note until you send it."
-                : "Hold the round button and speak. The text lands on the desktop's clipboard.")
-            : "Hold the round button and speak. Each take is saved here as a note.")
+                ? "Tap the red button to record, tap again to stop (or hold it while you talk). Each take stays here until you send it."
+                : "Tap the red button to record, tap again to stop (or hold it while you talk). The text lands on the desktop.")
+            : "Tap the red button to record, tap again to stop (or hold it while you talk). Each take is saved here as a note.")
         : statusEl.textContent;
     }
     updatePhoneChrome();
@@ -8519,7 +8526,7 @@ right lower quadrant"></textarea>
     if (!items.length) {
       var empty = document.createElement("div");
       empty.id = "bigNotesEmpty";
-      empty.textContent = "No notes yet. Hold the round button and speak — or tap it once to start and again to stop.";
+      empty.textContent = "No notes yet. Tap the red button to record, tap again to stop.";
       bigNotesEl.appendChild(empty);
     }
     var queued = queuedNoteIds();
@@ -8872,9 +8879,19 @@ right lower quadrant"></textarea>
     }
 
     if (bigBtnEl) {
-      bigBtnEl.textContent =
-        (recording && !stopping) ? "STOP" :
-        (stopping || finishing) ? "…" : (tnote ? "ADD" : "HOLD");
+      // An icon, not a word (the CSS draws it from data-mode); the words ride
+      // aria-label / title for screen readers and a long-press hint.
+      var mode = (recording && !stopping) ? "stop" : (stopping || finishing) ? "busy" : (tnote ? "add" : "record");
+      if (bigBtnEl.getAttribute("data-mode") !== mode) {
+        var words = mode === "stop" ? "Stop recording"
+          : mode === "busy" ? "Working…"
+          : mode === "add" ? "Record a take to add to the note"
+          : "Record: tap to start and stop, or hold while you talk";
+        bigBtnEl.textContent = "";
+        bigBtnEl.setAttribute("data-mode", mode);
+        bigBtnEl.setAttribute("aria-label", words);
+        bigBtnEl.title = words;
+      }
     }
   }
 
@@ -9159,6 +9176,8 @@ right lower quadrant"></textarea>
   if (joinOverlayEl) joinOverlayEl.addEventListener("click", (e) => { if (e.target === joinOverlayEl) closeJoinOverlay(); });
 
   if (micTipsDoneBtnEl)    micTipsDoneBtnEl.onclick    = () => closeMicTips();
+  if (micTipsCloseBtnEl)   micTipsCloseBtnEl.onclick   = () => closeMicTips();
+  if (micTipsEl) micTipsEl.addEventListener("keydown", (e) => { if (e.key === "Escape") closeMicTips(); });
   if (bigTipsBtnEl)        bigTipsBtnEl.onclick        = () => showMicTips();
   // Tapping the dark backdrop dismisses the tips (counts as seen).
   if (micTipsEl) micTipsEl.addEventListener("click", (e) => { if (e.target === micTipsEl) closeMicTips(); });
@@ -9221,21 +9240,11 @@ right lower quadrant"></textarea>
   });
   latestEl.addEventListener("paste", plainTextPaste);
 
-  // Clicking into the box also arms a one-shot append: the next dictation adds
-  // onto this note instead of starting fresh. The box already lights up on
-  // :focus with the same accent glow as the .armed state, so click-to-edit and
-  // click-to-append are now one gesture. The click places the caret normally
-  // (no select-all — a stray keystroke must never wipe the note). Guarded to
-  // idle + non-empty, mirroring toggleAppendArm; tap "Append next" to cancel.
-  latestEl.addEventListener("focus", function () {
-    if (recording || stopping || finishing) return;
-    if (joinedSessionCode) return; // joined: append is the desktop's job; still editable, just don't arm
-    if (!latestText || !latestText.trim()) return;
-    if (appendArmed) return;
-    appendArmed = true;
-    updateAppendChip();
-    setStatus("Next dictation will append to this text (tap 'Append next' to cancel).", "");
-  });
+  // Clicking into the box is for EDITING only. Until 2026-11-21 a focus also
+  // armed a one-shot append — and a browser re-fires focus on the box every
+  // time the window comes back to the front (AutoHotkey brings it forward on
+  // every take), so append kept switching itself on: "it both auto appends and
+  // deletes my old text". Append is only "➕ Append next" or append mode now.
   refreshLatestEditable();
 
   hotkeyBtn.onclick = () => {

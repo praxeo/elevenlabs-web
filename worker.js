@@ -1380,8 +1380,8 @@ const MANIFEST = {
   description: "Push-to-talk medical dictation via ElevenLabs Scribe v2 Medical (batch)",
   start_url: "/",
   display: "standalone",
-  background_color: "#0b0d10",
-  theme_color: "#0b0d10",
+  background_color: "#1a1f24",
+  theme_color: "#1a1f24",
   icons: [
     { src: "/icon-192.png", sizes: "192x192", type: "image/png" },
     { src: "/icon-512.png", sizes: "512x512", type: "image/png", purpose: "any" },
@@ -1399,78 +1399,165 @@ const INDEX_HTML = `<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <meta id="themeColorMeta" name="theme-color" content="#0b0d10" />
+  <meta id="themeColorMeta" name="theme-color" content="#1a1f24" />
   <link rel="manifest" href="/manifest.webmanifest" />
   <link id="faviconLink" rel="icon" type="image/png" href="/icon-192.png" />
   <link rel="apple-touch-icon" href="/icon-192.png" />
   <title>ElevenLabs Scribe v2 Dictation</title>
   <style>
+    /* Visual system (2026-11-21): a bedside monitor. A graphite bezel, a
+       recessed "glass" for text and the trace, and parameter colours that each
+       MEAN something — green = live signal / done, amber = working, red =
+       recording / failure, cyan = anything you can act on. Readouts (the
+       record band, the timer, section names) use the instrument face every
+       target already has installed (Bahnschrift on Windows, DIN Alternate on
+       Apple); prose uses the system UI face. Nothing is downloaded. */
     :root {
-      --bg: #0b0d10;
-      --panel: #151922;
-      --panel2: #10141b;
-      --text: #eef2f6;
-      --muted: #9aa4b2;
-      --line: #2a3140;
-      --accent: #7dd3fc;
-      --danger: #f87171;
-      --ok: #86efac;
-      --warn: #fde68a;
+      color-scheme: dark;  /* native controls (audio player, scrollbars) match */
+      --bg: #1a1f24;       /* bezel */
+      --panel: #232a31;    /* raised surface: overlay cards, phone notes */
+      --panel2: #12161a;   /* recessed glass: the note, inputs, the trace */
+      --raised: #262e35;   /* buttons */
+      --text: #e8edef;
+      --muted: #8e99a1;
+      --line: #2e373f;
+      --accent: #5cc6e6;   /* cyan: interactive */
+      --danger: #ff5b52;   /* red: recording, failure */
+      --ok: #5fe08f;       /* green: live trace, done */
+      --warn: #f2b640;     /* amber: working, check */
+      --font-readout: "Bahnschrift", "DIN Alternate", "DIN 2014", "D-DIN", "Segoe UI", system-ui, sans-serif;
+      --font-text: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: var(--bg); color: var(--text); line-height: 1.35;
+      font-family: var(--font-text); font-size: 15px;
+      background: var(--bg); color: var(--text); line-height: 1.45;
     }
-    main { max-width: 1000px; margin: 0 auto; padding: 14px; }
-    h1 { font-size: 18px; margin: 0 0 10px; }
-    .grid { display: grid; grid-template-columns: 1fr; gap: 12px; }
-    @media (min-width: 850px) { .grid { grid-template-columns: 1fr 380px; align-items: start; } }
-    .card {
-      background: var(--panel); border: 1px solid var(--line);
-      border-radius: 14px; padding: 14px;
+    main { max-width: 980px; margin: 0 auto; padding: 16px 18px 28px; }
+    h1 {
+      font-family: var(--font-readout); font-size: 15px; font-weight: 600;
+      color: var(--muted); margin: 0 0 12px; letter-spacing: 0.02em;
     }
-    label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
+    .grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
+    /* Narrow (the real use, a sliver beside Cerner): one column, the settings
+       below a rule. Wide: settings in a quiet side column behind a rule. */
+    #settingsCard { border-top: 1px solid var(--line); padding-top: 14px; }
+    @media (min-width: 860px) {
+      .grid { grid-template-columns: minmax(0, 1fr) 360px; gap: 0 28px; align-items: start; }
+      #settingsCard { border-top: 0; padding-top: 0; border-left: 1px solid var(--line); padding-left: 24px; }
+    }
+    .card { background: none; border: 0; padding: 0; }
+    label { display: block; font-size: 13px; color: var(--muted); margin: 16px 0 6px; }
     textarea, input, select {
       width: 100%; background: var(--panel2); color: var(--text);
-      border: 1px solid var(--line); border-radius: 10px; padding: 10px;
-      font-size: 14px; outline: none;
+      border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px;
+      font: inherit; font-size: 14px; outline: none;
     }
-    input[type="range"] { padding: 0; }
+    textarea:focus-visible, input:focus-visible, select:focus-visible {
+      border-color: var(--accent); box-shadow: 0 0 0 2px rgba(92, 198, 230, 0.25);
+    }
+    select {
+      appearance: none; -webkit-appearance: none; padding-right: 32px; cursor: pointer;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5l5 5 5-5' fill='none' stroke='%238e99a1' stroke-width='1.6'/%3E%3C/svg%3E");
+      background-repeat: no-repeat; background-position: right 12px center;
+    }
+    input[type="range"] { padding: 0; border: 0; background: none; accent-color: var(--accent); }
+    input[type="checkbox"] { accent-color: var(--accent); }
     textarea { min-height: 120px; resize: vertical; }
     button {
-      border: 1px solid var(--line); background: var(--panel2); color: var(--text);
-      padding: 10px 12px; border-radius: 10px; font-size: 14px; cursor: pointer;
+      font: inherit; font-size: 14px; color: var(--text);
+      background: var(--raised); border: 1px solid transparent;
+      padding: 8px 12px; border-radius: 8px; cursor: pointer;
+      transition: background-color 0.12s, border-color 0.12s, color 0.12s;
     }
-    button:hover { border-color: var(--accent); }
-    button.primary { background: #0c4a6e; border-color: #0369a1; }
-    button.danger { background: #5f1717; border-color: #991b1b; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:hover { background: #2e373f; }
+    button:focus-visible, summary:focus-visible, [contenteditable]:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 2px;
+    }
+    button.primary { background: #16495a; color: #fff; }
+    button.primary:hover { background: #1c5a6e; }
+    button.danger { background: #6b1a16; border-color: #a3261f; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.active { color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .row > * { flex: 1; }
     .row button { flex: 0 0 auto; }
-    #recordBtn { flex: 1 1 auto; font-weight: 600; }
+
+    /* ── The record band: the one bold element. Its colour is the state. ── */
+    #recBand { position: relative; }
+    #recordBtn {
+      display: flex; align-items: center; gap: 14px; width: 100%; min-height: 64px;
+      padding: 0 96px 0 18px; border-radius: 14px; text-align: left;
+      background: var(--panel); border: 1px solid #36404a;
+      font-family: var(--font-readout); font-size: 21px; font-weight: 600; letter-spacing: 0.01em;
+    }
+    #recordBtn::before {
+      content: ""; flex: none; width: 18px; height: 18px; border-radius: 50%;
+      background: var(--danger); box-shadow: 0 0 0 5px rgba(255, 91, 82, 0.16);
+    }
+    #recordBtn:hover { background: #29323a; border-color: #46525d; }
+    #recordBtn.danger { background: #b3261e; border-color: #e0463c; color: #fff; }
+    #recordBtn.danger::before { width: 16px; height: 16px; border-radius: 3px; background: #fff; box-shadow: none; }
+    body[data-state="busy"] #recordBtn:not(.danger)  { border-color: var(--warn); color: var(--warn); }
+    body[data-state="busy"] #recordBtn:not(.danger)::before { background: var(--warn); box-shadow: 0 0 0 5px rgba(242, 182, 64, 0.16); }
+    body[data-state="ok"] #recordBtn:not(.danger)    { border-color: rgba(95, 224, 143, 0.6); }
+    body[data-state="warn"] #recordBtn:not(.danger)  { border-color: var(--warn); }
+    body[data-state="fail"] #recordBtn:not(.danger),
+    body[data-state="alarm"] #recordBtn:not(.danger) { border-color: var(--danger); }
+    #micPill {
+      position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+      margin: 0; pointer-events: none;
+    }
+    #recordBtn.danger ~ #micPill { color: #fff; border-color: rgba(255, 255, 255, 0.55); background: transparent; }
+
+    /* ── The capture trace: a monitor lead, docked under the band. ── */
+    #recFeedback {
+      margin-top: 8px; padding: 10px 12px 8px;
+      background: var(--panel2); border: 1px solid #262e35; border-radius: 12px;
+    }
+    .recfb-row { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+    #recDot { width: 9px; height: 9px; border-radius: 50%; background: var(--danger); flex: none; align-self: center; animation: recpulse 1.3s ease-in-out infinite; }
+    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+    #recState { color: var(--muted); }
+    #recState.live { color: var(--ok); }
+    #recTimer {
+      margin-left: auto; font-family: var(--font-readout); font-size: 26px; font-weight: 600;
+      line-height: 1; font-variant-numeric: tabular-nums; color: var(--ok);
+    }
+    #waveCanvas {
+      width: 100%; height: 56px; margin-top: 6px; display: block; border-radius: 6px;
+      background-image:
+        repeating-linear-gradient(90deg, rgba(95, 224, 143, 0.08) 0 1px, transparent 1px 20px),
+        repeating-linear-gradient(0deg, rgba(95, 224, 143, 0.08) 0 1px, transparent 1px 14px);
+    }
+
     .status {
-      font-size: 13px; color: var(--muted); margin-top: 10px;
-      min-height: 18px; white-space: pre-wrap;
+      font-size: 14px; color: var(--muted); margin-top: 10px;
+      min-height: 20px; white-space: pre-wrap;
     }
     .status.ok { color: var(--ok); }
     .status.warn { color: var(--warn); }
     .status.err { color: var(--danger); }
+    /* The recovery banner borrows .status colours but holds markup: its source
+       indentation must not render as blank lines. */
+    #journalRecover { white-space: normal; }
+    #journalRecoverMsg { white-space: pre-wrap; }
+
+    /* ── The note ── */
+    .notelabel { margin-top: 18px; }
     .big {
-      font-size: 18px; white-space: pre-wrap; min-height: 140px;
+      font-size: 17px; line-height: 1.5; white-space: pre-wrap; min-height: 140px;
       background: var(--panel2); border: 1px solid var(--line);
-      border-radius: 12px; padding: 14px;
+      border-radius: 12px; padding: 14px 16px; overflow-wrap: anywhere;
     }
     .big[contenteditable="true"] { cursor: text; }
     .big[contenteditable="true"]:focus { outline: none; border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .big.armed { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-    .lastdict {
-      margin-top: 12px; background: var(--panel2);
-      border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
-    }
-    .lastdict-label { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
+    .noteactions { margin-top: 10px; }
+    /* The filed note: a left rule marks it as set aside, not active. */
+    .lastdict { margin-top: 18px; border-left: 3px solid var(--line); padding: 2px 0 2px 12px; }
+    .lastdict-label { color: var(--muted); font-size: 12.5px; margin-bottom: 4px; }
     .lastdict-text { white-space: pre-wrap; font-size: 14px; max-height: 96px; overflow: auto; caret-color: var(--accent); }
     /* While editing the slot, lift the height cap so the caret is never clipped
        by the overflow container (the "invisible caret on a new line" bug) and
@@ -1479,7 +1566,15 @@ const INDEX_HTML = `<!doctype html>
       outline: none; max-height: none; overflow: visible;
       box-shadow: inset 0 0 0 1px var(--accent); border-radius: 8px;
     }
-    .hint { color: var(--muted); font-size: 13px; }
+    /* Pairing: quiet until it matters. */
+    .pairrow { margin-top: 18px; }
+    .pairrow button, .historyrow button {
+      background: transparent; border-color: var(--line); color: var(--muted);
+    }
+    .pairrow button:hover, .historyrow button:hover { color: var(--text); background: transparent; border-color: #46525d; }
+    #pairPhoneBtn.linkdown { color: var(--danger); border-color: var(--danger); }
+
+    .hint { color: var(--muted); font-size: 12.5px; margin-top: 6px; }
     .history-item { border-top: 1px solid var(--line); padding: 12px 0; }
     .history-meta { color: var(--muted); font-size: 12px; margin-bottom: 6px; }
     .history-text { white-space: pre-wrap; font-size: 14px; }
@@ -1487,53 +1582,66 @@ const INDEX_HTML = `<!doctype html>
     .unfiltered { margin-top: 6px; font-size: 12px; color: var(--muted); }
     .unfiltered > summary { cursor: pointer; color: var(--warn); }
     .unfiltered-text { white-space: pre-wrap; margin: 6px 0; padding: 6px; border: 1px dashed var(--line); border-radius: 8px; color: var(--text); }
-    button.active { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
     .checkbox {
-      display: flex; gap: 8px; align-items: center;
-      color: var(--muted); font-size: 13px; margin-top: 10px;
+      display: flex; gap: 10px; align-items: flex-start; cursor: pointer;
+      color: var(--text); font-size: 14px; margin: 14px 0 0;
     }
-    .checkbox input { width: auto; }
-    .meterwrap {
-      position: relative; height: 14px; background: var(--panel2);
-      border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 8px;
-    }
-    #meterBar { position: absolute; left: 0; top: 0; bottom: 0; width: 0%; background: var(--ok); }
-    #openMark  { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--danger); left: 0%; }
-    #closeMark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--warn);   left: 0%; }
-    /* Live recording feedback: a scrolling voice waveform + timer + speech state,
-       so a batch dictation visibly proves it is capturing (no realtime STT). */
-    #recFeedback { margin-top: 10px; }
-    .recfb-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
-    #recDot { width: 10px; height: 10px; border-radius: 50%; background: var(--danger); flex: none; animation: recpulse 1.3s ease-in-out infinite; }
-    @keyframes recpulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
-    #recState { color: var(--muted); }
-    #recState.live { color: var(--ok); font-weight: 600; }
-    #recTimer { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
-    #waveCanvas { width: 100%; height: 46px; margin-top: 6px; display: block; background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; }
+    .checkbox input { width: 16px; height: 16px; margin: 2px 0 0; padding: 0; flex: none; }
+    .checkbox small.hint { display: block; margin-top: 2px; }
     .pill {
-      display: inline-block; margin-left: 8px; font-size: 12px; padding: 1px 8px;
-      border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+      display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px;
+      font-family: var(--font-readout); font-size: 11.5px; letter-spacing: 0.02em;
+      border: 1px solid var(--line); color: var(--muted); vertical-align: 1px;
     }
-    .pill.open { color: #0b0d10; background: var(--ok); border-color: var(--ok); }
-    .pill.ok   { color: var(--ok); border-color: var(--ok); }
-    .pill.live { color: #0b0d10; background: var(--accent); border-color: var(--accent); }
-    .pill.rec  { color: #fff; background: #b91c1c; border-color: #b91c1c; }
+    .pill.open { color: var(--bg); background: var(--ok); border-color: var(--ok); }
+    .pill.ok   { color: var(--ok); border-color: rgba(95, 224, 143, 0.5); }
+    .pill.live { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+    .pill.rec  { color: #fff; background: #b3261e; border-color: #b3261e; }
     .pill.fail { color: #fff; background: var(--danger); border-color: var(--danger); }
-    .pill.warn { color: #0b0d10; background: var(--warn); border-color: var(--warn); }
+    .pill.warn { color: var(--bg); background: var(--warn); border-color: var(--warn); }
+
+    /* ── Settings: plain rows behind hairlines, a chevron that turns. ── */
+    details.help { border-top: 1px solid var(--line); }
+    #diagnosticsSection { border-bottom: 1px solid var(--line); }
+    #history + details.help, .historyrow + #history[style*="none"] + details.help { margin-top: 14px; }
+    details.help > summary {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 13px 2px; cursor: pointer; list-style: none; user-select: none;
+      font-family: var(--font-readout); font-size: 16px; font-weight: 600; color: var(--text);
+    }
+    details.help > summary::-webkit-details-marker { display: none; }
+    details.help > summary::after {
+      content: ""; flex: none; width: 7px; height: 7px; margin-right: 6px;
+      border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+      transform: rotate(45deg); transition: transform 0.15s;
+    }
+    details.help[open] > summary::after { transform: rotate(-135deg); }
+    details.help > summary:hover { color: var(--accent); }
+    details.help .body { padding: 0 2px 18px; font-size: 14px; color: var(--text); }
+    details.help .body > label:first-child, details.help .body > .checkbox:first-child { margin-top: 2px; }
+    details.help h3 { font-size: 13px; margin: 12px 0 4px; color: var(--accent); }
+    details.help p { margin: 4px 0; color: var(--muted); }
+    .sliderval { color: var(--accent); font-family: var(--font-readout); font-size: 12.5px; margin-left: 4px; }
+    #audioPreview { width: 100%; }
+    kbd {
+      background: var(--panel2); border: 1px solid var(--line); border-radius: 6px;
+      padding: 2px 6px; font-size: 12px; color: var(--text);
+    }
+
     /* Phone-pairing overlay: the desktop's front-and-center QR, shown on demand
        from the compact "Pair a phone" button. Additive fixed overlay — the QR is
        big only WHILE pairing, then closes the moment a phone joins, so the
        primary card's tiny-window compactness rules are untouched. */
     #pairOverlay { display: none; position: fixed; inset: 0; z-index: 50;
-      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+      background: rgba(10, 13, 16, 0.85); align-items: center; justify-content: center; padding: 16px; }
     #pairOverlay.show { display: flex; }
     body.bigbtn #pairOverlay { display: none !important; } /* a joined phone never hosts pairing */
     #pairCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
       padding: 22px; max-width: 360px; width: 100%; text-align: center; }
-    #pairTitle { font-size: 18px; font-weight: 600; margin-bottom: 14px; }
+    #pairTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin-bottom: 14px; }
     #pairQr { display: inline-block; line-height: 0; background: #fff; padding: 10px; border-radius: 12px; }
     #pairQr svg { width: min(64vmin, 280px); height: auto; display: block; }
-    #pairCode { font-family: monospace; font-size: 34px; letter-spacing: 8px; color: var(--accent); margin: 16px 0 4px; }
+    #pairCode { font-family: ui-monospace, Consolas, monospace; font-size: 34px; letter-spacing: 8px; color: var(--accent); margin: 16px 0 4px; }
     #pairInstr { font-size: 13px; color: var(--muted); line-height: 1.5; }
     #pairStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
     #pairStatus.ok { color: var(--ok); }
@@ -1544,13 +1652,13 @@ const INDEX_HTML = `<!doctype html>
        a solo big-button phone (override "always") needs it to reach a desktop.
        Sits above #bigUi (40) and beside #pairOverlay (50). */
     #joinOverlay { display: none; position: fixed; inset: 0; z-index: 52;
-      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+      background: rgba(10, 13, 16, 0.85); align-items: center; justify-content: center; padding: 16px; }
     #joinOverlay.show { display: flex; }
     #joinCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
       padding: 22px; max-width: 360px; width: 100%; text-align: center; }
-    #joinTitle { font-size: 18px; font-weight: 600; margin-bottom: 10px; }
+    #joinTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin-bottom: 10px; }
     #joinInstr { font-size: 13px; color: var(--muted); line-height: 1.5; text-align: left; }
-    #joinCodeInput { font-family: monospace; font-size: 26px; letter-spacing: 6px; text-transform: uppercase;
+    #joinCodeInput { font-family: ui-monospace, Consolas, monospace; font-size: 26px; letter-spacing: 6px; text-transform: uppercase;
       text-align: center; width: 100%; max-width: 200px; padding: 8px 6px; }
     #joinStatus { font-size: 13px; min-height: 18px; margin-top: 10px; color: var(--muted); }
     #joinStatus.ok { color: var(--ok); }
@@ -1567,59 +1675,30 @@ const INDEX_HTML = `<!doctype html>
     /* Mic tips: a one-time, phone-first onboarding nudge for keeping OTHER
        people's voices out of the notes (iOS Voice Isolation + close-mic +
        push-to-talk discipline). Auto-shown once on the big-button surface,
-       reopenable from the top row / Options. Highest-leverage accuracy lever. */
+       reopenable from the phone layout's top row. */
     #micTips { display: none; position: fixed; inset: 0; z-index: 60;
-      background: rgba(0,0,0,0.8); align-items: center; justify-content: center; padding: 16px; }
+      background: rgba(10, 13, 16, 0.85); align-items: center; justify-content: center; padding: 16px; }
     #micTips.show { display: flex; }
     #micTipsCard { background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
       padding: 22px; max-width: 380px; width: 100%; max-height: 86vh; overflow-y: auto; }
-    #micTipsTitle { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+    #micTipsTitle { font-family: var(--font-readout); font-size: 19px; font-weight: 600; margin-bottom: 6px; }
     #micTipsLede { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
     #micTipsCard .mt-h { font-size: 13px; color: var(--accent); font-weight: 600; margin: 14px 0 6px; }
     #micTipsCard ol, #micTipsCard ul { margin: 0; padding-left: 20px; font-size: 14px; line-height: 1.55; }
     #micTipsCard li { margin: 5px 0; }
     #micTipsCard .mt-key { color: var(--text); font-weight: 600; }
     #micTipsCard .mt-note { font-size: 12px; color: var(--muted); margin-top: 6px; }
-    .sliderval { color: var(--accent); font-size: 12px; }
-    .legend { font-size: 11px; color: var(--muted); margin-top: 4px; }
-    .legend .dr { color: var(--danger); }
-    .legend .dy { color: var(--warn); }
-    details.help {
-      margin-top: 14px; border: 1px solid var(--line); border-radius: 10px;
-      background: var(--panel2); padding: 0 12px;
-    }
-    details.help > summary {
-      cursor: pointer; padding: 12px 0; font-size: 13px; color: var(--accent);
-      list-style: none; user-select: none;
-    }
-    details.help > summary::-webkit-details-marker { display: none; }
-    details.help > summary::before { content: "▸ "; }
-    details.help[open] > summary::before { content: "▾ "; }
-    details.help .body { padding: 0 0 12px; font-size: 13px; color: var(--text); }
-    details.help h3 { font-size: 13px; margin: 12px 0 4px; color: var(--accent); }
-    details.help p { margin: 4px 0; color: var(--muted); }
-    details.help table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 12px; }
-    details.help td { border-top: 1px solid var(--line); padding: 6px 4px; vertical-align: top; }
-    details.help td:first-child { color: var(--text); white-space: nowrap; padding-right: 10px; }
-    details.help td:last-child { color: var(--muted); }
-    details.help .tag { color: var(--danger); }
-    details.help .tag.y { color: var(--warn); }
-    kbd {
-      background: #0f172a; border: 1px solid var(--line); border-radius: 6px;
-      padding: 2px 6px; font-size: 12px; color: var(--text);
-    }
-    .divider { height: 1px; background: var(--line); margin: 18px 0 14px; }
     /* [UI] Window-wide state cue for a shrunk PWA window on a machine with no
        speakers. "full" repaints the whole window so any visible sliver of it
        reads at a glance; "border" draws an edge frame only; "off" disables it.
        Never applied under .bigbtn — the phone overlay has its own screen state. */
     body { transition: background-color .18s ease; }
-    body.tint-full[data-state="rec"]:not(.bigbtn)     { background: #430f0f; }
-    body.tint-full[data-state="busy"]:not(.bigbtn)    { background: #3a2a06; }
-    body.tint-full[data-state="ok"]:not(.bigbtn)      { background: #0c2b18; }
-    body.tint-full[data-state="warn"]:not(.bigbtn)    { background: #3a2a06; }
+    body.tint-full[data-state="rec"]:not(.bigbtn)     { background: #3c1513; }
+    body.tint-full[data-state="busy"]:not(.bigbtn)    { background: #352a10; }
+    body.tint-full[data-state="ok"]:not(.bigbtn)      { background: #11301f; }
+    body.tint-full[data-state="warn"]:not(.bigbtn)    { background: #352a10; }
     body.tint-full[data-state="fail"]:not(.bigbtn),
-    body.tint-full[data-state="alarm"]:not(.bigbtn)   { background: #4a0f0f; }
+    body.tint-full[data-state="alarm"]:not(.bigbtn)   { background: #45110f; }
     #stateEdge {
       position: fixed; inset: 0; pointer-events: none; z-index: 60;
       border: 0 solid transparent; transition: border-color .18s, border-width .18s;
@@ -1637,24 +1716,31 @@ const INDEX_HTML = `<!doctype html>
     body.tint-border[data-state="rec"]:not(.bigbtn) #stateEdge {
       border-width: 7px; border-color: var(--danger); animation: stateEdgePulse 1.4s ease-in-out infinite;
     }
-    @media (prefers-reduced-motion: reduce) { #stateEdge { animation: none !important; } }
+    @media (prefers-reduced-motion: reduce) {
+      #stateEdge, #recDot, #phoneRecBadge .recdot { animation: none !important; }
+      details.help > summary::after, button, body { transition: none !important; }
+    }
     #timingReadout {
-      font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, Menlo, monospace;
       color: var(--muted); white-space: pre-wrap; word-break: break-word; margin-top: 6px;
     }
     /* Tiny/minimized app window: shed chrome so record + status + transcript
        stay usable; everything else lives in the collapsible sections. */
     @media (max-width: 600px), (max-height: 600px) {
-      main { padding: 8px; }
+      main { padding: 8px 10px 16px; }
       h1 { display: none; }
-      .grid { gap: 8px; }
-      .card { padding: 10px; border-radius: 10px; }
-      .big { min-height: 72px; font-size: 16px; padding: 10px; }
+      .grid { gap: 14px; }
+      #recordBtn { min-height: 52px; font-size: 18px; padding-left: 14px; gap: 12px; }
+      #recTimer { font-size: 22px; }
+      #waveCanvas { height: 44px; }
+      .big { min-height: 72px; font-size: 16px; padding: 10px 12px; }
       textarea { min-height: 80px; }
-      label { margin: 8px 0 4px; }
-      .checkbox { margin-top: 8px; }
-      details.help { margin-top: 8px; }
+      label { margin: 10px 0 4px; }
+      .notelabel { margin-top: 12px; }
+      .checkbox { margin-top: 10px; }
       .status { margin-top: 6px; }
+      .pairrow { margin-top: 12px; }
+      details.help > summary { padding: 11px 2px; font-size: 15px; }
     }
     /* Phone notes layout (the "big-button" surface; the code keeps the bigbtn
        names). Active only while body carries .bigbtn (joined to a desktop
@@ -1682,7 +1768,7 @@ const INDEX_HTML = `<!doctype html>
     /* Wraps: at 375px the badge + pills + three buttons overflowed off-screen
        (Settings unreachable) once the Pair/Leave button joined the row. */
     #bigTopRow { width: 100%; display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; flex: 0 0 auto; }
-    #bigJoinedBadge { font-family: monospace; letter-spacing: 1px; color: var(--accent); font-size: 13px; flex: 1 1 auto; min-width: 0; }
+    #bigJoinedBadge { font-family: var(--font-readout); color: var(--accent); font-size: 14px; flex: 1 1 auto; min-width: 0; }
     #bigTopRow button { flex: 0 0 auto; white-space: nowrap; padding: 7px 10px; font-size: 13px; }
     #bigMicPill, #bigDesktopPill { font-size: 12px; white-space: nowrap; flex: 0 0 auto; }
     #bigMicPill.ok, #bigDesktopPill.ok { color: var(--muted); }
@@ -1706,7 +1792,7 @@ const INDEX_HTML = `<!doctype html>
        carries the colour. */
     #bigHead { flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px; }
     #bigStateRow { display: flex; align-items: baseline; gap: 10px; min-height: 28px; }
-    #bigState { font-size: 22px; font-weight: 800; letter-spacing: 1.5px; }
+    #bigState { font-family: var(--font-readout); font-size: 24px; font-weight: 700; letter-spacing: 1px; }
     #bigRecInfo { font-size: 14px; font-variant-numeric: tabular-nums; color: var(--text); }
     #bigStatus {
       font-size: 13px; color: var(--text); min-height: 18px;
@@ -1771,8 +1857,8 @@ const INDEX_HTML = `<!doctype html>
       position: fixed; left: 50%; transform: translateX(-50%); z-index: 42;
       bottom: calc(env(safe-area-inset-bottom, 0px) + 18px);
       width: 86px; height: 86px; border-radius: 50%; padding: 0;
-      font-size: 16px; font-weight: 800; letter-spacing: 1px;
-      border: 4px solid var(--line); background: #1e293b; color: var(--text);
+      font-family: var(--font-readout); font-size: 17px; font-weight: 700; letter-spacing: 1px;
+      border: 4px solid var(--line); background: var(--panel); color: var(--text);
       box-shadow: 0 6px 18px rgba(0, 0, 0, 0.6);
       touch-action: none; user-select: none; -webkit-user-select: none;
       -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent;
@@ -1815,28 +1901,18 @@ const INDEX_HTML = `<!doctype html>
 
 <body>
 <main>
-  <h1>ElevenLabs Scribe v2 Dictation</h1>
+  <h1>Dictation</h1>
 
   <div class="grid">
-    <section class="card">
-      <!-- Batch-only product: dictation uploads to ElevenLabs Scribe v2 on
-           release. The live capture-feedback panel below proves the mic is
-           hearing you while you record. -->
-      <div class="row" style="margin-top: 10px;">
+    <section class="card" id="primaryCard">
+      <!-- The record band: the one control that matters, coloured by state
+           (#recordBtn.danger while recording, body[data-state] otherwise —
+           the same derived state the window wash uses). The capture trace
+           docks directly under it while a take is running. -->
+      <div id="recBand">
         <button id="recordBtn" class="primary">Start recording</button>
-      </div>
-
-      <label>Mic level
         <span id="micPill" class="pill">mic off</span>
-        <span id="linkPill" class="pill">link idle</span>
-        <span id="gateState" class="pill" title="Noise gate: open = your voice is being recorded, closed = silence is being cut">gate closed</span>
-      </label>
-      <div class="meterwrap">
-        <div id="meterBar"></div>
-        <div id="closeMark"></div>
-        <div id="openMark"></div>
       </div>
-
       <div id="recFeedback" style="display:none">
         <div class="recfb-row">
           <span id="recDot"></span>
@@ -1848,7 +1924,7 @@ const INDEX_HTML = `<!doctype html>
 
       <!-- One line on purpose: .status is pre-wrap, so source indentation
            rendered as ragged indents + hard breaks in a tiny window. -->
-      <div class="status" id="status">Ctrl+Space: tap to start/stop, hold to talk (CapsLock via AHK also works). Beeps when the text is on the clipboard — keep this tab focused until the beep, then switch windows and Ctrl+V.</div>
+      <div class="status" id="status">Hold Ctrl+Space to talk, or tap it to start and stop. Keep this window in front until the beep, then paste.</div>
 
       <!-- Crash-recovery banner: shown only when the dictation journal finds a
            take that captured audio but never finished (the app died mid-dictation
@@ -1861,13 +1937,13 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
 
-      <label>Latest transcript <span id="appendChip" class="pill" style="display:none;"></span></label>
+      <label class="notelabel">Note <span id="appendChip" class="pill" style="display:none;"></span></label>
       <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
 
-      <div class="row" style="margin-top: 10px;">
+      <div class="row noteactions">
         <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
         <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
-        <button id="freshBtn" title="Clear the dictation box so the next dictation starts a new note (history is kept)">Clear dictation box</button>
+        <button id="freshBtn" title="Clear the box so the next dictation starts a new note (history is kept)">Clear</button>
         <!-- Joined devices only: re-send the note to the desktop clipboard (a
              fresh delivery — the recovery for a note stranded by a link outage). -->
         <button id="sendDesktopBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery, even if the link was down when it was dictated">📤 Send to desktop</button>
@@ -1885,12 +1961,12 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
 
-      <div class="row" style="margin-top: 8px; align-items: center; gap: 8px;">
+      <div class="row pairrow">
         <!-- Pairing is two-sided and the same page serves both ends, so BOTH
              directions are named: "Pair a phone" is what the DESKTOP clicks
              (show a QR/code); "Pair to a desktop" is what the PHONE taps
-             (type the desktop's code). One word each way — a user on the phone
-             used to see only "Pair a phone" and read it backwards. -->
+             (type the desktop's code). These two buttons and their overlays
+             are the only visible pairing controls (2026-11-21). -->
         <button id="pairPhoneBtn" title="On the DESKTOP: show a QR + code so your phone becomes the microphone — dictated text lands on this computer's clipboard">📱 Pair a phone</button>
         <button id="pairDesktopBtn" title="On the PHONE: enter the code the desktop shows — what you dictate here lands on that desktop's clipboard">🖥 Pair to a desktop</button>
         <!-- Live indicator: lights up when the paired phone starts dictating, so
@@ -1903,11 +1979,11 @@ const INDEX_HTML = `<!doctype html>
       </div>
     </section>
 
-    <section class="card">
-      <!-- Saved transcripts live at the TOP of this card for quick access to
-           past dictations (moved up from the bottom). Collapsed by default; the
-           persisted historyVisible toggle keeps the compact footprint. -->
-      <div class="row">
+    <section class="card" id="settingsCard">
+      <!-- Saved transcripts first, for quick access to past dictations.
+           Collapsed by default; the persisted historyVisible toggle keeps the
+           compact footprint. -->
+      <div class="row historyrow">
         <button id="toggleHistoryBtn">Show saved transcripts</button>
         <button id="clearBtn">Clear history</button>
       </div>
@@ -1924,14 +2000,14 @@ const INDEX_HTML = `<!doctype html>
           <label for="apiKey" id="apiKeyLabel">ElevenLabs API key</label>
           <input id="apiKey" type="password" placeholder="Paste your ElevenLabs API key" autocomplete="off" />
 
-          <!-- Realtime now runs on Deepgram Nova-3 via Workers AI (no STT key). This
-               legacy field is hidden but kept so saved settings/clear paths still resolve. -->
+          <!-- Legacy realtime key: hidden, kept so saved settings/clear paths
+               still resolve (the product is batch-only). -->
           <label for="sonioxKey" id="sonioxKeyLabel" style="display:none">Legacy realtime key (unused — the product is batch-only)</label>
           <input id="sonioxKey" type="password" placeholder="unused" autocomplete="off" style="display:none" />
 
           <label class="checkbox">
             <input type="checkbox" id="saveApiKey" />
-            Remember on this browser
+            <span>Remember on this browser</span>
           </label>
 
           <div class="row" style="margin-top: 10px;">
@@ -1940,104 +2016,46 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </details>
 
+      <!-- Options: the five choices a clinician actually makes (2026-11-21).
+           Machine-level tuning lives in Advanced, measurement in Diagnostics. -->
       <details class="help" id="optionsSection">
         <summary>Options</summary>
         <div class="body">
-          <label class="checkbox" style="margin-top: 4px;">
-            <input type="checkbox" id="autoCopy" checked />
-            Auto‑copy transcript to clipboard
-          </label>
-
           <label class="checkbox">
             <input type="checkbox" id="appendMode" />
-            Append consecutive recordings (don't clear)
+            <span>Add each dictation to the note<small class="hint">Off: every dictation starts a new note. “➕ Append next” adds just once.</small></span>
           </label>
-
-          <div class="row" style="margin: 2px 0 0 24px;">
-            <span class="hint">When on, every dictation adds to the note until you turn this off or clear the box. Off = each dictation starts fresh. (Use “➕ Append next” to append just once.)</span>
-          </div>
 
           <label class="checkbox">
             <input type="checkbox" id="startBeep" checked />
-            Start/done beeps (failure alarms always play)
+            <span>Start and done beeps<small class="hint">Failure alarms always sound.</small></span>
           </label>
 
-          <label for="hotkeyBtn">Push‑to‑talk hotkey</label>
+          <label class="checkbox">
+            <input type="checkbox" id="diarize" checked />
+            <span>Filter out other speakers<small class="hint">Keeps the voice loudest at your mic and warns when it removes much. Whatever it removes stays in History.</small></span>
+          </label>
+
+          <label for="hotkeyBtn">Push-to-talk key</label>
           <div class="row">
             <button id="hotkeyBtn" title="Click, then press the key combo you want">Ctrl + Space</button>
             <button id="hotkeyResetBtn" title="Reset to Ctrl + Space">Reset</button>
           </div>
-          <div class="hint" style="margin: 6px 0 12px;">
-            Tap = start/stop · Hold = push‑to‑talk · F13/F14 (AutoHotkey) always work
-          </div>
+          <div class="hint">Tap to start and stop, hold to talk. F13/F14 from AutoHotkey always work.</div>
 
-          <label for="sttPrimary">Transcription service (per device)</label>
+          <label for="sttPrimary">Transcription service</label>
           <select id="sttPrimary">
             <option value="elevenlabs" selected>ElevenLabs Scribe v2 Medical</option>
             <option value="soniox">Soniox (stt-async-v5)</option>
             <option value="openai">OpenAI gpt-transcribe</option>
             <option value="mistral">Mistral Voxtral Small Transcribe 3</option>
           </select>
-          <label for="sttBackup">Backup when it is slow or failing</label>
-          <select id="sttBackup">
-            <option value="mistral" selected>Mistral Voxtral</option>
-            <option value="soniox">Soniox</option>
-            <option value="openai">OpenAI gpt-transcribe</option>
-            <option value="elevenlabs">ElevenLabs</option>
-            <option value="none">None</option>
-          </select>
-          <div class="hint" id="sttHint" style="margin: 6px 0 12px;">
-            Switch the main service here if ElevenLabs is having problems. The backup gets the same
-            recording automatically when the main one errors or has not answered within a few seconds.
-          </div>
-
-          <div class="hint" style="margin: 10px 0 4px; color: var(--text);">Phone ↔ desktop link</div>
-          <div class="hint" style="margin: 0 0 6px;">Same page, two roles. <b>This computer receives:</b> Start phone session (same as 📱 Pair a phone on the main card). <b>This phone sends:</b> join a desktop by its code (same as 🖥 Pair to a desktop).</div>
-          <div class="row" style="margin-bottom: 4px; flex-wrap: wrap; gap: 6px; align-items: center;">
-            <button id="phoneStartBtn">Start phone session</button>
-            <span id="phoneCodeBadge" style="display:none; font-family: monospace; font-size: 20px; letter-spacing: 3px; color: var(--accent);"></span>
-            <button id="phoneStopBtn" style="display:none;">End session</button>
-          </div>
-          <div class="hint" id="phoneCodeHint" style="display:none; margin-bottom: 6px;"></div>
-          <div id="phoneQr" style="display:none; width:148px; line-height:0; border-radius:6px; overflow:hidden; margin: 0 0 8px;"></div>
-          <div class="row" style="align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px;">
-            <span class="hint" style="flex: 0 0 auto;">Join desktop:</span>
-            <input id="phoneJoinInput" type="text" maxlength="6" placeholder="ABC123" style="flex: 0 0 72px; font-family: monospace; text-transform: uppercase; text-align: center;" />
-            <button id="phoneJoinBtn">Join</button>
-            <span id="phoneJoinBadge" style="display:none; color: var(--ok);">Joined</span>
-            <button id="phoneLeaveBtn" style="display:none;">Leave</button>
-          </div>
-
-          <label for="windowTint">Recording cue for a small window (per device)</label>
-          <select id="windowTint">
-            <option value="full" selected>Colour the whole window</option>
-            <option value="border">Edge frame only</option>
-            <option value="off">Off</option>
-          </select>
-          <div class="hint" style="margin: 6px 0 4px;">
-            Makes the recording state readable when the window is shrunk beside Cerner and
-            the machine has no speakers: red while recording, amber while uploading, green
-            on success, red on failure. The tab title, favicon and taskbar badge follow too.
-          </div>
-
-          <label for="bigButtonMode">Phone layout (per device)</label>
-          <select id="bigButtonMode">
-            <option value="joined" selected>Automatic — when this device is paired to a desktop</option>
-            <option value="always">Always — this is the phone I dictate on</option>
-            <option value="never">Never — keep the full page even when paired</option>
-          </select>
-          <div class="hint" style="margin: 6px 0 4px;">
-            Turns this device into the phone dictation screen: your notes, with a floating record button. Stored on this device only.
-          </div>
-
-          <div class="row" style="margin-top: 10px;">
-            <button id="optionsMicTipsBtn" title="Tips for keeping other people's voices out of your notes">Mic tips — keep other voices out</button>
-          </div>
+          <div class="hint">Switch here if ElevenLabs is having problems.</div>
         </div>
       </details>
 
       <details class="help" id="keytermsSection">
-        <summary>Context / vocabulary keyterms</summary>
+        <summary>Vocabulary</summary>
         <div class="body">
           <div id="presetRow"></div>
 
@@ -2046,124 +2064,95 @@ tachycardia
 ascites
 right lower quadrant"></textarea>
 
-          <div class="hint" id="keytermHint" style="margin-bottom: 12px;">
-            Scribe v2 biases toward these terms. One per line, each &lt;= 20 chars, ≤5 words.
-            <strong>Keyterms add ~20 % to cost.</strong> 0 / 50 terms.
+          <div class="hint" id="keytermHint">
+            Scribe v2 biases toward these terms. One per line.
+            <strong>Keyterms add ~20 % to cost.</strong>
           </div>
         </div>
       </details>
 
       <details class="help" id="advanced">
-        <summary>Advanced audio &amp; noise settings</summary>
+        <summary>Advanced</summary>
         <div class="body">
-          <div class="legend">
-            <span class="dr">red mark on meter = gate OPEN threshold</span> &nbsp;|&nbsp;
-            <span class="dy">yellow = CLOSE threshold</span>
-          </div>
-
-          <label for="gateOpen">Gate open threshold <span class="sliderval" id="gateOpenVal"></span></label>
-          <input id="gateOpen" type="range" min="0" max="0.12" step="0.001" value="0.030" />
-
-          <label for="gateClose">Gate close threshold <span class="sliderval" id="gateCloseVal"></span></label>
-          <input id="gateClose" type="range" min="0" max="0.12" step="0.001" value="0.008" />
-
-          <label for="highpass">High‑pass filter <span class="sliderval" id="highpassVal"></span></label>
-          <input id="highpass" type="range" min="0" max="200" step="5" value="85" />
-
-          <label for="micGain">Mic input gain <span class="sliderval" id="micGainVal"></span></label>
+          <label for="micGain">Mic boost <span class="sliderval" id="micGainVal"></span></label>
           <input id="micGain" type="range" min="1" max="20" step="0.5" value="1" />
-          <div class="hint">Boost a quiet mic. If you see <b>peak:0.0000…</b> on a MIC FAIL while you ARE speaking, raise this (and lower the gate open threshold to match). 1× = no boost.</div>
-
-          <label class="checkbox" style="margin-top: 8px;">
-            <input type="checkbox" id="autoGain" />
-            Auto gain control <span class="hint">(off by default. Turn on to let the browser auto‑boost a quiet mic — easier than the slider, but can pump on a close mic.)</span>
-          </label>
-
-          <label for="gateLookahead">Gate look-ahead <span class="sliderval" id="gateLookaheadVal"></span></label>
-          <input id="gateLookahead" type="range" min="0" max="300" step="10" value="120" />
-          <div class="hint">Delays only the RECORDED audio, so the gate opens just before the word starts instead of just after. Recovers clipped word beginnings (f, s, h, p, t sounds are quiet and open the gate late). Costs this many ms of extra delay per dictation. 0 = off.</div>
-
-          <label for="releaseTail">Release tail <span class="sliderval" id="releaseTailVal"></span></label>
-          <input id="releaseTail" type="range" min="0" max="300" step="10" value="80" />
-          <div class="hint">Keeps capturing this long after you let go, so a fast release cannot cut the last syllable. 0 = off.</div>
-
-          <div class="hint" id="gateHint" style="margin-top: 6px;"></div>
+          <div class="hint">Raise it if a MIC FAIL shows peak:0.000… while you are talking. A dead mic still reads zero.</div>
 
           <label class="checkbox">
             <input type="checkbox" id="noiseSuppress" checked />
-            Browser noise suppression <span class="hint">(on by default; turn off to A/B if a close, quiet mic transcribes better)</span>
+            <span>Browser noise suppression<small class="hint">Try it off with a close, quiet mic.</small></span>
           </label>
 
           <label class="checkbox">
             <input type="checkbox" id="echoCancel" checked />
-            Echo cancellation <span class="hint">(on by default. Turn OFF if the mic captures silence on iPhone — iOS runs echo cancellation through the voice‑processing unit, which can go silent after a call/Siri/lock; off uses the plain mic path.)</span>
+            <span>Echo cancellation<small class="hint">Turn off if an iPhone records silence after a call, Siri or the lock screen.</small></span>
           </label>
 
+          <label for="sttBackup">Backup when the service is slow or failing</label>
+          <select id="sttBackup">
+            <option value="mistral" selected>Mistral Voxtral</option>
+            <option value="soniox">Soniox</option>
+            <option value="openai">OpenAI gpt-transcribe</option>
+            <option value="elevenlabs">ElevenLabs</option>
+            <option value="none">None</option>
+          </select>
+          <div class="hint" id="sttHint"></div>
+
+          <label for="windowTint">Recording colour for a small window</label>
+          <select id="windowTint">
+            <option value="full" selected>Colour the whole window</option>
+            <option value="border">Edge frame only</option>
+            <option value="off">Off</option>
+          </select>
+
+          <label for="bigButtonMode">Phone layout</label>
+          <select id="bigButtonMode">
+            <option value="joined" selected>Automatic — when this device is paired to a desktop</option>
+            <option value="always">Always — this is the phone I dictate on</option>
+            <option value="never">Never — keep the full page even when paired</option>
+          </select>
+        </div>
+      </details>
+
+      <details class="help" id="diagnosticsSection">
+        <summary>Diagnostics</summary>
+        <div class="body">
           <label class="checkbox">
-            <input type="checkbox" id="diarize" checked />
-            Filter out other speakers <span class="hint">(on by default on the phone layout. Keeps the voice that is clearly LOUDEST at the mic (yours, if the mic is close); when loudness cannot tell the voices apart it falls back to who said the most and warns on any cut. A big cut warns too, and every cut keeps the unfiltered text in History. Noise suppression can't do this — another person's voice is speech. ElevenLabs and Soniox label speakers; a take written by OpenAI or Mistral is never filtered.)</span>
-          </label>
-          <label class="checkbox" style="margin-left:22px">
-            <input type="checkbox" id="diarizeDesktop" />
-            …also on this desktop <span class="hint">(off by default: a desktop otherwise sends the proven single-speaker request. Turn on if you dictate in a room where other people talk; works best with a headset or close mic.)</span>
-          </label>
-
-          <div id="batchOptsSection">
-            <label class="checkbox">
-              <input type="checkbox" id="tagEvents" />
-              Tag audio events ((laughter), (cough), …)
-            </label>
-
-            <!-- Retired: word timestamps are now ALWAYS requested (the
-                 transcript-coverage guard needs per-word end times on every
-                 dictation). Hidden, not removed, so the persisted "timestamps"
-                 settings field keeps round-tripping (sonioxKey precedent). -->
-            <div style="display:none">
-              <label for="timestamps">Timestamps</label>
-              <select id="timestamps">
-                <option value="none" selected>none</option>
-                <option value="word">word</option>
-                <option value="character">character</option>
-              </select>
-            </div>
-          </div>
-
-          <label class="checkbox" style="margin-top:14px;">
             <input type="checkbox" id="streamUpload" checked />
-            Upload while you dictate <span class="hint">(on by default; Chrome/Edge. Sends the audio while you are still talking, so letting go only waits for the transcript. If anything goes wrong it falls back to the normal upload on its own. The timing log shows which path each take used.)</span>
+            <span>Upload while you dictate<small class="hint">Chrome and Edge. Falls back to the normal upload on its own.</small></span>
           </label>
 
-          <label style="margin-top:14px;">Last take timing</label>
+          <label>Last take timing</label>
           <div id="timingReadout">No takes recorded yet.</div>
           <div class="row" style="margin-top: 8px;">
             <button id="copyTimingBtn" title="Copy the recent per-take timing log as TSV (paste into a spreadsheet)">Copy timing log</button>
             <button id="clearTimingBtn" title="Clear the stored timing log for this device">Clear timing log</button>
           </div>
-          <div class="hint">Where each dictation's time actually goes, measured on this machine and network. <b>service</b> is the round trip to the transcription API; the <b>ElevenLabs</b> figure inside it is what the API itself spent, so <b>net</b> is our own network overhead. Add <code>?perf=1</code> to the URL to also log each take to the console.</div>
 
-          <h3>How do these settings work?</h3>
-          <p><strong>Local gate</strong>: the gate IS the recording — only audio loud enough to open it gets transcribed. With a close mic, raising the open threshold rejects quieter, more distant voices before they're ever recorded.</p>
-          <p><strong>Gate look-ahead and release tail</strong>: the recording starts a little <em>before</em> the gate opens and keeps going a little <em>after</em> you let go, so the first and last syllables are not clipped. Raise them if word edges go missing; 0 turns either off.</p>
-          <p><strong>Makeup gain</strong>: lifts a quiet mic above the gate. A dead mic still reads 0, so it can never hide a mic that is not capturing.</p>
-          <p><strong>Filter out other speakers</strong>: when a second person's voice is loud enough to clear the gate, the speaker filter is the only thing that can drop it — the gate can't tell two equally-loud voices apart. It keeps the main (most-spoken) voice and reports what it removed. Pair it with a close mic for the best result.</p>
-        </div>
-      </details>
-
-      <details class="help">
-        <summary>Last recorded audio &amp; downloads</summary>
-        <div class="body">
-          <label>Last recorded audio (captured locally)</label>
-          <audio id="audioPreview" controls style="width:100%; margin-bottom:10px;"></audio>
-          <div class="row">
+          <label>Last recording</label>
+          <audio id="audioPreview" controls></audio>
+          <div class="row" style="margin-top: 8px;">
             <button id="downloadAudioBtn">Download audio</button>
             <button id="downloadBtn">Download transcripts .txt</button>
           </div>
         </div>
       </details>
 
-      <div class="hint" style="margin-top: 14px;">
-        English‑only, Scribe v2 Medical. Mic stays warm between dictations for instant start.
-        Audio uploads to ElevenLabs Scribe v2 Medical on release.
+      <!-- Phone-link internals. Hidden since 2026-11-21: the two Pair buttons
+           on the main card and their overlays are the visible way to start,
+           join, end and leave a session (they duplicated this block). The
+           elements stay because the session code drives them (the big-button
+           Leave clicks phoneLeaveBtn) and the harness exercises them. -->
+      <div id="phoneLinkInternals" hidden>
+        <button id="phoneStartBtn">Start phone session</button>
+        <span id="phoneCodeBadge" style="display:none;"></span>
+        <button id="phoneStopBtn" style="display:none;">End session</button>
+        <div id="phoneCodeHint" style="display:none;"></div>
+        <div id="phoneQr" style="display:none;"></div>
+        <input id="phoneJoinInput" type="text" maxlength="6" />
+        <button id="phoneJoinBtn">Join</button>
+        <span id="phoneJoinBadge" style="display:none;">Joined</span>
+        <button id="phoneLeaveBtn" style="display:none;">Leave</button>
       </div>
     </section>
   </div>
@@ -2342,29 +2331,15 @@ right lower quadrant"></textarea>
 
   const keytermsEl       = document.getElementById("keyterms");
   const keytermHintEl    = document.getElementById("keytermHint");
-  const timestampsEl     = document.getElementById("timestamps");
-  const tagEventsEl      = document.getElementById("tagEvents");
-  const autoCopyEl       = document.getElementById("autoCopy");
   const appendModeEl     = document.getElementById("appendMode");
   const noiseSuppressEl  = document.getElementById("noiseSuppress");
   const streamUploadEl   = document.getElementById("streamUpload");
   const echoCancelEl     = document.getElementById("echoCancel");
   const diarizeEl        = document.getElementById("diarize");
-  const diarizeDesktopEl = document.getElementById("diarizeDesktop");
   const startBeepEl      = document.getElementById("startBeep");
 
-  const gateOpenEl       = document.getElementById("gateOpen");
-  const gateCloseEl      = document.getElementById("gateClose");
-  const gateOpenValEl    = document.getElementById("gateOpenVal");
-  const gateCloseValEl   = document.getElementById("gateCloseVal");
-  const highpassEl       = document.getElementById("highpass");
-  const highpassValEl    = document.getElementById("highpassVal");
   const micGainEl        = document.getElementById("micGain");
   const micGainValEl     = document.getElementById("micGainVal");
-  const gateLookaheadEl    = document.getElementById("gateLookahead");
-  const gateLookaheadValEl = document.getElementById("gateLookaheadVal");
-  const releaseTailEl      = document.getElementById("releaseTail");
-  const releaseTailValEl   = document.getElementById("releaseTailVal");
   const windowTintEl       = document.getElementById("windowTint");
   const sttPrimaryEl       = document.getElementById("sttPrimary");
   const sttBackupEl        = document.getElementById("sttBackup");
@@ -2375,12 +2350,7 @@ right lower quadrant"></textarea>
   const faviconEl          = document.getElementById("faviconLink");
   const themeColorEl       = document.getElementById("themeColorMeta");
   const BASE_TITLE         = (typeof document !== "undefined" && document.title) ? document.title : "Dictation";
-  const autoGainEl       = document.getElementById("autoGain");
 
-  const meterBar         = document.getElementById("meterBar");
-  const openMark         = document.getElementById("openMark");
-  const closeMark        = document.getElementById("closeMark");
-  const gateStateEl      = document.getElementById("gateState");
   const recFeedbackEl    = document.getElementById("recFeedback");
   const waveCanvasEl     = document.getElementById("waveCanvas");
   const recTimerEl       = document.getElementById("recTimer");
@@ -2388,7 +2358,6 @@ right lower quadrant"></textarea>
 
   const appendChipEl     = document.getElementById("appendChip");
   const micPillEl        = document.getElementById("micPill");
-  const linkPillEl       = document.getElementById("linkPill");
   const advancedEl       = document.getElementById("advanced");
   const authSectionEl    = document.getElementById("authSection");
   const authSummaryEl    = document.getElementById("authSummary");
@@ -2397,7 +2366,6 @@ right lower quadrant"></textarea>
   const presetRowEl       = document.getElementById("presetRow");
   const hotkeyBtn        = document.getElementById("hotkeyBtn");
   const hotkeyResetBtn   = document.getElementById("hotkeyResetBtn");
-  const gateHintEl       = document.getElementById("gateHint");
 
   // Phone mic session elements
   const phoneStartBtnEl  = document.getElementById("phoneStartBtn");
@@ -2435,7 +2403,6 @@ right lower quadrant"></textarea>
   const micTipsAndroidEl = document.getElementById("micTipsAndroid");
   const micTipsDoneBtnEl = document.getElementById("micTipsDoneBtn");
   const bigTipsBtnEl     = document.getElementById("bigTipsBtn");
-  const optionsMicTipsBtnEl = document.getElementById("optionsMicTipsBtn");
 
   // Big-button dictation layout elements
   const bigUiEl          = document.getElementById("bigUi");
@@ -2573,6 +2540,7 @@ right lower quadrant"></textarea>
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
   let phoneJoined       = false; // desktop: a phone has joined this session (phone_join ping / first delivery) — drives the pairing overlay/button
+  let phoneLinkConnected = true; // desktop: the listener socket is up (false while reconnecting) — drives the pair button's "Link down" cue
   let phoneLinkDropped  = false; // desktop: a "link dropped" alarm is showing — the reconnect must CLEAR it (a healed link left FAILED on screen)
   let phoneRecTimer     = null;  // desktop: safety auto-clear for the "phone is recording/transcribing" indicator (in case a stop/delivery ping is missed)
   let micTipsSeen       = false; // per-device: the "keep other voices out" onboarding nudge has been dismissed
@@ -2628,13 +2596,7 @@ right lower quadrant"></textarea>
   let micGainNode = null;
   let hpFilter = null;
   let analyserNode = null;
-  let gateNode = null;
   let destNode = null;
-  // [ACCURACY] Look-ahead delay, in the RECORDED branch only. The analyser
-  // stays wired to the undelayed signal, so the gate decision, the flatline
-  // watchdog, the corpse probe, maxRmsSeen, the meter and the coverage guard's
-  // lastGateOpenAtMs baseline all keep their exact current meaning.
-  let lookaheadNode = null;
   let stopTailTimer = null; // deferred mediaRecorder.stop() while the tail drains
   let gateTimer = null;
   let gateBuf = null;
@@ -2651,9 +2613,13 @@ right lower quadrant"></textarea>
   // can itself be silent after an interruption).
   let audioReused = false;
   let wakeLock = null;        // screen wake lock: iOS auto-lock reclaims the mic (held per dictation, and across the phone's big-button surface — see wakeLockDesired)
+  // "Speech is reaching the mic right now" — a READ-ONLY detector on the
+  // analyser with hysteresis (SPEECH_OPEN_RMS / SPEECH_CLOSE_RMS + a hold).
+  // Until 2026-11-21 this was the noise gate and it also muted the recording;
+  // now nothing is cut, it only drives the "Hearing you" light, the coverage
+  // guard's lastGateOpenAtMs baseline and the empty-take naming.
   let gateIsOpen = false;
   let gateLastOpen = 0;
-  let lastMeterPct = -1;
 
   // iOS quiet-mic level seed bookkeeping (additive _v9, per-device — see
   // seedIosAudioDefaults). audioSeedVersion = the seed already applied (one-shot
@@ -2678,19 +2644,23 @@ right lower quadrant"></textarea>
   let takeDeliveryStarted = false; // this take reached deliverFinalText (the finalize safety net reads it)
   let precomputedBatchKeyterms = null; // [LATENCY] batch keyterms JSON snapshotted at session start, off the stop-to-upload critical path
 
-  const METER_MAX    = 0.12;
-  const HOLD_SECONDS = 0.9;
+  const METER_MAX    = 0.12;  // full scale for the capture trace
+  const HOLD_SECONDS = 0.9;   // speech detector hold before it reads "silence"
+  // Speech-detection thresholds (read-only — they decide what the UI SAYS,
+  // never what is recorded). The open level is the old iOS-seeded gate value,
+  // low enough for a quiet iPhone, well above the close level.
+  const SPEECH_OPEN_RMS  = 0.018;
+  const SPEECH_CLOSE_RMS = 0.008;
+  const HIGHPASS_HZ      = 85;    // fixed rumble filter on the recording (the slider was retired)
   const DICTATION_SENTINEL = "##DICTATION_FAILED##";
 
   const FLATLINE_RMS       = 0.0008; // below this for the whole session = mic is almost certainly dead
-  // One-shot iOS quiet-mic level seed (see seedIosAudioDefaults). A quiet iPhone
-  // mic records below the load-bearing gate and lands in the silent dead-band;
-  // these seed a MODEST makeup gain + a slightly lower gate so a normal voice
-  // clears it WITHOUT anyone opening Advanced. The gain cap stays well under the
-  // ~4x dead-mic-mask boundary, and the gate stays clear of gateClose (0.008).
+  // One-shot iOS quiet-mic level seed (see seedIosAudioDefaults): a MODEST
+  // makeup gain so a quiet iPhone mic reads well above the flatline without
+  // anyone opening Advanced. The cap stays well under the ~4x dead-mic-mask
+  // boundary. (It also lowered the noise gate until the gate was removed.)
   const IOS_AUDIO_SEED_VERSION = 1;     // bump to re-push a corrected seed to un-tuned installs (additive, no _v9 bump)
   const IOS_SEED_MIC_GAIN      = 3;     // makeup gain x — deterministic + observable (gain:Nx in micDiag), unlike AGC
-  const IOS_SEED_GATE_OPEN     = 0.018; // gate open threshold — well above gateClose 0.008
   // Press-path corpse-mic probe (phone surface): an analyser frame below this RMS
   // means no audio is flowing (a live mic always has a tiny floor; an iOS corpse
   // delivers exact zeros). EVERY big-button press probes — reused graphs exit on
@@ -2721,19 +2691,11 @@ right lower quadrant"></textarea>
   // heals with no live frame, STOP and say so — the press path (a real user
   // gesture, which iOS treats far more favourably) becomes the way back.
   const MIC_IDLE_HEAL_MAX   = 3;
-  // [ACCURACY] Capture shaping around the load-bearing gate. The gate decides
-  // from the UNDELAYED analyser but gates audio that is GATE_LOOKAHEAD_MS
-  // behind it, so the ~70 ms of detection lag (30 ms tick + ~21 ms analysis
-  // window + 20 ms attack ramp) no longer eats the word onset — utterance-
-  // initial unvoiced consonants (f, s, h, p, t, th) sit below the 0.03 open
-  // threshold and were being attenuated in the audio that actually gets
-  // uploaded. RELEASE_TAIL_MS keeps capturing briefly past the PTT release so
-  // the last syllable is not truncated. Both are per-device sliders (0 = off);
-  // together they add their sum to the post-release latency, which is a
-  // deliberate trade: a clipped drug name costs a whole redictation.
-  const GATE_LOOKAHEAD_MS_DEFAULT = 120;
-  const RELEASE_TAIL_MS_DEFAULT   = 80;
-  const CAPTURE_TAIL_MAX_MS       = 1000; // hard bound on the deferred stop, whatever the sliders say
+  // [ACCURACY] Capture tail: keep recording this long past the PTT release so
+  // a fast let-go cannot truncate the last syllable. (Until 2026-11-21 a
+  // 120 ms gate look-ahead added to it; with no gate there is nothing to look
+  // ahead of, and every take lands that much sooner.)
+  const RELEASE_TAIL_MS = 80;
   const HOTKEY_TAP_MS      = 400;   // press shorter than this = tap (toggle); longer = hold (PTT)
   const CTX_INTERRUPT_GRACE_MS = 400; // an AudioContext must stay non-"running" THIS long mid-dictation before alarming — iOS fires spurious interrupted->running blips that drop no audio; only a sustained interruption (which freezes the analyser + loses speech) is real
 
@@ -3037,15 +2999,12 @@ right lower quadrant"></textarea>
     updateBigScreen();
   }
 
+  // The upload leg's state. No pill shows it any more (2026-11-21: the status
+  // line, the record band and the window wash already say uploading/failed),
+  // but currentUiState() still reads it, so every path keeps setting it.
+  // state: "idle" | "connecting" | "live" | "fail" | "uploading" | "refining"
   function setLinkPill(state) {
-    // state: "idle" | "connecting" | "live" | "fail" | "uploading" | "refining"
     lastLinkPillState = state;
-    if (state === "live")            { linkPillEl.textContent = "LIVE";        linkPillEl.className = "pill live"; }
-    else if (state === "connecting") { linkPillEl.textContent = "connecting…"; linkPillEl.className = "pill warn"; }
-    else if (state === "uploading")  { linkPillEl.textContent = "uploading…";  linkPillEl.className = "pill warn"; }
-    else if (state === "refining")   { linkPillEl.textContent = "refining…";   linkPillEl.className = "pill warn"; }
-    else if (state === "fail")       { linkPillEl.textContent = "LINK FAIL";   linkPillEl.className = "pill fail"; }
-    else                             { linkPillEl.textContent = "link idle";   linkPillEl.className = "pill"; }
     updateBigScreen();
   }
 
@@ -3090,18 +3049,6 @@ right lower quadrant"></textarea>
     appendChipEl.style.display = "";
     appendChipEl.textContent = "next dictation appends";
     appendChipEl.className = "pill ok";
-  }
-
-  /* ───── Engine UI (batch-only) ───── */
-  function applyEngineUI() {
-    if (gateHintEl) {
-      gateHintEl.textContent =
-        "Batch: the gate IS the recording — only audio loud enough to open it gets transcribed.";
-    }
-    if (gateStateEl) {
-      gateStateEl.title =
-        "Local noise gate state (decides what gets recorded and transcribed)";
-    }
   }
 
   /* ───── Access section (API key / passphrase) ─────
@@ -3227,32 +3174,9 @@ right lower quadrant"></textarea>
       "Batch sends " + bt + " / 1000 (each &lt; 50 chars).";
   }
 
-  /* ───── Gate UI ───── */
-  function enforceGateOrder(changed) {
-    let open = Number(gateOpenEl.value);
-    let close = Number(gateCloseEl.value);
-    if (open < close) {
-      if (changed === "open") gateCloseEl.value = String(open);
-      else gateOpenEl.value = String(close);
-    }
-  }
-
-  function updateGateLabels() {
-    gateOpenValEl.textContent  = "(" + Number(gateOpenEl.value).toFixed(3) + ")";
-    gateCloseValEl.textContent = "(" + Number(gateCloseEl.value).toFixed(3) + ")";
-    highpassValEl.textContent  =
-      Number(highpassEl.value) > 0 ? "(" + highpassEl.value + " Hz)" : "(off)";
-    if (micGainValEl) micGainValEl.textContent = "(" + Number(micGainEl.value).toFixed(1) + "×)";
-    if (gateLookaheadValEl) gateLookaheadValEl.textContent = "(" + Number(gateLookaheadEl.value) + " ms)";
-    if (releaseTailValEl) releaseTailValEl.textContent = "(" + Number(releaseTailEl.value) + " ms)";
-
-    openMark.style.left  = Math.min(100, (Number(gateOpenEl.value)  / METER_MAX) * 100) + "%";
-    closeMark.style.left = Math.min(100, (Number(gateCloseEl.value) / METER_MAX) * 100) + "%";
-  }
-
-  function setGateStateUI(isOpen) {
-    gateStateEl.textContent = isOpen ? "gate OPEN" : "gate closed";
-    gateStateEl.className  = isOpen ? "pill open" : "pill";
+  /* ───── Mic gain label ───── */
+  function updateGainLabel() {
+    if (micGainValEl) micGainValEl.textContent = Number(micGainEl.value).toFixed(1) + "×";
   }
 
   // ───── Live recording feedback (waveform + timer + speech state) ─────
@@ -3262,8 +3186,10 @@ right lower quadrant"></textarea>
   // degrades to just the timer/state when getContext is unavailable.
   let waveCtx = null;
   let waveLevels = [];
-  let waveColor = "#3fb950";
-  let waveColorDim = "#6b7280";
+  let waveX = 0;       // sweep cursor (canvas px): the trace is drawn in place, like a monitor lead
+  let waveScale = 1;   // devicePixelRatio, for a crisp trace
+  let waveColor = "#5fe08f";
+  let waveColorDim = "#3b4650";
   let recTimerLastSec = -1;
   let recFeedbackOn = false;
 
@@ -3275,18 +3201,18 @@ right lower quadrant"></textarea>
     if (bigRecInfoEl) bigRecInfoEl.textContent = "";
     if (!on) return;
     waveLevels = [];
+    waveX = 0;
     recTimerLastSec = -1;
     if (recTimerEl) recTimerEl.textContent = "0:00";
     if (recStateEl) { recStateEl.textContent = "Listening…"; recStateEl.className = ""; }
     try {
       var cs = getComputedStyle(document.documentElement);
       waveColor = (cs.getPropertyValue("--ok") || "").trim() || waveColor;
-      waveColorDim = (cs.getPropertyValue("--muted") || "").trim() || waveColorDim;
     } catch (e) {}
     try {
-      var w = waveCanvasEl.clientWidth || 320;
-      waveCanvasEl.width = w;
-      waveCanvasEl.height = 46;
+      waveScale = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+      waveCanvasEl.width = Math.round((waveCanvasEl.clientWidth || 320) * waveScale);
+      waveCanvasEl.height = Math.round((waveCanvasEl.clientHeight || 56) * waveScale);
       waveCtx = waveCanvasEl.getContext ? waveCanvasEl.getContext("2d") : null;
     } catch (e) { waveCtx = null; }
   }
@@ -3315,21 +3241,24 @@ right lower quadrant"></textarea>
     drawWave();
   }
 
+  // A monitor-style sweep: each 30 ms tick draws one column at the cursor and
+  // erases a short gap ahead of it, so the newest signal is always at the
+  // cursor and the previous pass stays visible beyond the gap. The level is a
+  // square-root curve so quiet speech still shows.
   function drawWave() {
-    if (!waveCtx) return;
+    if (!waveCtx || !waveLevels.length) return;
     var W = waveCanvasEl.width, H = waveCanvasEl.height;
-    var step = 4; // 3px bar + 1px gap
-    var maxBars = Math.max(1, Math.floor(W / step));
-    while (waveLevels.length > maxBars) waveLevels.shift();
-    waveCtx.clearRect(0, 0, W, H);
+    var step = 3 * waveScale, bar = 2 * waveScale, gap = 14 * waveScale;
+    var lv = waveLevels[waveLevels.length - 1];
+    if (waveLevels.length > 4) waveLevels.splice(0, waveLevels.length - 4); // only the newest is drawn
+    if (waveX + step > W) waveX = 0;
+    waveCtx.clearRect(waveX, 0, Math.min(step + gap, W - waveX), H);
+    if (waveX + step + gap > W) waveCtx.clearRect(0, 0, waveX + step + gap - W, H);
     var mid = H / 2;
-    for (var i = 0; i < waveLevels.length; i++) {
-      var lv = waveLevels[i];
-      var h = Math.max(2, lv * (H - 6));
-      var x = W - (waveLevels.length - i) * step;
-      waveCtx.fillStyle = lv > 0.05 ? waveColor : waveColorDim;
-      waveCtx.fillRect(x, mid - h / 2, 3, h);
-    }
+    var h = Math.max(1.5 * waveScale, Math.sqrt(lv) * (H - 8 * waveScale));
+    waveCtx.fillStyle = gateIsOpen ? waveColor : waveColorDim;
+    waveCtx.fillRect(waveX, mid - h / 2, bar, h);
+    waveX += step;
   }
 
   /* ───── Storage / Persistence ───── */
@@ -3344,25 +3273,17 @@ right lower quadrant"></textarea>
       engine:         engine,
       keyterms:       keytermsEl.value,
       presetIds:      Object.keys(presetInputs).filter((id) => presetInputs[id].checked),
-      timestamps:     timestampsEl.value,
-      tagEvents:      tagEventsEl.checked,
-      autoCopy:       autoCopyEl.checked,
       appendMode:     appendModeEl.checked,
       saveApiKey:     saveApiKeyEl.checked,
       noiseSuppress:  noiseSuppressEl.checked,
       echoCancel:     echoCancelEl.checked,
-      diarize:        diarizeEl.checked, // per-device: keep-primary-speaker filter (on by default)
-      diarizeDesktop: diarizeDesktopEl ? diarizeDesktopEl.checked : false, // per-device: the filter on a plain desktop too (off by default)
+      diarize:        diarizeEl.checked, // per-device: keep-primary-speaker filter (on by default, every device since 2026-11-21)
       startBeep:      startBeepEl.checked,
-      gateOpen:       gateOpenEl.value,
-      gateClose:       gateCloseEl.value,
-      highpass:       highpassEl.value,
+      // Per-device (mic-specific + a window cue for THIS screen). The gate,
+      // look-ahead, release-tail, high-pass, auto-gain, tag-events, auto-copy
+      // and timestamps fields were retired 2026-11-21: no longer written, and
+      // an old saved value is ignored (no _v9 bump).
       micGain:        micGainEl.value,
-      autoGain:       autoGainEl.checked,
-      // Per-device (mic- and machine-specific capture shaping + a window cue
-      // for THIS screen): none of these belong in the portable settings set.
-      gateLookahead:  gateLookaheadEl ? gateLookaheadEl.value : String(GATE_LOOKAHEAD_MS_DEFAULT),
-      releaseTail:    releaseTailEl ? releaseTailEl.value : String(RELEASE_TAIL_MS_DEFAULT),
       windowTint:     windowTintEl ? windowTintEl.value : "full",
       // Which service transcribes, and which backs it up (per device for now;
       // a portable-settings candidate once settings sync).
@@ -3426,23 +3347,13 @@ right lower quadrant"></textarea>
           if (presetInputs[id]) presetInputs[id].checked = true;
         }
       }
-      if (s.timestamps) timestampsEl.value = s.timestamps;
-      if (typeof s.tagEvents     === "boolean") tagEventsEl.checked     = s.tagEvents;
-      if (typeof s.autoCopy      === "boolean") autoCopyEl.checked      = s.autoCopy;
       if (typeof s.appendMode    === "boolean") appendModeEl.checked    = s.appendMode;
       if (typeof s.saveApiKey    === "boolean") saveApiKeyEl.checked    = s.saveApiKey;
       if (typeof s.noiseSuppress === "boolean") noiseSuppressEl.checked = s.noiseSuppress;
       if (typeof s.echoCancel === "boolean") echoCancelEl.checked = s.echoCancel;
       if (typeof s.diarize       === "boolean") diarizeEl.checked       = s.diarize; // default stays ON (checked in HTML) when unset
-      if (typeof s.diarizeDesktop === "boolean" && diarizeDesktopEl) diarizeDesktopEl.checked = s.diarizeDesktop; // default OFF
       if (typeof s.startBeep     === "boolean") startBeepEl.checked     = s.startBeep;
-      if (s.gateOpen  !== undefined) gateOpenEl.value  = s.gateOpen;
-      if (s.gateClose !== undefined) gateCloseEl.value = s.gateClose;
-      if (s.highpass  !== undefined) highpassEl.value  = s.highpass;
       if (s.micGain   !== undefined) micGainEl.value   = s.micGain;
-      if (typeof s.autoGain === "boolean") autoGainEl.checked = s.autoGain;
-      if (s.gateLookahead !== undefined && gateLookaheadEl) gateLookaheadEl.value = s.gateLookahead;
-      if (s.releaseTail   !== undefined && releaseTailEl)   releaseTailEl.value   = s.releaseTail;
       if (sttPrimaryEl && (s.sttPrimary === "elevenlabs" || s.sttPrimary === "soniox" || s.sttPrimary === "openai" || s.sttPrimary === "mistral")) {
         sttPrimaryEl.value = s.sttPrimary;
       }
@@ -4362,15 +4273,14 @@ right lower quadrant"></textarea>
     return r;
   }
 
-  // Diarization applies on the phone / big-button surface, where bystanders are
-  // the everyday risk, and on a desktop only when "…also on this desktop" is
-  // checked. An unchecked desktop keeps the proven single-speaker config
-  // (num_speakers=1 / diarize=false) — flipping the default STT shape for every
-  // desktop user with no measured accuracy backing is a risk the prime
-  // directive (never wrong/missing chart text) doesn't take; a clinician who
-  // dictates among other voices opts in on that device.
+  // Diarization (keep-primary-speaker) applies wherever the toggle is on — on
+  // by default on EVERY device since 2026-11-21 (the owner always dictates
+  // among other people, and the noise gate that used to drop quiet background
+  // voices is gone). Before that a plain desktop needed a separate opt-in and
+  // sent num_speakers=1 / diarize=false. The filter is a no-op on one voice and
+  // keeps everything (with a warning) when it cannot tell voices apart.
   function diarizeActive() {
-    return Boolean(diarizeEl.checked && (bigButtonActive() || (diarizeDesktopEl && diarizeDesktopEl.checked)));
+    return Boolean(diarizeEl.checked);
   }
 
   // Which service transcribes this device's takes, and which backs it up when
@@ -4432,7 +4342,7 @@ right lower quadrant"></textarea>
         var p = sttPrimary(), b = sttBackup();
         var msg = SHARED_MODE
           ? "Now: " + STT_LONG_NAMES[p] + (b === "none" ? ", with no backup." : ", backed up by " + sttName(b) + ".") +
-            " Switch the main service here if it is having problems; the backup gets the same recording automatically when the main one errors or has not answered within a few seconds."
+            " The backup gets the same recording when the main service errors or stalls."
           : "With your own ElevenLabs key only ElevenLabs is available; the other services need the shared access code.";
         if (p !== "elevenlabs") msg += " Only ElevenLabs uploads while you dictate, so " + sttName(p) + " starts when you let go.";
         if (p === "openai" || b === "openai") msg += " OpenAI returns text only: its takes get no speaker filter, no incomplete-transcript check and no keyterms.";
@@ -4482,8 +4392,8 @@ right lower quadrant"></textarea>
       // to a half-length transcript — it is retired/hidden, not removed).
       ["timestamps_granularity", "word"],
       ["no_verbatim", "true"], // always on — the "remove filler/false starts" toggle was removed
-      ["tag_audio_events", String(tagEventsEl.checked)],
-      ["diarize", String(diarizeActive())], // keep-primary-speaker: drop bystander voices — phone/big-button surface only
+      ["tag_audio_events", "false"], // fixed off: "(cough)" never belongs in a chart (the toggle was retired 2026-11-21)
+      ["diarize", String(diarizeActive())], // keep-primary-speaker: drop bystander voices (every device, on by default)
       ["stt_primary", sttPrimary()], // which service transcribes (Options)
       ["stt_backup", sttBackup()],   // ...and which one the Worker asks when it errors or stalls
       ["keyterms_json", precomputedBatchKeyterms || JSON.stringify(
@@ -5171,7 +5081,7 @@ right lower quadrant"></textarea>
              " mute:" + (track ? track.muted : "?") +
              " dev:" + ((track && track.label) ? track.label.slice(0, 30) : "?") +
              " ec:" + (echoCancelEl.checked ? "on" : "off") +
-             " agc:" + (autoGainEl.checked ? "on" : "off") +
+             " agc:off" +
              " gain:" + Number(micGainEl.value).toFixed(1) + "x" +
              " peak:" + maxRmsSeen.toFixed(5) +
              // The pre-capture probe fails BEFORE the per-take reset of
@@ -5400,7 +5310,7 @@ right lower quadrant"></textarea>
         channelCount: 1,
         echoCancellation: echoCancelEl.checked,
         noiseSuppression: noiseSuppressEl.checked,
-        autoGainControl: autoGainEl.checked,
+        autoGainControl: false, // fixed off (the toggle was retired 2026-11-21): browser AGC can pump and mask a dying mic
         sampleRate: 48000,
       },
     });
@@ -5477,69 +5387,42 @@ right lower quadrant"></textarea>
 
     const source = audioCtx.createMediaStreamSource(stream);
 
-    // Makeup gain right at the head of the graph, BEFORE the analyser/gate, so a
-    // quiet mic is boosted for the recording AND for the meter/gate/watchdog
-    // alike. Placed pre-analyser deliberately: it lifts a low-but-real signal
-    // above the flatline threshold + the gate, while a truly DEAD mic (zero
-    // samples) stays zero (gain × 0 = 0) — so it never masks a dead mic.
+    // Makeup gain right at the head of the graph, BEFORE the analyser, so a
+    // quiet mic is boosted for the recording AND for the trace/watchdog alike.
+    // Placed pre-analyser deliberately: it lifts a low-but-real signal above
+    // the flatline threshold, while a truly DEAD mic (zero samples) stays zero
+    // (gain × 0 = 0) — so it never masks a dead mic.
     micGainNode = audioCtx.createGain();
     micGainNode.gain.value = Number(micGainEl.value) || 1;
 
     hpFilter = audioCtx.createBiquadFilter();
     hpFilter.type = "highpass";
-    hpFilter.frequency.value = Number(highpassEl.value) || 0;
+    hpFilter.frequency.value = HIGHPASS_HZ;
     hpFilter.Q.value = 0.707;
 
     analyserNode = audioCtx.createAnalyser();
     analyserNode.fftSize = 1024;
 
-    gateNode = audioCtx.createGain();
-    gateNode.gain.value = 0;
-
     destNode = audioCtx.createMediaStreamDestination();
 
+    // The graph (2026-11-21 — no noise gate, no look-ahead delay):
+    //
+    //   mic -> makeup gain -> high-pass -> destNode   (what MediaRecorder records)
+    //                                  \-> analyserNode (read-only: trace, speech
+    //                                                    light, watchdog, probe)
+    //
+    // Everything the mic hears is recorded; nothing is cut by level. The
+    // analyser is a read-only leaf, exactly as before, so the flatline
+    // watchdog, the corpse probe, maxRmsSeen and the coverage baseline keep
+    // their meaning.
     source.connect(micGainNode);
     micGainNode.connect(hpFilter);
     hpFilter.connect(analyserNode);
-
-    // [ACCURACY] Look-ahead delay, RECORDED BRANCH ONLY.
-    //
-    //   hpFilter -> analyserNode                          (undelayed: gate decision,
-    //                                                       watchdog, probe, meter)
-    //   hpFilter -> lookaheadNode -> gateNode -> destNode  (delayed: what is recorded)
-    //
-    // The gate still opens off the live analyser, but the audio it opens onto is
-    // GATE_LOOKAHEAD_MS older — so by the time the gain has ramped up, the samples
-    // passing through are the ones from BEFORE the threshold crossing. That is the
-    // recovered word onset. Nothing that reads the analyser changes meaning, which
-    // is what keeps every existing loud-failure guarantee intact.
-    //
-    // createDelay is feature-detected: without it we fall back to the exact
-    // previous wiring rather than losing the capture path.
-    lookaheadNode = null;
-    try {
-      if (audioCtx.createDelay) {
-        lookaheadNode = audioCtx.createDelay(CAPTURE_TAIL_MAX_MS / 1000);
-        lookaheadNode.delayTime.value = gateLookaheadMs() / 1000;
-      }
-    } catch (e) { lookaheadNode = null; }
-
-    // BATCH CAPTURE: the post-gate audio is what MediaRecorder records and uploads.
-    // The analyser above drives the capture waveform + dead-mic watchdog (read off
-    // the same pre-gate signal).
-    if (lookaheadNode) {
-      hpFilter.connect(lookaheadNode);
-      lookaheadNode.connect(gateNode);
-    } else {
-      hpFilter.connect(gateNode);
-    }
-    gateNode.connect(destNode);
+    hpFilter.connect(destNode);
 
     gateBuf = new Float32Array(analyserNode.fftSize);
     gateIsOpen = false;
     gateLastOpen = 0;
-    lastMeterPct = -1;
-    setGateStateUI(false);
 
     if (gateTimer) clearInterval(gateTimer);
     gateTimer = setInterval(() => {
@@ -5550,12 +5433,6 @@ right lower quadrant"></textarea>
       for (let i = 0; i < gateBuf.length; i++) sum += gateBuf[i] * gateBuf[i];
       const rms = Math.sqrt(sum / gateBuf.length);
 
-      const pct = Math.min(100, (rms / METER_MAX) * 100);
-      if (Math.abs(pct - lastMeterPct) > 0.5) {
-        meterBar.style.width = pct + "%";
-        lastMeterPct = pct;
-      }
-
       // Live recording feedback: visible only while capturing (gateIsOpen is
       // updated just below, so the displayed state lags one tick — imperceptible).
       if (recording && !stopping) {
@@ -5565,24 +5442,21 @@ right lower quadrant"></textarea>
         showRecFeedback(false);
       }
 
-      const openT  = Number(gateOpenEl.value);
-      const closeT = Number(gateCloseEl.value);
+      // Speech detector (read-only: it mutes nothing).
+      const openT  = SPEECH_OPEN_RMS;
+      const closeT = SPEECH_CLOSE_RMS;
       const now    = audioCtx.currentTime;
 
       if (!gateIsOpen) {
         if (rms > openT) {
           gateIsOpen = true;
           gateLastOpen = now;
-          gateNode.gain.setTargetAtTime(1, now, 0.02);
-          setGateStateUI(true);
         }
       } else {
         if (rms > closeT) {
           gateLastOpen = now;
         } else if (now - gateLastOpen > HOLD_SECONDS) {
           gateIsOpen = false;
-          gateNode.gain.setTargetAtTime(0, now, 0.12);
-          setGateStateUI(false);
         }
       }
 
@@ -5602,9 +5476,8 @@ right lower quadrant"></textarea>
 
         // Coverage bookkeeping for the truncation guard (gateIsOpen was updated
         // just above, so this tick's state is current). Dead-band time — signal
-        // present but below the gate while it is closed — is the gate-drift
-        // signature (recorded as silence though the clinician kept talking);
-        // logged for diagnosis, never used to warn.
+        // present but below the speech level — is logged for diagnosis (a very
+        // quiet mic), never used to warn.
         if (gateIsOpen) { gateOpenMs += 30; lastGateOpenAtMs = nowMs; }
         else if (rms >= FLATLINE_RMS && rms < openT) deadBandMs += 30;
 
@@ -5656,10 +5529,7 @@ right lower quadrant"></textarea>
     if (audioCtx) { audioCtx.close().catch(() => {}); }
     if (stream) { for (const track of stream.getTracks()) track.stop(); }
     stream = null; audioCtx = null; micGainNode = null; hpFilter = null; analyserNode = null;
-    gateNode = null; destNode = null; lookaheadNode = null; gateBuf = null; gateIsOpen = false;
-    lastMeterPct = -1;
-    meterBar.style.width = "0%";
-    setGateStateUI(false);
+    destNode = null; gateBuf = null; gateIsOpen = false;
     setMicPill("off");
   }
 
@@ -5985,10 +5855,10 @@ right lower quadrant"></textarea>
       if (sessionFinalized) return;
       finalizeSession(false);
     };
-    // Loudness evidence for the speaker filter, in the recording's own time:
-    // the audio the recorder writes runs the look-ahead behind the analyser.
+    // Loudness evidence for the speaker filter, in the recording's own time
+    // (the recorder and the analyser hear the same, undelayed signal).
     takeLevels = diarizeActive()
-      ? { t0: Date.now(), offsetMs: lookaheadNode ? gateLookaheadMs() : 0, t: [], v: [] }
+      ? { t0: Date.now(), offsetMs: 0, t: [], v: [] }
       : null;
     mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
     journalStart(preferred || "audio/webm"); // begin the crash-recovery journal for this take (fire-and-forget)
@@ -6014,24 +5884,11 @@ right lower quadrant"></textarea>
     }
   }
 
-  // Current look-ahead / tail settings, clamped. Sliders are per-device and 0
-  // disables either half independently.
-  function gateLookaheadMs() {
-    var v = gateLookaheadEl ? Number(gateLookaheadEl.value) : GATE_LOOKAHEAD_MS_DEFAULT;
-    if (!isFinite(v) || v < 0) v = 0;
-    return Math.min(CAPTURE_TAIL_MAX_MS, v);
-  }
-  function releaseTailMs() {
-    var v = releaseTailEl ? Number(releaseTailEl.value) : RELEASE_TAIL_MS_DEFAULT;
-    if (!isFinite(v) || v < 0) v = 0;
-    return Math.min(CAPTURE_TAIL_MAX_MS, v);
-  }
-  // How long to keep capturing past the release: the look-ahead delay line still
-  // holds that many milliseconds of audio (stopping now would DROP it), plus the
-  // deliberate tail so a fast release cannot truncate the final syllable.
+  // How long to keep capturing past the release, so a fast let-go cannot
+  // truncate the final syllable. Fixed since 2026-11-21 (the slider and the
+  // gate look-ahead that used to add to it were retired).
   function captureTailMs() {
-    var la = lookaheadNode ? gateLookaheadMs() : 0;
-    return Math.max(0, Math.min(CAPTURE_TAIL_MAX_MS, la + releaseTailMs()));
+    return RELEASE_TAIL_MS;
   }
 
   function stopRecording() {
@@ -6050,8 +5907,8 @@ right lower quadrant"></textarea>
     stopPhase = null;
     setStatus("Stopping — preparing upload…", "warn");
 
-    // [ACCURACY] Drain the look-ahead delay line and add the release tail before
-    // stopping the recorder. stopping=true and the status above are already set,
+    // [ACCURACY] Keep capturing for the release tail before stopping the
+    // recorder. stopping=true and the status above are already set,
     // so the UI shows the busy state immediately — the wait is not a visible
     // hang. A second F14 during the window hits the stopping guard above and is
     // a no-op; any unexpected failure still routes straight to finalizeSession
@@ -6288,13 +6145,13 @@ right lower quadrant"></textarea>
     //     press it slips past the watchdog, so name it here ("MIC PRODUCED NO
     //     SIGNAL") rather than blaming the clinician for not speaking — this is
     //     the iOS corpse-mic capture (peak:0.00000 in the field).
-    //   lowLevel — peak in the dead-band [FLATLINE_RMS, gateOpen): real but too
-    //     quiet to clear the gate ("VERY LOW MIC LEVEL").
+    //   lowLevel — peak in the dead-band [FLATLINE_RMS, SPEECH_OPEN_RMS): real
+    //     but never reached speech level ("VERY LOW MIC LEVEL").
     // Both gated on !micAlarmFired so a fired watchdog keeps its own message.
     var noSignal = !unexpected && !micAlarmFired && maxRmsSeen < FLATLINE_RMS;
     var lowLevel = !unexpected && !micAlarmFired &&
                    maxRmsSeen >= FLATLINE_RMS &&
-                   maxRmsSeen < Number(gateOpenEl.value || 0.03);
+                   maxRmsSeen < SPEECH_OPEN_RMS;
 
     if (!blob || blob.size < 1024) {
       // Gate never opened / instant tap: nothing worth uploading. Cancel the
@@ -6542,7 +6399,9 @@ right lower quadrant"></textarea>
     const keptOnPhone = phoneLayout && (held || !joinedSessionCode);
     const noteSuffix = opts.note ? " " + opts.note : ""; // diarization "removed N words" note (no beep)
 
-    if (autoCopyEl.checked) {
+    // Auto-copy is unconditional (the toggle was retired 2026-11-21: the
+    // clipboard IS the deliverable on the AHK path).
+    {
       const copied = await copyText(cleaned);
       if (keptOnPhone) {
         announceKeptNote(copied, addedToNote, cleanOutcome, opts, noteSuffix, Boolean(noteId));
@@ -6571,23 +6430,6 @@ right lower quadrant"></textarea>
         warnBeep();
       } else {
         setStatus(label + " saved & copied. Done!" + noteSuffix, "ok");
-        doneBeep();
-      }
-    } else {
-      if (keptOnPhone) {
-        announceKeptNote(null, addedToNote, cleanOutcome, opts, noteSuffix, Boolean(noteId));
-      } else if (announceRelayOutcome) {
-        setStatus((desktopKnownAtStart === false
-          ? "Transcript saved — queueing for the desktop…"
-          : "Transcript sent to the desktop — confirming delivery…") + noteSuffix, "warn");
-      } else if (opts.unexpected) {
-        setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — partial transcript saved (not copied).", "err");
-        failBeep();
-      } else if (opts.degraded) {
-        setStatus(label + " saved." + noteSuffix, "warn");
-        warnBeep();
-      } else {
-        setStatus(label + " saved." + noteSuffix, "ok");
         doneBeep();
       }
     }
@@ -6922,9 +6764,11 @@ right lower quadrant"></textarea>
     // (a phone user who tapped this by mistake could not see it was running —
     // "End session" was a thousand pixels down in Options).
     if (pairPhoneBtnEl) {
-      pairPhoneBtnEl.textContent = phoneJoined ? "📱 Phone paired ✓"
+      pairPhoneBtnEl.textContent = (phoneSessionCode && !phoneLinkConnected) ? "📱 Link down · " + phoneSessionCode + " — reconnecting"
+        : phoneJoined ? "📱 Phone paired ✓"
         : phoneSessionCode ? "📱 Waiting for phone · " + phoneSessionCode
         : "📱 Pair a phone";
+      pairPhoneBtnEl.classList.toggle("linkdown", Boolean(phoneSessionCode && !phoneLinkConnected));
     }
     // The phone-side twin: reflects THIS device's join (the desktop side above
     // reflects a phone having joined this desktop). Both live on the primary
@@ -7081,11 +6925,10 @@ right lower quadrant"></textarea>
     return false;
   }
 
-  // One-shot iOS level seed (the foolproof piece): a quiet iPhone mic records
-  // below the load-bearing gate and lands in the silent dead-band (see
-  // finishBatchSession), so a colleague who never opens Advanced gets near-empty
-  // notes. Seed a MODEST makeup gain + a slightly lower gate so a normal voice
-  // clears the gate out of the box. Deterministic + observable (gain:Nx in
+  // One-shot iOS level seed (the foolproof piece): a quiet iPhone mic reads
+  // close to the flatline, so a colleague who never opens Advanced gets a weak
+  // recording. Seed a MODEST makeup gain so a normal voice reads well out of
+  // the box. (Until 2026-11-21 it also lowered the noise gate.) Deterministic + observable (gain:Nx in
   // micDiag) and a dead mic still reads 0 (gain x 0 = 0) — unlike browser AGC,
   // which is opaque and can mask a dying mic / pump the gate open / boost a
   // bystander into the kept speaker. Strictly additive + versioned (NO _v9
@@ -7097,7 +6940,6 @@ right lower quadrant"></textarea>
     if (audioUserTuned) return;                          // respect a deliberately tuned device
     if (audioSeedVersion >= IOS_AUDIO_SEED_VERSION) return; // one-shot per version
     micGainEl.value = String(IOS_SEED_MIC_GAIN);
-    if (Number(gateOpenEl.value) > IOS_SEED_GATE_OPEN) gateOpenEl.value = String(IOS_SEED_GATE_OPEN);
     audioSeedVersion = IOS_AUDIO_SEED_VERSION;
     saveSettingsNow();
   }
@@ -7124,6 +6966,8 @@ right lower quadrant"></textarea>
   }
 
   function setPhoneLinkUI(connected) {
+    phoneLinkConnected = connected;
+    updatePairButton(); // the visible cue: the Options code badge is hidden since 2026-11-21
     if (!phoneCodeBadgeEl || !phoneSessionCode) return;
     phoneCodeBadgeEl.textContent = connected ? phoneSessionCode : phoneSessionCode + " ⚠";
     phoneCodeBadgeEl.style.color = connected ? "var(--accent)" : "var(--danger)";
@@ -7433,6 +7277,7 @@ right lower quadrant"></textarea>
 
   function stopPhoneSession() {
     phoneSessionCode = ""; // cleared first so the onclose below does not reconnect
+    phoneLinkConnected = true;
     if (phonePingTimer)      { clearInterval(phonePingTimer); phonePingTimer = null; }
     if (phonePollTimer)      { clearInterval(phonePollTimer); phonePollTimer = null; }
     if (phoneReconnectTimer) { clearTimeout(phoneReconnectTimer); phoneReconnectTimer = null; }
@@ -7483,11 +7328,6 @@ right lower quadrant"></textarea>
     finalizedSegments = combined.trim() ? [combined] : []; // keep the box model in sync for further edits/append
     updateAppendChip(); // refresh the armed pill now the one-shot arm is consumed
     addHistory(combined, { language_code: "en", engine: "remote" });
-    if (!autoCopyEl.checked) {
-      if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript saved, not copied. Verify it!", "warn"); warnBeep(); }
-      else          { setStatus(replace ? "The phone re-sent a whole note — it REPLACED the note here." : (wantAppend ? "Phone transcript appended." : "Phone transcript received."), "ok"); doneBeep(); }
-      return;
-    }
     copyText(combined).then(function(ok) {
       if (ok) {
         pendingCopyText = "";
@@ -8070,7 +7910,7 @@ right lower quadrant"></textarea>
           themeColorEl.setAttribute("content",
             st === "rec" ? "#7f1d1d" :
             st === "busy" ? "#78350f" :
-            (st === "fail" || st === "alarm") ? "#7f1d1d" : "#0b0d10");
+            (st === "fail" || st === "alarm") ? "#7f1d1d" : "#1a1f24");
         }
       } catch (e) {}
     } catch (e) {}
@@ -8905,7 +8745,6 @@ right lower quadrant"></textarea>
 
   if (micTipsDoneBtnEl)    micTipsDoneBtnEl.onclick    = () => closeMicTips();
   if (bigTipsBtnEl)        bigTipsBtnEl.onclick        = () => showMicTips();
-  if (optionsMicTipsBtnEl) optionsMicTipsBtnEl.onclick = () => showMicTips();
   // Tapping the dark backdrop dismisses the tips (counts as seen).
   if (micTipsEl) micTipsEl.addEventListener("click", (e) => { if (e.target === micTipsEl) closeMicTips(); });
 
@@ -9029,43 +8868,11 @@ right lower quadrant"></textarea>
     URL.revokeObjectURL(url);
   };
 
-  gateOpenEl.addEventListener("input", () => {
-    audioUserTuned = true; // hand-tuned: the iOS level seed must never overwrite this
-    enforceGateOrder("open"); updateGateLabels(); saveSettings();
-  });
-  gateCloseEl.addEventListener("input", () => {
-    enforceGateOrder("close"); updateGateLabels(); saveSettings();
-  });
-  highpassEl.addEventListener("input", () => {
-    if (hpFilter) hpFilter.frequency.value = Number(highpassEl.value) || 0;
-    updateGateLabels();
-    saveSettings();
-  });
-  // Makeup gain updates the live node immediately (no rebuild) so the meter
-  // responds while tuning; AGC is a capture constraint, so it rebuilds the graph.
+  // Makeup gain updates the live node immediately (no rebuild).
   micGainEl.addEventListener("input", () => {
     audioUserTuned = true; // hand-tuned: the iOS level seed must never overwrite this
     if (micGainNode) micGainNode.gain.value = Number(micGainEl.value) || 1;
-    updateGateLabels();
-    saveSettings();
-  });
-  autoGainEl.addEventListener("change", () => {
-    audioUserTuned = true; // a deliberate AGC choice counts as hand-tuned — the seed must not stack makeup gain on top
-    saveSettings();
-    releaseAudio();
-    tryWarmOnLoad();
-  });
-  // Look-ahead retunes the live DelayNode — no graph rebuild, so it can be
-  // adjusted between takes (or mid-take) without dropping the mic.
-  if (gateLookaheadEl) gateLookaheadEl.addEventListener("input", () => {
-    if (lookaheadNode) {
-      try { lookaheadNode.delayTime.value = gateLookaheadMs() / 1000; } catch (e) {}
-    }
-    updateGateLabels();
-    saveSettings();
-  });
-  if (releaseTailEl) releaseTailEl.addEventListener("input", () => {
-    updateGateLabels();
+    updateGainLabel();
     saveSettings();
   });
   if (windowTintEl) windowTintEl.addEventListener("change", () => {
@@ -9141,8 +8948,8 @@ right lower quadrant"></textarea>
   setInterval(updateAppendChip, 1000);
 
   for (const el of [
-    apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl, timestampsEl, tagEventsEl,
-    autoCopyEl, appendModeEl, startBeepEl, diarizeEl, diarizeDesktopEl, streamUploadEl,
+    apiKeyEl, sonioxKeyEl, passphraseEl, saveApiKeyEl, keytermsEl,
+    appendModeEl, startBeepEl, diarizeEl, streamUploadEl,
   ]) {
     el.addEventListener("change", saveSettings);
     el.addEventListener("input", saveSettings);
@@ -9308,12 +9115,11 @@ right lower quadrant"></textarea>
 
   renderPresetRow(); // must precede loadSettings, which re-checks persisted presets
   loadSettings();
-  seedIosAudioDefaults(); // after loadSettings (respect a hand-tuned device), before updateGateLabels/tryWarmOnLoad so the seeded gain+gate are reflected and built
-  applyEngineUI();
+  seedIosAudioDefaults(); // after loadSettings (respect a hand-tuned device), before updateGainLabel/tryWarmOnLoad so the seeded gain is reflected and built
   applyWindowTintMode();   // window-wide recording cue: paint the persisted mode at boot
   refreshSttUi();          // the chosen transcription service + backup (greys out services with no key)
   renderTimingReadout(null); // show the most recent stored take, if any
-  updateGateLabels();
+  updateGainLabel();
   updateKeytermHint();
   updateHotkeyUI();
   restoreLatestFromHistory();

@@ -482,7 +482,9 @@ check('batch success status', status().includes('Done!'), status());
 const hist9 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9'));
 check('history entry tagged engine batch', hist9[0] && hist9[0].engine === 'batch', hist9[0] && hist9[0].engine);
 check('record button reset after batch', doc.getElementById('recordBtn').textContent.includes('Start'));
-check('link pill idle after batch', doc.getElementById('linkPill').textContent === 'link idle');
+// The link pill is gone (2026-11-21); the derived window state carries it.
+check('window state reads ok after batch', doc.body.getAttribute('data-state') === 'ok', doc.body.getAttribute('data-state'));
+check('the pared page has no link/gate pills or level meter', !doc.getElementById('linkPill') && !doc.getElementById('gateState') && !doc.getElementById('meterBar'));
 
 // ===== Scenario 10: batch upload failure -> sentinel =====
 console.log('--- scenario 10: batch upload failure ---');
@@ -495,7 +497,7 @@ await sleep(300);
 check('upload failure -> sentinel on clipboard', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('upload failure -> loud err status', statusCls().includes('err') && status().includes('FAILED'), status());
 check('upload failure surfaces the server error', status().includes('service exploded'), status());
-check('link pill FAIL after failed upload', doc.getElementById('linkPill').textContent === 'LINK FAIL');
+check('window state reads fail after a failed upload', doc.body.getAttribute('data-state') === 'fail', doc.body.getAttribute('data-state'));
 check('record button reset after failure', doc.getElementById('recordBtn').textContent.includes('Start'));
 
 // ===== Scenario 11: PTT queued during a slow batch upload =====
@@ -505,12 +507,11 @@ fetchQueue.push({ delayMs: 800, status: 200, body: { text: 'Slow upload note.' }
 doc.getElementById('recordBtn').click();
 await sleep(120);
 doc.getElementById('recordBtn').click(); // stop -> capture tail drains, then the slow upload starts
-// Wait past the capture tail (gate look-ahead 120 ms + release tail 80 ms, s45)
-// before asserting the upload is in flight: the recorder is deliberately still
-// running during that window so the delay line is not thrown away.
+// Wait past the capture tail (the 80 ms release tail, s45) before asserting
+// the upload is in flight.
 await sleep(340);
 doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F13' })); // PTT during upload
-check('still uploading when PTT queued', doc.getElementById('linkPill').textContent === 'uploading…', doc.getElementById('linkPill').textContent);
+check('still uploading when PTT queued', doc.body.getAttribute('data-state') === 'busy', doc.body.getAttribute('data-state'));
 await sleep(1100); // upload resolves, queued session starts (~60ms later)
 check('slow upload delivered', clipboard.includes('Slow upload note.'), JSON.stringify(clipboard));
 check('queued PTT started the next batch session', doc.getElementById('recordBtn').textContent.includes('Stop'));
@@ -2787,9 +2788,10 @@ check('s30: diarize toggle defaults ON (per-device)', doc.getElementById('diariz
 const mkWords = (spec) => spec.flatMap(([sid, ...ws]) => ws.map((t) => ({ text: t, type: 'word', speaker_id: sid })));
 const hist0 = () => JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]')[0] || {};
 
-// Leg 0: DESKTOP surface (default, not joined) — even with the toggle ON,
-// diarization is SUPPRESSED: diarize=false is sent and the full text is
-// delivered. The desktop keeps the proven single-speaker path.
+// Leg 0: DESKTOP surface (default, not joined). Since 2026-11-21 the filter is
+// on for EVERY device (there is no desktop opt-in any more): a plain desktop
+// sends diarize=true. This take is an even split (4 vs 3 words, no timings),
+// so the minority guard keeps EVERYTHING.
 const wordsTwo = mkWords([['speaker_0', 'Patient', 'is', 'stable'], ['speaker_1', 'hey', 'grab', 'lunch'], ['speaker_0', 'today']]);
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable hey grab lunch today', words: wordsTwo } });
 doc.getElementById('recordBtn').click();
@@ -2797,8 +2799,9 @@ await sleep(120);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 const up0 = fetchCalls[fetchCalls.length - 1];
-check('s30: desktop surface SUPPRESSES diarization (diarize=false even with toggle on)', up0.form.get('diarize') === 'false', up0.form.get('diarize'));
-check('s30: desktop surface delivers the full unfiltered text', clipboard.includes('lunch'), JSON.stringify(clipboard));
+check('s30: a plain desktop sends diarize=true by default (no opt-in since 2026-11-21)', up0.form.get('diarize') === 'true', up0.form.get('diarize'));
+check('s30: there is no "…also on this desktop" box any more', !doc.getElementById('diarizeDesktop'));
+check('s30: an even split on the desktop keeps the full text', clipboard.includes('lunch'), JSON.stringify(clipboard));
 
 // Switch to the phone / big-button surface so diarization actually applies.
 doc.getElementById('bigButtonMode').value = 'always';
@@ -2987,22 +2990,16 @@ doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
 doc.getElementById('bigButtonMode').value = 'joined'; // leave the surface as it was
 doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubbles: true }));
 
-// Leg D: the DESKTOP opt-in. Off by default (Leg 0 above proved the desktop
-// sends diarize=false); checked, a plain desktop sends diarize=true and keeps
-// the louder voice, and History shows what was removed.
-check('s30: "also on this desktop" defaults OFF', doc.getElementById('diarizeDesktop').checked === false);
-doc.getElementById('diarizeDesktop').checked = true;
-doc.getElementById('diarizeDesktop').dispatchEvent(new w.Event('change'));
-await sleep(300); // the settings save is debounced (250 ms)
-check('s30: the desktop opt-in persists (per-device)', JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9')).diarizeDesktop === true, w.localStorage.getItem('scribe_v2_settings_v9'));
+// Leg D: a plain DESKTOP with the default filter keeps the louder voice, and
+// History shows what was removed.
 doc.getElementById('freshBtn').click();
 const wordsD = mkTimed('speaker_0', 0.20, 0.45, ['Lungs', 'clear', 'bilaterally'])
   .concat(mkTimed('speaker_1', 0.72, 0.95, ['bed', 'four']));
 fetchQueue.push({ status: 200, body: { text: 'Lungs clear bilaterally bed four', words: wordsD } });
 await twoLevelTake(0.2, 0.01);
 const upD = fetchCalls[fetchCalls.length - 1];
-check('s30: desktop opt-in sends diarize=true', upD.form.get('diarize') === 'true', upD.form.get('diarize'));
-check('s30: desktop opt-in keeps the louder voice', clipboard.includes('Lungs clear bilaterally') && !clipboard.includes('bed four'), JSON.stringify(clipboard));
+check('s30: the desktop sends diarize=true by default', upD.form.get('diarize') === 'true', upD.form.get('diarize'));
+check('s30: the desktop keeps the louder voice', clipboard.includes('Lungs clear bilaterally') && !clipboard.includes('bed four'), JSON.stringify(clipboard));
 const histWasHidden = doc.getElementById('history').style.display === 'none';
 if (histWasHidden) doc.getElementById('toggleHistoryBtn').click();
 const unfD = doc.querySelector('#history .history-item .unfiltered');
@@ -3015,8 +3012,6 @@ check('s30: "Copy unfiltered" copies what was heard before the cut', clipboard =
 const rowsNoUnf = [...doc.querySelectorAll('#history .history-item')].filter((r) => !r.querySelector('.unfiltered')).length;
 check('s30: rows with nothing removed show no unfiltered block', rowsNoUnf > 0, rowsNoUnf);
 if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it again
-doc.getElementById('diarizeDesktop').checked = false; // back to the default
-doc.getElementById('diarizeDesktop').dispatchEvent(new w.Event('change'));
 
 // ===== Scenario 31m: mic capture levers + silent-capture telemetry =====
 // The per-device echo-cancellation / makeup-gain / auto-gain levers that the
@@ -3029,12 +3024,11 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
 {
   doc.getElementById('freshBtn').click();
   const ec = doc.getElementById('echoCancel');
-  const ag = doc.getElementById('autoGain');
   const mg = doc.getElementById('micGain');
 
   check('s31m: echo cancellation defaults ON', ec.checked === true);
   check('s31m: makeup gain defaults to 1x', mg.value === '1', mg.value);
-  check('s31m: auto gain control defaults OFF', ag.checked === false);
+  check('s31m: the auto-gain switch is gone (fixed off, 2026-11-21)', !doc.getElementById('autoGain'));
   check('s31m: Copy button is labelled "Copy & clear"', doc.getElementById('copyBtn').textContent.includes('Copy & clear'), doc.getElementById('copyBtn').textContent);
 
   // Echo cancellation is a capture constraint -> toggling it rebuilds the graph.
@@ -3045,13 +3039,8 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
   check('s31m: rebuild carries echoCancellation:false into getUserMedia', !!(lastGumConstraints && lastGumConstraints.audio && lastGumConstraints.audio.echoCancellation === false), JSON.stringify(lastGumConstraints && lastGumConstraints.audio));
   ec.checked = true; ec.dispatchEvent(new w.Event('change')); await sleep(200);
 
-  // Auto gain control rebuilds too.
-  g0 = gumCalls;
-  ag.checked = true; ag.dispatchEvent(new w.Event('change'));
-  await sleep(200);
-  check('s31m: toggling auto gain rebuilds the audio graph', gumCalls > g0, gumCalls + ' vs ' + g0);
-  check('s31m: rebuild carries autoGainControl:true into getUserMedia', !!(lastGumConstraints && lastGumConstraints.audio.autoGainControl === true), JSON.stringify(lastGumConstraints && lastGumConstraints.audio));
-  ag.checked = false; ag.dispatchEvent(new w.Event('change')); await sleep(200);
+  // Auto gain control is fixed OFF in every getUserMedia.
+  check('s31m: getUserMedia always asks for autoGainControl:false', !!(lastGumConstraints && lastGumConstraints.audio.autoGainControl === false), JSON.stringify(lastGumConstraints && lastGumConstraints.audio));
 
   // Makeup gain is a live node, NOT a capture constraint -> no rebuild.
   g0 = gumCalls;
@@ -3060,7 +3049,10 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
   check('s31m: makeup gain updates live without a graph rebuild', gumCalls === g0, gumCalls + ' vs ' + g0);
   await sleep(300); // let the debounced save flush
   const saved = JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9'));
-  check('s31m: levers persist (echoCancel on, autoGain off, micGain 8)', saved.echoCancel === true && saved.autoGain === false && saved.micGain === '8', JSON.stringify({ ec: saved.echoCancel, ag: saved.autoGain, mg: saved.micGain }));
+  check('s31m: levers persist (echoCancel on, micGain 8)', saved.echoCancel === true && saved.micGain === '8', JSON.stringify({ ec: saved.echoCancel, mg: saved.micGain }));
+  check('s31m: retired fields are no longer written (gate, look-ahead, tail, high-pass, auto gain, tag events, auto-copy)',
+    ['gateOpen', 'gateClose', 'gateLookahead', 'releaseTail', 'highpass', 'autoGain', 'tagEvents', 'autoCopy', 'diarizeDesktop', 'timestamps'].every((k) => !(k in saved)),
+    Object.keys(saved).join(','));
 
   // CRITICAL invariant (#42): makeup gain sits BEFORE the analyser, so gain × 0
   // = 0 — a high gain must NEVER lift a dead mic's silence above the flatline
@@ -3117,7 +3109,7 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
   const rd = rDom.window.document;
   check('s31m: reload restores echoCancel=false via loadSettings', rd.getElementById('echoCancel').checked === false);
   check('s31m: reload restores micGain=9 via loadSettings', rd.getElementById('micGain').value === '9', rd.getElementById('micGain').value);
-  check('s31m: reload restores autoGain=true via loadSettings', rd.getElementById('autoGain').checked === true);
+  check('s31m: a saved autoGain=true is ignored after the reload (fixed off)', !rd.getElementById('autoGain'));
 }
 
 // ===== Scenario 32j: dictation journal (crash-safe audio recovery) =====
@@ -3214,9 +3206,9 @@ console.log('--- scenario 32j: dictation journal crash recovery ---');
 }
 
 // ===== Scenario 33: iOS quiet-mic level seed (foolproof out-of-the-box gain) =====
-// A quiet iPhone mic records below the load-bearing gate (the silent dead-band).
-// An additive, iOS-gated, ONE-SHOT seed raises a MODEST makeup gain + lowers the
-// gate so a normal voice clears it without anyone opening Advanced — never on a
+// A quiet iPhone mic reads close to the flatline. An additive, iOS-gated,
+// ONE-SHOT seed raises a MODEST makeup gain (it also lowered the noise gate
+// until the gate was removed, 2026-11-21) without anyone opening Advanced — never on a
 // hand-tuned device, never on desktop, versioned (no _v9 bump), and the gain cap
 // stays at/below the dead-mic-mask boundary so a dead mic still reads 0.
 console.log('--- scenario 33: iOS quiet-mic level seed ---');
@@ -3248,8 +3240,7 @@ console.log('--- scenario 33: iOS quiet-mic level seed ---');
   const doc33a = d33a.window.document;
   check('s33: fresh iPhone seeds a modest makeup gain (3x)', doc33a.getElementById('micGain').value === '3', doc33a.getElementById('micGain').value);
   check('s33: seeded gain stays at/below the dead-mic-mask boundary (<=4x)', Number(doc33a.getElementById('micGain').value) <= 4, doc33a.getElementById('micGain').value);
-  check('s33: fresh iPhone lowers the gate so a normal voice clears it (0.018)', doc33a.getElementById('gateOpen').value === '0.018', doc33a.getElementById('gateOpen').value);
-  check('s33: seeded gate stays above gateClose 0.008', Number(doc33a.getElementById('gateOpen').value) > Number(doc33a.getElementById('gateClose').value), doc33a.getElementById('gateOpen').value + ' vs ' + doc33a.getElementById('gateClose').value);
+  check('s33: there is no gate to seed any more', !doc33a.getElementById('gateOpen'));
   const s33a = JSON.parse(d33a.window.localStorage.getItem('scribe_v2_settings_v9'));
   check('s33: the seed version is stamped (one-shot)', s33a.audioSeedVersion === 1, JSON.stringify(s33a.audioSeedVersion));
 
@@ -3262,13 +3253,11 @@ console.log('--- scenario 33: iOS quiet-mic level seed ---');
   const d33c = mkSeedDom({ ua: IPHONE_UA, settings: { audioUserTuned: true } });
   await sleep(120);
   check('s33: a hand-tuned iPhone is left alone (gain unchanged)', d33c.window.document.getElementById('micGain').value === '1', d33c.window.document.getElementById('micGain').value);
-  check('s33: a hand-tuned iPhone is left alone (gate unchanged)', d33c.window.document.getElementById('gateOpen').value === '0.030', d33c.window.document.getElementById('gateOpen').value);
 
   // (d) desktop UA -> never seeded (the iOS gate excludes it)
   const d33d = mkSeedDom({ ua: DESKTOP_UA, settings: {} });
   await sleep(120);
   check('s33: desktop is never seeded (gain unchanged)', d33d.window.document.getElementById('micGain').value === '1', d33d.window.document.getElementById('micGain').value);
-  check('s33: desktop is never seeded (gate unchanged)', d33d.window.document.getElementById('gateOpen').value === '0.030', d33d.window.document.getElementById('gateOpen').value);
 }
 
 // ===== Scenario 23p: phone corpse-mic probe (press-path mic health check) =====
@@ -4355,7 +4344,7 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
 //     setting both sliders to 0 restores the immediate stop.
 // ─────────────────────────────────────────────────────────────────────────────
 {
-  console.log('--- scenario 45: gate look-ahead + release tail ---');
+  console.log('--- scenario 45: no gate, fixed release tail ---');
   resetAudioWiring();
   let w45;
   let recorder45 = null;
@@ -4395,41 +4384,36 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   await sleep(150);
   const doc45 = dom45.window.document;
 
-  check('s45: the look-ahead slider defaults to 120 ms', doc45.getElementById('gateLookahead').value === '120', doc45.getElementById('gateLookahead').value);
-  check('s45: the release tail slider defaults to 80 ms', doc45.getElementById('releaseTail').value === '80', doc45.getElementById('releaseTail').value);
+  // 2026-11-21: no noise gate and no look-ahead. The graph is
+  //   mic -> makeup gain -> high-pass -> destination (recorded)
+  //                                 \-> analyser (read-only leaf)
+  // and the only capture shaping left is the fixed 80 ms release tail.
+  check('s45: the look-ahead and release-tail sliders are gone', !doc45.getElementById('gateLookahead') && !doc45.getElementById('releaseTail'));
 
   micRms = 0.05;
   doc45.getElementById('recordBtn').click();
   await sleep(150);
 
-  const delay45 = audioWiring.delays[audioWiring.delays.length - 1];
-  check('s45: a DelayNode is created for the look-ahead', !!delay45);
-  check('s45: the delay is set from the slider (120 ms => 0.12 s)',
-    delay45 && Math.abs(delay45.delayTime.value - 0.12) < 1e-6, delay45 && delay45.delayTime.value);
-
-  // Wiring: hpFilter feeds BOTH the analyser (undelayed) and the delay (recorded).
+  check('s45: no DelayNode is created (no look-ahead)', audioWiring.delays.length === 0, audioWiring.delays.length);
   const hp45 = audioWiring.biquads[audioWiring.biquads.length - 1];
-  const feedsAnalyser = !!(hp45 && hp45.out.some((n) => n && n._kind === 'analyser'));
-  const feedsDelay = !!(hp45 && hp45.out.some((n) => n && n._kind === 'delay'));
-  check('s45: the high-pass feeds the analyser directly (UNDELAYED)', feedsAnalyser);
-  check('s45: the high-pass also feeds the look-ahead delay (recorded branch)', feedsDelay);
-  check('s45: the high-pass does NOT feed the gate directly any more (the delay is in between)',
-    hp45 && !hp45.out.some((n) => n && n._kind === 'gain'), hp45 && hp45.out.map((n) => n && n._kind).join(','));
-  check('s45: the delay feeds the gate gain (delay -> gate -> destination)',
-    delay45 && delay45.out.some((n) => n && n._kind === 'gain'), delay45 && delay45.out.map((n) => n && n._kind).join(','));
+  check('s45: the high-pass is fixed at 85 Hz', hp45 && hp45.frequency.value === 85, hp45 && hp45.frequency.value);
+  check('s45: the high-pass feeds the analyser directly', !!(hp45 && hp45.out.some((n) => n && n._kind === 'analyser')));
+  check('s45: the high-pass feeds the RECORDED destination directly (no gate in between)',
+    !!(hp45 && hp45.out.some((n) => n && n._kind === 'dest')), hp45 && hp45.out.map((n) => n && n._kind).join(','));
+  const gainsInto = audioWiring.gains.filter((g) => g.out.some((n) => n && n._kind === 'dest'));
+  check('s45: no gain node (gate) sits in front of the destination', gainsInto.length === 0, gainsInto.length);
   const analyser45 = audioWiring.analysers[audioWiring.analysers.length - 1];
-  check('s45: the analyser is a read-only leaf (nothing downstream can delay it)',
-    analyser45 && analyser45.out.length === 0, analyser45 && analyser45.out.length);
+  check('s45: the analyser is a read-only leaf', analyser45 && analyser45.out.length === 0, analyser45 && analyser45.out.length);
 
-  // The stop must be DEFERRED by look-ahead + tail (120 + 80 = 200 ms).
+  // The stop is DEFERRED by the 80 ms release tail.
   stopCount45 = 0;
   doc45.getElementById('recordBtn').click(); // release
-  await sleep(60);
-  check('s45: the recorder is still capturing 60 ms after release (tail draining)',
+  await sleep(40);
+  check('s45: the recorder is still capturing 40 ms after release (tail draining)',
     recorder45 && recorder45.state === 'recording', recorder45 && recorder45.state);
   check('s45: the status already shows the busy state during the tail',
     doc45.getElementById('status').textContent.includes('Stopping'), doc45.getElementById('status').textContent);
-  await sleep(400);
+  await sleep(300);
   check('s45: the recorder has stopped once the tail elapsed',
     recorder45 && recorder45.state === 'inactive', recorder45 && recorder45.state);
   check('s45: the recorder was stopped EXACTLY once (no double-stop)', stopCount45 === 1, stopCount45);
@@ -4437,21 +4421,26 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   check('s45: the take still delivers normally after the tail',
     (w45._clip || '').includes('Tail note'), w45._clip);
 
-  // Zero sliders => the previous immediate-stop behaviour, unchanged.
-  const dom45b = mkDom45({ gateLookahead: '0', releaseTail: '0' });
+  // Old saved slider values are ignored: the tail stays 80 ms, no delay appears.
+  resetAudioWiring();
+  const dom45b = mkDom45({ gateLookahead: '300', releaseTail: '0', gateOpen: '0.1', highpass: '0' });
   await sleep(150);
   const doc45b = dom45b.window.document;
   stopCount45 = 0;
   micRms = 0.05;
   doc45b.getElementById('recordBtn').click();
   await sleep(150);
+  const hp45b = audioWiring.biquads[audioWiring.biquads.length - 1];
+  check('s45: a saved high-pass of 0 is ignored (fixed 85 Hz)', hp45b && hp45b.frequency.value === 85, hp45b && hp45b.frequency.value);
+  check('s45: a saved look-ahead is ignored (no delay node)', audioWiring.delays.length === 0, audioWiring.delays.length);
   doc45b.getElementById('recordBtn').click();
   await sleep(30);
-  check('s45: with both sliders at 0 the recorder stops immediately (no deferral)',
-    recorder45 && recorder45.state === 'inactive', recorder45 && recorder45.state);
-  check('s45: still exactly one stop with the tail disabled', stopCount45 === 1, stopCount45);
+  check('s45: a saved release tail of 0 is ignored (still capturing at 30 ms)',
+    recorder45 && recorder45.state === 'recording', recorder45 && recorder45.state);
+  await sleep(300);
+  check('s45: ...and it stops exactly once after the fixed tail', stopCount45 === 1 && recorder45.state === 'inactive', stopCount45 + ' ' + recorder45.state);
   await sleep(600);
-  check('s45: the zero-tail take delivers too', (w45._clip || '').includes('Tail note'), w45._clip);
+  check('s45: that take delivers too', (w45._clip || '').includes('Tail note'), w45._clip);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5387,7 +5376,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   const o51 = (rec51.frames[0] && rec51.frames[0].json) || {};
   check('s51a: the options frame comes first and asks for the same transcript as the upload',
     rec51.frames[0] && rec51.frames[0].type === 'O' && o51.file_format === 'other' && o51.timestamps_granularity === 'word' &&
-    o51.no_verbatim === 'true' && o51.diarize === 'false' && typeof o51.keyterms_json === 'string',
+    o51.no_verbatim === 'true' && o51.diarize === 'true' && typeof o51.keyterms_json === 'string', // the filter is on by default on a desktop too (2026-11-21)
     JSON.stringify(o51).slice(0, 160));
   const aFrames = rec51.frames.filter((f) => f.type === 'A');
   const endFrame = rec51.frames.find((f) => f.type === 'E');

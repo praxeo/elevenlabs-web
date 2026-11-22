@@ -3020,6 +3020,38 @@ const rowsNoUnf = [...doc.querySelectorAll('#history .history-item')].filter((r)
 check('s30: rows with nothing removed show no unfiltered block', rowsNoUnf > 0, rowsNoUnf);
 if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it again
 
+// The record bar's speaker-filter pill (2026-11-21, "That's a key feature"):
+// it shows the filter's state on every take and a tap turns it on or off —
+// the same switch as Options, saved per device — but never mid-take.
+{
+  const fp = doc.getElementById('filterPill');
+  const saved30 = () => JSON.parse(w.localStorage.getItem('scribe_v2_settings_v9') || '{}').diarize;
+  check('s30p: the record bar shows the speaker filter as on', !!fp && fp.textContent.includes('Speaker filter') && fp.className.includes('on') && doc.getElementById('diarize').checked, fp && fp.textContent);
+  fp.click();
+  await sleep(300); // the settings save is debounced (250 ms)
+  check('s30p: a tap turns it off (Options checkbox too) and is saved', !doc.getElementById('diarize').checked && fp.className.includes('off') && /off/.test(fp.textContent) && saved30() === false, fp.textContent + ' saved=' + saved30());
+  check('s30p: turning it off is said in words', /Speaker filter off/.test(status()), status());
+  fp.click();
+  await sleep(300);
+  check('s30p: a second tap turns it back on and is saved', doc.getElementById('diarize').checked && fp.className.includes('on') && saved30() === true, fp.textContent + ' saved=' + saved30());
+  doc.getElementById('diarize').checked = false;
+  doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
+  check('s30p: the pill follows the Options checkbox', fp.className.includes('off'), fp.className);
+  doc.getElementById('diarize').checked = true;
+  doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
+  doc.getElementById('freshBtn').click();
+  fetchQueue.push({ status: 200, body: { text: 'Pill take.' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(120);
+  check('s30p: the pill is locked during a take', fp.disabled === true);
+  fp.click();
+  check('s30p: a tap mid-take changes nothing', doc.getElementById('diarize').checked === true);
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s30p: the pill unlocks when the take is done', fp.disabled === false && clipboard.includes('Pill take.'), String(fp.disabled) + ' ' + JSON.stringify(clipboard));
+  await sleep(300);
+}
+
 // ===== Scenario 31m: mic capture levers + silent-capture telemetry =====
 // The per-device echo-cancellation / makeup-gain / auto-gain levers that the
 // silent-capture commits added (#39/#42) had no coverage. Assert their defaults,

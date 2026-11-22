@@ -124,6 +124,14 @@
 //      URL carries ?auth=, delivery/status/latest fetches carry the header, a
 //      401'd delivery fails LOUD naming the access code and stays queued, and
 //      starting/joining the link without a saved code warns immediately
+//  60. a click is not a failed dictation: a take under a second with no text
+//      ends quietly (sentinel still copied, "Too short", no beep), a failed
+//      upload of one stays loud
+//  61. a long take survives a dead connection: the server checked while
+//      recording and while the upload waits (OFFLINE in the title), the same
+//      recording re-sent when the server answers or an upload is stuck, an
+//      early loud failure when every upload failed offline, the background
+//      rescue into a NOTE after a relaunch, and the automatic cloud report
 //
 // Exits non-zero on any failure. Extend these scenarios whenever the session
 // flow, beeps, clipboard behavior, or watchdog change.
@@ -217,6 +225,8 @@ let activeWakeLock = null;
 // upload fails the scenario loudly instead of hanging.
 const fetchQueue = [];
 const fetchCalls = [];
+let pingMode = 'up';
+let pingCalls = 0;
 const mainCtxInstances = []; // only the MAIN DOM's AudioContexts (the app's live one is last)
 
 const dom = new JSDOM(html, {
@@ -242,6 +252,17 @@ const dom = new JSDOM(html, {
     window.URL.createObjectURL = () => 'blob:mock';
     window.URL.revokeObjectURL = () => {};
     window.fetch = (url, opts) => {
+      // The reachability check (/api/ping, 2026-11-22) never touches the
+      // upload queue: pingMode 'up' answers at once, 'down' fails like a dead
+      // network, 'hang' never answers (only the caller's abort ends it).
+      if (String(url).includes('/api/ping')) {
+        pingCalls++;
+        if (pingMode === 'down') return Promise.reject(new TypeError('Failed to fetch'));
+        if (pingMode === 'hang') return new Promise((resolve, reject) => {
+          if (opts && opts.signal) opts.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+        });
+        return Promise.resolve({ ok: true, status: 204, headers: { get: () => null }, text: () => Promise.resolve('') });
+      }
       fetchCalls.push({ url: String(url), opts: opts || {}, form: opts && opts.body });
       const next = fetchQueue.shift() || { status: 500, body: { error: 'unexpected fetch (queue empty)' } };
       return new Promise((resolve, reject) => {
@@ -360,7 +381,9 @@ micRms = 0.05;
 console.log('--- scenario 3b: low-mic-level loud failure ---');
 micRms = 0.015; // dead-band: > FLATLINE_RMS 0.0008, < gateOpen 0.030
 doc.getElementById('recordBtn').click();
-await sleep(200); // let the gate-meter loop record the dead-band peak (no flatline: peak > 0.0008)
+// Over QUIET_TAP_MS (1 s): a take this long is a dictation, so its empty
+// outcome is named and loud (a shorter one is a quiet click — scenario 60).
+await sleep(1200); // let the gate-meter loop record the dead-band peak (no flatline: peak > 0.0008)
 check('s3b: no flatline alarm fires in the dead-band', !status().includes('MIC NOT CAPTURING'), status());
 clipboard = ''; // isolate this take's clipboard outcome from scenario 3's sentinel
 fetchQueue.push({ status: 200, body: { text: '' } });
@@ -380,7 +403,7 @@ micRms = 0.05;
 console.log('--- scenario 3c: true-zero capture loud failure ---');
 micRms = 0.0; // true zero — the mic delivers nothing
 doc.getElementById('recordBtn').click();
-await sleep(200); // SHORT hold: under the 2.5s flatline watchdog, so it must classify at finalize
+await sleep(1200); // under the 2.5s flatline watchdog (so it must classify at finalize), but over QUIET_TAP_MS
 check('s3c: no flatline alarm on a short zero take', !status().includes('MIC NOT CAPTURING'), status());
 clipboard = ''; // isolate this take's clipboard outcome
 fetchQueue.push({ status: 200, body: { text: '' } });
@@ -390,6 +413,62 @@ check('s3c: a true-zero capture fails LOUD naming the mic', status().includes('M
 check('s3c: true-zero capture copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('s3c: not blamed on the clinician ("no speech")', !status().includes('No speech detected'), status());
 micRms = 0.05;
+
+// ===== Scenario 60: a click is not a failed dictation (2026-11-22) =====
+// The owner: "If I just click the button, I don't need to see a message that
+// dictation failed after a half second click." A take under QUIET_TAP_MS (1 s)
+// that produced no text ends quietly: the sentinel is still copied (nothing
+// stale can be pasted), but the status is neutral, there is no fail beep, and
+// the window title says "Too short" so the AutoHotkey bar shows a grey line
+// instead of FAILED. A short take whose upload FAILED stays loud, and a take
+// over a second keeps the named loud failures (scenarios 3b/3c).
+console.log('--- scenario 60: a short take that heard nothing ends quietly ---');
+{
+  const vibes60 = [];
+  w.navigator.vibrate = (p) => { vibes60.push(JSON.stringify(p)); return true; };
+  const failBeep60 = () => vibes60.includes('[220,90,220]');
+  const ring60 = () => { try { return JSON.parse(w.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+
+  // 60a: a half-second click that heard only the room.
+  micRms = 0.004; // the room: above the dead-mic floor, below speech level
+  clipboard = '';
+  const uploads60 = fetchCalls.length;
+  doc.getElementById('recordBtn').click();
+  await sleep(450);
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s60a: the clipboard still gets the sentinel (nothing stale can be pasted)', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+  check('s60a: a click that heard nothing uploads nothing', fetchCalls.length === uploads60, fetchCalls.length - uploads60);
+  check('s60a: the status says "Too short", not a failure', /Too short/.test(status()) && !/FAILED|LOW MIC|NO SIGNAL/.test(status()) && !statusCls().includes('err'), status() + ' / ' + statusCls());
+  check('s60a: no fail beep', !failBeep60(), vibes60.join(' '));
+  check('s60a: the window title says "Too short" (the AutoHotkey bar reads it)', doc.title.includes('Too short'), doc.title);
+  check('s60a: the window is not painted as a failure', doc.body.getAttribute('data-state') === 'idle', doc.body.getAttribute('data-state'));
+  const r60 = ring60()[0] || {};
+  check('s60a: the timing log keeps it as a tap, not a failed take', r60.outcome === 'tap' && !r60.errKind, JSON.stringify(r60).slice(0, 120));
+
+  // 60b: a short take that DID hear speech, but no words came back: sent once, still quiet.
+  micRms = 0.05;
+  fetchQueue.push({ status: 200, body: { text: '' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(450);
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s60b: a short take that heard speech is still sent', fetchCalls.length === uploads60 + 1, fetchCalls.length - uploads60);
+  check('s60b: ...and with no words back it ends quietly too', /Too short/.test(status()) && !statusCls().includes('err') && !failBeep60(), status());
+  check('s60b: ...the sentinel is copied', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
+
+  // 60c: a short take whose upload FAILED is a real failure: loud as ever.
+  fetchQueue.push({ status: 500, body: { error: 'service exploded' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(450);
+  doc.getElementById('recordBtn').click();
+  await sleep(400);
+  check('s60c: a short take whose upload failed is LOUD', statusCls().includes('err') && /FAILED/.test(status()), status());
+  check('s60c: ...with the fail beep', failBeep60(), vibes60.join(' '));
+  check('s60c: ...and FAILED in the title', doc.title.includes('FAILED') && !doc.title.includes('Too short'), doc.title);
+  delete w.navigator.vibrate;
+  micRms = 0.05;
+}
 
 // ===== Scenario 4 (batch): append mode appends consecutive recordings =====
 // No time window anymore: with append mode on, the second dictation always
@@ -2012,15 +2091,26 @@ console.log('--- scenario 25: big-button layout ---');
   check('s25b: queued session delivered cleanly', (B.win._clip || '').includes('After redden.'), JSON.stringify(B.win._clip));
 
   // no-speech outcome: the sentinel lands on the clipboard — the big screen
-  // must read as a FAILURE, never as a success-family DONE
+  // must read as a FAILURE, never as a success-family DONE. (A take over a
+  // second: a shorter one that heard nothing is a quiet click, below.)
   B.batchText = '';
   pev(B.win, bigBtnB, 'pointerdown', 20);
-  await sleep(550);
+  await sleep(1200);
   pev(B.win, bigBtnB, 'pointerup', 20);
   await sleep(400);
   check('s25b: no-speech outcome copies the sentinel', B.win._clip === '##DICTATION_FAILED##', JSON.stringify(B.win._clip));
   check('s25b: sentinel outcome reddens the screen', screenB() === 'fail', screenB());
   check('s25b: headline never claims DONE on a sentinel outcome', dB.getElementById('bigState').textContent === 'FAILED', dB.getElementById('bigState').textContent);
+  // A half-second hold that brought no words back is a click (2026-11-22):
+  // the sentinel is still copied, but the screen is not painted FAILED.
+  B.win._clip = '';
+  pev(B.win, bigBtnB, 'pointerdown', 120);
+  await sleep(550);
+  pev(B.win, bigBtnB, 'pointerup', 120);
+  await sleep(400);
+  check('s25b: a half-second hold with no words still copies the sentinel', B.win._clip === '##DICTATION_FAILED##', JSON.stringify(B.win._clip));
+  check('s25b: ...but the screen is not painted as a failure', screenB() !== 'fail' && screenB() !== 'alarm', screenB());
+  check('s25b: ...and the headline claims neither DONE nor FAILED', !/DONE|FAILED/.test(dB.getElementById('bigState').textContent), dB.getElementById('bigState').textContent);
   B.batchText = 'Big note.';
 
   // settings stay reachable behind the existing sections
@@ -3016,11 +3106,12 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
     JSON.stringify(flog.slice(0, 2)));
   micRms = 0.05; mg.value = '1'; mg.dispatchEvent(new w.Event('input'));
 
-  // micDiag on the QUICK-RELEASE no-speech path (#41): a short tap that never
-  // trips the 2.5s flatline watchdog still surfaces + logs the audio-graph state.
+  // micDiag on the QUICK-RELEASE no-speech path (#41): a short take that never
+  // trips the 2.5s flatline watchdog still surfaces + logs the audio-graph
+  // state. (Over QUIET_TAP_MS: a click under a second ends quietly, s60.)
   fetchQueue.push({ status: 200, body: { text: '' } });
   doc.getElementById('recordBtn').click();
-  await sleep(80);
+  await sleep(1200);
   doc.getElementById('recordBtn').click();
   await sleep(300);
   check('s31m: quick-release no-speech copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
@@ -5274,8 +5365,10 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
           headers: { get: () => null }, text: () => Promise.resolve(JSON.stringify(next.body)),
         }), 10));
       };
+      // Upload-while-dictating is OFF by default since 2026-11-22: these
+      // streaming tests turn it on by hand (streamUploadSet), as a clinician would.
       win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify(
-        Object.assign({ saveApiKey: true, micGranted: true }, o.settings || {})));
+        Object.assign({ saveApiKey: true, micGranted: true, streamUpload: true, streamUploadSet: true }, o.settings || {})));
       win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-51');
       win.addEventListener('error', (e) => { console.log('PAGE ERROR (51):', e.message); failures++; });
     },
@@ -5295,7 +5388,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   const win51 = dom51.window;
   const doc51 = win51.document;
   const ring51 = () => { try { return JSON.parse(win51.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
-  check('s51: the Advanced toggle exists and is on by default',
+  check('s51: the toggle exists and stays on once turned on by hand',
     !!doc51.getElementById('streamUpload') && doc51.getElementById('streamUpload').checked === true);
 
   doc51.getElementById('recordBtn').click();
@@ -5425,6 +5518,26 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   check('s51h: the timing log records a stream timeout', e51h.path === 'stream' && e51h.errKind === 'timeout', e51h.path + ' ' + e51h.errKind);
   dom51h.window.close();
   mode51 = 'ok';
+
+  // --- 51i: OFF by default (2026-11-22) -----------------------------------
+  // The owner found it no faster and less stable, and a hung streamed take is
+  // never sent a second time. A fresh device has it off, and so does every
+  // device that saved the OLD default "on" without ever choosing it.
+  calls51 = [];
+  const dom51i = mkDom51({ settings: { streamUpload: undefined, streamUploadSet: undefined } });
+  await sleep(200);
+  check('s51i: a fresh device has upload-while-dictating OFF', dom51i.window.document.getElementById('streamUpload').checked === false);
+  batch51.push({ status: 200, body: { text: 'Default off note.' } });
+  await take51(dom51i.window.document);
+  await sleep(600);
+  check('s51i: ...so its take opens no stream and uploads the ordinary way',
+    streams51().length === 0 && (dom51i.window._clip || '').includes('Default off note.'), streams51().length + ' ' + dom51i.window._clip);
+  dom51i.window.close();
+  const dom51j = mkDom51({ settings: { streamUpload: true, streamUploadSet: undefined } });
+  await sleep(200);
+  check('s51i: a saved "on" from the old default (never chosen by hand) is now off',
+    dom51j.window.document.getElementById('streamUpload').checked === false);
+  dom51j.window.close();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -7048,6 +7161,219 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   await sleep(200);
   check('s58: ...and the second Discard empties it', !shown58(C), msg58(C));
   C.dom.window.close();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 61. [RELIABILITY] A long take must never die on a dead connection (2026-11-22).
+//     A long dictation on a work remote desktop never reached the server — not
+//     the warm-up its start sends, not its upload — so the app waited out its
+//     whole deadline, failed, and the saved recording died with the desktop.
+//     Covered: (a) a recording that cannot reach the server says so while it
+//     is spoken (status + OFFLINE in the title, which the AutoHotkey bar
+//     reads); (b) its upload, sent into the dead connection, goes up AGAIN
+//     once the server answers and is delivered like any take; (c) an upload
+//     stuck on a healthy path gets a second one beside it at its fair time,
+//     not before; (d) every upload failing with the server unreachable fails
+//     loud BEFORE the deadline, says the recording will transcribe itself
+//     ("will retry" in the title), and after a relaunch it does — into a NOTE,
+//     never the clipboard, with a warn cue and "Recovered" in the title; (e) a
+//     failed take reports itself to the cloud log in shared mode (timings
+//     only, never text), and (f) a report from Diagnostics carries the newest
+//     takes' timing rows.
+// ─────────────────────────────────────────────────────────────────────────────
+{
+  console.log('--- scenario 61: long takes survive a dead connection ---');
+  const resShared61 = await worker.default.fetch(new Request('https://dictation.test/'), { ELEVENLABS_API_KEY: 'srv-key', APP_PASSPHRASE: 'sesame' });
+  const htmlShared61 = await resShared61.text();
+  const mk61 = (o) => {
+    o = o || {};
+    const st = { ping: 'up', posts: [], pings: 0, reports: [], uploads: o.uploads || [], skewMs: 0, vibes: [] };
+    const dom = new JSDOM(o.shared ? htmlShared61 : html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        win.isSecureContext = true;
+        Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+        if (o.idb) win.indexedDB = o.idb;
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        const realNow = Date.now.bind(Date);
+        win.Date.now = () => realNow() + st.skewMs; // a take "lasts" as long as the test says
+        const t0 = realNow();
+        win.AudioContext = class extends MockAudioCtx {
+          constructor() { super(); Object.defineProperty(this, 'currentTime', { get: () => (realNow() + st.skewMs - t0) / 1000, configurable: true }); }
+        };
+        win.WebSocket = MockWS;
+        win.navigator.vibrate = (p) => { st.vibes.push(JSON.stringify(p)); return true; };
+        Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true });
+        win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener() {} };
+        // start(1000)-alike: chunks land during the take (and in the journal).
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; this._iv = null; }
+          static isTypeSupported() { return false; }
+          _emit() { if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) }); }
+          start() { this.state = 'recording'; this._iv = win.setInterval(() => this._emit(), 200); }
+          stop() {
+            if (this.state === 'inactive') return;
+            this.state = 'inactive';
+            if (this._iv) { win.clearInterval(this._iv); this._iv = null; }
+            this._emit();
+            if (this.onstop) this.onstop();
+          }
+        };
+        win.fetch = (url, opts) => {
+          const u = String(url);
+          if (u.includes('/api/ping')) {
+            st.pings++;
+            if (st.ping === 'down') return Promise.reject(new TypeError('Failed to fetch'));
+            return Promise.resolve({ ok: true, status: 204, headers: { get: () => null }, text: () => Promise.resolve('') });
+          }
+          if (u.includes('/api/report')) {
+            st.reports.push({ url: u, opts: opts || {}, body: JSON.parse(String((opts && opts.body) || '{}')) });
+            return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"ok":true,"id":"x"}') });
+          }
+          st.posts.push({ url: u, at: realNow() });
+          const next = st.uploads.shift() || { kind: 'hang' };
+          if (next.kind === 'reject') return Promise.reject(new TypeError('Failed to fetch'));
+          return new Promise((resolve, reject) => {
+            if (opts && opts.signal) opts.signal.addEventListener('abort', () => { const e = new Error('aborted'); e.name = 'AbortError'; reject(e); });
+            if (next.kind === 'hang') return; // only OUR abort ends it
+            setTimeout(() => resolve({ ok: next.status >= 200 && next.status < 300, status: next.status, headers: { get: () => null },
+              text: () => Promise.resolve(JSON.stringify(next.body)) }), next.delayMs || 10);
+          });
+        };
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        if (o.shared) win.localStorage.setItem('scribe_v2_passphrase_v9', 'sesame');
+        else win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-61');
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (61):', e.message); failures++; });
+      },
+    });
+    return { dom, st, win: dom.window, doc: dom.window.document };
+  };
+  const status61 = (D) => D.doc.getElementById('status').textContent.trim();
+  const cls61 = (D) => D.doc.getElementById('status').className;
+  const ring61 = (D) => { try { return JSON.parse(D.win.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
+  const warnBeeps61 = (D) => D.st.vibes.filter((v) => v === '[90,90,90]').length;
+  micRms = 0.05;
+
+  // --- 61a/b: dictating into a dead connection -------------------------------
+  {
+    const A = mk61({ uploads: [{ kind: 'hang' }, { kind: 'ok', status: 200, body: { text: 'Back online note.' } }] });
+    await sleep(250);
+    A.st.ping = 'down';
+    A.doc.getElementById('recordBtn').click();
+    await sleep(6800); // the first server check runs 6 s into the take
+    check('s61a: a recording that cannot reach the server SAYS so while it is spoken',
+      /can't reach the server/.test(status61(A)) && /Keep going/.test(status61(A)), status61(A));
+    check('s61a: ...and OFFLINE is in the title (the AutoHotkey bar reads it)', A.doc.title.includes('OFFLINE') && A.doc.title.includes('REC'), A.doc.title);
+    check('s61a: it is a cue, never a stop: still recording', A.doc.getElementById('recordBtn').textContent.includes('Stop'));
+    A.doc.getElementById('recordBtn').click(); // the first upload goes into the dead connection and hangs
+    await sleep(2500);
+    check('s61b: while it waits it says the server cannot be reached and the recording is kept',
+      /can't reach the server/.test(status61(A)) && /recording is kept/.test(status61(A)), status61(A));
+    check('s61b: ...with OFFLINE in the working title', A.doc.title.includes('OFFLINE') && A.doc.title.includes('Working'), A.doc.title);
+    check('s61b: one upload so far', A.st.posts.length === 1, A.st.posts.length);
+    A.st.ping = 'up'; // the connection comes back
+    await sleep(4500);
+    check('s61b: once the server answers, the SAME recording goes up again', A.st.posts.length === 2, A.st.posts.length);
+    check('s61b: ...and is delivered like any take (clipboard, Done!)',
+      (A.win._clip || '').includes('Back online note.') && /Done!/.test(status61(A)) && cls61(A).includes('ok'), status61(A));
+    check('s61b: OFFLINE is gone from the title', !A.doc.title.includes('OFFLINE'), A.doc.title);
+    const e = ring61(A)[0] || {};
+    check('s61b: the timing log: uploaded twice, server unreachable during the take, not a failure',
+      e.attempts === 2 && e.reach === 'down' && !e.errKind, JSON.stringify(e).slice(0, 200));
+    A.win.close();
+  }
+
+  // --- 61c: an upload stuck on a healthy path ---------------------------------
+  {
+    const C = mk61({ uploads: [{ kind: 'hang' }, { kind: 'ok', status: 200, body: { text: 'Hedged long note.' } }] });
+    await sleep(250);
+    C.doc.getElementById('recordBtn').click();
+    await sleep(300);
+    C.st.skewMs = 60000; // the take "lasted" a minute: a long deadline, and ~16 s of fair time for its upload
+    await sleep(200);
+    C.doc.getElementById('recordBtn').click();
+    await sleep(13500);
+    check('s61c: fast, healthy server checks alone do not double an upload before its fair time', C.st.posts.length === 1, C.st.posts.length);
+    await sleep(5500);
+    check('s61c: an upload still unanswered past its fair time gets a second one beside it', C.st.posts.length === 2, C.st.posts.length);
+    check('s61c: ...and the take is delivered', (C.win._clip || '').includes('Hedged long note.') && /Done!/.test(status61(C)), status61(C));
+    const e = ring61(C)[0] || {};
+    check('s61c: the timing log says it went up twice, the server always reachable', e.attempts === 2 && !e.reach, JSON.stringify(e).slice(0, 200));
+    C.win.close();
+  }
+
+  // --- 61d: every upload failing, the server unreachable: loud early, then rescued after a relaunch ---
+  {
+    const idb61 = new IDBFactory();
+    const D = mk61({ idb: idb61, uploads: [{ kind: 'reject' }, { kind: 'reject' }, { kind: 'reject' }] });
+    await sleep(300);
+    D.doc.getElementById('recordBtn').click();
+    await sleep(500);
+    D.st.skewMs = 120000; // a two-minute dictation: its deadline is well past a minute
+    D.st.ping = 'down';
+    await sleep(200);
+    D.doc.getElementById('recordBtn').click(); // the upload fails at once, and the server stays unreachable
+    await sleep(26000);
+    const eD = ring61(D)[0] || {};
+    check('s61d: with every upload failed and the server unreachable it fails LOUD, well before its deadline',
+      D.win._clip === '##DICTATION_FAILED##' && cls61(D).includes('err') && eD.errKind === 'network' && eD.deadline > 40000,
+      status61(D) + ' / ' + JSON.stringify(eD).slice(0, 160));
+    check('s61d: ...with the fail beep', D.st.vibes.includes('[220,90,220]'), D.st.vibes.join(' '));
+    check('s61d: the status says the recording will be transcribed into the notes by itself',
+      /RECORDING was saved/.test(status61(D)) && /by itself/.test(status61(D)) && /Do NOT redictate/.test(status61(D)), status61(D));
+    check('s61d: "will retry" is in the title (the AutoHotkey bar says FAILED — WILL RETRY)', D.doc.title.includes('will retry'), D.doc.title);
+    check('s61d: the banner says so too', /by itself/.test(D.doc.getElementById('journalRecoverMsg').textContent), D.doc.getElementById('journalRecoverMsg').textContent);
+    check('s61d: the timing log says the server was unreachable', eD.reach === 'down', JSON.stringify(eD).slice(0, 160));
+    D.win.close(); // the page is reloaded (or the desktop restarted) before the server is back
+
+    const E = mk61({ idb: idb61, uploads: [{ kind: 'ok', status: 200, body: { text: 'Recovered long note.' } }] });
+    await sleep(700);
+    check('s61d: after a relaunch it is offered as a failed upload that will transcribe itself',
+      E.doc.getElementById('journalRecover').style.display !== 'none' && /upload FAILED/.test(E.doc.getElementById('journalRecoverMsg').textContent) &&
+      /by itself/.test(E.doc.getElementById('journalRecoverMsg').textContent), E.doc.getElementById('journalRecoverMsg').textContent);
+    const warnsAtBoot = warnBeeps61(E);
+    check('s61d: nothing is uploaded before the first background try', E.st.posts.length === 0, E.st.posts.length);
+    await sleep(16000); // the first background try comes 15 s later, and the server answers
+    const newest = E.doc.querySelector('#deskNotes .bnote-text');
+    check('s61d: the recording became the newest NOTE', !!newest && newest.textContent.includes('Recovered long note.'), newest && newest.textContent);
+    check('s61d: ...NOT the clipboard (by then the clinician may be in another chart)', !(E.win._clip || '').includes('Recovered long note.'), JSON.stringify(E.win._clip));
+    check('s61d: a warn cue says where it is', cls61(E).includes('warn') && /Recovered your/.test(status61(E)) && /newest note/.test(status61(E)) &&
+      warnBeeps61(E) === warnsAtBoot + 1, status61(E));
+    check('s61d: "Recovered" is in the title (the AutoHotkey bar shows it over Cerner)', E.doc.title.includes('Recovered'), E.doc.title);
+    check('s61d: the banner is gone, after exactly one upload', E.doc.getElementById('journalRecover').style.display === 'none' && E.st.posts.length === 1, E.st.posts.length);
+    E.win.close();
+    const F = mk61({ idb: idb61 });
+    await sleep(700);
+    check('s61d: a later relaunch offers nothing: the saved audio was deleted', F.doc.getElementById('journalRecover').style.display === 'none');
+    F.win.close();
+  }
+
+  // --- 61e/f: the cloud log, in shared mode ----------------------------------
+  {
+    const G = mk61({ shared: true, uploads: [{ kind: 'ok', status: 500, body: { error: 'service exploded' } }] });
+    await sleep(300);
+    G.doc.getElementById('recordBtn').click();
+    await sleep(1300);
+    G.doc.getElementById('recordBtn').click();
+    await sleep(3200);
+    const rep = G.st.reports[0];
+    check('s61e: a failed take reports itself to the cloud log',
+      !!rep && rep.body.kind === 'auto' && /FAILED/.test(rep.body.details) && /http-500/.test(rep.body.details), rep && JSON.stringify(rep.body).slice(0, 220));
+    check('s61e: ...with its timing row, and the access code in a header (never the URL)',
+      !!rep && rep.body.timing && rep.body.timing.errKind === 'http-500' && rep.opts.headers['x-app-auth'] === 'sesame' && !rep.url.includes('sesame'),
+      rep && JSON.stringify(rep.body.timing));
+    check('s61e: ...and never the note or any text', !!rep && !rep.body.noteText && !rep.body.expected, rep && JSON.stringify(rep.body).slice(0, 220));
+    check('s61e: exactly one report for one failed take', G.st.reports.length === 1, G.st.reports.length);
+    G.doc.getElementById('reportProblemBtn').click();
+    G.doc.getElementById('reportDetails').value = 'long dictation failed';
+    G.doc.getElementById('reportSendBtn').click();
+    await sleep(150);
+    const rep2 = G.st.reports[1];
+    check('s61f: a report from Diagnostics carries the newest takes\' timing rows',
+      !!rep2 && Array.isArray(rep2.body.timing) && rep2.body.timing[0] && rep2.body.timing[0].errKind === 'http-500' && rep2.body.kind === 'problem',
+      rep2 && JSON.stringify(rep2.body.timing).slice(0, 200));
+    G.win.close();
+  }
 }
 
 // ===== Scenario 59: report a mistake (cloud log, 2026-11-21) =====

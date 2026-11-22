@@ -303,6 +303,14 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    // Reachability check (2026-11-22). The client asks it while a long take is
+    // recording and while an upload is unanswered, to tell "this computer
+    // cannot reach the server" from "the server is slow". It says only that
+    // this Worker answered: no auth, no body, never cached.
+    if (url.pathname === "/api/ping") {
+      return new Response(null, { status: 204, headers: { "cache-control": "no-store" } });
+    }
+
     // Phone mic session relay via Durable Object
     if (url.pathname.startsWith("/api/session/")) {
       const parts = url.pathname.split("/"); // ["","api","session",code,?action]
@@ -1387,7 +1395,10 @@ async function handleReports(request, env, url) {
       if (!details && !expected) return json({ error: "Say what went wrong (or the word it missed)." }, 400);
       const now = Date.now();
       const id = now.toString(36) + "-" + Math.random().toString(36).slice(2, 8);
-      const kind = r.kind === "word" ? "word" : "problem";
+      // "auto": a failed take reported by the app itself (timings and error
+      // type only, no note text), so a desktop that disappears still leaves
+      // the evidence.
+      const kind = r.kind === "word" ? "word" : (r.kind === "auto" ? "auto" : "problem");
       const noteAt = Number(r.noteCreatedAt);
       let timing = null;
       try { if (r.timing && typeof r.timing === "object") timing = JSON.stringify(r.timing).slice(0, 4000); } catch {}
@@ -2265,8 +2276,8 @@ right lower quadrant"></textarea>
         <summary>Diagnostics</summary>
         <div class="body">
           <label class="checkbox">
-            <input type="checkbox" id="streamUpload" checked />
-            <span>Upload while you dictate<small class="hint">Chrome and Edge. Falls back to the normal upload on its own.</small></span>
+            <input type="checkbox" id="streamUpload" />
+            <span>Upload while you dictate<small class="hint">Off by default. Chrome and Edge only; a streamed take that hangs is not sent again.</small></span>
           </label>
 
           <label>Last take timing</label>
@@ -2743,6 +2754,20 @@ right lower quadrant"></textarea>
   let pendingDeleteId     = null;  // two-tap delete: the note whose Delete was tapped once
   let pendingDeleteTimer  = null;
   let lastStatusHeadline  = "";    // optional headline for an ok status ("SAVED" when a note stayed on the phone)
+  // A word the window title carries for the AutoHotkey bar, which can read
+  // the dictation window's title without focus: "tap" (a too-short take ended
+  // quietly), "retry" (a failed take will be transcribed by itself later),
+  // "recovered" (it was). Set only through setStatus's fourth argument and
+  // dropped by the next status, like the headline.
+  let lastStatusMark      = "";
+  let serverUnreachable   = false; // the last server check failed: the title says OFFLINE while a take runs
+  let reachTimer          = null;  // the server checks while a take records
+  let rescueTimer         = null;  // the background transcription of failed long takes
+  let rescueBusy          = null;  // the saved recording being transcribed in the background right now
+  let rescueDelay         = 15000; // its current back-off
+  let autoReportQueue     = [];    // failed takes' automatic reports waiting to reach the cloud log
+  let autoReportTimer     = null;
+  let streamUploadSetByHand = false; // upload-while-dictating was turned ON by hand (it is off by default)
   let lastQueuedSig       = "";    // which notes the delivery queue carries (re-render the tags when it changes)
   let recovering          = false; // a saved recording is being re-uploaded (recoverPendingDictation): no take may start, notes are locked
   let lastChromeBusy      = null;  // session busy state last mirrored into the notes (editable or not)
@@ -2915,6 +2940,41 @@ right lower quadrant"></textarea>
   const SLOW_SERVICE_EL_MS      = 8000;    // an ElevenLabs wait this long counts as slow
   const SLOW_SERVICE_LOOKBACK   = 5;       // how many recent takes to look at
   const SLOW_SERVICE_WINDOW_MS  = 30 * 60 * 1000; // and only takes this recent
+  // [RELIABILITY] A long take must never die on a dead connection (2026-11-22).
+  // On a work remote desktop a long dictation never reached the server: not
+  // the warm-up its start sends, not its upload. The app waited out the whole
+  // deadline on a request that went nowhere, failed, and the saved recording
+  // died with the remote desktop. Now: the app checks the server while a take
+  // records (an early warning, said on the AutoHotkey bar too), sends the SAME
+  // recording again when an upload is stuck but the server answers, and a long
+  // take that still fails is transcribed into a note by itself once the server
+  // is back (never onto the clipboard: by then the clinician may be in another
+  // chart). The owner: "I cannot have long form dictations timing out."
+  const REACH_FIRST_CHECK_MS  = 6000;   // first server check this far into a recording
+  const REACH_RECHECK_MS      = 20000;  // ...then this often while it records (5 s while it fails)
+  const REACH_TIMEOUT_MS      = 4000;   // a check with no answer by then = the server is unreachable
+  const UPLOAD_PROBE_AFTER_MS = 6000;   // an upload still unanswered this long starts server checks
+  const UPLOAD_PROBE_EVERY_MS = 4000;   // ...one at a time, this often
+  const UPLOAD_PROBE_FAST_MS  = 1500;   // a check answered this fast proves the path is healthy NOW
+  const UPLOAD_MAX_ATTEMPTS   = 3;      // the first upload + at most two more of the same recording
+  // When a healthy path but no answer means the newest upload is stuck: base +
+  // its bytes at ~83 KB/s + the service's own time on that much audio.
+  const HEDGE_BASE_MS         = 12000;
+  const HEDGE_MS_PER_KB       = 12;
+  const HEDGE_MS_PER_AUDIO_S  = 60;
+  const OFFLINE_GIVE_UP_MS    = 20000;  // every upload failed AND the server unreachable this long: fail now, not at the deadline
+  // A take this short that produced no text is a click, not a dictation: it
+  // ends quietly (the sentinel is still copied, so nothing stale can be
+  // pasted). The owner: "If I just click the button, I don't need to see a
+  // message that dictation failed after a half second click."
+  const QUIET_TAP_MS          = 1000;
+  // A failed take at least this long is transcribed into a note automatically
+  // once the server answers; a shorter one is quicker to redictate than to
+  // find later (and a late duplicate of a redictated note would confuse).
+  const RESCUE_MIN_REC_MS     = 20000;
+  const RESCUE_RETRY_MS       = 15000;  // first background try after the failure, then backing off...
+  const RESCUE_RETRY_MAX_MS   = 120000; // ...to at most this
+  const RESCUE_MAX_TRIES      = 40;     // past this the recording waits for a hand Retry
   // [LATENCY] Streamed upload (see openTakeStream): the audio goes up while the
   // clinician is still talking. Past the length cap the stream is given up and
   // the take uploads the ordinary way at release; after this many consecutive
@@ -3081,12 +3141,13 @@ right lower quadrant"></textarea>
   // status instead of DONE — "SAVED" when the note stayed on the phone, which
   // is a success but not a delivery. Tied to THIS status: any later setStatus
   // without one drops it.
-  function setStatus(msg, cls, headline) {
+  function setStatus(msg, cls, headline, mark) {
     statusIsBootHint = false;
     statusEl.className = "status " + (cls || "");
     statusEl.textContent = msg;
     lastStatusCls = cls || "";
     lastStatusHeadline = headline || "";
+    lastStatusMark = mark || "";
     updateBigScreen();
   }
 
@@ -3365,7 +3426,11 @@ right lower quadrant"></textarea>
       sttPrimary:     sttPrimaryEl ? sttPrimaryEl.value : "elevenlabs",
       sttBackup:      sttBackupEl ? sttBackupEl.value : "mistral",
       sttBackupSet:   sttBackupSet,
-      streamUpload:   streamUploadEl ? streamUploadEl.checked : true, // per-device: this network may not stream
+      // per-device: this network may not stream. OFF by default since
+      // 2026-11-22; streamUploadSet says it was turned ON by hand, so a saved
+      // "on" from the old default is not mistaken for a choice.
+      streamUpload:   streamUploadEl ? streamUploadEl.checked : false,
+      streamUploadSet: Boolean(streamUploadEl && streamUploadEl.checked) || streamUploadSetByHand,
       audioSeedVersion: audioSeedVersion, // additive: which iOS level seed has been applied (one-shot per version)
       audioUserTuned:   audioUserTuned,   // additive: user hand-tuned a mic-level slider — never auto-seed over it
       advancedOpen:   Boolean(advancedEl && advancedEl.open),
@@ -3443,7 +3508,12 @@ right lower quadrant"></textarea>
       if (windowTintEl && (s.windowTint === "full" || s.windowTint === "border" || s.windowTint === "off")) {
         windowTintEl.value = s.windowTint;
       }
-      if (typeof s.streamUpload === "boolean" && streamUploadEl) streamUploadEl.checked = s.streamUpload;
+      // Upload-while-dictating is OFF by default (2026-11-22): the owner found it
+      // no faster and less stable, and a streamed take that hangs is never sent
+      // a second time. Every device that saved the old default "on" goes off;
+      // only one turned on by hand since (streamUploadSet) keeps it.
+      streamUploadSetByHand = s.streamUploadSet === true;
+      if (typeof s.streamUpload === "boolean" && streamUploadEl) streamUploadEl.checked = streamUploadSetByHand ? s.streamUpload : false;
       if (typeof s.audioSeedVersion === "number")  audioSeedVersion = s.audioSeedVersion;
       if (typeof s.audioUserTuned   === "boolean") audioUserTuned   = s.audioUserTuned;
       if (typeof s.advancedOpen === "boolean" && advancedEl) advancedEl.open = s.advancedOpen;
@@ -3775,14 +3845,26 @@ right lower quadrant"></textarea>
           // At the cap the journal stopped mirroring mid-take: the recovery is
           // real but PARTIAL — the banner must say so (a silently half-recovered
           // note is the same wrong-text failure the journal exists to prevent).
-          if (blob && blob.size >= 1024) { found.push({ session: sess, blob: blob, capped: bufs.length >= JOURNAL_MAX_CHUNKS }); continue; }
+          if (blob && blob.size >= 1024) {
+            // A take whose UPLOAD failed was marked so (journalMarkFailed): it
+            // comes back worded as one, and a long one keeps transcribing
+            // itself in the background.
+            const failed = Boolean(sess.uploadFailed);
+            found.push({ session: sess, blob: blob, capped: bufs.length >= JOURNAL_MAX_CHUNKS,
+              fromUpload: failed, reason: failed ? (sess.failReason || "") : "",
+              recMs: Math.round(sess.recMs || 0),
+              autoRescue: failed && (sess.recMs || 0) >= RESCUE_MIN_REC_MS });
+            continue;
+          }
         }
         try { await journalClear(sess && sess.id); } catch (e) {}
       }
       if (!found.length) return;
       pendingRecovery = found[0];
       recoveryBacklog = found.slice(1);
-      showJournalRecover(found[0].session, found[0].capped);
+      if (found[0].fromUpload) { showUploadRecover(found[0].reason, true, found[0]); warnBeep(); }
+      else showJournalRecover(found[0].session, found[0].capped);
+      scheduleRescue();
     } catch (e) {}
   }
 
@@ -3800,9 +3882,154 @@ right lower quadrant"></textarea>
   // any (silently — the outcome that got us here already had its cue).
   function advanceRecovery() {
     pendingRecovery = recoveryBacklog.length ? recoveryBacklog.shift() : null;
+    updateRecoverBanner();
+  }
+
+  // Re-draw the banner for the recording it offers (silently).
+  function updateRecoverBanner() {
     if (!pendingRecovery) { hideJournalRecover(); return; }
     if (pendingRecovery.fromUpload) showUploadRecover(pendingRecovery.reason || "", Boolean(pendingRecovery.session && pendingRecovery.session.id), pendingRecovery);
     else showJournalRecover(pendingRecovery.session, pendingRecovery.capped, true);
+  }
+
+  function isSavedRecording(rec) {
+    return Boolean(rec) && (rec === pendingRecovery || recoveryBacklog.indexOf(rec) !== -1);
+  }
+
+  // A saved recording is done: it leaves the banner (or the line behind it)
+  // and its saved audio is deleted.
+  function settleRecovery(rec) {
+    try { if (rec && rec.session && rec.session.id) journalClear(rec.session.id).catch(function () {}); } catch (e) {}
+    if (rec === pendingRecovery) { advanceRecovery(); return; }
+    var i = recoveryBacklog.indexOf(rec);
+    if (i !== -1) recoveryBacklog.splice(i, 1);
+    updateRecoverBanner();
+  }
+
+  // Mark a failed take's saved recording as a failed UPLOAD (with its length),
+  // so a relaunch offers it as one — and keeps transcribing it by itself when
+  // it was long. Best-effort, like every journal write.
+  async function journalMarkFailed(sid, recMs, reason) {
+    if (journalDisabled || !sid) return;
+    try {
+      const db = await journalOpen();
+      if (!db) return;
+      const tx = db.transaction("sessions", "readwrite");
+      const store = tx.objectStore("sessions");
+      const req = store.get(sid);
+      req.onsuccess = function () {
+        const s = req.result;
+        if (!s) return;
+        s.uploadFailed = true;
+        s.recMs = Math.round(recMs || 0);
+        s.failReason = String(reason || "").slice(0, 200);
+        store.put(s);
+      };
+      await jTxDone(tx);
+    } catch (e) {}
+  }
+
+  /* ───── [RELIABILITY] Rescue: a failed long take transcribes itself ─────
+     A long dictation that failed because the server could not be reached is
+     transcribed in the background as soon as the server answers again, and
+     lands as a NOTE with a warn cue: never on the clipboard, because by then
+     the clinician may be in another patient's chart. It runs only while the
+     app is idle (a take and a hand Retry come first), oldest first, and it
+     backs off while the server stays unreachable. The banner's Retry and
+     Discard keep working throughout; whichever comes first settles it. */
+  function rescueCandidates() {
+    var out = [];
+    if (pendingRecovery && pendingRecovery.autoRescue && pendingRecovery.blob) out.push(pendingRecovery);
+    for (var i = 0; i < recoveryBacklog.length; i++) {
+      var r = recoveryBacklog[i];
+      if (r && r.autoRescue && r.blob) out.push(r);
+    }
+    return out; // newest first
+  }
+
+  function scheduleRescue(delay) {
+    if (rescueTimer || !rescueCandidates().length) return;
+    rescueTimer = setTimeout(rescueTick, typeof delay === "number" ? delay : rescueDelay);
+  }
+
+  function backOffRescue() {
+    rescueDelay = Math.min(RESCUE_RETRY_MAX_MS, Math.round(rescueDelay * 1.6));
+    scheduleRescue();
+  }
+
+  async function rescueTick() {
+    rescueTimer = null;
+    var list = rescueCandidates();
+    if (!list.length) { rescueDelay = RESCUE_RETRY_MS; return; }
+    if (recording || stopping || finishing || recovering || rescueBusy) { scheduleRescue(3000); return; }
+    // A transcript that came back while a take was running lands now.
+    for (var i = list.length - 1; i >= 0; i--) {
+      if (list[i].rescued) { landRescue(list[i]); scheduleRescue(1000); return; }
+    }
+    var rec = list[list.length - 1]; // the oldest first, so the notes land in the order they were spoken
+    var p = await pingServer(REACH_TIMEOUT_MS);
+    if (!p.ok) { backOffRescue(); return; }
+    if (recording || stopping || finishing || recovering || !isSavedRecording(rec)) { scheduleRescue(3000); return; }
+    rescueBusy = rec;
+    rec.tries = (rec.tries || 0) + 1;
+    var fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
+    var recMs = rec.recMs || Math.round(rec.blob.size / 8); // 64 kbps = 8 bytes a ms
+    var r;
+    try {
+      r = await batchTranscribe(rec.blob, fileName, batchUploadTimeoutMs(recMs, rec.blob.size), "", recMs, true);
+    } catch (e) {
+      r = { ok: false, retryable: true, error: (e && e.message) || "upload failed" };
+    }
+    rescueBusy = null;
+    if (!isSavedRecording(rec)) { scheduleRescue(1000); return; } // retried or discarded by hand meanwhile
+    if (r.ok && r.text && r.text.trim()) {
+      rec.rescued = r;
+      rescueDelay = RESCUE_RETRY_MS;
+      scheduleRescue(0); // lands at once when idle
+      return;
+    }
+    if (r.ok || r.retryable === false || rec.tries >= RESCUE_MAX_TRIES) {
+      // No words, or a recording no service will take: it waits on the banner
+      // for a hand Retry or Discard.
+      rec.autoRescue = false;
+      updateRecoverBanner();
+      scheduleRescue(1000);
+      return;
+    }
+    backOffRescue();
+  }
+
+  // The rescued text becomes the newest note, with a warn cue that says where
+  // it is. A recovered take has no loudness trace, so it is never filtered.
+  function landRescue(rec) {
+    var r = rec.rescued;
+    rec.rescued = null;
+    var text = cleanTranscript(r.text);
+    var viaService = r.provider && r.provider !== "elevenlabs" ? r.provider : "";
+    var entry = null;
+    try {
+      entry = addHistory(text, { language_code: "en", engine: "batch", recovered: true,
+        sendable: Boolean(joinedSessionCode && bigButtonActive()), stt: viaService });
+    } catch (e) { entry = null; }
+    if (!entry) {
+      rec.autoRescue = false;
+      updateRecoverBanner();
+      setStatus("⚠ A saved recording was transcribed but could NOT be saved as a note (storage full?). It is still saved — use 'Retry the upload'.", "err");
+      failBeep();
+      return;
+    }
+    settleRecovery(rec);
+    var when = recoveryWhen(rec);
+    var len = rec.recMs ? " (" + fmtMinSec(rec.recMs / 1000) + ")" : "";
+    var viaNote = sttOutcomeNote(r);
+    var otherVoices = diarizeActive() && speakerCount(r.words) > 1
+      ? " It has more than one voice — other speakers were NOT removed from a recovered take." : "";
+    setStatus("↺ Recovered your " + (when ? when + " " : "") + "dictation" + len +
+      ": the server answered again and it was transcribed. It is the newest note — copy it from there (nothing was pasted)." +
+      (joinedSessionCode ? " It is NOT sent to the desktop: tap 📤 Send on it." : "") +
+      (viaNote ? " " + viaNote : "") + otherVoices, "warn", "", "recovered");
+    warnBeep();
+    updateAppendChip();
   }
 
   function showJournalRecover(session, capped, silent) {
@@ -3854,7 +4081,7 @@ right lower quadrant"></textarea>
   //
   // Deliberately SILENT: the caller (deliverFinalText) owns the single outcome
   // beep for this take, and a warn beep here would be a second cue.
-  function armUploadRecovery(blob, reason) {
+  function armUploadRecovery(blob, reason, recMs) {
     try {
       if (!blob || blob.size < 1024) return false;
       // A recording already waiting for its retry is NEVER dropped to make room:
@@ -3878,8 +4105,13 @@ right lower quadrant"></textarea>
         blob: blob,
         fromUpload: true,
         reason: reason || "",
+        recMs: Math.round(recMs || 0),
+        // A long take transcribes itself once the server answers (rescueTick).
+        autoRescue: (recMs || 0) >= RESCUE_MIN_REC_MS,
       };
+      journalMarkFailed(journalSessionId, recMs, reason);
       showUploadRecover(reason, Boolean(journalSessionId), pendingRecovery);
+      if (pendingRecovery.autoRescue) { rescueDelay = RESCUE_RETRY_MS; scheduleRescue(); }
       return true;
     } catch (e) { return false; }
   }
@@ -3889,7 +4121,9 @@ right lower quadrant"></textarea>
     var when = recoveryWhen(rec);
     if (journalRecoverMsgEl) journalRecoverMsgEl.textContent =
       "⚠ The transcription upload FAILED" + (when ? " for your " + when + " dictation" : "") + " (" + (reason || "upload failed") + ") — but your RECORDING was saved. " +
-      "Retry the upload instead of redictating." +
+      (rec && rec.autoRescue
+        ? "It will be transcribed into your notes by itself as soon as the server answers — or retry it now. Do not redictate."
+        : "Retry the upload instead of redictating.") +
       (persisted ? " It also survives a reload, so you can retry after relaunching the app." : "") +
       (joinedSessionCode ? " A successful retry is sent to the desktop like any other dictation." : "") +
       recoveryMoreNote();
@@ -3914,6 +4148,12 @@ right lower quadrant"></textarea>
       return;
     }
     if (recovering) return; // a second tap while the first retry is uploading must not start another
+    // The background rescue already has it: one upload of a recording at a time.
+    if (pendingRecovery.rescued) { landRescue(pendingRecovery); return; }
+    if (rescueBusy === pendingRecovery) {
+      setStatus("That recording is being transcribed right now, in the background — it will appear in your notes in a moment.", "warn");
+      return;
+    }
     const rec = pendingRecovery;
     // While the re-upload runs the retry owns the note it will write: no take
     // may start (startRecording refuses) and the notes are locked — a note
@@ -4357,6 +4597,13 @@ right lower quadrant"></textarea>
         try {
           const secs = Math.round((Date.now() - t0) / 1000);
           if (secs < 2) return; // don't clutter a fast take
+          // A server check failed during this wait: say what is wrong, and that
+          // the recording is safe, instead of a count that reads like a slow service.
+          if (serverUnreachable) {
+            setStatus("⚠ This computer can't reach the server — still trying… " + secs + "s" +
+              (cap ? " (allowing up to " + cap + "s)" : "") + ". The recording is kept; nothing is lost.", "warn");
+            return;
+          }
           setStatus(label + "… " + secs + "s" + (cap ? " (allowing up to " + cap + "s" +
             (slow ? " — " + sttName(sttPrimary()) + " has been slow" : "") + ")" : ""), "warn");
         } catch (e) {}
@@ -4394,15 +4641,18 @@ right lower quadrant"></textarea>
   // Shared by the ordinary upload and the streamed one, so a streamed take is
   // judged exactly like an uploaded one: the same errors, the same speaker
   // filter, the same coverage-guard inputs.
-  async function readTranscribeResponse(res) {
-    stampTake("headers"); // [PERF] response headers back = upload + service done
+  // bg: a background transcription (a failed long take's rescue): it belongs
+  // to no take, so it must never stamp or fill the timing row of the take that
+  // may be recording while it runs.
+  async function readTranscribeResponse(res, bg) {
+    if (!bg) stampTake("headers"); // [PERF] response headers back = upload + service done
     // Fold the Worker's own Server-Timing in: "el" is the ElevenLabs round
     // trip, so (service - worker) is OUR network overhead — the only part any
     // transport work could ever recover. Character classes only, no
     // backslashes: this source lives inside a template literal.
     try {
       var stHeader = (res.headers && res.headers.get) ? res.headers.get("server-timing") : "";
-      if (stHeader && takeTimings) {
+      if (stHeader && takeTimings && !bg) {
         var mParse = /parse;dur=([0-9.]+)/.exec(stHeader);
         var mEl    = /(^|[ ,])el;dur=([0-9.]+)/.exec(stHeader);
         var mWk    = /worker;dur=([0-9.]+)/.exec(stHeader);
@@ -4416,7 +4666,7 @@ right lower quadrant"></textarea>
       }
     } catch (e) {}
     const raw = await res.text();
-    stampTake("body"); // [PERF] full response in hand
+    if (!bg) stampTake("body"); // [PERF] full response in hand
     let data;
     try { data = JSON.parse(raw); } catch (e) { data = { raw: raw }; }
 
@@ -4445,7 +4695,7 @@ right lower quadrant"></textarea>
       ? data.stt_provider : "elevenlabs";
     var fallbackReason = data.stt_fallback ? String(data.stt_fallback).slice(0, 160) : "";
     var sttNote = data.stt_note ? String(data.stt_note).slice(0, 200) : "";
-    try { if (takeTimings) { takeTimings.provider = provider; takeTimings.fallback = Boolean(fallbackReason); } } catch (e) {}
+    try { if (takeTimings && !bg) { takeTimings.provider = provider; takeTimings.fallback = Boolean(fallbackReason); } } catch (e) {}
     // Coverage-guard inputs: the FULL words[] (pre-speaker-filter — coverage
     // measures what the service transcribed, not what the filter kept) and the
     // decoded audio duration. Both null when absent so the guard can only ever
@@ -4459,7 +4709,76 @@ right lower quadrant"></textarea>
              provider: provider, fallbackReason: fallbackReason, sttNote: sttNote };
   }
 
-  async function batchTranscribe(blob, fileName, timeoutMs, label, recMs) {
+  // A tiny, uncached GET the Worker answers at once (/api/ping). ok: the
+  // server could be reached within timeoutMs; ms: how long it took. Never
+  // throws, never takes longer than timeoutMs.
+  function pingServer(timeoutMs) {
+    var t0 = Date.now();
+    return new Promise(function (resolve) {
+      var settled = false;
+      var ctrl = null;
+      try { ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null; } catch (e) { ctrl = null; }
+      var timer = setTimeout(function () {
+        try { if (ctrl) ctrl.abort(); } catch (e) {}
+        settle(false);
+      }, timeoutMs || REACH_TIMEOUT_MS);
+      function settle(ok) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve({ ok: ok, ms: Date.now() - t0 });
+      }
+      try {
+        fetch("/api/ping?t=" + Date.now(), { method: "GET", cache: "no-store", signal: ctrl ? ctrl.signal : undefined })
+          .then(function (res) { settle(Boolean(res && res.ok)); }, function () { settle(false); });
+      } catch (e) { settle(false); }
+    });
+  }
+
+  // How long an upload may go unanswered, on a path a server check just
+  // proved healthy, before it is taken to be stuck: base + its bytes at
+  // ~83 KB/s + the service's own time on that much audio.
+  function hedgeAfterMs(bytes, recMs) {
+    return HEDGE_BASE_MS + Math.round((bytes || 0) / 1024 * HEDGE_MS_PER_KB) +
+           Math.round(Math.max(0, recMs || 0) / 1000 * HEDGE_MS_PER_AUDIO_S);
+  }
+
+  // The server check's verdict while a take runs. The title carries it
+  // (OFFLINE, which the AutoHotkey bar reads); while recording the status
+  // says it in words, and during an upload the upload ticker does.
+  function setServerReach(ok) {
+    var was = serverUnreachable;
+    serverUnreachable = !ok;
+    if (!ok) { try { if (takeTimings) takeTimings.reach = "down"; } catch (e) {} }
+    if (was === serverUnreachable) return;
+    if (recording && !stopping) {
+      if (!ok) setStatus("⚠ This computer can't reach the server right now. Keep going — the recording is kept here, and it is sent as soon as the connection is back.", "warn");
+      else setStatus("The connection is back. Recording… stop when you are done and it will be transcribed.", "ok");
+    } else {
+      applyWindowState();
+    }
+  }
+
+  // Server checks while a take records: a long dictation into a dead
+  // connection must be known while it is being spoken, not at the end.
+  function startReachWatch() {
+    if (reachTimer) { clearTimeout(reachTimer); reachTimer = null; }
+    var mine = sessionSeq;
+    var tick = function () {
+      reachTimer = null;
+      if (!recording || stopping || sessionSeq !== mine) return;
+      pingServer(REACH_TIMEOUT_MS).then(function (p) {
+        if (!recording || stopping || sessionSeq !== mine) return;
+        setServerReach(p.ok);
+        reachTimer = setTimeout(tick, p.ok ? REACH_RECHECK_MS : 5000);
+      });
+    };
+    reachTimer = setTimeout(tick, REACH_FIRST_CHECK_MS);
+  }
+
+  // The ordinary upload. bg: a background transcription (a failed long take's
+  // rescue) — no status ticker, no timing stamps, no OFFLINE title.
+  async function batchTranscribe(blob, fileName, timeoutMs, label, recMs, bg) {
     const form = new FormData();
     const apiKey = apiKeyEl.value.trim();
     if (apiKey) form.append("api_key", apiKey);
@@ -4470,37 +4789,140 @@ right lower quadrant"></textarea>
     // before asking the Soniox fallback (a long take takes longer to transcribe).
     if (recMs > 0) form.append("rec_ms", String(Math.round(recMs)));
 
-    const ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
-    const killer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (e) {} }, timeoutMs) : null;
-
-    try {
+    const t0 = Date.now();
+    const deadlineAt = t0 + timeoutMs;
+    const hedgeMs = hedgeAfterMs(blob.size || 0, recMs);
+    if (!bg) {
       stampTake("uploadStart"); // [PERF] bytes start moving here
       startUploadTicker(label || "Uploading audio for transcription", timeoutMs);
-      const res = await fetch("/api/transcribe", {
-        method: "POST",
-        body: form,
-        signal: ctrl ? ctrl.signal : undefined,
-      });
-      return await readTranscribeResponse(res);
-    } catch (err) {
-      const aborted = err && err.name === "AbortError";
-      // Both are retryable by definition: the audio never reached a verdict.
-      // An abort is OUR deadline firing, which on the phone link almost always
-      // means the upload leg was still in flight (the ElevenLabs request log
-      // shows no such request at all) — never a reason to drop the recording.
-      return {
-        ok: false,
-        text: "",
-        errKind: aborted ? "timeout" : "network",
-        retryable: true,
-        error: aborted
-          ? "timed out after " + Math.round(timeoutMs / 1000) + "s"
-          : (err && err.message ? err.message : String(err)),
-      };
-    } finally {
-      if (killer) clearTimeout(killer);
-      stopUploadTicker();
     }
+
+    // [RELIABILITY] One upload normally answers in about a second. When it has
+    // not, the server is checked. Unreachable is said out loud (the recording
+    // is safe), and once the server answers again the SAME recording goes up
+    // again: the upload that went into a dead connection may never come back.
+    // A fast, healthy check beside an upload long overdue means that upload is
+    // stuck, so one more goes up beside it. The first good answer wins and the
+    // rest are abandoned. The deadline is unchanged, so a take that cannot get
+    // through still ends loud at the same moment — or sooner, when every
+    // upload has failed outright and the server stays unreachable. Both are
+    // retryable by definition: the audio never reached a verdict.
+    return await new Promise(function (resolve) {
+      var attempts = [];
+      var finished = false;
+      var probeTimer = null;
+      var probing = false;
+      var unreachableSince = 0;
+      var everDown = !bg && serverUnreachable; // the recording already saw it down
+      var downSinceLaunch = false;
+      var lastLaunchAt = 0;
+      var lastErrAnswer = null;
+      var lastNetErr = null;
+      var killer = setTimeout(function () {
+        finish({ ok: false, text: "", errKind: "timeout", retryable: true,
+          error: "timed out after " + Math.round(timeoutMs / 1000) + "s" +
+                 (everDown ? " (this computer could not reach the server)" : "") });
+      }, timeoutMs);
+
+      function finish(result) {
+        if (finished) return;
+        finished = true;
+        clearTimeout(killer);
+        if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
+        attempts.forEach(function (a) { if (!a.over) { try { if (a.ctrl) a.ctrl.abort(); } catch (e) {} } });
+        if (!bg) {
+          stopUploadTicker();
+          try {
+            if (takeTimings) {
+              takeTimings.attempts = attempts.length;
+              if (everDown) takeTimings.reach = "down";
+            }
+          } catch (e) {}
+        }
+        resolve(result);
+      }
+      function inFlight() {
+        var n = 0;
+        for (var i = 0; i < attempts.length; i++) if (!attempts[i].over) n++;
+        return n;
+      }
+      function netResult() {
+        return { ok: false, text: "", errKind: "network", retryable: true,
+          error: (lastNetErr && lastNetErr.message ? lastNetErr.message : String(lastNetErr || "the upload failed")) +
+                 (everDown ? " (this computer could not reach the server)" : "") };
+      }
+      function launch() {
+        var a = { ctrl: null, over: false };
+        try { a.ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null; } catch (e) { a.ctrl = null; }
+        attempts.push(a);
+        lastLaunchAt = Date.now();
+        downSinceLaunch = !bg && serverUnreachable;
+        var p;
+        try {
+          p = fetch("/api/transcribe", { method: "POST", body: form, signal: a.ctrl ? a.ctrl.signal : undefined });
+        } catch (err) {
+          p = Promise.reject(err);
+        }
+        p.then(function (res) {
+          if (finished) { a.over = true; return; }
+          return readTranscribeResponse(res, bg).then(function (r) {
+            a.over = true;
+            if (finished) return;
+            // A good answer wins at once. An error answer wins only when no
+            // other upload of this recording could still bring a good one.
+            if (r.ok || inFlight() === 0) finish(r);
+            else lastErrAnswer = r;
+          });
+        }).catch(function (err) {
+          a.over = true;
+          if (finished) return;
+          if (err && err.name === "AbortError") return; // ours: the deadline, or another upload won
+          lastNetErr = err;
+          if (inFlight() > 0) return;                    // another upload may still answer
+          if (lastErrAnswer) { finish(lastErrAnswer); return; }
+          if (attempts.length >= UPLOAD_MAX_ATTEMPTS) { finish(netResult()); return; }
+          scheduleProbe(0);                              // send it again once the server answers
+        });
+      }
+      function scheduleProbe(delay) {
+        if (finished || probing) return;
+        if (probeTimer) {
+          if (delay > 0) return;
+          clearTimeout(probeTimer);
+        }
+        probeTimer = setTimeout(runProbe, delay);
+      }
+      function runProbe() {
+        probeTimer = null;
+        if (finished) return;
+        probing = true;
+        pingServer(REACH_TIMEOUT_MS).then(function (p) {
+          probing = false;
+          if (finished) return;
+          var now = Date.now();
+          if (p.ok) {
+            unreachableSince = 0;
+            if (!bg && serverUnreachable) setServerReach(true);
+            var room = deadlineAt - now > 3000;
+            var stuck = inFlight() === 0 || downSinceLaunch ||
+                        (p.ms <= UPLOAD_PROBE_FAST_MS && now - lastLaunchAt >= hedgeMs);
+            if (room && stuck && attempts.length < UPLOAD_MAX_ATTEMPTS) launch();
+            else if (inFlight() === 0) { finish(lastErrAnswer || netResult()); return; }
+          } else {
+            if (!unreachableSince) unreachableSince = now;
+            everDown = true;
+            downSinceLaunch = true;
+            if (!bg) setServerReach(false);
+            if (inFlight() === 0 && now - unreachableSince >= OFFLINE_GIVE_UP_MS) { finish(netResult()); return; }
+          }
+          scheduleProbe(UPLOAD_PROBE_EVERY_MS);
+        });
+      }
+
+      launch();
+      // A recording that already saw the server unreachable checks at once.
+      scheduleProbe(everDown ? 1000 : UPLOAD_PROBE_AFTER_MS);
+    });
   }
 
   /* ───── [LATENCY] Streamed upload (ported from WhisperInk) ─────
@@ -4923,6 +5345,11 @@ right lower quadrant"></textarea>
         // Why a stream fell back: a class of error, never a URL or body. One
         // line, bounded, so it can never break a TSV row.
         pathNote: String(t.pathNote || "").replace(/\\s+/g, " ").slice(0, 160),
+        // [RELIABILITY] How many times the recording was uploaded (more than
+        // once = an upload was stuck or failed and the same audio went up
+        // again), and "down" when a server check failed during this take.
+        attempts: (typeof t.attempts === "number") ? t.attempts : null,
+        reach:    t.reach || "",
       };
       // net = what the service round trip cost us MINUS what the Worker says it
       // spent: our own network + Cloudflare overhead, the part transport work
@@ -4935,6 +5362,8 @@ right lower quadrant"></textarea>
         log.unshift(entry);
         localStorage.setItem(TIMING_LOG_KEY, JSON.stringify(log.slice(0, TIMING_LOG_MAX)));
       } catch (e) {}
+      // A failed take reports itself to the cloud log (no-op off shared mode).
+      if (entry.errKind) queueAutoReport(entry);
       renderTimingReadout(entry);
       try {
         if (PERF_DEBUG && typeof console !== "undefined" && console.log) console.log("[perf]", entry);
@@ -5041,7 +5470,7 @@ right lower quadrant"></textarea>
   function timingLogTsv() {
     var cols = ["at","outcome","stage","errKind","deadline","total","flush","upload","service","net","elMs","parseMs","workerMs",
                 "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize","path","pathNote",
-                "primary","provider","fallback","hedgeMs","backupMs","spk","spkBy","spkRatio","spkCut"];
+                "primary","provider","fallback","hedgeMs","backupMs","spk","spkBy","spkRatio","spkCut","attempts","reach"];
     var out = [cols.join("\\t")];
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
@@ -5568,6 +5997,7 @@ right lower quadrant"></textarea>
     if (finalDeadlineTimer) { clearTimeout(finalDeadlineTimer); finalDeadlineTimer = null; }
     if (quietTimer)         { clearTimeout(quietTimer);         quietTimer = null; }
     if (stopTailTimer)      { clearTimeout(stopTailTimer);      stopTailTimer = null; }
+    if (reachTimer)         { clearTimeout(reachTimer);         reachTimer = null; }
   }
 
   async function startRecording() {
@@ -5841,6 +6271,8 @@ right lower quadrant"></textarea>
     setMicPill("rec");
     updateAppendChip();
     setStatus("Recording… stop when you are done and it will be transcribed.", "ok");
+    serverUnreachable = false;
+    startReachWatch(); // [RELIABILITY] a dead connection is said while the take is spoken, not at its end
     startBeep();
     // Joined phone: light the desktop's "recording" indicator (no-op if unpaired).
     // Not for a take that stays on the phone — the desktop would sit on
@@ -5868,6 +6300,7 @@ right lower quadrant"></textarea>
     stampTake("release"); // [PERF] t0 of the release-to-clipboard budget
     userStopped = true;
     stopping = true;
+    if (reachTimer) { clearTimeout(reachTimer); reachTimer = null; } // the upload's own checks take over
     refreshNoteLocks(); // keep the box locked through the upload phase
     updateAppendChip();      // disable Copy & clear / Clear box through the upload
 
@@ -6122,11 +6555,25 @@ right lower quadrant"></textarea>
                    maxRmsSeen >= FLATLINE_RMS &&
                    maxRmsSeen < SPEECH_OPEN_RMS;
 
-    if (!blob || blob.size < 1024) {
+    const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
+    // A take under QUIET_TAP_MS that produces no text is a click, not a lost
+    // dictation (2026-11-22): it ends quietly — the sentinel is still copied,
+    // so nothing stale can be pasted, but no red status, no fail beep, and the
+    // title says "Too short" so the AutoHotkey bar shows a grey line instead of
+    // FAILED. The exceptions stay loud: a mic alarm, an unexpected failure, a
+    // failed upload (below), and on the phone a capture of pure zeros (the
+    // iOS dead-mic capture that a short press slips past the watchdog with).
+    const quietTap = !unexpected && !micAlarmFired && recMs > 0 && recMs < QUIET_TAP_MS &&
+                     !(noSignal && bigButtonActive());
+
+    // The speech detector never heard anything at speech level in a take that
+    // short: there is nothing to send (and nothing to pay for).
+    const tapUnheard = quietTap && maxRmsSeen < SPEECH_OPEN_RMS;
+    if (!blob || blob.size < 1024 || tapUnheard) {
       // Gate never opened / instant tap: nothing worth uploading. Cancel the
       // stream mid-body so ElevenLabs never gets a request to transcribe or bill.
       if (streamed) abandonTakeStream(streamed, "nothing to transcribe");
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap });
       return;
     }
 
@@ -6139,7 +6586,6 @@ right lower quadrant"></textarea>
     setLinkPill("uploading");
     setStatus(streamed ? "Transcribing…" : "Uploading audio for transcription…", "warn");
 
-    const recMs = (recEndedAt && recStartedAt) ? Math.max(0, recEndedAt - recStartedAt) : 0;
     const deadlineMs = batchUploadTimeoutMs(recMs, blob.size || 0);
     if (takeTimings) { takeTimings.deadlineMs = deadlineMs; takeTimings.primary = sttPrimary(); }
     const r = await transcribeTake(streamed, blob, blobChunks, fileName, deadlineMs, recMs);
@@ -6154,8 +6600,9 @@ right lower quadrant"></textarea>
       // uses and KEEP the journal record instead of clearing it — the clinician
       // retries the upload rather than redictating from memory. The outcome is
       // still LOUD (sentinel + fail beep + red status); recovery is additive.
-      const kept = (r.retryable !== false) && armUploadRecovery(blob, r.error || "");
-      await deliverFinalText("", { unexpected: true, keepJournal: kept, recoverable: kept });
+      const kept = (r.retryable !== false) && armUploadRecovery(blob, r.error || "", recMs);
+      await deliverFinalText("", { unexpected: true, keepJournal: kept, recoverable: kept,
+        autoRescue: Boolean(kept && pendingRecovery && pendingRecovery.autoRescue) });
       return;
     }
 
@@ -6177,7 +6624,7 @@ right lower quadrant"></textarea>
     updateLiveDisplay();
 
     if (!r.text || !r.text.trim()) {
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap });
       return;
     }
 
@@ -6255,15 +6702,33 @@ right lower quadrant"></textarea>
     // so iOS doesn't auto-lock between takes and reclaim the mic (wakeLockDesired).
     if (!bigButtonActive()) releaseWakeLock();
     const label = opts.label || "Transcript";
+    // The take's outcome replaces any "can't reach the server" it showed.
+    serverUnreachable = false;
+    if (reachTimer) { clearTimeout(reachTimer); reachTimer = null; }
 
     if (!cleaned.trim()) {
       await writeSentinel();
+      if (opts.quietTap) {
+        // A click, not a dictation: nothing was recorded, and the clipboard
+        // holds the sentinel so nothing stale can be pasted. Neutral, no beep.
+        setStatus("Too short — nothing recorded. Hold the key (or keep recording) while you talk.", "", "", "tap");
+        stampTake("delivered");
+        recordTakeTiming("tap"); // not a failure: the ring keeps it out of the failure counts
+        finishing = false;
+        updateBigScreen();
+        updateAppendChip();
+        maybePendingStart();
+        return;
+      }
       if (opts.unexpected) {
         // Still LOUD (sentinel on the clipboard + fail beep below) — but when the
         // audio survived, say so in the same breath, because "redictate it" is
         // the wrong and expensive instinct here.
         setStatus("Dictation FAILED — " + (lastWsError || "connection lost") + ". Nothing was transcribed; sentinel copied." +
-          (opts.recoverable ? " Your RECORDING was saved — use 'Retry the upload' above; do NOT redictate." : ""), "err");
+          (opts.autoRescue
+            ? " Your RECORDING was saved — it will be transcribed into your notes by itself as soon as the server answers (or use 'Retry the upload' above). Do NOT redictate."
+            : (opts.recoverable ? " Your RECORDING was saved — use 'Retry the upload' above; do NOT redictate." : "")),
+          "err", "", opts.autoRescue ? "retry" : "");
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic." + recordMicFailure("no-speech-mic-alarm"), "err");
       } else if (opts.noSignal) {
@@ -6818,11 +7283,82 @@ right lower quadrant"></textarea>
         if (isFinite(gap) && gap <= bestGap) { best = log[i]; bestGap = gap; }
       }
       if (!best) return null;
-      var keep = ["at", "outcome", "recMs", "total", "elMs", "kb", "keyterms", "diarize", "path", "primary", "provider", "fallback", "spk", "spkBy", "spkCut", "errKind"];
-      var out = {};
-      keep.forEach(function (k) { if (best[k] !== undefined) out[k] = best[k]; });
-      return out;
+      return trimTimingRow(best);
     } catch (e) { return null; }
+  }
+
+  // A timing row cut to what helps a diagnosis. Durations, sizes and error
+  // classes only — never a URL, a header or any text.
+  var TIMING_REPORT_KEYS = ["at", "outcome", "stage", "errKind", "deadline", "recMs", "total", "upload", "service",
+    "elMs", "kb", "keyterms", "diarize", "path", "pathNote", "primary", "provider", "fallback", "attempts", "reach",
+    "spk", "spkBy", "spkCut"];
+  function trimTimingRow(row) {
+    var out = {};
+    TIMING_REPORT_KEYS.forEach(function (k) { if (row && row[k] !== undefined) out[k] = row[k]; });
+    return out;
+  }
+
+  // The newest few takes' rows, for a report that is not about one note: a
+  // failed take leaves no note, and its row is the evidence.
+  function recentTimingRows(n) {
+    try {
+      var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
+      if (!Array.isArray(log) || !log.length) return null;
+      return log.slice(0, n).map(trimTimingRow);
+    } catch (e) { return null; }
+  }
+
+  // [RELIABILITY] A failed take reports itself to the cloud log: its timing
+  // row and error type only, never the note. A work desktop that is wiped at
+  // logoff then still leaves the evidence (2026-11-22: a long take failed on a
+  // remote desktop that no longer exists, and its timing log went with it).
+  // Shared mode only; sent while no take runs; retried while the page is open.
+  function queueAutoReport(entry) {
+    try {
+      if (!SHARED_MODE || !entry || !entry.errKind) return;
+      autoReportQueue.push({
+        kind: "auto",
+        details: "Automatic report: a take FAILED (" + entry.errKind + (entry.stage ? " at " + entry.stage : "") +
+          (typeof entry.total === "number" ? " after " + Math.round(entry.total / 1000) + " s" : "") + "; " +
+          fmtMinSec((entry.recMs || 0) / 1000) + " recorded, " + (entry.kb || 0) + " KB" +
+          (entry.attempts > 1 ? ", uploaded " + entry.attempts + " times" : "") +
+          (entry.reach === "down" ? "; this computer could not reach the server" : "") + ").",
+        service: entry.primary || "",
+        device: bigButtonActive() ? "phone" : "desktop",
+        userAgent: (navigator.userAgent || "").slice(0, 300),
+        timing: trimTimingRow(entry),
+      });
+      while (autoReportQueue.length > 10) autoReportQueue.shift();
+      flushAutoReports(2000);
+    } catch (e) {}
+  }
+
+  function flushAutoReports(delay) {
+    if (autoReportTimer || !autoReportQueue.length) return;
+    autoReportTimer = setTimeout(sendAutoReport, delay || 0);
+  }
+
+  async function sendAutoReport() {
+    autoReportTimer = null;
+    if (!autoReportQueue.length) return;
+    if (recording || stopping || finishing || recovering || rescueBusy) { flushAutoReports(10000); return; }
+    var item = autoReportQueue[0];
+    var sent = false;
+    try {
+      var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+      var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 10000);
+      var res = await fetch("/api/report", {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-app-auth": passphraseEl.value.trim() },
+        body: JSON.stringify(item),
+        signal: ctrl ? ctrl.signal : undefined,
+      });
+      clearTimeout(timer);
+      // A refusal that can never succeed (no access code, no report storage) is dropped.
+      sent = Boolean(res && (res.ok || (res.status >= 400 && res.status < 500) || res.status === 503));
+    } catch (e) {}
+    if (sent) autoReportQueue.shift();
+    flushAutoReports(sent ? 500 : 60000);
   }
 
   // Add one term to this device's custom vocabulary (once, case-insensitively).
@@ -6859,7 +7395,9 @@ right lower quadrant"></textarea>
       service: ctx.service || "",
       device: bigButtonActive() ? "phone" : "desktop",
       userAgent: (navigator.userAgent || "").slice(0, 300),
-      timing: ctx.noteCreatedAt ? timingRowFor(ctx.noteCreatedAt) : null,
+      // A note's report carries that take's row; any other report the newest
+      // few (a failed take has no note, and its row is the evidence).
+      timing: ctx.noteCreatedAt ? timingRowFor(ctx.noteCreatedAt) : recentTimingRows(5),
     };
     reportSendBtnEl.disabled = true;
     reportStatusEl.textContent = "Sending…";
@@ -6890,8 +7428,12 @@ right lower quadrant"></textarea>
     }
   }
 
+  function reportKindLabel(kind) {
+    return kind === "word" ? "missed word" : (kind === "auto" ? "failed take (automatic)" : "problem");
+  }
+
   function reportAsText(r) {
-    return new Date(r.created_at).toLocaleString() + " · " + (r.kind === "word" ? "missed word" : "problem") +
+    return new Date(r.created_at).toLocaleString() + " · " + reportKindLabel(r.kind) +
       (r.service ? " · " + r.service : "") + (r.device ? " · " + r.device : "") + "\\n" +
       (r.expected ? "Word: " + r.expected + "\\n" : "") +
       (r.details ? "What went wrong: " + r.details + "\\n" : "") +
@@ -6940,7 +7482,7 @@ right lower quadrant"></textarea>
       item.className = "report-item";
       var meta = document.createElement("div");
       meta.className = "report-meta";
-      meta.textContent = new Date(rep.created_at).toLocaleString() + " · " + (rep.kind === "word" ? "missed word" : "problem") +
+      meta.textContent = new Date(rep.created_at).toLocaleString() + " · " + reportKindLabel(rep.kind) +
         (rep.service ? " · " + rep.service : "") + (rep.device ? " · " + rep.device : "");
       var body = document.createElement("div");
       body.textContent = (rep.expected ? "“" + rep.expected + "”" + (rep.details ? ": " : "") : "") + (rep.details || "");
@@ -8058,18 +8600,25 @@ right lower quadrant"></textarea>
   function applyWindowState() {
     try {
       var st = currentUiState();
-      if (st === lastWindowState) return;
-      lastWindowState = st;
+      // The title is also the AutoHotkey bar's window into this page (it can
+      // read a window's title without focus): OFFLINE while a take runs and
+      // the server cannot be reached, and the status's mark otherwise. The
+      // script looks for these exact words; change them in both places.
+      var mark = (serverUnreachable && (st === "rec" || st === "busy")) ? "offline" : (lastStatusMark || "");
+      var key = st + "|" + mark;
+      if (key === lastWindowState) return;
+      lastWindowState = key;
       if (document.body) document.body.setAttribute("data-state", st);
       document.title =
-        st === "rec"   ? "\u25CF REC \u2014 Dictation" :
-        st === "busy"  ? "\u2026 Working \u2014 Dictation" :
+        st === "rec"   ? (mark === "offline" ? "\u25CF REC \u00B7 OFFLINE \u2014 Dictation" : "\u25CF REC \u2014 Dictation") :
+        st === "busy"  ? (mark === "offline" ? "\u2026 Working \u00B7 OFFLINE \u2014 Dictation" : "\u2026 Working \u2014 Dictation") :
         // A dropped phone link is its own word: "FAILED" in the tab title reads
         // as "my dictation failed" from across the room.
         (st === "fail" && phoneLinkDropped && !recording && !finishing) ? "\u26A0 LINK DOWN \u2014 Dictation" :
-        (st === "fail" || st === "alarm") ? "\u26A0 FAILED \u2014 Dictation" :
-        st === "warn"  ? "\u26A0 Check \u2014 Dictation" :
-        st === "ok"    ? "\u2713 Done \u2014 Dictation" : BASE_TITLE;
+        (st === "fail" || st === "alarm") ? (mark === "retry" ? "\u26A0 FAILED \u00B7 will retry \u2014 Dictation" : "\u26A0 FAILED \u2014 Dictation") :
+        st === "warn"  ? (mark === "recovered" ? "\u21BA Recovered \u2014 Dictation" : "\u26A0 Check \u2014 Dictation") :
+        st === "ok"    ? "\u2713 Done \u2014 Dictation" :
+        mark === "tap" ? "\u00B7 Too short \u2014 Dictation" : BASE_TITLE;
       setStateFavicon(st);
       // App badge: installed-PWA taskbar/dock dot. "Limited availability" per
       // MDN and unverified on every target, so it is a bonus on top of the

@@ -109,16 +109,19 @@ InitStateBar()
 ; It can be read without focus. The page (worker.js, applyWindowState) puts
 ; these words in it, and this script looks for them — change them in both:
 ;   "OFFLINE"    a take is running and the page cannot reach its server
-;   "Too short"  a click the page heard nothing in: ended quietly, nothing sent
-;   "will retry" a failed take whose recording is transcribed by itself later
-;   "Recovered"  ...and it was: the text is the newest note in the page
+;   "REC" / "Working"  a take is recording / being transcribed
+;   "Too short"     a click the page heard no words in: ended quietly
+;   "will retry"    a failed take whose recording is transcribed by itself later
+;   "Recovered"     ...and it was: the text is the newest note in the page
+;   "not recovered" ...and it could not be: retry it in the page, or redictate
+; The words are matched with case, so "Recovered" never matches "not recovered".
 DictTitle() {
     global DICT_HWND
     t := ""
     try t := WinGetTitle("ahk_id " DICT_HWND)
     return t
 }
-TitleHas(word) => InStr(DictTitle(), word) > 0
+TitleHas(word) => InStr(DictTitle(), word, true) > 0
 
 ; The page writes its outcome into its title just before it writes the
 ; clipboard; give the browser a moment to pass a fresh title to the window.
@@ -126,7 +129,7 @@ SettledTitle(ms := 500) {
     deadline := A_TickCount + ms
     loop {
         t := DictTitle()
-        if (InStr(t, "Too short") || InStr(t, "FAILED") || InStr(t, "Done") || InStr(t, "Check") || InStr(t, "Recovered"))
+        if (InStr(t, "Too short", true) || InStr(t, "FAILED", true) || InStr(t, "Done", true) || InStr(t, "Check", true) || InStr(t, "Recovered", true))
             return t
         if (A_TickCount >= deadline)
             return t
@@ -141,15 +144,25 @@ SettledTitle(ms := 500) {
 SetTimer(WatchForRecovered, 1000)
 WatchForRecovered() {
     global BUSY, DICT_HWND
-    static shown := false
+    static shown := "", lost := false
     if (BUSY || !DICT_HWND || !WinExist("ahk_id " DICT_HWND))
         return
-    rec := TitleHas("Recovered")
-    if (rec && !shown) {
+    t := DictTitle()
+    if (InStr(t, "not recovered", true)) {
+        if (!lost) {
+            FailState("⚠ NOT RECOVERED — RETRY IN APP")
+            Fail("A saved dictation could NOT be transcribed by itself. Open the dictation window: retry it there, or redictate it.")
+        }
+        lost := true
+        return
+    }
+    lost := false
+    rec := InStr(t, "Recovered", true) > 0
+    if (rec && shown != t) {
         ShowState("↺ RECOVERED — IN NOTES", "B45309")
         Notify("A failed dictation was recovered: it is the newest note in the dictation window. Nothing was pasted — copy it from there.")
     }
-    shown := rec
+    shown := rec ? t : ""
 }
 
 ; ===== Phone-link poller (non-blocking) =====
@@ -362,18 +375,25 @@ RunTake(isHeld, waitRelease) {
     ; While you talk, the page's title says when it cannot reach its server, so
     ; a long dictation into a dead connection is known while it is spoken —
     ; not three minutes later.
+    ; sawTake: the page's title showed THIS take recording or working. Only
+    ; such a press can end as a quiet "Too short" — a press the page refused
+    ; before recording leaves the previous take's title up for a moment.
     startTick := A_TickCount
     capped := false
     offline := false
-    nextLook := A_TickCount + 500
+    sawTake := false
+    nextLook := A_TickCount
     while isHeld() {
         if (A_TickCount - startTick > HOLD_CAP_MS) {
             capped := true
             break
         }
         if (A_TickCount >= nextLook) {
-            nextLook := A_TickCount + 500
-            nowOff := TitleHas("OFFLINE")
+            nextLook := A_TickCount + 100
+            t := DictTitle()
+            if (InStr(t, "REC", true) || InStr(t, "Working", true))
+                sawTake := true
+            nowOff := InStr(t, "OFFLINE", true) > 0
             if (nowOff != offline) {
                 offline := nowOff
                 if offline {
@@ -414,6 +434,9 @@ RunTake(isHeld, waitRelease) {
     ; Keep the dictation window focused until the clipboard write lands.
     label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
     ShowState(label, "B45309")
+    t := DictTitle()
+    if (InStr(t, "REC", true) || InStr(t, "Working", true))
+        sawTake := true
     if !WaitForTranscript(label) {
         FailState("⚠ TIMED OUT")
         Fail("Dictation FAILED: no transcript after " CLIP_TIMEOUT " s. Nothing was pasted. Check the dictation window.")
@@ -430,14 +453,14 @@ RunTake(isHeld, waitRelease) {
     if InStr(txt, SENTINEL) {
         A_Clipboard := ""
         title := SettledTitle()
-        ; A short press the page heard nothing in: it ended quietly and says
-        ; "Too short" in its title. A grey line, no sound, no toast.
-        if (!capped && heldMs < 2000 && InStr(title, "Too short")) {
-            FlashState("TOO SHORT — NOTHING SENT", "4B5563", 1800)
+        ; A short press the page recorded and heard no words in: it ended
+        ; quietly and says "Too short" in its title. A grey line, no sound.
+        if (!capped && sawTake && heldMs < 2000 && InStr(title, "Too short", true)) {
+            FlashState("TOO SHORT — NO WORDS", "4B5563", 1800)
             ReturnFocus()
             return
         }
-        if InStr(title, "will retry") {
+        if InStr(title, "will retry", true) {
             FailState("⚠ FAILED — WILL RETRY")
             Fail("Dictation FAILED: nothing was pasted. The recording is SAVED in the dictation window and is transcribed into its notes by itself once the connection is back — do not redictate.")
         } else {

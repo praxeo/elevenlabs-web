@@ -429,8 +429,8 @@ console.log('--- scenario 60: a short take that heard nothing ends quietly ---')
   const failBeep60 = () => vibes60.includes('[220,90,220]');
   const ring60 = () => { try { return JSON.parse(w.localStorage.getItem('scribe_v2_timing_v9') || '[]'); } catch (e) { return []; } };
 
-  // 60a: a half-second click that heard only the room.
-  micRms = 0.004; // the room: above the dead-mic floor, below speech level
+  // 60a: a half-second click on a desktop mic that delivered silence.
+  micRms = 0.0;
   clipboard = '';
   const uploads60 = fetchCalls.length;
   doc.getElementById('recordBtn').click();
@@ -438,13 +438,24 @@ console.log('--- scenario 60: a short take that heard nothing ends quietly ---')
   doc.getElementById('recordBtn').click();
   await sleep(300);
   check('s60a: the clipboard still gets the sentinel (nothing stale can be pasted)', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
-  check('s60a: a click that heard nothing uploads nothing', fetchCalls.length === uploads60, fetchCalls.length - uploads60);
+  check('s60a: a click that held only silence uploads nothing', fetchCalls.length === uploads60, fetchCalls.length - uploads60);
   check('s60a: the status says "Too short", not a failure', /Too short/.test(status()) && !/FAILED|LOW MIC|NO SIGNAL/.test(status()) && !statusCls().includes('err'), status() + ' / ' + statusCls());
   check('s60a: no fail beep', !failBeep60(), vibes60.join(' '));
   check('s60a: the window title says "Too short" (the AutoHotkey bar reads it)', doc.title.includes('Too short'), doc.title);
   check('s60a: the window is not painted as a failure', doc.body.getAttribute('data-state') === 'idle', doc.body.getAttribute('data-state'));
   const r60 = ring60()[0] || {};
   check('s60a: the timing log keeps it as a tap, not a failed take', r60.outcome === 'tap' && !r60.errKind, JSON.stringify(r60).slice(0, 120));
+
+  // 60a2: the room's level (below the speech light) IS sent: a quiet word can
+  // sit below the light and still be a word. No words back: quiet.
+  micRms = 0.004;
+  fetchQueue.push({ status: 200, body: { text: '' } });
+  doc.getElementById('recordBtn').click();
+  await sleep(450);
+  doc.getElementById('recordBtn').click();
+  await sleep(300);
+  check('s60a2: a short take at the room\'s level is still sent (a quiet word may be in it)', fetchCalls.length === uploads60 + 1, fetchCalls.length - uploads60);
+  check('s60a2: ...and with no words back it ends quietly', /Too short/.test(status()) && !statusCls().includes('err') && !failBeep60(), status());
 
   // 60b: a short take that DID hear speech, but no words came back: sent once, still quiet.
   micRms = 0.05;
@@ -453,7 +464,7 @@ console.log('--- scenario 60: a short take that heard nothing ends quietly ---')
   await sleep(450);
   doc.getElementById('recordBtn').click();
   await sleep(300);
-  check('s60b: a short take that heard speech is still sent', fetchCalls.length === uploads60 + 1, fetchCalls.length - uploads60);
+  check('s60b: a short take that heard speech is still sent', fetchCalls.length === uploads60 + 2, fetchCalls.length - uploads60);
   check('s60b: ...and with no words back it ends quietly too', /Too short/.test(status()) && !statusCls().includes('err') && !failBeep60(), status());
   check('s60b: ...the sentinel is copied', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 
@@ -7260,7 +7271,9 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     await sleep(250);
     A.st.ping = 'down';
     A.doc.getElementById('recordBtn').click();
-    await sleep(6800); // the first server check runs 6 s into the take
+    await sleep(5000);
+    check('s61a: one failed check is not yet an outage (a busy link can miss one)', !/can't reach the server/.test(status61(A)) && !A.doc.title.includes('OFFLINE'), status61(A));
+    await sleep(4000); // checks at 4 s and 8 s: two in a row
     check('s61a: a recording that cannot reach the server SAYS so while it is spoken',
       /can't reach the server/.test(status61(A)) && /Keep going/.test(status61(A)), status61(A));
     check('s61a: ...and OFFLINE is in the title (the AutoHotkey bar reads it)', A.doc.title.includes('OFFLINE') && A.doc.title.includes('REC'), A.doc.title);
@@ -7272,8 +7285,11 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
     check('s61b: ...with OFFLINE in the working title', A.doc.title.includes('OFFLINE') && A.doc.title.includes('Working'), A.doc.title);
     check('s61b: one upload so far', A.st.posts.length === 1, A.st.posts.length);
     A.st.ping = 'up'; // the connection comes back
-    await sleep(4500);
-    check('s61b: once the server answers, the SAME recording goes up again', A.st.posts.length === 2, A.st.posts.length);
+    await sleep(4000);
+    check('s61b: once the server answers, OFFLINE leaves the title', !A.doc.title.includes('OFFLINE'), A.doc.title);
+    check('s61b: ...but an upload still in flight gets no copy before its fair time', A.st.posts.length === 1, A.st.posts.length);
+    await sleep(11500);
+    check('s61b: past its fair time, with the server answering, the SAME recording goes up again', A.st.posts.length === 2, A.st.posts.length);
     check('s61b: ...and is delivered like any take (clipboard, Done!)',
       (A.win._clip || '').includes('Back online note.') && /Done!/.test(status61(A)) && cls61(A).includes('ok'), status61(A));
     check('s61b: OFFLINE is gone from the title', !A.doc.title.includes('OFFLINE'), A.doc.title);
@@ -7341,11 +7357,68 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
       warnBeeps61(E) === warnsAtBoot + 1, status61(E));
     check('s61d: "Recovered" is in the title (the AutoHotkey bar shows it over Cerner)', E.doc.title.includes('Recovered'), E.doc.title);
     check('s61d: the banner is gone, after exactly one upload', E.doc.getElementById('journalRecover').style.display === 'none' && E.st.posts.length === 1, E.st.posts.length);
+    // Append mode must not add the next take onto the rescued note: that would
+    // put its (maybe another patient's) words on the clipboard with the new take.
+    E.doc.getElementById('appendMode').click();
+    check('s61g: append mode on, but the chip does not offer the rescued note', E.doc.getElementById('appendMode').checked &&
+      !/adds to the newest/.test(E.doc.getElementById('appendChip') ? E.doc.getElementById('appendChip').textContent : ''),
+      E.doc.getElementById('appendChip') && E.doc.getElementById('appendChip').textContent);
+    E.st.uploads.push({ kind: 'ok', status: 200, body: { text: 'Next patient.' } });
+    E.doc.getElementById('recordBtn').click();
+    await sleep(1300);
+    E.doc.getElementById('recordBtn').click();
+    await sleep(500);
+    check('s61g: the next take is its OWN note, and only its words are on the clipboard',
+      (E.win._clip || '') === 'Next patient. ' && E.doc.querySelector('#deskNotes .bnote-text').textContent.trim() === 'Next patient.',
+      JSON.stringify(E.win._clip));
+    const texts = [...E.doc.querySelectorAll('#deskNotes .bnote-text')].map((n) => n.textContent.trim());
+    check('s61g: the rescued note is left as it was', texts.includes('Recovered long note.'), texts.join(' | '));
     E.win.close();
     const F = mk61({ idb: idb61 });
     await sleep(700);
     check('s61d: a later relaunch offers nothing: the saved audio was deleted', F.doc.getElementById('journalRecover').style.display === 'none');
     F.win.close();
+  }
+
+  // --- 61h/i: a rescue that gives up says so; it never hides a newer failure ---
+  {
+    // H: a long take the service failed (5xx, waitable) -> "will retry"; the
+    //    rescue's answer has no words -> it says it could not, loud.
+    // I: the same, then a NEWER short take fails; the rescue lands -> the newer
+    //    failure stays on screen (red, FAILED title), the recovery is added.
+    const H = mk61({ uploads: [{ kind: 'ok', status: 500, body: { error: 'both services down' } }, { kind: 'ok', status: 200, body: { text: '' } }] });
+    const I = mk61({ uploads: [{ kind: 'ok', status: 500, body: { error: 'both services down' } }, { kind: 'ok', status: 500, body: { error: 'still down' } },
+      { kind: 'ok', status: 200, body: { text: 'Rescued after a newer failure.' } }] });
+    await sleep(300);
+    for (const X of [H, I]) X.doc.getElementById('recordBtn').click();
+    await sleep(400);
+    for (const X of [H, I]) X.st.skewMs = 30000; // half-minute dictations
+    await sleep(200);
+    for (const X of [H, I]) X.doc.getElementById('recordBtn').click();
+    await sleep(800);
+    check('s61h: a long take the service failed says it will be transcribed by itself', /by itself/.test(status61(H)) && H.doc.title.includes('will retry'), status61(H) + ' / ' + H.doc.title);
+    I.doc.getElementById('recordBtn').click(); // the clock offset is constant, so this take is ~1.3 s
+    await sleep(1300);
+    I.doc.getElementById('recordBtn').click();
+    await sleep(700);
+    check('s61i: a newer, short take fails loud (no "by itself")', cls61(I).includes('err') && !/by itself/.test(status61(I)) && I.doc.title.includes('FAILED'), status61(I));
+    const warnsI = warnBeeps61(I);
+    await sleep(15500); // the background tries
+    check('s61h: a rescue that cannot get words out of it SAYS so, loud', cls61(H).includes('err') && /could NOT be transcribed by itself/.test(status61(H)) && /no words/.test(status61(H)),
+      status61(H));
+    check('s61h: ...with "not recovered" in the title (the AutoHotkey bar turns red)', H.doc.title.includes('not recovered'), H.doc.title);
+    check('s61h: ...the recording stays on the banner for a hand Retry', H.doc.getElementById('journalRecover').style.display !== 'none' &&
+      /Retry the upload instead/.test(H.doc.getElementById('journalRecoverMsg').textContent), H.doc.getElementById('journalRecoverMsg').textContent);
+    check('s61h: ...and no note was made', !H.doc.querySelector('#deskNotes .bnote-text') || !/Rescued/.test(H.doc.querySelector('#deskNotes').textContent));
+    const newestI = I.doc.querySelector('#deskNotes .bnote-text');
+    check('s61i: the rescue still lands its note', !!newestI && newestI.textContent.includes('Rescued after a newer failure.'), newestI && newestI.textContent);
+    check('s61i: ...but the newer failure stays on screen: red, with the recovery added', cls61(I).includes('err') && /still down/.test(status61(I)) && /Also: ↺ Recovered/.test(status61(I)),
+      status61(I));
+    check('s61i: ...and FAILED stays in the title (the AutoHotkey bar keeps the newer failure)', I.doc.title.includes('FAILED') && !I.doc.title.includes('Recovered'), I.doc.title);
+    check('s61i: the recovery still has its warn cue', warnBeeps61(I) === warnsI + 1, warnBeeps61(I) + ' vs ' + warnsI);
+    check('s61i: the clipboard keeps the sentinel, not the rescued words', I.win._clip === '##DICTATION_FAILED##', JSON.stringify(I.win._clip));
+    H.win.close();
+    I.win.close();
   }
 
   // --- 61e/f: the cloud log, in shared mode ----------------------------------

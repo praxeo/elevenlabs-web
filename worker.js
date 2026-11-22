@@ -1675,6 +1675,13 @@ const INDEX_HTML = `<!doctype html>
       outline: none; max-height: none; overflow: visible;
       box-shadow: inset 0 0 0 1px var(--accent); border-radius: 8px;
     }
+    /* The desktop notes list: the phone's note cards, in the primary card. */
+    #deskNotes { display: flex; flex-direction: column; gap: 8px; }
+    #deskNotesEmpty { color: var(--muted); font-size: 14px; padding: 10px 2px; }
+    #deskMoreBtn { align-self: flex-start; }
+    .bnote.target { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    #primaryCard .bnote-text { font-size: 16px; line-height: 1.5; }
+    .bnote-locked .bnote-actions button { opacity: 0.45; pointer-events: none; }
     /* Pairing: quiet until it matters. */
     .pairrow { margin-top: 18px; }
     .pairrow button, .historyrow button {
@@ -2100,32 +2107,15 @@ const INDEX_HTML = `<!doctype html>
         </div>
       </div>
 
+      <!-- The notes list (2026-11-22, the owner: "I should be able to add in to
+           any prior dictation and edit them … each one should be easily
+           editable"). Every dictation is a card — the same card the phone
+           layout uses (buildNoteCard): edit in place, ➕ Add to this, Copy,
+           Report, delete. The notes ARE the history entries. -->
       <div class="notehead">
-        <label class="notelabel">Note <span id="appendChip" class="pill" style="display:none;"></span></label>
-        <button id="reportBtn" class="quietbtn" title="Report a missed word or other mistake in this note">Report a mistake</button>
+        <label class="notelabel">Notes <span id="appendChip" class="pill" style="display:none;"></span></label>
       </div>
-      <div id="latest" class="big" title="Click to edit this text — clicking also arms 'Append next' so the next dictation adds onto this note."></div>
-
-      <div class="row noteactions">
-        <button id="copyBtn" title="Copy this note to the clipboard, then file it below and clear the box ready for a new dictation">Copy &amp; clear</button>
-        <button id="appendToggleBtn" title="Arm 'append' so the next dictation is added to this note instead of starting a new one; tap again to cancel">➕ Append next</button>
-        <button id="freshBtn" title="Clear the box so the next dictation starts a new note (history is kept)">Clear</button>
-        <!-- Joined devices only: re-send the note to the desktop clipboard (a
-             fresh delivery — the recovery for a note stranded by a link outage). -->
-        <button id="sendDesktopBtn" style="display:none" title="Send this note to the desktop clipboard again — a fresh delivery, even if the link was down when it was dictated">📤 Send to desktop</button>
-      </div>
-
-      <!-- "Last dictation" slot: the most recently filed note. The box above is
-           the ACTIVE note; copying it (or starting a new dictation) files it here.
-           Hidden until there's something filed (keeps the compact card compact). -->
-      <div id="lastDictation" class="lastdict" style="display:none;">
-        <div class="lastdict-label">Last dictation</div>
-        <div id="lastDictationText" class="lastdict-text"></div>
-        <div class="row" style="margin-top: 8px;">
-          <button id="lastCopyBtn" title="Copy this filed note to the clipboard (leaves the box alone)">Copy</button>
-          <button id="lastAppendBtn" title="Bring this note back into the box and arm append so the next dictation continues it">➕ Append to this</button>
-        </div>
-      </div>
+      <div id="deskNotes"></div>
 
       <div class="row pairrow">
         <!-- Pairing is two-sided and the same page serves both ends, so BOTH
@@ -2146,15 +2136,6 @@ const INDEX_HTML = `<!doctype html>
     </section>
 
     <section class="card" id="settingsCard">
-      <!-- Saved transcripts first, for quick access to past dictations.
-           Collapsed by default; the persisted historyVisible toggle keeps the
-           compact footprint. -->
-      <div class="row historyrow">
-        <button id="toggleHistoryBtn">Show saved transcripts</button>
-        <button id="clearBtn">Clear history</button>
-      </div>
-      <div id="history" style="display:none;"></div>
-
       <details class="help" id="authSection">
         <summary id="authSummary">Access</summary>
         <div class="body">
@@ -2189,7 +2170,7 @@ const INDEX_HTML = `<!doctype html>
         <div class="body">
           <label class="checkbox">
             <input type="checkbox" id="appendMode" />
-            <span>Add each dictation to the note<small class="hint">Off: every dictation starts a new note. “➕ Append next” adds just once.</small></span>
+            <span>Add each dictation to the newest note<small class="hint">Off: every dictation is a new note. “➕ Add to this” on a note adds just once.</small></span>
           </label>
 
           <label class="checkbox">
@@ -2293,6 +2274,11 @@ right lower quadrant"></textarea>
           <div class="row" style="margin-top: 8px;">
             <button id="copyTimingBtn" title="Copy the recent per-take timing log as TSV (paste into a spreadsheet)">Copy timing log</button>
             <button id="clearTimingBtn" title="Clear the stored timing log for this device">Clear timing log</button>
+          </div>
+
+          <label>Notes on this device</label>
+          <div class="row">
+            <button id="clearBtn" title="Delete every note on this device (asks first)">Delete all notes</button>
           </div>
 
           <label>Reports</label>
@@ -2484,24 +2470,14 @@ right lower quadrant"></textarea>
 
   const recordBtn        = document.getElementById("recordBtn");
   const clearBtn         = document.getElementById("clearBtn");
-  const copyBtn          = document.getElementById("copyBtn");
-  const sendDesktopBtn   = document.getElementById("sendDesktopBtn");
   const queueChipEl      = document.getElementById("queueChip");
   const bigQueueChipEl   = document.getElementById("bigQueueChip");
   const bigRecoverChipEl = document.getElementById("bigRecoverChip");
-  const appendToggleBtn  = document.getElementById("appendToggleBtn");
-  const freshBtn         = document.getElementById("freshBtn");
-  const lastDictationEl     = document.getElementById("lastDictation");
-  const lastDictationTextEl = document.getElementById("lastDictationText");
-  const lastCopyBtn         = document.getElementById("lastCopyBtn");
-  const lastAppendBtn       = document.getElementById("lastAppendBtn");
   const downloadBtn      = document.getElementById("downloadBtn");
   const downloadAudioBtn = document.getElementById("downloadAudioBtn");
-  const toggleHistoryBtn = document.getElementById("toggleHistoryBtn");
+  const deskNotesEl      = document.getElementById("deskNotes");
 
   const statusEl         = document.getElementById("status");
-  const latestEl         = document.getElementById("latest");
-  const historyEl        = document.getElementById("history");
   const audioPreviewEl   = document.getElementById("audioPreview");
 
   const keytermsEl       = document.getElementById("keyterms");
@@ -2583,7 +2559,6 @@ right lower quadrant"></textarea>
   const reportStatusEl    = document.getElementById("reportStatus");
   const reportSendBtnEl   = document.getElementById("reportSendBtn");
   const reportCancelBtnEl = document.getElementById("reportCancelBtn");
-  const reportBtnEl       = document.getElementById("reportBtn");
   const reportProblemBtnEl = document.getElementById("reportProblemBtn");
   const showReportsBtnEl  = document.getElementById("showReportsBtn");
   const reportsListEl     = document.getElementById("reportsList");
@@ -2640,10 +2615,7 @@ right lower quadrant"></textarea>
 
   let finalizedSegments = [];
   let currentPartial = "";
-  // The "Last dictation" slot: the most recently FILED note (the active box note
-  // moves here when you Copy latest, clear the box, or start a fresh dictation).
-  // In-memory only — re-derived from history at boot (restoreLatestFromHistory).
-  let archivedText = "";
+  let archivedText = ""; // retired with the "Last dictation" slot (2026-11-22); kept so stale reads stay harmless
   // The createdAt of the history entry the slot mirrors, so a slot edit persists
   // back to THAT row by id — never by text (identical-text rows would collide and
   // the wrong stored dictation could be overwritten). null = no stable link
@@ -3075,80 +3047,17 @@ right lower quadrant"></textarea>
     return t;
   }
 
+  // latestText is the working text of the take in flight (the note it adds
+  // onto + the new words); the list shows the saved notes themselves.
   function updateLiveDisplay() {
     const combined = finalizedSegments.join(" ") + (currentPartial ? " " + currentPartial : "");
-    const cleaned = cleanTranscript(combined);
-    latestText = cleaned;
-    latestEl.textContent = cleaned;
+    latestText = cleanTranscript(combined);
     updatePhoneChrome();
-    renderLastDictation();
   }
 
-  // The "Last dictation" slot. The active box note moves here when it's filed
-  // (Copy latest / Clear box / starting a fresh dictation); the slot is just a
-  // read-only view of the last filed note with its own Copy + "Append to this".
-  // Hidden when empty or mid-session so the compact card stays compact.
-  function renderLastDictation() {
-    if (!lastDictationEl) return;
-    // The slot text is hand-editable while idle (contenteditable + persist on
-    // blur, see the slot handlers) — so while it's being edited, keep it shown
-    // and never rewrite textContent (that would collapse the caret).
-    const editing = lastDictationTextEl && document.activeElement === lastDictationTextEl;
-    const t = (archivedText || "").trim();
-    // Always available for edits/append — it no longer disappears mid-session.
-    // Only hidden when there is genuinely nothing filed (and not being edited),
-    // so an empty box never clutters the compact card.
-    if (!t && !editing) {
-      lastDictationEl.style.display = "none";
-      return;
-    }
-    lastDictationEl.style.display = "";
-    if (lastDictationTextEl) {
-      lastDictationTextEl.setAttribute("contenteditable", "true");
-      if (!editing) lastDictationTextEl.textContent = t;
-    }
-    // "Append to this" pulls the slot note back into the box, so it only makes
-    // sense when the box is empty and we're idle — otherwise it would clobber the
-    // active note (use the box's own "Append next" then) or fight a live session.
-    if (lastAppendBtn) lastAppendBtn.disabled =
-      recording || stopping || finishing || Boolean(latestText && latestText.trim());
-  }
-
-  // File the given text into the slot (no-op for empty text, so filing an
-  // already-empty box never wipes the slot). The note is already in history;
-  // the slot is just the most-recent filed note surfaced next to the box.
-  function fileToSlot(text) {
-    if (text && text.trim()) {
-      archivedText = text.trim();
-      // Link the slot to a specific history row so a later slot edit targets it
-      // by createdAt, not by text. The filed note is the active box note = the
-      // most recent delivery, so it matches history[0] unless the box was
-      // hand-edited after delivery — in which case there is no clean link and a
-      // slot edit stays slot-only (safer than overwriting the wrong row).
-      var h = getHistory();
-      archivedCreatedAt = (h[0] && (h[0].text || "").trim() === archivedText) ? h[0].createdAt : null;
-      renderLastDictation();
-    }
-  }
-
-  // Clear the active note box (Copy latest / Clear box / fresh-start all use it).
-  function clearBox() {
-    finalizedSegments = [];
-    currentPartial = "";
-    latestText = "";
-    if (latestEl) latestEl.textContent = "";
-    appendArmed = false;
-  }
-
-  // The transcript box is hand-editable only while idle — during a session the
-  // live/finalize paths own its text (updateLiveDisplay) and an editable box
-  // would fight the cursor. Derive editability from session state; never flip it
-  // mid-edit (setAttribute to the same value would be a no-op anyway).
-  function refreshLatestEditable() {
-    if (!latestEl) return;
-    const want = (!recording && !stopping && !finishing) ? "true" : "false";
-    if (latestEl.getAttribute("contenteditable") !== want) latestEl.setAttribute("contenteditable", want);
-  }
+  // Notes lock while a take runs (the take may be about to rewrite one) and
+  // unlock after: re-render the desktop list on every session edge.
+  function refreshNoteLocks() { renderDeskNotes(); }
 
   // contenteditable accepts rich HTML on paste; force plain text so a pasted
   // snippet can't smuggle markup into a note that gets copied into a chart.
@@ -3200,47 +3109,21 @@ right lower quadrant"></textarea>
     updateBigScreen();
   }
 
+  // The chip beside "Notes" says where the next take goes when it is NOT a
+  // new note: onto the note armed with "➕ Add to this", or onto the newest
+  // note in append mode. (Desktop list; the phone has its own target bar.)
   function updateAppendChip() {
-    const hasText = Boolean(latestText && latestText.trim());
-    if (!hasText) appendArmed = false; // nothing left to append to
-    renderLastDictation(); // mirror session/box state into the slot (hide on rec, button enable)
-    latestEl.classList.toggle("armed", appendArmed && !recording);
-    if (appendToggleBtn) {
-      appendToggleBtn.classList.toggle("active", appendArmed && !recording);
-      appendToggleBtn.disabled = !hasText || recording || stopping || finishing;
-    }
-    // Box-clearing buttons are unsafe during a session and the in-flight upload
-    // (finishing): the delivery re-files from sessionBaseText, so a clear now
-    // would reappear. Disable them in that window (the onclick handlers also
-    // guard the path) — mirrors the appendToggleBtn guard above.
-    const busy = recording || stopping || finishing;
-    if (copyBtn)  copyBtn.disabled  = !hasText || busy;
-    if (freshBtn) freshBtn.disabled = busy;
-    // Manual desktop re-send: joined devices only, idle-only (its outcome cue
-    // must never collide with a live session's single beep).
-    if (sendDesktopBtn) {
-      sendDesktopBtn.style.display = joinedSessionCode ? "" : "none";
-      sendDesktopBtn.disabled = !hasText || busy;
-    }
     updatePhoneChrome(); // the phone layout mirrors session state (1s interval keeps it honest)
-    if (!hasText || busy) {
-      appendChipEl.style.display = "none";
-      return;
+    if (!appendChipEl) return;
+    var busy = recording || stopping || finishing;
+    var text = "";
+    if (!busy && !bigButtonActive()) {
+      var target = noteTargetId ? noteById(noteTargetId) : null;
+      if (target) text = "next take adds to the " + noteClock(target) + " note";
+      else if (appendModeEl.checked && !joinedSessionCode && getHistory().length) text = "next take adds to the newest note";
     }
-    if (appendArmed) {
-      // One-shot arm from clicking the box — beats the checkbox/window.
-      appendChipEl.style.display = "";
-      appendChipEl.textContent = "next dictation appends (box clicked)";
-      appendChipEl.className = "pill ok";
-      return;
-    }
-    if (!appendModeEl.checked) {
-      appendChipEl.style.display = "none";
-      return;
-    }
-    appendChipEl.style.display = "";
-    appendChipEl.textContent = "next dictation appends";
-    appendChipEl.className = "pill ok";
+    appendChipEl.style.display = text ? "" : "none";
+    if (text) { appendChipEl.textContent = text; appendChipEl.className = "pill ok"; }
   }
 
   /* ───── Access section (API key / passphrase) ─────
@@ -4139,26 +4022,12 @@ right lower quadrant"></textarea>
   // Boot restore: show the most recent saved transcript instead of an empty
   // box across reloads. The restored note clears like any other when the next
   // session starts fresh, and click-to-append can extend it.
+  // Boot: the list is the history, so there is nothing to restore into a box.
+  // latestText starts as the newest note (Report's default, nothing else).
   function restoreLatestFromHistory() {
     const items = getHistory();
-    if (!items.length || !items[0].text || !items[0].text.trim()) return;
-    finalizedSegments = [items[0].text.trim()];
-    currentPartial = "";
-    // The box shows the newest note, so the slot shows the one before it (so the
-    // "Last dictation" view is consistent across reloads, not just in-session).
-    if (items[1] && items[1].text && items[1].text.trim()) {
-      archivedText = items[1].text.trim();
-      archivedCreatedAt = items[1].createdAt || null; // slot ↔ that history row, for edit persistence
-    }
-    updateLiveDisplay();
-  }
-
-  function applyHistoryVisibility() {
-    const items = getHistory();
-    historyEl.style.display = historyVisible ? "block" : "none";
-    toggleHistoryBtn.textContent =
-      (historyVisible ? "Hide saved transcripts" : "Show saved transcripts") +
-      " (" + items.length + ")";
+    latestText = items[0] && items[0].text ? items[0].text.trim() : "";
+    renderDeskNotes();
   }
 
   // A take the speaker filter cut keeps what the service heard BEFORE the cut
@@ -4179,120 +4048,41 @@ right lower quadrant"></textarea>
     return box;
   }
 
-  function renderHistory() {
-    applyHistoryVisibility();
-    if (!historyVisible) return;
+  // The old desktop "saved transcripts" list is now the notes list itself.
+  function renderHistory() { renderDeskNotes(); }
 
-    const items = getHistory();
-    historyEl.innerHTML = "";
-
+  // ───── The desktop notes list (2026-11-22) ─────
+  // The phone's note cards (buildNoteCard) on the desktop page, newest first,
+  // DESK_NOTES_PAGE at a time. Same rules as the phone list: never rebuilt
+  // under a caret (the blur re-renders), locked while a take runs.
+  const DESK_NOTES_PAGE = 10;
+  let deskNotesExpanded = false;
+  function renderDeskNotes() {
+    if (!deskNotesEl) return;
+    var ae = document.activeElement;
+    if (ae && ae.classList && ae.classList.contains("bnote-text") && deskNotesEl.contains(ae)) return;
+    var items = getHistory();
+    if (noteTargetId && !items.some(function (it) { return it.createdAt === noteTargetId; })) noteTargetId = null;
+    var busy = sessionBusy();
+    var queued = queuedNoteIds();
+    deskNotesEl.innerHTML = "";
+    deskNotesEl.classList.toggle("bnote-locked", busy);
     if (!items.length) {
-      historyEl.innerHTML = '<div class="hint">No transcripts yet.</div>';
-      return;
+      var empty = document.createElement("div");
+      empty.id = "deskNotesEmpty";
+      empty.textContent = "No notes yet. Each dictation lands here, ready to edit or add to.";
+      deskNotesEl.appendChild(empty);
     }
-
-    // Show only the newest HISTORY_PAGE by default — the full list takes too much
-    // room in the expanded desktop view; the "Show N more" control below reveals
-    // the rest. Editing/persistence keys off createdAt, so a sliced view is safe.
-    const limit = historyExpanded ? items.length : HISTORY_PAGE;
-    for (const item of items.slice(0, limit)) {
-      const div = document.createElement("div");
-      div.className = "history-item";
-
-      const meta = document.createElement("div");
-      meta.className = "history-meta";
-      meta.textContent = new Date(item.createdAt).toLocaleString() +
-        (item.engine ? " · " + item.engine : "") +
-        (item.stt ? " · via " + sttName(item.stt) : "") +
-        (item.editedAt ? " · edited" : "");
-
-      // Past transcripts are hand-editable in place — like the active box and
-      // the "Last dictation" slot: the text is contenteditable, so a click lands
-      // the caret and you just type. Edits persist on blur, keyed by createdAt
-      // (a re-render can't hit the wrong row) and stamped editedAt ("· edited").
-      // Escape reverts to the pre-edit text. Plain-text paste, no clipboard side
-      // effects (persist never copies). A no-op edit (unchanged text) is skipped.
-      const text = document.createElement("div");
-      text.className = "history-text";
-      text.setAttribute("contenteditable", "true");
-      text.textContent = item.text;
-      text.addEventListener("paste", plainTextPaste);
-
-      let original = item.text;
-      text.addEventListener("focus", () => { original = text.textContent; });
-      text.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") { text.textContent = original; text.blur(); }
-      });
-      text.addEventListener("blur", () => {
-        const newText = text.textContent;
-        if (newText === original) return;
-        const all = getHistory();
-        const i = all.findIndex((it) => it.createdAt === item.createdAt);
-        if (i < 0) return;
-        all[i].text = newText;
-        all[i].editedAt = new Date().toISOString();
-        // Persist directly (not setHistory) so the live re-render can't tear down
-        // this row mid-interaction; reflect the "edited" marker in place instead.
-        saveHistoryItems(all);
-        meta.textContent = new Date(item.createdAt).toLocaleString() +
-          (item.engine ? " · " + item.engine : "") +
-          (item.stt ? " · via " + sttName(item.stt) : "") + " · edited";
-        original = newText;
-        setStatus("Saved edit to the transcript.", "ok");
-      });
-
-      const row = document.createElement("div");
-      row.className = "row";
-      row.style.marginTop = "8px";
-
-      const copy = document.createElement("button");
-      copy.textContent = "Copy";
-      // Copy the current (possibly mid-edit) text, not a stale snapshot.
-      copy.onclick = () => copyText(text.textContent);
-
-      row.append(copy);
-
-      const report = document.createElement("button");
-      report.textContent = "Report";
-      report.title = "Report a missed word or other mistake in this note";
-      report.onclick = () => openReport({ noteText: text.textContent, noteCreatedAt: item.createdAt, service: item.stt || "elevenlabs" });
-      row.append(report);
-
-      // Joined: any past note can be pushed to the desktop clipboard — the
-      // recovery for a note stranded by a link outage (even one that aged past
-      // the delivery-queue TTL or is bound to an old session code).
-      if (joinedSessionCode) {
-        const send = document.createElement("button");
-        send.textContent = "📤 Send to desktop";
-        send.title = "Send this note to the desktop clipboard (a fresh delivery)";
-        send.onclick = () => sendTextToDesktop(text.textContent, [item.createdAt], null, { texts: [cleanTranscript(text.textContent)] });
-        row.append(send);
-      }
-
-      div.append(meta, text);
-      if (item.unfiltered) div.append(unfilteredBlock(item.unfiltered));
-      div.append(row);
-      historyEl.append(div);
+    var limit = deskNotesExpanded ? items.length : DESK_NOTES_PAGE;
+    for (var i = 0; i < items.length && i < limit; i++) deskNotesEl.appendChild(buildNoteCard(items[i], queued, busy, { desk: true }));
+    if (items.length > DESK_NOTES_PAGE) {
+      var more = document.createElement("button");
+      more.id = "deskMoreBtn";
+      more.textContent = deskNotesExpanded ? "Show fewer" : "Show " + (items.length - DESK_NOTES_PAGE) + " older notes";
+      more.onclick = function () { deskNotesExpanded = !deskNotesExpanded; renderDeskNotes(); };
+      deskNotesEl.appendChild(more);
     }
-
-    // "Show N more" / "Show fewer" — only when there's more than one page. The
-    // toggle button up top still shows the FULL count; this just paginates the list.
-    if (items.length > HISTORY_PAGE) {
-      const moreRow = document.createElement("div");
-      moreRow.className = "row";
-      moreRow.style.marginTop = "10px";
-      const moreBtn = document.createElement("button");
-      moreBtn.id = "historyMoreBtn";
-      if (historyExpanded) {
-        moreBtn.textContent = "Show fewer (last " + HISTORY_PAGE + ")";
-        moreBtn.onclick = () => { historyExpanded = false; renderHistory(); };
-      } else {
-        moreBtn.textContent = "Show " + (items.length - HISTORY_PAGE) + " more";
-        moreBtn.onclick = () => { historyExpanded = true; renderHistory(); };
-      }
-      moreRow.append(moreBtn);
-      historyEl.append(moreRow);
-    }
+    updateAppendChip();
   }
 
   /* ───── Clipboard ───── */
@@ -5791,7 +5581,7 @@ right lower quadrant"></textarea>
       failBeep();
       return;
     }
-    if (bigButtonActive()) blurEditingNote(); // a note mid-edit is saved before the take (it may add to it)
+    blurEditingNote(); // a note mid-edit is saved before the take (it may add to it) — desktop cards too
     stopRequested = false;
     pendingStart = false;
     // Zero the capture peak + probe reading UP FRONT, not just in the per-take
@@ -5961,47 +5751,28 @@ right lower quadrant"></textarea>
     ctxNotRunningSince = 0;
     clearSessionTimers();
 
-    // Continue the current text when armed by clicking the transcript box
-    // (one-shot), or when append mode is on. Otherwise start fresh. The
-    // decision is explicit — no time window — so the same action always
-    // gives the same result (append vs. fresh is never clock-dependent).
-    //
-    // The phone notes layout decides per NOTE instead: a take adds to the note
-    // armed with "Add to this" (one-shot), otherwise it becomes a new note.
+    // Every take is a NOTE (2026-11-22: the desktop has the phone's notes list
+    // too). It adds onto the note armed with "➕ Add to this" (one-shot), or —
+    // on the desktop, with append mode on — onto the newest note; otherwise it
+    // becomes a new note. The decision is explicit, never clock-dependent.
     // Either way it is a single segment on its own: a take that adds to a note,
     // or any take in keep-on-phone mode, stays on the phone (sessionHold) —
     // never auto-sent — so the desktop's own append can never double it. A
     // plain paired take in send mode still goes to the desktop as one segment
     // and the desktop owns append (below), exactly as before.
     const phoneLayout = bigButtonActive();
-    const targetNote = phoneLayout ? noteById(noteTargetId) : null;
+    let targetNote = noteById(noteTargetId);
+    // Append mode (desktop, not joined): each take adds to the newest note. A
+    // joined device is only a mic — the desktop owns append (deliverRemoteText).
+    if (!targetNote && !phoneLayout && !joinedSessionCode && appendModeEl.checked) targetNote = getHistory()[0] || null;
     noteTargetId = null; // one-shot: consumed by this take (a missing note just starts a new one)
     sessionNoteTargetId = targetNote ? targetNote.createdAt : null;
     sessionHold = Boolean(targetNote) || Boolean(phoneLayout && joinedSessionCode && phoneKeepMode);
-    if (targetNote) {
-      appendArmed = false;
-      finalizedSegments = (targetNote.text || "").trim() ? [(targetNote.text || "").trim()] : [];
-    } else if (phoneLayout && !joinedSessionCode) {
-      // A solo phone: every take is its own note (the list is the history);
-      // the box's append arm/mode belong to the full-page layout.
-      appendArmed = false;
-      finalizedSegments = [];
-    } else if (joinedSessionCode) {
-      // Joined to a desktop: THIS device is only the microphone — the desktop
-      // owns the note and its append mode (see deliverRemoteText). Always deliver
-      // a single dictation; accumulating here too would double-append on the
-      // desktop (silent wrong text on a chart). A solo big-button device (not
-      // joined) still appends locally via the branches below.
-      appendArmed = false;
-      finalizedSegments = [];
-    } else if (appendArmed) {
-      appendArmed = false; // consumed by this session
-    } else if (!appendModeEl.checked) {
-      // Starting fresh files the note being replaced into the "Last dictation"
-      // slot (it stays visible there + in history) before the box is cleared.
-      fileToSlot(finalizedSegments.join(" "));
-      finalizedSegments = [];
-    }
+    appendArmed = false;
+    // Joined to a desktop with no note armed: THIS device is only the
+    // microphone and delivers a single dictation (the desktop owns append —
+    // accumulating here too would double-append on the desktop).
+    finalizedSegments = (targetNote && (targetNote.text || "").trim()) ? [(targetNote.text || "").trim()] : [];
     currentPartial = "";
     updateLiveDisplay();
 
@@ -6064,7 +5835,7 @@ right lower quadrant"></textarea>
 
     recording = true;
     stopping = false;
-    refreshLatestEditable(); // lock the box: the live/finalize path owns its text now
+    refreshNoteLocks(); // lock the box: the live/finalize path owns its text now
     recordBtn.textContent = "Stop recording";
     recordBtn.classList.add("danger");
     setMicPill("rec");
@@ -6097,7 +5868,7 @@ right lower quadrant"></textarea>
     stampTake("release"); // [PERF] t0 of the release-to-clipboard budget
     userStopped = true;
     stopping = true;
-    refreshLatestEditable(); // keep the box locked through the upload phase
+    refreshNoteLocks(); // keep the box locked through the upload phase
     updateAppendChip();      // disable Copy & clear / Clear box through the upload
 
     // No tail/commit phases: stopping the recorder flushes the last chunk,
@@ -6181,7 +5952,7 @@ right lower quadrant"></textarea>
       try { setStatus("⚠ Dictation may NOT have been delivered — " + why + ". VERIFY the clipboard before pasting; redictate if it is wrong.", "err"); } catch (e) {}
       try { failBeep(); } catch (e) {}
       finishing = false;
-      try { updateBigScreen(); updateAppendChip(); refreshLatestEditable(); } catch (e) {}
+      try { updateBigScreen(); updateAppendChip(); refreshNoteLocks(); } catch (e) {}
       try { maybePendingStart(); } catch (e) {}
     }
   }
@@ -6635,7 +6406,7 @@ right lower quadrant"></textarea>
     stampTake("delivered");
     recordTakeTiming(opts.degraded ? "degraded" : (opts.unexpected ? "unexpected" : "ok"));
     finishing = false;
-    refreshLatestEditable(); // back to idle: the box is hand-editable again
+    refreshNoteLocks(); // back to idle: the box is hand-editable again
     updateBigScreen(); // the outcome status above was computed under finishing=true (busy)
     updateAppendChip();
 
@@ -7032,23 +6803,6 @@ right lower quadrant"></textarea>
     if (reportClosing) { clearTimeout(reportClosing); reportClosing = null; }
     if (reportOverlayEl) reportOverlayEl.classList.remove("show");
     reportCtx = null;
-  }
-
-  // The note the box shows, with the history entry it came from when it is
-  // the newest one (that entry knows which service wrote it). An empty box
-  // reports the newest saved note instead; nothing at all = a general report.
-  function currentNoteForReport() {
-    var items = getHistory();
-    var newest = items[0] || null;
-    var boxText = (latestText || "").trim();
-    if (boxText) {
-      var match = newest && cleanTranscript(newest.text || "").trim() === cleanTranscript(boxText).trim() ? newest : null;
-      return { noteText: boxText, noteCreatedAt: match ? match.createdAt : null, service: match ? (match.stt || "elevenlabs") : "" };
-    }
-    if (newest && (newest.text || "").trim()) {
-      return { noteText: newest.text.trim(), noteCreatedAt: newest.createdAt, service: newest.stt || "elevenlabs" };
-    }
-    return null;
   }
 
   // The timing row of the take that wrote the note (the nearest within two
@@ -7737,24 +7491,26 @@ right lower quadrant"></textarea>
     // replace: the phone re-sent a WHOLE note the desktop already had (a
     // correction, or a deliberate re-send) — appending it would repeat that
     // text, so it takes the note's place instead.
-    var base = (latestText || "").trim();
-    var wantAppend = !replace && Boolean(base) && (appendModeEl.checked || appendArmed);
-    appendArmed = false;
-    // A delivery that does not append takes the box: file the note it replaces
-    // into "Last dictation" first, exactly as a fresh take dictated here does
-    // (it used to vanish from view, surviving only in History).
-    if (!wantAppend && base && !replace) fileToSlot(base);
-    var combined = wantAppend ? cleanTranscript(base + " " + text) : text;
+    // The desktop's notes list (2026-11-22): a delivery adds onto the note
+    // armed with "➕ Add to this", or (append mode) onto the newest note, in
+    // place; otherwise it is a new note. A whole-note re-send (replace) is
+    // always a NEW note — the desktop cannot tell which of its notes the phone
+    // meant, and overwriting the wrong one would be wrong text on a chart.
+    var target = replace ? null : (noteById(noteTargetId) || (appendModeEl.checked ? getHistory()[0] || null : null));
+    if (target) noteTargetId = null; // a one-shot arm is consumed here
+    var wantAppend = Boolean(target && (target.text || "").trim());
+    var combined = wantAppend ? cleanTranscript(target.text.trim() + " " + text) : text;
     latestText = combined;
-    latestEl.textContent = combined;
-    finalizedSegments = combined.trim() ? [combined] : []; // keep the box model in sync for further edits/append
-    updateAppendChip(); // refresh the armed pill now the one-shot arm is consumed
-    addHistory(combined, { language_code: "en", engine: "remote" });
+    finalizedSegments = [];
+    if (!(wantAppend && updateNoteText(target.createdAt, combined, { appendedAt: new Date().toISOString() }))) {
+      addHistory(combined, { language_code: "en", engine: "remote" });
+    }
+    updateAppendChip();
     copyText(combined).then(function(ok) {
       if (ok) {
         pendingCopyText = "";
         if (degraded) { setStatus("⚠ Phone delivery never arrived — LIVE transcript copied instead (less accurate). Verify it!", "warn"); warnBeep(); }
-        else          { setStatus(replace ? "The phone re-sent a whole note — it REPLACED the note here and is copied. Done!" : (wantAppend ? "Phone transcript appended & copied. Done!" : "Phone transcript copied. Done!"), "ok"); doneBeep(); }
+        else          { setStatus(replace ? "The phone re-sent an edited note — it is a new note here (the earlier version is kept) and is copied. Done!" : (wantAppend ? "Phone transcript appended & copied. Done!" : "Phone transcript copied. Done!"), "ok"); doneBeep(); }
       } else {
         // Clipboard writes need document focus, and this tab is usually behind
         // Citrix/Cerner when a delivery lands. Hold the text; retry on refocus.
@@ -7829,7 +7585,6 @@ right lower quadrant"></textarea>
       rtDebugLog("[rt-listener " + Math.round(performance.now()) + "] partial(" + partial.length + "): " + JSON.stringify(partial));
       var combined = remoteCommitted + (remoteCommitted && partial ? " " : "") + partial;
       latestText = cleanTranscript(combined);
-      latestEl.textContent = latestText;
       return;
     }
 
@@ -7839,7 +7594,6 @@ right lower quadrant"></textarea>
       rtDebugLog("[rt-listener " + Math.round(performance.now()) + "] COMMIT(" + seg.length + ") remoteCommitted.len=" + remoteCommitted.length + ": " + JSON.stringify(seg));
       if (seg) remoteCommitted += (remoteCommitted ? " " : "") + seg;
       latestText = cleanTranscript(remoteCommitted);
-      latestEl.textContent = latestText;
       return;
     }
 
@@ -8538,6 +8292,7 @@ right lower quadrant"></textarea>
   }
 
   function renderPhoneNotes() {
+    renderDeskNotes(); // the desktop list shows the same notes; every caller refreshes both
     if (!bigNotesEl || !bigButtonActive()) return;
     // Never rebuild under a caret: that would drop the keyboard mid-word. The
     // blur handler re-renders once the edit is saved.
@@ -8580,7 +8335,10 @@ right lower quadrant"></textarea>
     updatePhoneChrome();
   }
 
-  function buildNoteCard(item, queued, busy) {
+  // opts.desk: the desktop list — no selection checkbox (selecting several
+  // notes to send or copy as one is the phone layout's).
+  function buildNoteCard(item, queued, busy, opts) {
+    opts = opts || {};
     var id = item.createdAt;
     var card = document.createElement("div");
     card.className = "bnote";
@@ -8600,7 +8358,7 @@ right lower quadrant"></textarea>
     var time = document.createElement("span");
     time.className = "bnote-time";
     time.textContent = formatNoteTime(item) + (item.editedAt ? " · edited" : "");
-    head.append(sel, time);
+    if (opts.desk) head.append(time); else head.append(sel, time);
     var tag = noteTag(item, queued);
     if (tag) {
       var tagEl = document.createElement("span");
@@ -8727,15 +8485,23 @@ right lower quadrant"></textarea>
   }
 
   // "Add to this": the NEXT take is added to the end of this note — one-shot,
-  // like the desktop's Append next. The result stays on the phone (never
+  // like the desktop note card. The result stays on the phone (never
   // auto-sent), so the desktop's own append can never double it.
   function toggleNoteTarget(id) {
     if (sessionBusy()) return;
     noteTargetId = (noteTargetId === id) ? null : id;
     renderPhoneNotes();
+    var t = noteTargetId ? noteById(noteTargetId) : null;
     setStatus(noteTargetId
-      ? "Your next take will be ADDED to this note" + (joinedSessionCode ? ". It stays on the phone until you tap Send." : ".")
+      ? "Your next take will be ADDED to " + (t ? "the " + noteClock(t) + " note" : "this note") + (joinedSessionCode && bigButtonActive() ? ". It stays on the phone until you tap Send." : ".")
       : "Your next take starts a new note.", "");
+  }
+
+  // A note's clock time for sentences ("the 4:43 PM note").
+  function noteClock(item) {
+    var d = new Date(item && item.createdAt);
+    if (isNaN(d.getTime())) return "earlier";
+    try { return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }); } catch (e) { return d.toTimeString().slice(0, 5); }
   }
 
   function deleteNoteTap(id) {
@@ -8778,8 +8544,8 @@ right lower quadrant"></textarea>
       sendTextToDesktop(st.tail, [id], "Sending the new words to the desktop (it already has the rest)…",
         { texts: [full], deliveredMsg: "The new words reached the desktop clipboard (it already had the rest). Done!" });
     } else if (st.kind === "sent" || st.kind === "edited") {
-      sendTextToDesktop(full, [id], "Sending the whole note — it REPLACES the desktop's current note…",
-        { texts: [full], replace: true, deliveredMsg: "The note reached the desktop and REPLACED its current note. Done!" });
+      sendTextToDesktop(full, [id], "Sending the whole edited note — the desktop keeps it as a new note…",
+        { texts: [full], replace: true, deliveredMsg: "The edited note reached the desktop as a new note (its earlier version is kept there). Done!" });
     } else {
       sendTextToDesktop(full, [id], null, { texts: [full] });
     }
@@ -8993,7 +8759,6 @@ right lower quadrant"></textarea>
   if (bigSelCopyBtnEl) bigSelCopyBtnEl.onclick = () => copySelectedNotes();
   if (bigSelClearBtnEl) bigSelClearBtnEl.onclick = () => { selectedNoteIds = []; renderPhoneNotes(); };
   if (bigTargetCancelBtnEl) bigTargetCancelBtnEl.onclick = () => { if (noteTargetId) toggleNoteTarget(noteTargetId); };
-  if (sendDesktopBtn) sendDesktopBtn.onclick = () => sendTextToDesktop(latestText);
   if (queueChipEl) queueChipEl.onclick = () => queueChipTapped();
   if (bigQueueChipEl) bigQueueChipEl.onclick = () => queueChipTapped();
 
@@ -9026,110 +8791,29 @@ right lower quadrant"></textarea>
     setStatus(SHARED_MODE ? "Shared passphrase / key removed." : "API key removed.", "ok");
   };
 
-  clearBtn.onclick = () => {
+  // Diagnostics → "Delete all notes": the first click only arms it (4 s), the
+  // second deletes — one stray click must never wipe a shift's notes.
+  let clearAllArmed = null;
+  if (clearBtn) clearBtn.onclick = () => {
+    if (sessionBusy()) return;
+    if (!clearAllArmed) {
+      var n = getHistory().length;
+      clearBtn.textContent = "Click again to delete all " + n + (n === 1 ? " note" : " notes");
+      clearAllArmed = setTimeout(function () { clearAllArmed = null; clearBtn.textContent = "Delete all notes"; }, 4000);
+      return;
+    }
+    clearTimeout(clearAllArmed);
+    clearAllArmed = null;
+    clearBtn.textContent = "Delete all notes";
     localStorage.removeItem(STORE_KEY);
     latestText = "";
-    latestEl.textContent = "";
-    finalizedSegments = []; // Fixed: Make sure screen buffer is cleared alongside history
+    finalizedSegments = [];
     currentPartial = "";
-    archivedText = ""; // the slot mirrors history — wiping history empties it too
-    archivedCreatedAt = null;
     noteTargetId = null;
     selectedNoteIds = [];
     renderHistory();
     renderPhoneNotes();
-    updateAppendChip();
-    setStatus("History cleared.");
-  };
-
-  freshBtn.onclick = () => {
-    // Never clear mid-session or during the in-flight upload (finishing): the
-    // delivery rebuilds finalizedSegments from sessionBaseText and re-files, so a
-    // box cleared now would reappear with the delivered text. The button is also
-    // disabled in that window (updateAppendChip) — this guards the path anyway.
-    if (recording || stopping || finishing) return;
-    // Clearing the box files the note into the "Last dictation" slot first, so
-    // it stays visible (and one tap of "Append to this" can bring it back).
-    fileToSlot(latestText);
-    clearBox();
-    updateLiveDisplay();
-    updateAppendChip();
-    setStatus("Dictation box cleared — the next dictation starts a new note (it's in 'Last dictation' and history).", "ok");
-  };
-
-  // Copy latest = copy AND file it: the note goes to the clipboard, then moves
-  // to the "Last dictation" slot and the box clears, ready for a fresh note. A
-  // failed copy keeps the box (the loud copyText status stands) so nothing is
-  // lost before the deliverable actually landed.
-  copyBtn.onclick = async () => {
-    // Same in-flight guard as freshBtn: Copy & clear empties the box, which the
-    // delivery would then overwrite from sessionBaseText. Don't clear mid-upload.
-    if (recording || stopping || finishing) return;
-    if (!latestText || !latestText.trim()) return;
-    const text = latestText;
-    const ok = await copyText(text);
-    if (!ok) return;
-    fileToSlot(text);
-    clearBox();
-    updateLiveDisplay();
-    updateAppendChip();
-    setStatus("Copied — filed below as 'Last dictation'. The box is ready for a new note.", "ok");
-  };
-
-  // The "Last dictation" slot text is hand-editable too (like the active box and
-  // history rows): the caret lands where you click, edits keep archivedText live
-  // (so the slot's Copy/Append use the edited text), and on blur the edit is
-  // persisted back to its history entry (matched by the pre-edit text, stamped
-  // editedAt). A blanked slot never wipes the saved note. Plain-text paste.
-  var slotEditBase = "";
-  function persistSlotEdit() {
-    if (!lastDictationTextEl) return;
-    const newText = (lastDictationTextEl.textContent || "").trim();
-    archivedText = lastDictationTextEl.textContent;
-    if (!newText || newText === (slotEditBase || "").trim()) { slotEditBase = newText; return; }
-    // Persist by the linked row's createdAt — never by matching text (two rows
-    // with identical text would let the edit land on the wrong stored dictation).
-    // No link (a hand-edited box was filed) ⇒ the slot edit is slot-only.
-    if (archivedCreatedAt) {
-      const all = getHistory();
-      const i = all.findIndex(function (it) { return it.createdAt === archivedCreatedAt; });
-      if (i >= 0) {
-        all[i].text = lastDictationTextEl.textContent;
-        all[i].editedAt = new Date().toISOString();
-        setHistory(all); // persist + re-render the list (the slot DOM is separate)
-        setStatus("Saved edit to the last dictation.", "ok");
-      }
-    }
-    slotEditBase = newText;
-  }
-  if (lastDictationTextEl) {
-    lastDictationTextEl.addEventListener("focus", function () { slotEditBase = (archivedText || "").trim(); });
-    lastDictationTextEl.addEventListener("input", function () { archivedText = lastDictationTextEl.textContent; });
-    lastDictationTextEl.addEventListener("blur", persistSlotEdit);
-    lastDictationTextEl.addEventListener("paste", plainTextPaste);
-  }
-
-  // Slot "Copy": copy the filed note straight to the clipboard, leaving the box
-  // (and the slot) untouched — a re-grab of an older note, not a state change.
-  if (lastCopyBtn) lastCopyBtn.onclick = () => { if (archivedText && archivedText.trim()) copyText(archivedText); };
-
-  // Slot "Append to this": bring the filed note back into the box and arm a
-  // one-shot append so the next dictation continues it. Only valid when the box
-  // is empty (renderLastDictation disables it otherwise) — append targets what's
-  // in the box, and we must never clobber a different active note.
-  if (lastAppendBtn) lastAppendBtn.onclick = () => {
-    if (recording || stopping || finishing) return;
-    const t = (archivedText || "").trim();
-    if (!t) return;
-    if (latestText && latestText.trim()) return; // box busy — guard (button is also disabled)
-    finalizedSegments = [t];
-    currentPartial = "";
-    archivedText = ""; // it's the active note now, not the archived one
-    archivedCreatedAt = null;
-    appendArmed = true;
-    updateLiveDisplay();
-    updateAppendChip();
-    setStatus("Loaded the last dictation into the box — the next dictation will append to it.", "ok");
+    setStatus("All notes deleted from this device.");
   };
 
   if (journalRecoverBtn) journalRecoverBtn.onclick = () => recoverPendingDictation();
@@ -9194,7 +8878,6 @@ right lower quadrant"></textarea>
   };
   if (joinCodeInputEl) joinCodeInputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && joinGoBtnEl) { e.preventDefault(); joinGoBtnEl.click(); } });
   if (joinCloseBtnEl) joinCloseBtnEl.onclick = () => closeJoinOverlay();
-  if (reportBtnEl) reportBtnEl.onclick = () => openReport(currentNoteForReport());
   if (filterPillEl) filterPillEl.onclick = () => {
     if (recording || stopping || finishing) return; // a running take keeps the choice it started with
     diarizeEl.checked = !diarizeEl.checked;
@@ -9250,44 +8933,7 @@ right lower quadrant"></textarea>
   }
   if (phoneLeaveBtnEl) phoneLeaveBtnEl.onclick = () => leaveDesktopSession();
 
-  // "Append next" arms a one-shot: the next dictation is added onto the current
-  // note instead of starting fresh — independent of the append-mode checkbox;
-  // tap again to cancel. (Clicking into the box arms this too via its focus
-  // handler; this button is the explicit toggle/cancel.) Ignored mid-session.
-  function toggleAppendArm() {
-    if (recording || stopping || finishing) return;
-    // Joined to a desktop: append is the DESKTOP's job (this device is only the
-    // mic — see startRecording/deliverRemoteText), so arming here would mislead.
-    if (joinedSessionCode) return;
-    if (!latestText || !latestText.trim()) return;
-    appendArmed = !appendArmed;
-    updateAppendChip();
-    setStatus(appendArmed
-      ? "Next dictation will append to this text (tap 'Append next' again to cancel)."
-      : "Next dictation starts fresh.", "");
-  }
-  if (appendToggleBtn) appendToggleBtn.onclick = toggleAppendArm;
-
-  // The transcript box is hand-editable while idle (contenteditable, toggled by
-  // refreshLatestEditable). Typing rewrites the in-memory note so Copy/Append/
-  // delivery all use the edited text; collapse to one segment so a later append
-  // splices cleanly onto it. Skip cleanTranscript here — it would fight the
-  // cursor (trailing space, collapsing) mid-type; delivery still cleans output.
-  latestEl.addEventListener("input", () => {
-    if (recording || stopping || finishing) return; // not editable then; guard anyway
-    latestText = latestEl.textContent;
-    finalizedSegments = latestText.trim() ? [latestText] : [];
-    if (!latestText.trim()) appendArmed = false;
-    updateAppendChip(); // mirrors text + armed state into the big peek too
-  });
-  latestEl.addEventListener("paste", plainTextPaste);
-
-  // Clicking into the box is for EDITING only. Until 2026-11-21 a focus also
-  // armed a one-shot append — and a browser re-fires focus on the box every
-  // time the window comes back to the front (AutoHotkey brings it forward on
-  // every take), so append kept switching itself on: "it both auto appends and
-  // deletes my old text". Append is only "➕ Append next" or append mode now.
-  refreshLatestEditable();
+  refreshNoteLocks();
 
   hotkeyBtn.onclick = () => {
     capturingHotkey = !capturingHotkey;
@@ -9300,12 +8946,6 @@ right lower quadrant"></textarea>
     updateHotkeyUI();
     saveSettingsNow();
     setStatus("Hotkey reset to " + hotkeyLabel(hotkey) + ".", "ok");
-  };
-
-  toggleHistoryBtn.onclick = () => {
-    historyVisible = !historyVisible;
-    saveSettingsNow();
-    renderHistory();
   };
 
   downloadBtn.onclick = () => {

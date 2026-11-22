@@ -304,7 +304,9 @@ const w = dom.window;
 const doc = w.document;
 const status = () => doc.getElementById('status').textContent.trim();
 const statusCls = () => doc.getElementById('status').className;
-const latest = () => doc.getElementById('latest').textContent;
+// The newest note on the desktop notes list (2026-11-22: the list replaced the box).
+const newestNoteText = (d) => { const t = d.querySelector('#deskNotes .bnote-text'); return t ? t.textContent : ''; };
+const latest = () => newestNoteText(doc);
 
 await sleep(200);
 
@@ -315,7 +317,7 @@ check('append mode unchecked by default', !doc.getElementById('appendMode').chec
 check('legacy clean-up options removed from the DOM (now permanently on)',
   !doc.getElementById('noVerbatim') && !doc.getElementById('stripNewlines') && !doc.getElementById('stripEllipses') && !doc.getElementById('trailingSpace'),
   [doc.getElementById('noVerbatim'), doc.getElementById('stripNewlines'), doc.getElementById('stripEllipses'), doc.getElementById('trailingSpace')].map(Boolean).join(','));
-check('latest transcript restored from history on boot', latest().includes('Restored note.'), latest());
+check('the newest note is listed on boot', latest().includes('Restored note.'), latest());
 check('auth section open while credentials are missing', doc.getElementById('authSection').open === true);
 check('auth summary prompts for the key', doc.getElementById('authSummary').textContent.includes('paste your ElevenLabs API key'), doc.getElementById('authSummary').textContent);
 
@@ -329,13 +331,11 @@ check('auth summary shows the key is set', doc.getElementById('authSummary').tex
 // covers the append-off default.
 doc.getElementById('appendMode').click();
 check('append mode toggled on for the append scenario', doc.getElementById('appendMode').checked);
-doc.getElementById('freshBtn').click(); // clear the restored note so the next scenario starts fresh
 
 // ===== Scenario 3 (batch): dead mic flatline alarm =====
 // The mic watchdog runs in batch mode too (no WS dependency): a flatline signal
 // fires the alarm, and a no-text finalize copies the sentinel.
 console.log('--- scenario 3: batch dead mic alarm ---');
-doc.getElementById('freshBtn').click();
 micRms = 0.0; // flatline
 doc.getElementById('recordBtn').click();
 await sleep(2900); // > 2.5s flatline detection
@@ -358,7 +358,6 @@ micRms = 0.05;
 // delivery) so low gain can never masquerade as a silent capture bug. Strictly
 // disjoint from the flatline alarm (which owns maxRmsSeen < FLATLINE_RMS).
 console.log('--- scenario 3b: low-mic-level loud failure ---');
-doc.getElementById('freshBtn').click();
 micRms = 0.015; // dead-band: > FLATLINE_RMS 0.0008, < gateOpen 0.030
 doc.getElementById('recordBtn').click();
 await sleep(200); // let the gate-meter loop record the dead-band peak (no flatline: peak > 0.0008)
@@ -371,7 +370,6 @@ check('s3b: low level fails LOUD naming the cause + lever', status().includes('V
 check('s3b: low level still copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('s3b: not misreported as a dead mic', !status().includes('microphone never produced a signal'), status());
 micRms = 0.05;
-doc.getElementById('freshBtn').click();
 
 // ===== Scenario 3c (batch): a TRUE-ZERO capture fails as "MIC PRODUCED NO SIGNAL" =====
 // A dead / iOS-corpse mic delivers literal silence (peak 0). On a HELD take the
@@ -380,7 +378,6 @@ doc.getElementById('freshBtn').click();
 // speaking. It now fails LOUD naming the mic (peak < FLATLINE_RMS), distinct from
 // the dead-band "VERY LOW MIC LEVEL" (peak in [FLATLINE_RMS, gateOpen)).
 console.log('--- scenario 3c: true-zero capture loud failure ---');
-doc.getElementById('freshBtn').click();
 micRms = 0.0; // true zero — the mic delivers nothing
 doc.getElementById('recordBtn').click();
 await sleep(200); // SHORT hold: under the 2.5s flatline watchdog, so it must classify at finalize
@@ -393,7 +390,6 @@ check('s3c: a true-zero capture fails LOUD naming the mic', status().includes('M
 check('s3c: true-zero capture copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
 check('s3c: not blamed on the clinician ("no speech")', !status().includes('No speech detected'), status());
 micRms = 0.05;
-doc.getElementById('freshBtn').click();
 
 // ===== Scenario 4 (batch): append mode appends consecutive recordings =====
 // No time window anymore: with append mode on, the second dictation always
@@ -412,8 +408,8 @@ await sleep(80);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 check('append mode keeps both notes after a long pause', latest().includes('First note.') && latest().includes('Second note.'), latest());
+check('append mode adds to the newest note in place (no second note)', JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]').filter((it) => /First note\./.test(it.text)).length === 1, w.localStorage.getItem('scribe_v2_transcripts_v9'));
 doc.getElementById('appendMode').click(); // back to default (off) for the remaining scenarios
-doc.getElementById('freshBtn').click();
 
 // ===== Scenario 7 (batch): configurable hotkey (default Ctrl+Space) + F13/F14 =====
 console.log('--- scenario 7: batch hotkey tap + hold ---');
@@ -452,11 +448,9 @@ check('F13 keydown starts recording', doc.getElementById('recordBtn').textConten
 doc.dispatchEvent(new w.KeyboardEvent('keydown', { code: 'F14' }));
 await sleep(300);
 check('F14 keydown stops + delivers', clipboard.includes('F13 note.'), JSON.stringify(clipboard));
-doc.getElementById('freshBtn').click();
 
 // ===== Scenario 9: batch engine happy path =====
 console.log('--- scenario 9: batch happy path ---');
-doc.getElementById('freshBtn').click();
 const sCountBatch = sockets.length;
 const fCountBatch = fetchCalls.length;
 fetchQueue.push({ status: 200, body: { text: 'Batch note dictated.' } });
@@ -488,7 +482,6 @@ check('the pared page has no link/gate pills or level meter', !doc.getElementByI
 
 // ===== Scenario 10: batch upload failure -> sentinel =====
 console.log('--- scenario 10: batch upload failure ---');
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 500, body: { error: 'service exploded' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -502,7 +495,6 @@ check('record button reset after failure', doc.getElementById('recordBtn').textC
 
 // ===== Scenario 11: PTT queued during a slow batch upload =====
 console.log('--- scenario 11: batch queued PTT ---');
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ delayMs: 800, status: 200, body: { text: 'Slow upload note.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -520,189 +512,134 @@ doc.getElementById('recordBtn').click(); // wrap up the queued session
 await sleep(300);
 check('queued session delivered too', clipboard.includes('Second.'), JSON.stringify(clipboard));
 
-// ===== Scenario 17: click-to-append — clicking the box arms a one-shot append =====
-console.log('--- scenario 17: click-to-append ---');
-check('append mode off (the shipped default)', !doc.getElementById('appendMode').checked);
-doc.getElementById('freshBtn').click();
-fetchQueue.push({ status: 200, body: { text: 'Alpha.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
-check('base note delivered', clipboard.includes('Alpha.'), JSON.stringify(clipboard));
-check('chip hidden with append mode off', doc.getElementById('appendChip').style.display === 'none');
+// ===== Scenario 17: "Add to this" on any note (2026-11-22) =====
+// The desktop has the phone's notes list: every dictation is a card, and
+// "➕ Add to this" (one-shot) makes the next take add onto THAT note in place —
+// the newest or any older one — and copies the whole note. Focusing a card's
+// text only edits it (it never arms anything).
+console.log('--- scenario 17: add to any note ---');
+{
+  const cards = () => [...doc.querySelectorAll('#deskNotes .bnote')];
+  const hist17 = () => JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  check('append mode off (the shipped default)', !doc.getElementById('appendMode').checked);
+  check('the old box, its buttons and the slot are gone', !doc.getElementById('latest') && !doc.getElementById('appendToggleBtn') && !doc.getElementById('copyBtn') && !doc.getElementById('freshBtn') && !doc.getElementById('lastDictation'));
+  fetchQueue.push({ status: 200, body: { text: 'Alpha.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('a take is a new note at the top', latest().includes('Alpha.') && clipboard.includes('Alpha.'), latest());
+  check('chip hidden with nothing armed', doc.getElementById('appendChip').style.display === 'none');
 
-doc.getElementById('appendToggleBtn').click(); // arm: next dictation appends
-check('Append-next button arms the append chip',
-  doc.getElementById('appendChip').style.display !== 'none' &&
-  doc.getElementById('appendChip').textContent.includes('append'),
-  doc.getElementById('appendChip').textContent);
-check('box highlighted while armed', doc.getElementById('latest').className.includes('armed'));
-check('Append-next button shows the active state', doc.getElementById('appendToggleBtn').className.includes('active'));
-doc.getElementById('appendToggleBtn').click(); // second click cancels
-check('second click disarms', doc.getElementById('appendChip').style.display === 'none');
+  cards()[0].querySelector('.bnote-add').click();
+  check('"Add to this" arms the note and says so', cards()[0].classList.contains('target') && cards()[0].querySelector('.bnote-add').textContent.includes('Adding next take') &&
+    /next take adds to the .* note/.test(doc.getElementById('appendChip').textContent), doc.getElementById('appendChip').textContent);
+  cards()[0].querySelector('.bnote-add').click();
+  check('a second click cancels', !cards()[0].classList.contains('target') && doc.getElementById('appendChip').style.display === 'none');
+  cards()[0].querySelector('.bnote-text').dispatchEvent(new w.Event('focus', { bubbles: false }));
+  check('focusing a note only edits it (never arms)', doc.getElementById('appendChip').style.display === 'none' && !cards()[0].classList.contains('target'));
+  cards()[0].querySelector('.bnote-text').dispatchEvent(new w.Event('blur', { bubbles: false }));
 
-// Clicking into the box is for EDITING only (2026-11-21). It used to arm
-// append as well, and a browser re-fires focus on the box whenever the window
-// comes back to the front, so append switched itself on: "it both auto
-// appends and deletes my old text". Append is only ever the button or the
-// append-mode checkbox now.
-doc.getElementById('latest').dispatchEvent(new w.Event('focus', { bubbles: false }));
-check('focusing the box does NOT arm append',
-  doc.getElementById('appendChip').style.display === 'none' &&
-  !doc.getElementById('latest').className.includes('armed') &&
-  !doc.getElementById('appendToggleBtn').className.includes('active'),
-  doc.getElementById('appendChip').textContent);
+  const n0 = hist17().length;
+  cards()[0].querySelector('.bnote-add').click();
+  fetchQueue.push({ status: 200, body: { text: 'Beta.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('the take is added onto that note and the whole note is copied', clipboard.includes('Alpha.') && clipboard.includes('Beta.'), JSON.stringify(clipboard));
+  check('...in place: no new note', hist17().length === n0 && latest().includes('Alpha.') && latest().includes('Beta.'), hist17().length + ' vs ' + n0 + ' | ' + latest());
 
-doc.getElementById('appendToggleBtn').click(); // re-arm for the real run
+  fetchQueue.push({ status: 200, body: { text: 'Gamma.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('the arm is one-shot: the next take is a new note', clipboard.includes('Gamma.') && !clipboard.includes('Beta.') && latest() === 'Gamma. ', JSON.stringify(clipboard) + ' | ' + latest());
 
-fetchQueue.push({ status: 200, body: { text: 'Beta.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
-check('armed dictation appended onto the note', clipboard.includes('Alpha.') && clipboard.includes('Beta.'), JSON.stringify(clipboard));
+  // Add to an OLDER note: it grows where it is; the newest note is untouched.
+  cards()[1].querySelector('.bnote-add').click();
+  fetchQueue.push({ status: 200, body: { text: 'Delta.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('a take can be added to an OLDER note', /Alpha\. Beta\. Delta\./.test(cards()[1].querySelector('.bnote-text').textContent), cards()[1].querySelector('.bnote-text').textContent);
+  check('...the whole older note is copied, and the newest note is untouched', /Alpha\. Beta\. Delta\./.test(clipboard) && latest() === 'Gamma. ', JSON.stringify(clipboard) + ' | ' + latest());
+}
 
-fetchQueue.push({ status: 200, body: { text: 'Gamma.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
-check('arm is one-shot: the following dictation starts fresh', clipboard.includes('Gamma.') && !clipboard.includes('Beta.'), JSON.stringify(clipboard));
+// ===== Scenario 31: every note is editable in place =====
+console.log('--- scenario 31: editing notes ---');
+{
+  const cards = () => [...doc.querySelectorAll('#deskNotes .bnote')];
+  fetchQueue.push({ status: 200, body: { text: 'Patinet stbl.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  const txt = () => cards()[0].querySelector('.bnote-text');
+  check('s31: a note is editable while idle', txt().getAttribute('contenteditable') === 'true', txt().getAttribute('contenteditable'));
+  txt().dispatchEvent(new w.Event('focus', { bubbles: false }));
+  txt().textContent = 'Patient stable today.';
+  txt().dispatchEvent(new w.Event('blur', { bubbles: false }));
+  await sleep(30);
+  const saved31 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  check('s31: the edit is saved to the note', saved31[0] && saved31[0].text === 'Patient stable today.' && !!saved31[0].editedAt, JSON.stringify(saved31[0]));
+  check('s31: the card says "edited"', cards()[0].querySelector('.bnote-time').textContent.includes('edited'), cards()[0].querySelector('.bnote-time').textContent);
+  clipboard = '';
+  cards()[0].querySelector('.bnote-copy').click();
+  await sleep(30);
+  check('s31: the note\'s Copy copies the edited text', clipboard.includes('Patient stable today.'), JSON.stringify(clipboard));
+  // An emptied note is refused (delete is the way to remove one).
+  txt().dispatchEvent(new w.Event('focus', { bubbles: false }));
+  txt().textContent = '   ';
+  txt().dispatchEvent(new w.Event('blur', { bubbles: false }));
+  await sleep(30);
+  check('s31: an emptied note is refused, the text kept', JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]')[0].text === 'Patient stable today.' && /can't be empty/.test(status()), status());
 
-// ===== Scenario 31: editing the dictation boxes (active box + history) =====
-console.log('--- scenario 31: editing dictation boxes ---');
-// Land a clean note so there is something to edit.
-doc.getElementById('freshBtn').click();
-fetchQueue.push({ status: 200, body: { text: 'Patinet stbl.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
-const latestBox = doc.getElementById('latest');
-check('s31: active box is editable while idle', latestBox.getAttribute('contenteditable') === 'true', latestBox.getAttribute('contenteditable'));
+  // Adding to the edited note builds on the EDITED text, not the typo.
+  cards()[0].querySelector('.bnote-add').click();
+  fetchQueue.push({ status: 200, body: { text: 'Plan unchanged.' } });
+  doc.getElementById('recordBtn').click(); await sleep(60);
+  check('s31: notes are locked while a take runs', txt().getAttribute('contenteditable') === 'false', txt().getAttribute('contenteditable'));
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('s31: adding builds on the edited text', clipboard.includes('Patient stable today.') && clipboard.includes('Plan unchanged.') && !clipboard.includes('Patinet stbl.'), JSON.stringify(clipboard));
+  check('s31: notes are editable again after the take', txt().getAttribute('contenteditable') === 'true', txt().getAttribute('contenteditable'));
 
-// Hand-edit the active box and fire the input event jsdom needs.
-latestBox.textContent = 'Patient stable today.';
-latestBox.dispatchEvent(new w.Event('input', { bubbles: true }));
-await sleep(20);
-clipboard = '';
-doc.getElementById('copyBtn').click();
-await sleep(40);
-check('s31: edited active-box text is what Copy latest copies', clipboard.includes('Patient stable today.'), JSON.stringify(clipboard));
-// Copy latest also FILES the note (Option B): the box clears and the slot shows it.
-check('s31: Copy latest clears the box', !doc.getElementById('latest').textContent.trim(), JSON.stringify(doc.getElementById('latest').textContent));
-check('s31: Copy latest fills the Last dictation slot',
-  doc.getElementById('lastDictation').style.display !== 'none' && doc.getElementById('lastDictationText').textContent.includes('Patient stable today.'),
-  doc.getElementById('lastDictationText').textContent);
+  // Pagination: the newest 10, then "Show N older notes". (Adding to a note
+  // no longer makes an extra entry, so land a few more notes first.)
+  for (const t31 of ['Extra one.', 'Extra two.', 'Extra three.']) {
+    fetchQueue.push({ status: 200, body: { text: t31 } });
+    doc.getElementById('recordBtn').click(); await sleep(120);
+    doc.getElementById('recordBtn').click(); await sleep(300);
+  }
+  const total31 = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]').length;
+  check('s31: enough notes to exercise pagination (>10)', total31 > 10, String(total31));
+  check('s31: only the newest 10 notes render by default', cards().length === 10, String(cards().length));
+  const more31 = doc.getElementById('deskMoreBtn');
+  check('s31: a "Show N older notes" control is present', !!more31 && more31.textContent === 'Show ' + (total31 - 10) + ' older notes', more31 ? more31.textContent : 'none');
+  more31.click();
+  check('s31: "Show older" reveals every note', cards().length === total31, String(cards().length));
+  doc.getElementById('deskMoreBtn').click();
+  check('s31: "Show fewer" collapses back to 10', cards().length === 10, String(cards().length));
+}
 
-// Bring the filed note back via the slot's "Append to this", then append onto
-// it: the dictation must splice onto the EDITED base, not the original typo.
-doc.getElementById('lastAppendBtn').click();
-check('s31: "Append to this" reloads the filed note into the box', doc.getElementById('latest').textContent.includes('Patient stable today.'), doc.getElementById('latest').textContent);
-fetchQueue.push({ status: 200, body: { text: 'Plan unchanged.' } });
-doc.getElementById('recordBtn').click();
-await sleep(120);
-doc.getElementById('recordBtn').click();
-await sleep(300);
-check('s31: append builds on the edited base', clipboard.includes('Patient stable today.') && clipboard.includes('Plan unchanged.') && !clipboard.includes('Patinet stbl.'), JSON.stringify(clipboard));
-
-// The box locks (non-editable) during a session so live/finalize own its text.
-fetchQueue.push({ status: 200, body: { text: 'Locked note.' } });
-doc.getElementById('recordBtn').click();
-await sleep(60);
-check('s31: active box is NOT editable mid-session', latestBox.getAttribute('contenteditable') === 'false', latestBox.getAttribute('contenteditable'));
-doc.getElementById('recordBtn').click();
-await sleep(300);
-check('s31: active box is editable again after delivery', latestBox.getAttribute('contenteditable') === 'true', latestBox.getAttribute('contenteditable'));
-
-// History editing: open the list, click into the newest entry, edit it in place.
-// Rows are directly contenteditable now (click-to-place-caret); edits persist on
-// blur (no Edit/Save buttons).
-if (doc.getElementById('history').style.display === 'none') doc.getElementById('toggleHistoryBtn').click();
-check('s31: history list is visible', doc.getElementById('history').style.display !== 'none');
-const firstItem = doc.querySelector('.history-item');
-check('s31: history renders items', !!firstItem);
-const itemText = firstItem.querySelector('.history-text');
-check('s31: history text is directly editable (contenteditable)', itemText.getAttribute('contenteditable') === 'true', itemText.getAttribute('contenteditable'));
-itemText.dispatchEvent(new w.Event('focus', { bubbles: true }));
-itemText.textContent = 'Locked note, corrected.';
-itemText.dispatchEvent(new w.Event('blur', { bubbles: true })); // persist on blur
-await sleep(20);
-const savedHist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
-check('s31: edited history text persisted to storage', savedHist[0] && savedHist[0].text === 'Locked note, corrected.', JSON.stringify(savedHist[0]));
-check('s31: edited history entry is stamped editedAt', !!(savedHist[0] && savedHist[0].editedAt));
-check('s31: the "edited" marker shows in place', firstItem.querySelector('.history-meta').textContent.includes('edited'), firstItem.querySelector('.history-meta').textContent);
-
-// Pagination: the list shows only the newest 10 by default (so it doesn't take
-// over the expanded desktop view), with a "Show N more" control. The top toggle
-// still reflects the FULL count.
-const totalHist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]').length;
-check('s31: enough history to exercise pagination (>10)', totalHist > 10, String(totalHist));
-check('s31: only the newest 10 rows render by default', doc.querySelectorAll('.history-item').length === 10, String(doc.querySelectorAll('.history-item').length));
-check('s31: the toggle still shows the full count', doc.getElementById('toggleHistoryBtn').textContent.includes('(' + totalHist + ')'), doc.getElementById('toggleHistoryBtn').textContent);
-const moreBtn = doc.getElementById('historyMoreBtn');
-check('s31: a "Show N more" control is present', !!moreBtn && moreBtn.textContent === 'Show ' + (totalHist - 10) + ' more', moreBtn ? moreBtn.textContent : 'none');
-moreBtn.click();
-check('s31: "Show more" reveals every row', doc.querySelectorAll('.history-item').length === totalHist, String(doc.querySelectorAll('.history-item').length));
-const fewerBtn = doc.getElementById('historyMoreBtn');
-check('s31: expanded offers "Show fewer"', !!fewerBtn && fewerBtn.textContent.includes('Show fewer'), fewerBtn ? fewerBtn.textContent : 'none');
-fewerBtn.click();
-check('s31: "Show fewer" collapses back to 10', doc.querySelectorAll('.history-item').length === 10, String(doc.querySelectorAll('.history-item').length));
-
-// ===== Scenario 32: Last-dictation slot + Copy-files-and-readies (Option B) =====
-// The active box holds the current note; finishing it (Copy latest, Clear box,
-// or starting a fresh dictation) FILES it into the "Last dictation" slot and
-// readies the box for a new note. The slot has its own Copy + "Append to this".
-console.log('--- scenario 32: last-dictation slot ---');
-doc.getElementById('freshBtn').click(); // clean slate
-fetchQueue.push({ status: 200, body: { text: 'Note one.' } });
-doc.getElementById('recordBtn').click(); await sleep(120);
-doc.getElementById('recordBtn').click(); await sleep(300);
-check('s32: note one is in the active box', doc.getElementById('latest').textContent.includes('Note one.'), doc.getElementById('latest').textContent);
-
-// Starting a NEW (fresh) dictation files the previous note into the slot.
-fetchQueue.push({ status: 200, body: { text: 'Note two.' } });
-doc.getElementById('recordBtn').click(); await sleep(120);
-doc.getElementById('recordBtn').click(); await sleep(300);
-check('s32: fresh start files the previous note to the slot', doc.getElementById('lastDictationText').textContent.includes('Note one.'), doc.getElementById('lastDictationText').textContent);
-check('s32: box now holds the new note only', doc.getElementById('latest').textContent.includes('Note two.') && !doc.getElementById('latest').textContent.includes('Note one.'), doc.getElementById('latest').textContent);
-
-// Slot "Copy" grabs the filed note without disturbing the box.
-clipboard = '';
-doc.getElementById('lastCopyBtn').click();
-await sleep(40);
-check('s32: slot Copy copies the filed note', clipboard.includes('Note one.'), JSON.stringify(clipboard));
-check('s32: slot Copy leaves the box alone', doc.getElementById('latest').textContent.includes('Note two.'), doc.getElementById('latest').textContent);
-
-// The slot text is hand-editable too: place the caret, edit, and the change
-// persists on blur to its history entry (stamped editedAt).
-const slotText = doc.getElementById('lastDictationText');
-check('s32: slot text is directly editable (contenteditable)', slotText.getAttribute('contenteditable') === 'true', slotText.getAttribute('contenteditable'));
-slotText.focus();
-slotText.textContent = 'Note one corrected.';
-slotText.dispatchEvent(new w.Event('input', { bubbles: true }));
-slotText.blur();
-await sleep(20);
-const histAfterSlotEdit = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
-check('s32: editing the slot persists to its history entry',
-  histAfterSlotEdit.some((it) => it.text === 'Note one corrected.' && it.editedAt),
-  JSON.stringify(histAfterSlotEdit.map((it) => it.text)));
-
-// The slot now STAYS visible (and editable) mid-session — it no longer
-// disappears when a recording starts; the just-filed note shows in it. The
-// "Append to this" button is disabled mid-session (it loads into the box).
-fetchQueue.push({ status: 200, body: { text: 'Note three.' } });
-doc.getElementById('recordBtn').click();
-await sleep(60);
-check('s32: slot stays visible mid-session', doc.getElementById('lastDictation').style.display !== 'none', doc.getElementById('lastDictation').style.display);
-check('s32: "Append to this" is disabled mid-session', doc.getElementById('lastAppendBtn').disabled === true, String(doc.getElementById('lastAppendBtn').disabled));
-doc.getElementById('recordBtn').click();
-await sleep(300);
-
-// Clearing history empties the slot too (the slot mirrors the saved note).
-doc.getElementById('clearBtn').click();
-check('s32: clearing history empties the slot', doc.getElementById('lastDictation').style.display === 'none', doc.getElementById('lastDictation').style.display);
+// ===== Scenario 32: the notes list (delete, delete all) =====
+console.log('--- scenario 32: the notes list ---');
+{
+  const cards = () => [...doc.querySelectorAll('#deskNotes .bnote')];
+  const hist32 = () => JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
+  fetchQueue.push({ status: 200, body: { text: 'Note one.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  fetchQueue.push({ status: 200, body: { text: 'Note two.' } });
+  doc.getElementById('recordBtn').click(); await sleep(120);
+  doc.getElementById('recordBtn').click(); await sleep(300);
+  check('s32: takes stack as separate notes, newest first', cards()[0].querySelector('.bnote-text').textContent === 'Note two. ' && cards()[1].querySelector('.bnote-text').textContent === 'Note one. ',
+    cards().slice(0, 2).map((c) => c.querySelector('.bnote-text').textContent).join(' | '));
+  const n32 = hist32().length;
+  cards()[0].querySelector('.bnote-del').click();
+  check('s32: one click on delete only arms it', hist32().length === n32 && cards()[0].querySelector('.bnote-del').textContent.includes('Delete?'));
+  cards()[0].querySelector('.bnote-del').click();
+  await sleep(20);
+  check('s32: a second click deletes that note only', hist32().length === n32 - 1 && cards()[0].querySelector('.bnote-text').textContent === 'Note one. ', hist32().length + ' | ' + cards()[0].querySelector('.bnote-text').textContent);
+  const clear32 = doc.getElementById('clearBtn');
+  clear32.click();
+  check('s32: "Delete all notes" asks first', hist32().length === n32 - 1 && /again to delete all/.test(clear32.textContent), clear32.textContent);
+  clear32.click();
+  await sleep(20);
+  check('s32: the second click deletes every note', hist32().length === 0 && !!doc.getElementById('deskNotesEmpty'), String(hist32().length));
+}
 
 // ===== Scenario 18: keyterm presets — injected lists, merge, dedupe, persistence =====
 console.log('--- scenario 18: keyterm presets ---');
@@ -727,7 +664,6 @@ check('one checkbox per optional preset, none for always-on lists',
 
 // Leg A (batch, unchecked): always-on terms ride, preset terms do not,
 // custom terms lead the merged list (carried on the upload form).
-doc.getElementById('freshBtn').click();
 doc.getElementById('keyterms').value = 'zebraterm';
 fetchQueue.push({ status: 200, body: { text: 'Preset leg A.' } });
 doc.getElementById('recordBtn').click();
@@ -751,7 +687,6 @@ check('checked preset id persisted in settings (additive v9 field)',
 
 // Leg B (batch, checked): preset terms ride; a custom dupe of a preset term
 // is sent exactly once.
-doc.getElementById('freshBtn').click();
 doc.getElementById('keyterms').value = 'zebraterm\n' + p1Term;
 fetchQueue.push({ status: 200, body: { text: 'Preset leg B.' } });
 doc.getElementById('recordBtn').click();
@@ -768,7 +703,6 @@ check('leg B delivered normally', clipboard.includes('Preset leg B.'), JSON.stri
 
 // Leg C (batch, checked): the upload form carries the full preset list plus
 // the always-on list.
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Preset leg C.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -782,7 +716,6 @@ check('batch call carries the always-on list', alwaysTerms.every((t) => ktC.incl
 // even with the custom box empty.
 p1Box.click();
 doc.getElementById('keyterms').value = '';
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Preset leg D.' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -835,12 +768,8 @@ console.log('--- scenario 19: phone mic session ---');
     sessionSock.open();
     sessionSock.msg({ message_type: 'partial_transcript', transcript: 'Hello' });
     await sleep(10);
-    const latestEl19 = doc19.getElementById('latest');
-    check('desktop shows partial from phone', (latestEl19.textContent || '').includes('Hello'));
-
     sessionSock.msg({ message_type: 'committed_transcript', transcript: 'Hello world.' });
     await sleep(10);
-    check('desktop shows committed from phone', (latestEl19.textContent || '').includes('Hello world'));
 
     sessionSock.msg({ message_type: 'phone_delivery', text: 'Hello world.' });
     await sleep(30);
@@ -1042,12 +971,11 @@ console.log('--- scenario 20: phone link resilience ---');
   sockB.msg({ message_type: 'phone_delivery', text: 'Fresh replace.', delivery_id: 'd6' });
   await sleep(40);
   check('s20: append mode off => delivery replaces', (w20._clip || '').includes('Fresh replace.') && !(w20._clip || '').includes('Plus one.'), JSON.stringify(w20._clip));
-  // ...and the note it replaced is NOT just gone from view: like a take
-  // dictated here, it moves into "Last dictation" (2026-11-21: "it deletes my
-  // old text").
-  check('s20: a replacing phone delivery files the old note into Last dictation',
-    doc20.getElementById('lastDictation').style.display !== 'none' && doc20.getElementById('lastDictationText').textContent.includes('Plus one.'),
-    doc20.getElementById('lastDictation').style.display + ' | ' + doc20.getElementById('lastDictationText').textContent);
+  // ...as a NEW note, and the note before it is still listed (2026-11-21:
+  // "it deletes my old text"; since 2026-11-22 every delivery is a note).
+  const notes20 = [...doc20.querySelectorAll('#deskNotes .bnote-text')].map((t) => t.textContent);
+  check('s20: a phone delivery without append lands as a new note; the earlier note stays',
+    /Fresh replace\./.test(notes20[0] || '') && notes20.some((t) => /Plus one\./.test(t)), notes20.slice(0, 3).join(' | '));
 
   // End session: everything closes and stays closed (no reconnect loop)
   doc20.getElementById('phoneStopBtn').click();
@@ -1513,7 +1441,6 @@ console.log('--- scenario 22: phone link persistence ---');
 console.log('--- scenario 23: iOS mic resilience ---');
 
 // Leg A (main DOM): a dictation holds a screen wake lock until delivery
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Wake lock note.' } });
 const wlBefore = wakeLockCalls;
 doc.getElementById('recordBtn').click();
@@ -1525,7 +1452,6 @@ check('s23: dictation delivered', clipboard.includes('Wake lock note.'), JSON.st
 check('s23: wake lock released after delivery', activeWakeLock === null);
 
 // Leg B (main DOM): an iOS-interrupted track ("live" but muted) forces a mic rebuild
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Rebuilt mic note.' } });
 micTrack.muted = true;
 const gumBefore = gumCalls;
@@ -1637,7 +1563,6 @@ check('s23: dictation works on the rebuilt mic', clipboard.includes('Rebuilt mic
 console.log('--- scenario 23r: resume forces a mic rebuild + interruption alarm ---');
 
 // Baseline: with NO backgrounding, a healthy graph is reused (no re-acquire).
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Reuse note.' } });
 micTrack.readyState = 'live'; micTrack.muted = false;
 const gumReuseBefore = gumCalls;
@@ -1651,7 +1576,6 @@ check('s23r: the reused-graph dictation delivers', clipboard.includes('Reuse not
 // Background the PWA (pagehide on iOS): the track still reports "live"/unmuted
 // (the iOS corpse), but the next press MUST rebuild rather than record silence.
 w.dispatchEvent(new w.Event('pagehide'));
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Resumed note.' } });
 micTrack.readyState = 'live'; micTrack.muted = false; // looks alive — the bug condition
 const gumResumeBefore = gumCalls;
@@ -1666,7 +1590,6 @@ check('s23r: dictation works after the forced rebuild', clipboard.includes('Resu
 Object.defineProperty(doc, 'visibilityState', { value: 'hidden', configurable: true });
 doc.dispatchEvent(new w.Event('visibilitychange'));
 Object.defineProperty(doc, 'visibilityState', { value: 'visible', configurable: true });
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Hidden note.' } });
 const gumHiddenBefore = gumCalls;
 doc.getElementById('recordBtn').click();
@@ -1681,7 +1604,6 @@ await sleep(300);
 // BUT it must DEBOUNCE: iOS emits spurious interrupted->running blips that drop
 // no audio, and the old instant-fire turned those into failed dictations (the
 // mic-stability regression). Only a SUSTAINED interruption (> the grace) alarms.
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 200, body: { text: 'Interrupted note.' } });
 micRms = 0.05; // real "speech" level so only the AudioContext-state check can alarm
 doc.getElementById('recordBtn').click();
@@ -2790,7 +2712,6 @@ console.log('--- scenario 29: batch-only product ---');
 // is a degraded warn too, and every cut keeps the unfiltered text in history.
 console.log('--- scenario 30: diarization keep-primary-speaker ---');
 doc.getElementById('apiKey').value = 'test-key';
-doc.getElementById('freshBtn').click();
 check('s30: diarize toggle defaults ON (per-device)', doc.getElementById('diarize').checked === true);
 const mkWords = (spec) => spec.flatMap(([sid, ...ws]) => ws.map((t) => ({ text: t, type: 'word', speaker_id: sid })));
 const hist0 = () => JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]')[0] || {};
@@ -2838,7 +2759,6 @@ async function twoLevelTake(first, second) {
 
 // Leg A: a quieter bystander (1 of 9 words) that LOUDNESS confirms — small
 // removal, clean Done!, and the unfiltered text is still kept (every cut).
-doc.getElementById('freshBtn').click();
 const wordsA = mkTimed('speaker_0', 0.20, 0.45, ['Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'])
   .concat(mkTimed('speaker_1', 0.72, 0.95, ['okay']));
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA } });
@@ -2858,7 +2778,6 @@ check('s30: the phone note shows the removed voices, collapsed', (doc.querySelec
 // its (padded) span overlaps a few of the clinician's samples — trace and word
 // timings never line up to the millisecond. A word's level is the MEDIAN of its
 // samples, so the overlap cannot lend it the clinician's level.
-doc.getElementById('freshBtn').click();
 const wordsEdge = mkTimed('speaker_0', 0.15, 0.45, ['Abdomen', 'soft', 'nontender', 'and', 'not', 'distended', 'on', 'exam'])
   .concat(mkTimed('speaker_1', 0.50, 0.85, ['okay']));
 fetchQueue.push({ status: 200, body: { text: 'Abdomen soft nontender and not distended on exam okay', words: wordsEdge } });
@@ -2870,7 +2789,6 @@ check('s30: (edge) picked by loudness', ring30()[0] && ring30()[0].spkBy === 'le
 // the bystander (28 words) wins and the clinician's 4 words are 12.5% — under
 // DIARIZE_WARN_SHARE, so a clean "Done!" with the WRONG text before this change. Loudness keeps the
 // clinician; cutting 88% of the words is still a warn (a long cut).
-doc.getElementById('freshBtn').click();
 const chatter = 'so anyway i told her that we would have to wait until the results came back before we could decide anything about the discharge plan for him today'.split(' ');
 const wordsGap = mkTimed('speaker_0', 0.20, 0.45, ['Negative', 'for', 'chest', 'pain'])
   .concat(mkTimed('speaker_1', 0.70, 1.00, chatter));
@@ -2885,7 +2803,6 @@ check('s30: the long cut keeps the conversation in history', (hist0().unfiltered
 // Leg level-tie: both voices at the SAME level (constant mic). Loudness cannot
 // tell them apart, so the word-count rule picks — and any cut it makes is a
 // warn, however small, because nothing confirmed the pick.
-doc.getElementById('freshBtn').click();
 const wordsTie = mkTimed('speaker_0', 0.20, 0.45, ['Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'])
   .concat(mkTimed('speaker_1', 0.72, 0.95, ['okay']));
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsTie } });
@@ -2897,7 +2814,6 @@ check('s30: the timing log records a word-count pick with the near-1 ratio', rin
 
 // Leg A-untimed: words with NO timings (no loudness reading at all) — the old
 // word-count behaviour, but a small cut is no longer a clean Done!.
-doc.getElementById('freshBtn').click();
 const wordsA0 = mkWords([['speaker_0', 'Patient', 'is', 'stable', 'and', 'resting', 'comfortably', 'this', 'morning'], ['speaker_1', 'okay']]);
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable and resting comfortably this morning okay', words: wordsA0 } });
 doc.getElementById('recordBtn').click();
@@ -2910,7 +2826,6 @@ check('s30: the timing log records no reading (ratio 0)', ring30()[0] && ring30(
 
 // Leg R: a RETRIED upload has no loudness trace of its own, so it is delivered
 // WHOLE (never filtered blind) and the status says other voices are still in it.
-doc.getElementById('freshBtn').click();
 fetchQueue.push({ status: 500, body: { error: 'upstream exploded' } });
 doc.getElementById('recordBtn').click();
 await sleep(120);
@@ -2926,7 +2841,6 @@ check('s30: the retry says other speakers were NOT removed', status().includes('
 
 // Leg A2: a LARGE removal (3 of 9 words) — degraded WARN, not Done!, and the
 // unfiltered transcript is stashed in history for recovery.
-doc.getElementById('freshBtn').click();
 const wordsBig = mkWords([['speaker_0', 'Assessment', 'and', 'plan', 'continue', 'current', 'medications'], ['speaker_1', 'did', 'you', 'eat']]);
 fetchQueue.push({ status: 200, body: { text: 'Assessment and plan continue current medications did you eat', words: wordsBig } });
 doc.getElementById('recordBtn').click();
@@ -2942,7 +2856,6 @@ check('s30: unfiltered transcript stashed in history for recovery', (hist0().unf
 // Leg guard: NO clear majority (4 vs 3 = 57%, below the 60% min share) — the
 // filter keeps EVERYTHING rather than risk dropping the clinician (or acting on
 // Scribe over-diarizing one continuous voice).
-doc.getElementById('freshBtn').click();
 const wordsEven = mkWords([['speaker_0', 'the', 'patient', 'reports', 'mild'], ['speaker_1', 'pain', 'since', 'yesterday']]);
 fetchQueue.push({ status: 200, body: { text: 'the patient reports mild pain since yesterday', words: wordsEven } });
 doc.getElementById('recordBtn').click();
@@ -2956,7 +2869,6 @@ check('s30: minority guard => no removal note, clean Done!', !status().includes(
 // most-words heuristic keeps the wrong speaker — but the safety net makes it
 // LOUD (degraded warn) and recoverable (unfiltered in history), never a silent
 // confident Done!.
-doc.getElementById('freshBtn').click();
 const wordsInv = mkWords([['speaker_1', 'so', 'anyway', 'i', 'told', 'her', 'that'], ['speaker_0', 'chest', 'pain']]);
 fetchQueue.push({ status: 200, body: { text: 'so anyway i told her that chest pain', words: wordsInv } });
 doc.getElementById('recordBtn').click();
@@ -2967,7 +2879,6 @@ check('s30: inverted dominance is a degraded WARN, never a confident Done!', sta
 check('s30: inverted dominance keeps the clinician words recoverable in history', (hist0().unfiltered || '').includes('chest pain'), JSON.stringify(hist0()));
 
 // Leg B: a single speaker is a no-op — the full text survives, no note.
-doc.getElementById('freshBtn').click();
 const wordsOne = mkWords([['speaker_0', 'Solo', 'note', 'here']]);
 fetchQueue.push({ status: 200, body: { text: 'Solo note here', words: wordsOne } });
 doc.getElementById('recordBtn').click();
@@ -2979,7 +2890,6 @@ check('s30: single speaker => no removal note', !status().includes('Filtered out
 
 // Leg C: toggle OFF — diarize=false sent, and the client never filters even if
 // the server were to return a multi-speaker words[] (the guard is client-side).
-doc.getElementById('freshBtn').click();
 doc.getElementById('diarize').checked = false;
 doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
 fetchQueue.push({ status: 200, body: { text: 'Patient is stable hey grab lunch today', words: wordsTwo } });
@@ -2999,7 +2909,6 @@ doc.getElementById('bigButtonMode').dispatchEvent(new w.Event('change', { bubble
 
 // Leg D: a plain DESKTOP with the default filter keeps the louder voice, and
 // History shows what was removed.
-doc.getElementById('freshBtn').click();
 const wordsD = mkTimed('speaker_0', 0.20, 0.45, ['Lungs', 'clear', 'bilaterally'])
   .concat(mkTimed('speaker_1', 0.72, 0.95, ['bed', 'four']));
 fetchQueue.push({ status: 200, body: { text: 'Lungs clear bilaterally bed four', words: wordsD } });
@@ -3007,18 +2916,15 @@ await twoLevelTake(0.2, 0.01);
 const upD = fetchCalls[fetchCalls.length - 1];
 check('s30: the desktop sends diarize=true by default', upD.form.get('diarize') === 'true', upD.form.get('diarize'));
 check('s30: the desktop keeps the louder voice', clipboard.includes('Lungs clear bilaterally') && !clipboard.includes('bed four'), JSON.stringify(clipboard));
-const histWasHidden = doc.getElementById('history').style.display === 'none';
-if (histWasHidden) doc.getElementById('toggleHistoryBtn').click();
-const unfD = doc.querySelector('#history .history-item .unfiltered');
-check('s30: History shows "Other voices were removed" on the cut take', !!unfD && unfD.querySelector('summary').textContent.includes('Other voices were removed'), (doc.getElementById('history').innerHTML || '').slice(0, 300));
+const unfD = doc.querySelector('#deskNotes .bnote .unfiltered');
+check('s30: the note shows "Other voices were removed" on the cut take', !!unfD && unfD.querySelector('summary').textContent.includes('Other voices were removed'), (doc.getElementById('deskNotes').innerHTML || '').slice(0, 300));
 check('s30: History holds the unfiltered text for that take', !!unfD && unfD.querySelector('.unfiltered-text').textContent === 'Lungs clear bilaterally bed four', unfD && unfD.textContent);
 clipboard = '';
 if (unfD) unfD.querySelector('button').click();
 await sleep(20);
 check('s30: "Copy unfiltered" copies what was heard before the cut', clipboard === 'Lungs clear bilaterally bed four', JSON.stringify(clipboard));
-const rowsNoUnf = [...doc.querySelectorAll('#history .history-item')].filter((r) => !r.querySelector('.unfiltered')).length;
-check('s30: rows with nothing removed show no unfiltered block', rowsNoUnf > 0, rowsNoUnf);
-if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it again
+const rowsNoUnf = [...doc.querySelectorAll('#deskNotes .bnote')].filter((r) => !r.querySelector('.unfiltered')).length;
+check('s30: notes with nothing removed show no unfiltered block', rowsNoUnf > 0, rowsNoUnf);
 
 // The record bar's speaker-filter pill (2026-11-21, "That's a key feature"):
 // it shows the filter's state on every take and a tap turns it on or off —
@@ -3039,7 +2945,6 @@ if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it ag
   check('s30p: the pill follows the Options checkbox', fp.className.includes('off'), fp.className);
   doc.getElementById('diarize').checked = true;
   doc.getElementById('diarize').dispatchEvent(new w.Event('change'));
-  doc.getElementById('freshBtn').click();
   fetchQueue.push({ status: 200, body: { text: 'Pill take.' } });
   doc.getElementById('recordBtn').click();
   await sleep(120);
@@ -3061,14 +2966,13 @@ if (histWasHidden) doc.getElementById('toggleHistoryBtn').click(); // hide it ag
 // safety invariant: makeup gain (pre-analyser) can NEVER mask a dead mic.
 console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
 {
-  doc.getElementById('freshBtn').click();
   const ec = doc.getElementById('echoCancel');
   const mg = doc.getElementById('micGain');
 
   check('s31m: echo cancellation defaults ON', ec.checked === true);
   check('s31m: makeup gain defaults to 1x', mg.value === '1', mg.value);
   check('s31m: the auto-gain switch is gone (fixed off, 2026-11-21)', !doc.getElementById('autoGain'));
-  check('s31m: Copy button is labelled "Copy & clear"', doc.getElementById('copyBtn').textContent.includes('Copy & clear'), doc.getElementById('copyBtn').textContent);
+  check('s31m: every note card has its own Copy', [...doc.querySelectorAll('#deskNotes .bnote')].every((c) => !!c.querySelector('.bnote-copy')));
 
   // Echo cancellation is a capture constraint -> toggling it rebuilds the graph.
   let g0 = gumCalls;
@@ -3097,7 +3001,6 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
   // = 0 — a high gain must NEVER lift a dead mic's silence above the flatline
   // watchdog. A 15x flatline still alarms and copies the sentinel.
   mg.value = '15'; mg.dispatchEvent(new w.Event('input'));
-  doc.getElementById('freshBtn').click();
   micRms = 0.0; // dead mic
   doc.getElementById('recordBtn').click();
   await sleep(2900);
@@ -3115,7 +3018,6 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
 
   // micDiag on the QUICK-RELEASE no-speech path (#41): a short tap that never
   // trips the 2.5s flatline watchdog still surfaces + logs the audio-graph state.
-  doc.getElementById('freshBtn').click();
   fetchQueue.push({ status: 200, body: { text: '' } });
   doc.getElementById('recordBtn').click();
   await sleep(80);
@@ -3219,7 +3121,7 @@ console.log('--- scenario 32j: dictation journal crash recovery ---');
   await sleep(350);
   check('s32j: recovered audio is re-uploaded for transcription', reboot.fetches.some((u) => u.includes('/api/transcribe')), reboot.fetches.join(','));
   check('s32j: recovered text lands on the clipboard', (reboot.win._clip || '').includes('Recovered dictation text.'), JSON.stringify(reboot.win._clip));
-  check('s32j: recovered note is in the box', rd.getElementById('latest').textContent.includes('Recovered dictation text.'), rd.getElementById('latest').textContent);
+  check('s32j: the recovered note is listed', newestNoteText(rd).includes('Recovered dictation text.'), newestNoteText(rd));
   check('s32j: recovery banner hidden after success', rd.getElementById('journalRecover').style.display === 'none');
   check('s32j: journal cleared after successful recovery', (await orphanRecordingCount()) === 0, await orphanRecordingCount());
   reboot.dom.window.close();
@@ -3463,39 +3365,30 @@ console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
   const deliveries34 = () => fetch34.filter((c) => c.url.includes('/deliver') && c.opts && String(c.opts.body).includes('phone_delivery'));
   doc34.getElementById('apiKey').value = 'test-key';
 
-  // (a) The box's send button: visible when joined, sends the restored note.
-  const sendBtn = doc34.getElementById('sendDesktopBtn');
-  check('s34a: the send button is visible on a joined device', sendBtn.style.display !== 'none' && !sendBtn.disabled, sendBtn.style.display + '/' + sendBtn.disabled);
+  // (a) A note card's Send (the paired phone layout): POSTs the note as a
+  //     fresh phone_delivery to the joined code. (The box's own send button
+  //     and the old saved-list rows went with the box, 2026-11-22.)
+  const cardSendBtn = () => doc34.querySelector('#bigNotes .bnote .bnote-send');
+  check('s34a: a note card offers Send on a joined device', !!cardSendBtn());
   const n0 = deliveries34().length;
-  sendBtn.click();
+  cardSendBtn().click();
   await sleep(250);
   const sent = deliveries34().slice(n0);
   check('s34a: the send POSTs a fresh phone_delivery to the joined code', sent.length === 1 && sent[0].url.includes('/api/session/SEND01/deliver'), JSON.stringify(sent.map((c) => c.url)));
-  check('s34a: the sent text is the cleaned box note', sent.length && JSON.parse(sent[0].opts.body).text.includes('History note from earlier.'), sent.length && sent[0].opts.body);
+  check('s34a: the sent text is the cleaned note', sent.length && JSON.parse(sent[0].opts.body).text.includes('History note from earlier.'), sent.length && sent[0].opts.body);
   check('s34a: a fresh delivery_id rides the manual send', sent.length && !!JSON.parse(sent[0].opts.body).delivery_id, sent.length && sent[0].opts.body);
-  check('s34a: the delivered manual send announces Done', st34().includes('Delivered to the desktop clipboard. Done!'), st34());
+  check('s34a: the delivered manual send announces Done', st34().includes('Done!'), st34());
 
-  // (b) Mid-session the manual send is a no-op (idle-only guard).
+  // (b) Mid-session the card's Send is inert (idle-only guard).
   micRms = 0.05;
   doc34.getElementById('recordBtn').click();
   await sleep(120);
   const n1 = deliveries34().length;
-  check('s34b: the send button is disabled mid-session', sendBtn.disabled === true, String(sendBtn.disabled));
-  sendBtn.click();
+  cardSendBtn().click();
   await sleep(120);
   check('s34b: a mid-session send click POSTs nothing', deliveries34().length === n1, deliveries34().length - n1 + ' extra');
   doc34.getElementById('recordBtn').click(); // stop; the take relays normally (+1 delivery)
   await sleep(500);
-
-  // (c) History rows carry a per-row send button while joined.
-  doc34.getElementById('toggleHistoryBtn').click();
-  await sleep(30);
-  const rowSend = Array.from(doc34.querySelectorAll('#history button')).find((b) => b.textContent.includes('Send to desktop'));
-  check('s34c: history rows offer Send to desktop while joined', !!rowSend, Array.from(doc34.querySelectorAll('#history button')).map((b) => b.textContent).join('|'));
-  const n2 = deliveries34().length;
-  rowSend.click();
-  await sleep(250);
-  check('s34c: the history-row send delivers that row\'s text', deliveries34().length === n2 + 1, (deliveries34().length - n2) + ' posts');
 
   // (d) On the phone layout (the overlay covers the box) every note card
   //     offers its own Send while joined.
@@ -3518,7 +3411,9 @@ console.log('--- scenario 34: manual send-to-desktop + queue chip ---');
   // (f) Unjoined devices never show the send affordances.
   doc34.getElementById('phoneLeaveBtn').click();
   await sleep(30);
-  check('s34f: the send button hides when not joined', sendBtn.style.display === 'none', sendBtn.style.display);
+  // The visible list is the desktop one now (the phone overlay is hidden and
+  // is rebuilt when it next opens).
+  check('s34f: no visible note offers Send when not joined', !doc34.body.classList.contains('bigbtn') && !!doc34.querySelector('#deskNotes .bnote') && !doc34.querySelector('#deskNotes .bnote-send'));
 }
 
 // ===== Scenario 35: desktop /latest poll fallback =====
@@ -4922,9 +4817,9 @@ console.log('--- scenario 42c: client link auth + loud 401 ---');
   await sleep(160);
   doc48.getElementById('recordBtn').click();
   await sleep(900);
-  check('s48a: the take still transcribed and is in the box',
-    (doc48.getElementById('latest').textContent || '').includes('Phone only note.'),
-    doc48.getElementById('latest').textContent);
+  check('s48a: the take still transcribed and is a note',
+    newestNoteText(doc48).includes('Phone only note.'),
+    newestNoteText(doc48));
   check('s48a: a phone-only dictation is NOT reported as a failure', !cls48().includes('err'), cls48() + ' / ' + s48());
   check('s48a: it reads as a success', cls48().includes('ok'), cls48() + ' / ' + s48());
   check('s48a: it gets the DONE cue, not a warn', lastVibe() === DONE, lastVibe());
@@ -5685,7 +5580,7 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
   await sleep(250);
   const lastI = deliveries52(A)[deliveries52(A).length - 1];
   check('s52i: an edited note goes whole, marked replace', deliveries52(A).length === nI + 1 && lastI.text === 'First note, corrected. ' && lastI.replace === true, JSON.stringify(lastI));
-  check('s52i: the phone says it replaced the desktop copy', status52(A).includes('REPLACED'), status52(A));
+  check('s52i: the phone says the desktop got the edited note as a new note', /new note/i.test(status52(A)), status52(A));
   check('s52i: and the note is Sent again', cardTag(cards(A)[0]).includes('✓ Sent'), cardTag(cards(A)[0]));
   // Edit it once more so the next legs still have an edited note to count.
   const txtI3 = cards(A)[0].querySelector('.bnote-text');
@@ -5858,11 +5753,12 @@ console.log('--- scenario 51: the client streams the take while it is spoken ---
     await sleep(30);
     sockL.msg({ message_type: 'phone_delivery', text: 'New words.', delivery_id: 'L2' });
     await sleep(30);
-    check('s52l: a plain delivery still appends on an append-mode desktop', docL.getElementById('latest').textContent === 'First part. New words. ', JSON.stringify(docL.getElementById('latest').textContent));
+    check('s52l: a plain delivery still appends on an append-mode desktop', newestNoteText(docL) === 'First part. New words. ', JSON.stringify(newestNoteText(docL)));
     sockL.msg({ message_type: 'phone_delivery', text: 'First part, corrected. New words.', delivery_id: 'L3', replace: true });
     await sleep(30);
-    check('s52l: a replace delivery takes the note\'s place (no repeat)', docL.getElementById('latest').textContent === 'First part, corrected. New words.' && wL._clip === 'First part, corrected. New words.', JSON.stringify(docL.getElementById('latest').textContent));
-    check('s52l: and says so', docL.getElementById('status').textContent.includes('REPLACED'), docL.getElementById('status').textContent);
+    check('s52l: a replace delivery is a NEW note (never appended, never overwriting a desktop note)', newestNoteText(docL) === 'First part, corrected. New words.' && wL._clip === 'First part, corrected. New words.' &&
+      [...docL.querySelectorAll('#deskNotes .bnote-text')].some((t) => t.textContent === 'First part. New words. '), JSON.stringify(newestNoteText(docL)));
+    check('s52l: and says so', /new note/i.test(docL.getElementById('status').textContent), docL.getElementById('status').textContent);
     domL.window.close();
   }
 
@@ -6768,9 +6664,8 @@ console.log('--- scenario 54: the main service and its backup (Worker) ---');
   check('s55: the Advanced readout says the backup (Soniox) transcribed the take', readout.includes('TRANSCRIBED BY SONIOX (the backup)') && readout.includes('1 transcribed by the backup service'), readout);
   const hist = JSON.parse(w.localStorage.getItem('scribe_v2_transcripts_v9') || '[]');
   check('s55: the saved note is tagged as transcribed by Soniox', hist[0] && hist[0].stt === 'soniox', JSON.stringify(hist[0]));
-  if (doc.getElementById('history').style.display === 'none') doc.getElementById('toggleHistoryBtn').click();
-  const metaText = [...doc.querySelectorAll('.history-meta')].map((m) => m.textContent).join(' | ');
-  check('s55: History shows "via Soniox" on that note', metaText.includes('via Soniox'), metaText);
+  const metaText = [...doc.querySelectorAll('#deskNotes .bnote-time')].map((m) => m.textContent).join(' | ');
+  check('s55: the note card shows "via Soniox"', metaText.includes('via Soniox'), metaText);
 
   // The next take (ElevenLabs back to normal) gets the longer floor: the
   // fallback running is itself evidence that ElevenLabs was slow.
@@ -7260,7 +7155,8 @@ console.log('--- scenario 59: report a mistake ---');
   const rs59 = () => d59.getElementById('reportStatus').textContent;
   const statusBefore = d59.getElementById('status').textContent;
 
-  d59.getElementById('reportBtn').click();
+  const card59 = (i) => [...d59.querySelectorAll('#deskNotes .bnote')][i];
+  card59(0).querySelector('.bnote-report').click();
   check('s59: the note\'s Report opens the box', ov59());
   check('s59: the box shows the note it is about', d59.getElementById('reportNote').textContent.includes('metro pole'), d59.getElementById('reportNote').textContent);
   check('s59: the box is enabled in shared mode', !d59.getElementById('reportSendBtn').disabled);
@@ -7289,7 +7185,7 @@ console.log('--- scenario 59: report a mistake ---');
 
   // A failed send keeps the text and says so; the vocabulary is not doubled.
   reply59 = { status: 500, body: { error: 'Report storage failed: D1 down' } };
-  d59.getElementById('reportBtn').click();
+  card59(0).querySelector('.bnote-report').click();
   d59.getElementById('reportExpected').value = 'Metoprolol';
   d59.getElementById('reportDetails').value = 'again';
   d59.getElementById('reportSendBtn').click();
@@ -7300,18 +7196,17 @@ console.log('--- scenario 59: report a mistake ---');
   d59.getElementById('reportCancelBtn').click();
   check('s59: Cancel closes the box', !ov59());
 
-  // History rows open it too, with that row's note and service.
-  const rows59 = [...d59.querySelectorAll('#history .history-item')];
-  const repBtn = rows59[1] && [...rows59[1].querySelectorAll('button')].find((b) => b.textContent === 'Report');
-  check('s59: each history row has a Report button', !!repBtn);
+  // An older note opens it with that note and its service.
+  const repBtn = card59(1) && card59(1).querySelector('.bnote-report');
+  check('s59: each note has a Report button', !!repBtn);
   if (repBtn) repBtn.click();
-  check('s59: a history row reports ITS note', ov59() && d59.getElementById('reportNote').textContent.includes('knee'), d59.getElementById('reportNote').textContent);
+  check('s59: an older note reports ITS note', ov59() && d59.getElementById('reportNote').textContent.includes('knee'), d59.getElementById('reportNote').textContent);
   reply59 = { status: 200, body: { ok: true, id: 'r2' } };
   d59.getElementById('reportDetails').value = 'missed a word';
   d59.getElementById('reportSendBtn').click();
   await sleep(60);
   const sent59b = JSON.parse((fetch59.filter((c) => c.url.endsWith('/api/report')).pop() || { opts: { body: '{}' } }).opts.body);
-  check('s59: a row\'s report names the service that wrote it (Soniox) and is a "problem" without a word', sent59b.service === 'soniox' && sent59b.kind === 'problem', JSON.stringify(sent59b).slice(0, 160));
+  check('s59: that report names the service that wrote it (Soniox) and is a "problem" without a word', sent59b.service === 'soniox' && sent59b.kind === 'problem', JSON.stringify(sent59b).slice(0, 160));
   await sleep(1700);
 
   // The sent list.

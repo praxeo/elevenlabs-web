@@ -1588,7 +1588,7 @@ const INDEX_HTML = `<!doctype html>
     #recBand { position: relative; }
     #recordBtn {
       display: flex; align-items: center; gap: 14px; width: 100%; min-height: 64px;
-      padding: 0 96px 0 18px; border-radius: 14px; text-align: left;
+      padding: 0 150px 0 18px; border-radius: 14px; text-align: left;
       background: var(--panel); border: 1px solid #36404a;
       font-family: var(--font-readout); font-size: 21px; font-weight: 600; letter-spacing: 0.01em;
     }
@@ -1605,11 +1605,20 @@ const INDEX_HTML = `<!doctype html>
     body[data-state="warn"] #recordBtn:not(.danger)  { border-color: var(--warn); }
     body[data-state="fail"] #recordBtn:not(.danger),
     body[data-state="alarm"] #recordBtn:not(.danger) { border-color: var(--danger); }
-    #micPill {
-      position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
-      margin: 0; pointer-events: none;
+    #bandPills {
+      position: absolute; right: 12px; top: 50%; transform: translateY(-50%);
+      display: flex; flex-direction: column; align-items: flex-end; gap: 4px; pointer-events: none;
     }
-    #recordBtn.danger ~ #micPill { color: #fff; border-color: rgba(255, 255, 255, 0.55); background: transparent; }
+    #bandPills .pill { margin: 0; white-space: nowrap; }
+    #filterPill {
+      pointer-events: auto; cursor: pointer; background: transparent; padding: 2px 8px; border-radius: 999px;
+      font-family: var(--font-readout); font-size: 11.5px; letter-spacing: 0.02em; line-height: 1.45;
+    }
+    #filterPill.on  { color: var(--ok); border: 1px solid rgba(95, 224, 143, 0.5); }
+    #filterPill.off { color: var(--warn); border: 1px solid rgba(242, 182, 64, 0.6); }
+    #filterPill:hover { background: rgba(255, 255, 255, 0.06); }
+    #filterPill:disabled { opacity: 0.6; cursor: default; }
+    #recordBtn.danger ~ #bandPills .pill { color: #fff; border-color: rgba(255, 255, 255, 0.55); background: transparent; }
 
     /* ── The capture trace: a monitor lead, docked under the band. ── */
     #recFeedback {
@@ -1854,7 +1863,7 @@ const INDEX_HTML = `<!doctype html>
       main { padding: 8px 10px 16px; }
       h1 { display: none; }
       .grid { gap: 14px; }
-      #recordBtn { min-height: 52px; font-size: 18px; padding-left: 14px; gap: 12px; }
+      #recordBtn { min-height: 56px; font-size: 18px; padding-left: 14px; padding-right: 130px; gap: 12px; }
       #recTimer { font-size: 22px; }
       #waveCanvas { height: 44px; }
       .big { min-height: 72px; font-size: 16px; padding: 10px 12px; }
@@ -2059,7 +2068,13 @@ const INDEX_HTML = `<!doctype html>
            docks directly under it while a take is running. -->
       <div id="recBand">
         <button id="recordBtn" class="primary">Start recording</button>
-        <span id="micPill" class="pill">mic off</span>
+        <!-- The band's readouts: the mic, and the speaker filter (2026-11-21,
+             the owner: "That's a key feature") — a tap turns the filter on or
+             off between takes, so its state is visible on every take. -->
+        <div id="bandPills">
+          <span id="micPill" class="pill">mic off</span>
+          <button id="filterPill" class="pill on" type="button" aria-pressed="true">Speaker filter ✓</button>
+        </div>
       </div>
       <div id="recFeedback" style="display:none">
         <div class="recfb-row">
@@ -2496,6 +2511,7 @@ right lower quadrant"></textarea>
   const streamUploadEl   = document.getElementById("streamUpload");
   const echoCancelEl     = document.getElementById("echoCancel");
   const diarizeEl        = document.getElementById("diarize");
+  const filterPillEl     = document.getElementById("filterPill");
   const startBeepEl      = document.getElementById("startBeep");
 
   const micGainEl        = document.getElementById("micGain");
@@ -8352,7 +8368,24 @@ right lower quadrant"></textarea>
     } catch (e) {}
   }
 
+  // The record bar's speaker-filter pill mirrors Options → "Filter out other
+  // speakers" and is locked while a take runs (that take's request was built
+  // with the choice it started with).
+  function updateFilterPill() {
+    if (!filterPillEl) return;
+    var on = Boolean(diarizeEl && diarizeEl.checked);
+    var text = on ? "Speaker filter ✓" : "Speaker filter off";
+    if (filterPillEl.textContent !== text) filterPillEl.textContent = text;
+    filterPillEl.className = "pill " + (on ? "on" : "off");
+    filterPillEl.setAttribute("aria-pressed", on ? "true" : "false");
+    filterPillEl.title = on
+      ? "Speaker filter on: keeps the voice loudest at your mic and removes the others (they stay in History). Click to turn it off."
+      : "Speaker filter off: every voice the mic hears goes into the note. Click to turn it on.";
+    filterPillEl.disabled = Boolean(recording || stopping || finishing);
+  }
+
   function updateBigScreen() {
+    updateFilterPill();
     applyWindowState(); // desktop window cue — must run even without the overlay
     if (!bigUiEl) return;
     const state = currentUiState();
@@ -9162,6 +9195,15 @@ right lower quadrant"></textarea>
   if (joinCodeInputEl) joinCodeInputEl.addEventListener("keydown", (e) => { if (e.key === "Enter" && joinGoBtnEl) { e.preventDefault(); joinGoBtnEl.click(); } });
   if (joinCloseBtnEl) joinCloseBtnEl.onclick = () => closeJoinOverlay();
   if (reportBtnEl) reportBtnEl.onclick = () => openReport(currentNoteForReport());
+  if (filterPillEl) filterPillEl.onclick = () => {
+    if (recording || stopping || finishing) return; // a running take keeps the choice it started with
+    diarizeEl.checked = !diarizeEl.checked;
+    diarizeEl.dispatchEvent(new Event("change")); // saves the setting (per device)
+    setStatus(diarizeEl.checked
+      ? "Speaker filter on: the voice loudest at your mic is kept, other voices are removed (and kept in History)."
+      : "Speaker filter off: every voice the mic hears goes into the note.", "");
+  };
+  if (diarizeEl) diarizeEl.addEventListener("change", updateFilterPill);
   if (reportProblemBtnEl) reportProblemBtnEl.onclick = () => openReport(null);
   if (showReportsBtnEl) showReportsBtnEl.onclick = () => { showReports(); };
   if (reportSendBtnEl) reportSendBtnEl.onclick = () => { sendReport(); };
@@ -9544,6 +9586,7 @@ right lower quadrant"></textarea>
   refreshSttUi();          // the chosen transcription service + backup (greys out services with no key)
   renderTimingReadout(null); // show the most recent stored take, if any
   updateGainLabel();
+  updateFilterPill();
   updateKeytermHint();
   updateHotkeyUI();
   restoreLatestFromHistory();

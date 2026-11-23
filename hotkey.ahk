@@ -36,7 +36,7 @@ STATE_BAR_W      := 250        ; at 100 % scaling; scaled automatically for high
 STATE_BAR_H      := 38
 STATE_BAR_MARGIN := 18         ; distance from the bottom-right corner of the work area
 
-; --- Mouse side buttons (from testbutton-phase1b.ahk) ---
+; --- Mouse side buttons ---
 ; Forward (XButton2) held = dictate. Back (XButton1): once = Enter, twice =
 ; click + paste, with right-click = select all + copy. See the bottom of the file.
 DBLCLICK_MS    := 300          ; back-button double-press window

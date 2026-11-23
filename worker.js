@@ -6094,11 +6094,23 @@ right lower quadrant"></textarea>
     }
   }
 
+  // A press that arrives while the mic is still starting AND after that take's
+  // release was latched: the person is holding again before anything was
+  // recorded, so the take that is starting becomes this press's take (the
+  // latched stop is undone). Ignoring it lost the dictation (2026-11-23).
+  // Returns true when it took the take over.
+  function resumeStartingTake() {
+    if (!startInFlight || !stopRequested) return false;
+    stopRequested = false;
+    pressStartedAt = Date.now();
+    pressEndedAt = 0;
+    return true;
+  }
+
   async function startRecordingWork() {
     if (recording || stopping || finishing) return;
-    // A new press: the last click's "Too short" leaves the title NOW, so the
-    // AutoHotkey bar can never read it as this press's outcome (hotkey.ahk
-    // trusts "Too short" only once the title has been without it since the press).
+    // A new press: the last click's "Too short" leaves the title NOW — the
+    // title must never show an earlier take's outcome as this press's.
     if (lastStatusMark === "tap") { lastStatusMark = ""; applyWindowState(); }
     if (recovering) {
       // A saved recording is being re-uploaded and is about to write its note
@@ -9372,7 +9384,10 @@ right lower quadrant"></textarea>
     blurEditingNote(); // save a note mid-edit first (the take may add to it); drops the keyboard too
     bigBtnPointerId = e.pointerId !== undefined ? e.pointerId : -1;
     try { bigBtnEl.setPointerCapture(e.pointerId); } catch (err) {}
-    if (!recording && !stopping && !finishing && !startInFlight) {
+    if (startInFlight && resumeStartingTake()) {
+      bigBtnEngaged = true; // pressed again before the mic was ready: this press owns the take
+      bigBtnDownAt = Date.now();
+    } else if (!recording && !stopping && !finishing && !startInFlight) {
       bigBtnEngaged = true;
       bigBtnDownAt = Date.now();
       startRecording();
@@ -9442,7 +9457,8 @@ right lower quadrant"></textarea>
   recordBtn.onclick = () => {
     // A second click while the mic is still starting means stop: it latches,
     // and the take ends the moment it begins.
-    if (recording || startInFlight) stopRecording();
+    if (recording) stopRecording();
+    else if (startInFlight) { if (!resumeStartingTake()) stopRecording(); }
     else startRecording();
   };
 
@@ -9755,7 +9771,8 @@ right lower quadrant"></textarea>
     // F13/F14 are the AutoHotkey contract (CapsLock relay) — always active.
     if (e.code === "F13") {
       e.preventDefault();
-      if (!recording && !stopping && !finishing) startRecording();
+      if (startInFlight) resumeStartingTake(); // pressed again before the mic was ready; a repeat of a held press is a no-op
+      else if (!recording && !stopping && !finishing) startRecording();
       else if (stopping || finishing) pendingStart = true; // PTT again while finalizing: queue it
       return;
     }
@@ -9790,7 +9807,10 @@ right lower quadrant"></textarea>
       // An unmodified key (e.g. plain Space) must stay typable in form fields
       if (inField && !(hotkey.ctrl || hotkey.alt || hotkey.meta)) return;
       e.preventDefault();
-      if (!recording && !stopping && !finishing && !startInFlight) {
+      if (startInFlight && resumeStartingTake()) {
+        hotkeyEngaged = true; // pressed again before the mic was ready: this press owns the take
+        hotkeyDownAt = Date.now();
+      } else if (!recording && !stopping && !finishing && !startInFlight) {
         hotkeyEngaged = true;
         hotkeyDownAt = Date.now();
         startRecording();

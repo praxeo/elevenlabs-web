@@ -8,9 +8,15 @@ SetKeyDelay(0, 10)
 SPINUP         := 80           ; ms before speaking (mic is kept warm by the browser)
 MIN_HOLD       := 200          ; a tap shorter than this records nothing and ends quietly (grey
                                ; bar, no sound). Measured AFTER window activation + SPINUP, so the
-                               ; real threshold is ~280 ms+. A press under ~1 s that the page heard
-                               ; no words in also ends quietly ("TOO SHORT"): the page says so in
-                               ; its window title. A real failure is still loud.
+                               ; real threshold is ~280 ms+.
+CLICK_MS       := 1000         ; a press held less than this that brings back NO text is a click,
+                               ; not a lost dictation: a grey bar for 2 s, no sound, no toast — and
+                               ; nothing is pasted. Decided here from the press itself, never from
+                               ; the dictation window's title, so it holds whatever version of the
+                               ; page is open and however the window is reached (2026-11-23, the
+                               ; owner: "a single click and not hold is pretty apparent"). A held
+                               ; press (longer) that fails is still loud, and the page itself stays
+                               ; loud for a failed upload of any length (its recording is kept).
 CLIP_TIMEOUT   := 165          ; backstop; must cover the browser's batch deadline (hard-capped
                                ; at 150 s by UPLOAD_DEADLINE_MAX_MS) plus capture tail
 ACT_TIMEOUT    := 0.15         ; per-attempt window-activation wait
@@ -118,7 +124,8 @@ InitStateBar()
 ; these words in it, and this script looks for them — change them in both:
 ;   "OFFLINE"    a take is running and the page cannot reach its server
 ;   "REC" / "Working"  a take is recording / being transcribed
-;   "Too short"     a click the page heard no words in: ended quietly
+;   "Too short"     a click the page heard no words in (informational: this
+;                   script judges a click by the press itself, CLICK_MS)
 ;   "will retry"    a failed take whose recording is transcribed by itself later
 ;   "Recovered"     ...and it was: the text is the newest note in the page
 ;   "not recovered" ...and it could not be: retry it in the page, or redictate
@@ -309,9 +316,8 @@ ReturnFocus() {
 ; when the dictation window loses focus (the browser cannot write the clipboard
 ; without it) and says so, instead of silently running out the 165 s clock.
 ; It also says when the page cannot reach its server (the page keeps trying,
-; and sends the recording again once it can). staleShort is cleared once the
-; title has been seen without the last click's "Too short" (see RunTake).
-WaitForTranscript(label, &staleShort) {
+; and sends the recording again once it can).
+WaitForTranscript(label := "TRANSCRIBING…") {
     global CLIP_TIMEOUT, DICT_HWND
     deadline := A_TickCount + CLIP_TIMEOUT * 1000
     shown := label
@@ -322,8 +328,6 @@ WaitForTranscript(label, &staleShort) {
         if (A_TickCount < nextLook)
             continue
         nextLook := A_TickCount + 500
-        if !InStr(DictTitle(), "Too short", true)
-            staleShort := false
         if !WinActive("ahk_id " DICT_HWND)
             want := "⚠ REFOCUS DICTATION", color := "7C2D12"
         else if TitleHas("OFFLINE")
@@ -368,7 +372,7 @@ PushToTalk(isHeld, waitRelease) {
 }
 
 RunTake(isHeld, waitRelease) {
-    global DICT_HWND, SPINUP, MIN_HOLD, HOLD_CAP_MS, CLIP_TIMEOUT
+    global DICT_HWND, SPINUP, MIN_HOLD, CLICK_MS, HOLD_CAP_MS, CLIP_TIMEOUT
     global STRIP_NEWLINES, TRAILING_SPACE, SENTINEL, PREV_HWND, AUTO_PASTE
 
     A_Clipboard := ""
@@ -381,13 +385,6 @@ RunTake(isHeld, waitRelease) {
         return
     }
 
-    ; staleShort: the title still shows the LAST click's "Too short". Until the
-    ; title has been seen without it, a "Too short" cannot be this press's
-    ; outcome (a press the page refused would otherwise read as a quiet click).
-    ; The page drops it from the title the moment a press arrives, so it is
-    ; normally cleared on the first look below — even when the mic is slow to
-    ; start and the page never shows REC before the release.
-    staleShort := InStr(DictTitle(), "Too short", true) > 0
     Send("{F13}")
     ShowState("● RECORDING", "B91C1C")
     Sleep(SPINUP)
@@ -407,10 +404,7 @@ RunTake(isHeld, waitRelease) {
         }
         if (A_TickCount >= nextLook) {
             nextLook := A_TickCount + 100
-            t := DictTitle()
-            if !InStr(t, "Too short", true)
-                staleShort := false
-            nowOff := InStr(t, "OFFLINE", true) > 0
+            nowOff := TitleHas("OFFLINE")
             if (nowOff != offline) {
                 offline := nowOff
                 if offline {
@@ -451,9 +445,7 @@ RunTake(isHeld, waitRelease) {
     ; Keep the dictation window focused until the clipboard write lands.
     label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
     ShowState(label, "B45309")
-    if !InStr(DictTitle(), "Too short", true)
-        staleShort := false
-    if !WaitForTranscript(label, &staleShort) {
+    if !WaitForTranscript(label) {
         FailState("⚠ TIMED OUT")
         Fail("Dictation FAILED: no transcript after " CLIP_TIMEOUT " s. Nothing was pasted. Check the dictation window.")
         ReturnFocus()
@@ -468,15 +460,17 @@ RunTake(isHeld, waitRelease) {
     ; never as text to paste into a chart.
     if InStr(txt, SENTINEL) {
         A_Clipboard := ""
-        title := SettledTitle()
-        ; A short press the page heard no words in: it ended quietly and says
-        ; "Too short" in its title (this press's, not the last click's —
-        ; staleShort). A grey line, no sound.
-        if (!capped && !staleShort && heldMs < 2000 && InStr(title, "Too short", true)) {
-            FlashState("TOO SHORT — NO WORDS", "4B5563", 1800)
+        ; A click, not a dictation: a press under CLICK_MS that brought back no
+        ; text. Grey for 2 s, no sound, no toast, nothing pasted. Whatever the
+        ; reason (nothing said, or a word the page could not send — it keeps
+        ; that recording and says so itself), the next step is the same: press
+        ; and hold to dictate.
+        if (!capped && heldMs < CLICK_MS) {
+            FlashState("TOO SHORT — NOT PASTED", "4B5563", 2000)
             ReturnFocus()
             return
         }
+        title := SettledTitle()
         if InStr(title, "will retry", true) {
             FailState("⚠ FAILED — WILL RETRY")
             Fail("Dictation FAILED: nothing was pasted. The recording is SAVED in the dictation window and is transcribed into its notes by itself once the connection is back — do not redictate.")
@@ -598,13 +592,15 @@ CancelPendingEnter() {
     SetTimer(FireEnter, 0)
 }
 
-; Click + paste, but never the failure marker into a chart.
+; Click + paste, but never the failure marker into a chart. A marker left on
+; the clipboard is an old outcome (that take already said so when it ended),
+; so this is not a new failure: it is cleared, the bar says there was nothing
+; to paste, and nothing is clicked or pasted. No sound, nothing that stays up.
 ClickPaste() {
     global SENTINEL, PASTE_DELAY_MS
     if InStr(A_Clipboard, SENTINEL) {
         A_Clipboard := ""
-        FailState("⚠ NOT PASTED")
-        Fail("The clipboard held the dictation-failed marker, so nothing was pasted.")
+        FlashState("NOTHING TO PASTE", "4B5563", 2000)
         return
     }
     Click

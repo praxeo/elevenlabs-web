@@ -36,6 +36,13 @@ STATE_BAR_W      := 250        ; at 100 % scaling; scaled automatically for high
 STATE_BAR_H      := 38
 STATE_BAR_MARGIN := 18         ; distance from the bottom-right corner of the work area
 
+; --- Mouse side buttons ---
+; Forward (XButton2) held = dictate. Back (XButton1): once = Enter, twice =
+; click + paste, with right-click = select all + copy. See the bottom of the file.
+DBLCLICK_MS    := 300          ; back-button double-press window
+COPY_DELAY_MS  := 30           ; delay between Ctrl+A and Ctrl+C
+PASTE_DELAY_MS := 100          ; delay after the click before Ctrl+V
+
 ; --- Phone-link clipboard poller (optional) ---
 PHONE_POLL_URL := ""           ; e.g. "https://eleven.example.workers.dev" (no trailing slash)
 PHONE_CODE     := ""           ; 6-char session code from the desktop page
@@ -47,6 +54,7 @@ DICT_HWND   := 0
 BUSY        := false
 PREV_HWND   := 0               ; the window you were in when the press started
 SPACE_GUARD := false           ; swallows a still-held Space after a Ctrl+Space take
+X1_WAITING  := false           ; a back-button press is waiting to see if a second one follows
 
 ; ===== On-screen state bar =====
 StateGui := ""
@@ -327,11 +335,14 @@ WaitForTranscript(label := "TRANSCRIBING…") {
     return false
 }
 
-; ===== Shared push-to-talk engine (used by CapsLock AND Ctrl+Space) =====
-; isHeld()      → true while the PTT key/chord is physically held
+; ===== Shared push-to-talk engine (CapsLock, Ctrl+Space AND the mouse's Forward button) =====
+; isHeld()      → true while the PTT key/chord/button is physically held
 ; waitRelease() → blocks until the PTT key is physically released
 PushToTalk(isHeld, waitRelease) {
     global DICT_HWND, BUSY
+    ; A back-button Enter still waiting to fire was meant for Cerner; once the
+    ; take focuses the dictation window it would land there instead.
+    CancelPendingEnter()
     if BUSY {                          ; another take (e.g. via the other hotkey) is running
         waitRelease()
         return
@@ -421,7 +432,7 @@ RunTake(isHeld, waitRelease) {
     capMin := Round(HOLD_CAP_MS / 60000)
     if capped {
         ErrBeep()
-        Notify("Recording STOPPED at the " capMin "-minute limit: anything said after that was NOT recorded. Let go of the key.")
+        Notify("Recording STOPPED at the " capMin "-minute limit: anything said after that was NOT recorded. Let go of the key or button.")
     }
 
     if (heldMs < MIN_HOLD) {
@@ -514,6 +525,8 @@ CapsRelease()  => KeyWait("CapsLock", "P")
 ; Chord counts as held only while BOTH keys are down — releasing either stops.
 ChordHeld()    => GetKeyState("Space", "P") && GetKeyState("Ctrl", "P")
 SpaceRelease() => KeyWait("Space", "P")
+X2Held()       => GetKeyState("XButton2", "P")
+X2Release()    => KeyWait("XButton2", "P")
 
 ; Clears the Space guard once Space is physically up.
 ClearSpaceGuard() {
@@ -553,6 +566,72 @@ $^Space::
 #HotIf SPACE_GUARD
 *Space::return
 #HotIf
+
+; ===== Push-to-talk #3: hold the mouse's Forward button (XButton2) =====
+; Identical pipeline. The button never does browser-Forward while this runs.
+*XButton2::PushToTalk(X2Held, X2Release)
+
+; ===== Mouse Back button (XButton1) =====
+; Once: Enter. Twice within DBLCLICK_MS: click where the pointer is, then paste.
+; Held with a right-click: select all, then copy.
+; Because Back+right-click is a combination, the plain Back action runs when the
+; button is RELEASED (and only if no right-click happened while it was held).
+; None of these act while a take is running.
+
+FireEnter() {
+    global X1_WAITING, BUSY
+    X1_WAITING := false
+    if BUSY                            ; a take began meanwhile: focus is on the dictation window
+        return
+    SendEvent("{Enter}")
+}
+
+CancelPendingEnter() {
+    global X1_WAITING
+    X1_WAITING := false
+    SetTimer(FireEnter, 0)
+}
+
+; Click + paste, but never the failure marker into a chart.
+ClickPaste() {
+    global SENTINEL, PASTE_DELAY_MS
+    if InStr(A_Clipboard, SENTINEL) {
+        A_Clipboard := ""
+        FailState("⚠ NOT PASTED")
+        Fail("The clipboard held the dictation-failed marker, so nothing was pasted.")
+        return
+    }
+    Click
+    Sleep(PASTE_DELAY_MS)
+    SendEvent("^v")
+}
+
+XButton1 & RButton::
+{
+    global BUSY, COPY_DELAY_MS
+    if BUSY
+        return
+    CancelPendingEnter()
+    SendEvent("^a")
+    Sleep(COPY_DELAY_MS)
+    SendEvent("^c")
+    KeyWait("RButton")
+    KeyWait("XButton1")
+}
+
+*XButton1::
+{
+    global BUSY, X1_WAITING, DBLCLICK_MS
+    if BUSY
+        return
+    if X1_WAITING {                    ; second press: click + paste instead of Enter
+        CancelPendingEnter()
+        ClickPaste()
+        return
+    }
+    X1_WAITING := true
+    SetTimer(FireEnter, -DBLCLICK_MS)
+}
 
 ; Shift+CapsLock toggles real caps lock — and restores AlwaysOff when turning
 ; it off (plain SetCapsLockState(0) would silently drop the AlwaysOff lock).

@@ -2768,6 +2768,8 @@ right lower quadrant"></textarea>
   let autoReportQueue     = [];    // failed takes' automatic reports waiting to reach the cloud log
   let outcomeSeq          = 0;     // counts take outcomes: a rescue may replace only its OWN failure's status
   let pressStartedAt      = 0;     // when the press that started this take arrived (before the mic start)
+  let pressEndedAt        = 0;     // when its release arrived (may be BEFORE the recorder started)
+  let startInFlight       = false; // startRecording is still acquiring the mic: no recorder yet
   let rescueCancel        = null;  // stops the background rescue's upload when a live take starts
   let reachDownStreak     = 0;     // consecutive failed server checks while recording
   let autoReportTimer     = null;
@@ -6076,8 +6078,28 @@ right lower quadrant"></textarea>
     if (reachTimer)         { clearTimeout(reachTimer);         reachTimer = null; }
   }
 
+  // [RELIABILITY] One start at a time, and the start is visible to the release
+  // paths (2026-11-23). Acquiring the mic can take a moment (a fresh
+  // getUserMedia after the window was hidden), and during it there is no
+  // recorder yet: an F14 arriving then used to read as "idle" and be dropped,
+  // so the take began after the last F14 — a mic nobody was holding — and a
+  // second press could start a second, overlapping take.
   async function startRecording() {
+    if (recording || stopping || finishing || startInFlight) return;
+    startInFlight = true;
+    try {
+      await startRecordingWork();
+    } finally {
+      startInFlight = false;
+    }
+  }
+
+  async function startRecordingWork() {
     if (recording || stopping || finishing) return;
+    // A new press: the last click's "Too short" leaves the title NOW, so the
+    // AutoHotkey bar can never read it as this press's outcome (hotkey.ahk
+    // trusts "Too short" only once the title has been without it since the press).
+    if (lastStatusMark === "tap") { lastStatusMark = ""; applyWindowState(); }
     if (recovering) {
       // A saved recording is being re-uploaded and is about to write its note
       // and the clipboard: a take started now would race both. Refuse LOUDLY
@@ -6096,6 +6118,7 @@ right lower quadrant"></textarea>
     serverUnreachable = false;
     reachDownStreak = 0;
     pressStartedAt = Date.now();
+    pressEndedAt = 0;
     if (rescueCancel) { try { rescueCancel(); } catch (e) {} }
     stopRequested = false;
     pendingStart = false;
@@ -6377,6 +6400,9 @@ right lower quadrant"></textarea>
   }
 
   function stopRecording() {
+    // The release time decides whether the press was a click (finishBatchSession);
+    // the first release counts, even one that arrived before the recorder started.
+    if (!pressEndedAt && (recording || startInFlight)) pressEndedAt = Date.now();
     if (!recording || stopping) {
       stopRequested = true;
       return;
@@ -6648,8 +6674,10 @@ right lower quadrant"></textarea>
     // failed upload (below), and on the phone a capture of pure zeros (the
     // iOS dead-mic capture that a short press slips past the watchdog with).
     // Both the recording AND the press must be short: a press held for two
-    // seconds whose mic took a second to start is not a click.
-    const pressMs = (recEndedAt && pressStartedAt) ? Math.max(0, recEndedAt - pressStartedAt) : recMs;
+    // seconds whose mic took a second to start is not a click. The press runs
+    // to its RELEASE: a click whose mic took a second to start is still a click.
+    const pressEnd = pressEndedAt || recEndedAt;
+    const pressMs = (pressEnd && pressStartedAt) ? Math.max(0, pressEnd - pressStartedAt) : recMs;
     const quietTap = !unexpected && !micAlarmFired && recMs > 0 && recMs < QUIET_TAP_MS &&
                      pressMs < QUIET_TAP_MS && !(noSignal && bigButtonActive());
 
@@ -9344,7 +9372,7 @@ right lower quadrant"></textarea>
     blurEditingNote(); // save a note mid-edit first (the take may add to it); drops the keyboard too
     bigBtnPointerId = e.pointerId !== undefined ? e.pointerId : -1;
     try { bigBtnEl.setPointerCapture(e.pointerId); } catch (err) {}
-    if (!recording && !stopping && !finishing) {
+    if (!recording && !stopping && !finishing && !startInFlight) {
       bigBtnEngaged = true;
       bigBtnDownAt = Date.now();
       startRecording();
@@ -9412,7 +9440,9 @@ right lower quadrant"></textarea>
 
   /* ───── Controls & Event Listeners ───── */
   recordBtn.onclick = () => {
-    if (recording) stopRecording();
+    // A second click while the mic is still starting means stop: it latches,
+    // and the take ends the moment it begins.
+    if (recording || startInFlight) stopRecording();
     else startRecording();
   };
 
@@ -9743,8 +9773,8 @@ right lower quadrant"></textarea>
       const alreadyEnding = stopping || finishing;
       if (recording && !alreadyEnding) {
         stopRecording();                 // the live capture ends here
-      } else if (stopRequested && !alreadyEnding) {
-        stopRecording();                 // latch: F14 beat the recorder's start
+      } else if ((stopRequested || startInFlight) && !alreadyEnding) {
+        stopRecording();                 // latch: F14 beat the recorder's start (the take stops the moment it begins)
       } else {
         // Idle, or the press that queued a start just ended: a session starting
         // AFTER the last F14 would violate the contract.
@@ -9760,7 +9790,7 @@ right lower quadrant"></textarea>
       // An unmodified key (e.g. plain Space) must stay typable in form fields
       if (inField && !(hotkey.ctrl || hotkey.alt || hotkey.meta)) return;
       e.preventDefault();
-      if (!recording && !stopping && !finishing) {
+      if (!recording && !stopping && !finishing && !startInFlight) {
         hotkeyEngaged = true;
         hotkeyDownAt = Date.now();
         startRecording();

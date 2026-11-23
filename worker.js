@@ -2976,6 +2976,8 @@ right lower quadrant"></textarea>
   // pasted). The owner: "If I just click the button, I don't need to see a
   // message that dictation failed after a half second click."
   const QUIET_TAP_MS          = 1000;
+  const START_STALL_MS        = 5000;   // a press whose mic has not started after this fails LOUD (9 s on the phone surface)
+  const START_STALL_PHONE_MS  = 9000;   // the phone's corpse probe + rebuild + retries can legitimately take ~6 s
   // A failed take at least this long is transcribed into a note automatically
   // once the server answers; a shorter one is quicker to redictate than to
   // find later (and a late duplicate of a redictated note would confuse).
@@ -6084,14 +6086,43 @@ right lower quadrant"></textarea>
   // recorder yet: an F14 arriving then used to read as "idle" and be dropped,
   // so the take began after the last F14 — a mic nobody was holding — and a
   // second press could start a second, overlapping take.
+  //
+  // A start must never hang in silence either (2026-11-23, "now mic isn't
+  // working"). The mic start awaits the browser: getUserMedia (a permission
+  // prompt may be waiting in this window) and AudioContext.resume(), which
+  // Chrome leaves PENDING — not rejected — while the page has had no click.
+  // With one start at a time, such a hang used to swallow every later press.
+  // So: (1) each press asks the browser to wake a suspended context with
+  // its own activation, which also settles a boot warm-up stuck on resume();
+  // (2) a start that has not reached the recorder after START_STALL_MS fails
+  // LOUD (sentinel + fail beep + what to do) and is abandoned — if it
+  // finishes later it records nothing (startTicket), and the next press
+  // starts afresh.
+  let startTicket = 0;
   async function startRecording() {
     if (recording || stopping || finishing || startInFlight) return;
+    try { if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(function () {}); } catch (e) {}
     startInFlight = true;
+    const ticket = ++startTicket;
+    const stall = setTimeout(function () { startStalled(ticket); }, bigButtonActive() ? START_STALL_PHONE_MS : START_STALL_MS);
     try {
-      await startRecordingWork();
+      await startRecordingWork(ticket);
     } finally {
-      startInFlight = false;
+      clearTimeout(stall);
+      if (ticket === startTicket) startInFlight = false; // an abandoned start never clears a newer one's flag
     }
+  }
+
+  async function startStalled(ticket) {
+    if (ticket !== startTicket || !startInFlight || recording) return;
+    startTicket++;          // the stuck start is abandoned: if it finishes later, it records nothing
+    startInFlight = false;  // the next press starts afresh
+    stopRequested = false;
+    pendingStart = false;
+    await writeSentinel();
+    setStatus("Recording did NOT start — the microphone did not answer (nothing was recorded). Click once inside this window; if the browser asks to use the microphone, allow it. Then press again." +
+      recordMicFailure("precapture-stalled"), "err");
+    failBeep();
   }
 
   // A press that arrives while the mic is still starting AND after that take's
@@ -6107,8 +6138,11 @@ right lower quadrant"></textarea>
     return true;
   }
 
-  async function startRecordingWork() {
+  async function startRecordingWork(ticket) {
     if (recording || stopping || finishing) return;
+    // After every wait below: a start the stall guard abandoned says nothing
+    // more and records nothing (its failure was already announced).
+    const abandoned = function () { return ticket !== undefined && ticket !== startTicket; };
     // A new press: the last click's "Too short" leaves the title NOW — the
     // title must never show an earlier take's outcome as this press's.
     if (lastStatusMark === "tap") { lastStatusMark = ""; applyWindowState(); }
@@ -6193,6 +6227,7 @@ right lower quadrant"></textarea>
         if (attempt < 2) await new Promise(function (r) { setTimeout(r, 350); });
       }
     }
+    if (abandoned()) return;
     if (audioErr) {
       await writeSentinel();
       setMicPill("fail");
@@ -6224,6 +6259,7 @@ right lower quadrant"></textarea>
         // tear down and rebuild internally, and an extra external teardown only
         // supersedes builds that other resume handlers may have in flight.
         try { await ensureAudio(); } catch (e) {}
+        if (abandoned()) return;
         // A rebuild that could not produce a graph must fail LOUD rather than
         // fall through — probeMicAlive treats a missing analyser as "alive"
         // (fail-safe for a cold graph), which would otherwise start a take with
@@ -6238,6 +6274,7 @@ right lower quadrant"></textarea>
         }
         micAlive = await probeMicAlive(MIC_PROBE_REBUILD_SETTLE_MS);
       }
+      if (abandoned()) return;
       if (!micAlive) {
         await writeSentinel();
         setMicPill("fail");
@@ -6250,6 +6287,7 @@ right lower quadrant"></textarea>
       setBigMicPill("ok");
     }
     if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
+    if (abandoned()) return;
     if (!audioCtx || audioCtx.state !== "running") {
       await writeSentinel();
       setStatus("Audio not running. Click page once, then try again.", "err");
@@ -6333,6 +6371,7 @@ right lower quadrant"></textarea>
     // Pure batch: no WebSocket, no pre-roll (the gate-in-path recording cannot
     // splice in pre-gate frames). The post-gate MediaRecorder IS the capture
     // path; upload happens on stop.
+    if (abandoned()) return;
     startBatchRecording();
   }
 

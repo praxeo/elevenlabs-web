@@ -6,13 +6,19 @@ SetKeyDelay(0, 10)
 
 ; ===== CONFIG =====
 SPINUP         := 80           ; ms before speaking (mic is kept warm by the browser)
-MIN_HOLD       := 200          ; taps shorter than this are discarded. Measured AFTER window
-                               ; activation + SPINUP, so the real threshold is ~280 ms+.
+MIN_HOLD       := 200          ; a tap shorter than this records nothing and ends quietly (grey
+                               ; bar, no sound). Measured AFTER window activation + SPINUP, so the
+                               ; real threshold is ~280 ms+. A press under ~1 s that the page heard
+                               ; no words in also ends quietly ("TOO SHORT"): the page says so in
+                               ; its window title. A real failure is still loud.
 CLIP_TIMEOUT   := 165          ; backstop; must cover the browser's batch deadline (hard-capped
                                ; at 150 s by UPLOAD_DEADLINE_MAX_MS) plus capture tail
 ACT_TIMEOUT    := 0.15         ; per-attempt window-activation wait
 ACT_TRIES      := 2
-HOLD_CAP_MS    := 60000        ; absolute max hold before we force-stop (anti-wedge)
+HOLD_CAP_MS    := 900000       ; 15 min: a hold this long is a stuck key, not a dictation. It was
+                               ; 60 s, which cut every long dictation off at 1:00 and switched the
+                               ; bar to TRANSCRIBING while you were still talking (2026-11-22).
+                               ; Hitting it now beeps, says so, and never starts another take.
 STRIP_NEWLINES := true
 TRAILING_SPACE := true
 ERR_SOUND      := true         ; the ONLY sound this script makes — on failure
@@ -98,6 +104,66 @@ FailState(msg) {
 }
 
 InitStateBar()
+
+; ===== The dictation window's title is the page's state =====
+; It can be read without focus. The page (worker.js, applyWindowState) puts
+; these words in it, and this script looks for them — change them in both:
+;   "OFFLINE"    a take is running and the page cannot reach its server
+;   "REC" / "Working"  a take is recording / being transcribed
+;   "Too short"     a click the page heard no words in: ended quietly
+;   "will retry"    a failed take whose recording is transcribed by itself later
+;   "Recovered"     ...and it was: the text is the newest note in the page
+;   "not recovered" ...and it could not be: retry it in the page, or redictate
+; The words are matched with case, so "Recovered" never matches "not recovered".
+DictTitle() {
+    global DICT_HWND
+    t := ""
+    try t := WinGetTitle("ahk_id " DICT_HWND)
+    return t
+}
+TitleHas(word) => InStr(DictTitle(), word, true) > 0
+
+; The page writes its outcome into its title just before it writes the
+; clipboard; give the browser a moment to pass a fresh title to the window.
+SettledTitle(ms := 500) {
+    deadline := A_TickCount + ms
+    loop {
+        t := DictTitle()
+        if (InStr(t, "Too short", true) || InStr(t, "FAILED", true) || InStr(t, "Done", true) || InStr(t, "Check", true) || InStr(t, "Recovered", true))
+            return t
+        if (A_TickCount >= deadline)
+            return t
+        Sleep(50)
+    }
+}
+
+; A failed LONG take is transcribed by the page itself once its server answers
+; again, into its notes list (never the clipboard: you may be in another chart
+; by then). Its title then says "Recovered"; this puts that on the bar, which
+; is what you see from Cerner.
+SetTimer(WatchForRecovered, 1000)
+WatchForRecovered() {
+    global BUSY, DICT_HWND
+    static shown := "", lost := false
+    if (BUSY || !DICT_HWND || !WinExist("ahk_id " DICT_HWND))
+        return
+    t := DictTitle()
+    if (InStr(t, "not recovered", true)) {
+        if (!lost) {
+            FailState("⚠ NOT RECOVERED — RETRY IN APP")
+            Fail("A saved dictation could NOT be transcribed by itself. Open the dictation window: retry it there, or redictate it.")
+        }
+        lost := true
+        return
+    }
+    lost := false
+    rec := InStr(t, "Recovered", true) > 0
+    if (rec && shown != t) {
+        ShowState("↺ RECOVERED — IN NOTES", "B45309")
+        Notify("A failed dictation was recovered: it is the newest note in the dictation window. Nothing was pasted — copy it from there.")
+    }
+    shown := rec ? t : ""
+}
 
 ; ===== Phone-link poller (non-blocking) =====
 LAST_DELIVERY_ID := ""
@@ -234,20 +300,28 @@ ReturnFocus() {
 ; Wait for transcript or sentinel. Unlike a single long ClipWait, this notices
 ; when the dictation window loses focus (the browser cannot write the clipboard
 ; without it) and says so, instead of silently running out the 165 s clock.
-WaitForTranscript() {
+; It also says when the page cannot reach its server (the page keeps trying,
+; and sends the recording again once it can).
+WaitForTranscript(label := "TRANSCRIBING…") {
     global CLIP_TIMEOUT, DICT_HWND
     deadline := A_TickCount + CLIP_TIMEOUT * 1000
-    lost := false
+    shown := label
+    nextLook := 0
     while (A_TickCount < deadline) {
         if ClipWait(0.25, 1)
             return true
-        nowLost := !WinActive("ahk_id " DICT_HWND)
-        if (nowLost != lost) {
-            lost := nowLost
-            if lost
-                ShowState("⚠ REFOCUS DICTATION", "7C2D12")
-            else
-                ShowState("TRANSCRIBING…", "B45309")
+        if (A_TickCount < nextLook)
+            continue
+        nextLook := A_TickCount + 500
+        if !WinActive("ahk_id " DICT_HWND)
+            want := "⚠ REFOCUS DICTATION", color := "7C2D12"
+        else if TitleHas("OFFLINE")
+            want := "TRANSCRIBING — NO CONNECTION", color := "9A3412"
+        else
+            want := label, color := "B45309"
+        if (want != shown) {
+            shown := want
+            ShowState(want, color)
         }
     }
     return false
@@ -297,11 +371,39 @@ RunTake(isHeld, waitRelease) {
     ShowState("● RECORDING", "B91C1C")
     Sleep(SPINUP)
 
-    ; Wait for release via PHYSICAL key state; hard cap prevents wedging.
+    ; Wait for release via PHYSICAL key state; the cap only catches a stuck key.
+    ; While you talk, the page's title says when it cannot reach its server, so
+    ; a long dictation into a dead connection is known while it is spoken —
+    ; not three minutes later.
+    ; sawTake: the page's title showed THIS take recording or working. Only
+    ; such a press can end as a quiet "Too short" — a press the page refused
+    ; before recording leaves the previous take's title up for a moment.
     startTick := A_TickCount
+    capped := false
+    offline := false
+    sawTake := false
+    nextLook := A_TickCount
     while isHeld() {
-        if (A_TickCount - startTick > HOLD_CAP_MS)
+        if (A_TickCount - startTick > HOLD_CAP_MS) {
+            capped := true
             break
+        }
+        if (A_TickCount >= nextLook) {
+            nextLook := A_TickCount + 100
+            t := DictTitle()
+            if (InStr(t, "REC", true) || InStr(t, "Working", true))
+                sawTake := true
+            nowOff := InStr(t, "OFFLINE", true) > 0
+            if (nowOff != offline) {
+                offline := nowOff
+                if offline {
+                    ShowState("● REC — NO CONNECTION", "9A3412")
+                    ErrBeep()
+                    Notify("The dictation window can't reach its server. Keep going: the recording is kept, and it is sent when the connection is back.")
+                } else
+                    ShowState("● RECORDING", "B91C1C")
+            }
+        }
         Sleep(15)
     }
     heldMs := A_TickCount - startTick
@@ -316,19 +418,31 @@ RunTake(isHeld, waitRelease) {
     Sleep(20)
     Send("{F14}")                      ; cheap insurance; browser ignores the 2nd
 
+    capMin := Round(HOLD_CAP_MS / 60000)
+    if capped {
+        ErrBeep()
+        Notify("Recording STOPPED at the " capMin "-minute limit: anything said after that was NOT recorded. Let go of the key.")
+    }
+
     if (heldMs < MIN_HOLD) {
-        FlashState("TAP IGNORED", "7C2D12", 1200)
-        Fail("Tap ignored (hold to dictate).")
+        ; A tap, not a dictation: nothing to wait for and nothing to alarm about.
+        FlashState("TAP — NOTHING RECORDED", "4B5563", 1200)
         ReturnFocus()
         return
     }
 
     ; Keep the dictation window focused until the clipboard write lands.
-    ShowState("TRANSCRIBING…", "B45309")
-    if !WaitForTranscript() {
+    label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
+    ShowState(label, "B45309")
+    t := DictTitle()
+    if (InStr(t, "REC", true) || InStr(t, "Working", true))
+        sawTake := true
+    if !WaitForTranscript(label) {
         FailState("⚠ TIMED OUT")
         Fail("Dictation FAILED: no transcript after " CLIP_TIMEOUT " s. Nothing was pasted. Check the dictation window.")
         ReturnFocus()
+        if capped
+            waitRelease()              ; never let a still-held key start another take
         return
     }
 
@@ -338,9 +452,24 @@ RunTake(isHeld, waitRelease) {
     ; never as text to paste into a chart.
     if InStr(txt, SENTINEL) {
         A_Clipboard := ""
-        FailState("⚠ FAILED")
-        Fail("Dictation FAILED: nothing was pasted. The dictation window says why (and offers Retry when the recording was kept).")
+        title := SettledTitle()
+        ; A short press the page recorded and heard no words in: it ended
+        ; quietly and says "Too short" in its title. A grey line, no sound.
+        if (!capped && sawTake && heldMs < 2000 && InStr(title, "Too short", true)) {
+            FlashState("TOO SHORT — NO WORDS", "4B5563", 1800)
+            ReturnFocus()
+            return
+        }
+        if InStr(title, "will retry", true) {
+            FailState("⚠ FAILED — WILL RETRY")
+            Fail("Dictation FAILED: nothing was pasted. The recording is SAVED in the dictation window and is transcribed into its notes by itself once the connection is back — do not redictate.")
+        } else {
+            FailState("⚠ FAILED")
+            Fail("Dictation FAILED: nothing was pasted. The dictation window says why (and offers Retry when the recording was kept).")
+        }
         ReturnFocus()
+        if capped
+            waitRelease()
         return
     }
 
@@ -353,6 +482,8 @@ RunTake(isHeld, waitRelease) {
         FailState("⚠ EMPTY")
         Fail("Dictation FAILED: the transcript was empty. Nothing was pasted.")
         ReturnFocus()
+        if capped
+            waitRelease()
         return
     }
     if TRAILING_SPACE
@@ -367,6 +498,13 @@ RunTake(isHeld, waitRelease) {
     pasted := ReturnFocus()
     if (AUTO_PASTE && pasted)
         Send("^v")
+    if capped {
+        ; The text is real but stops at the limit: say so until the next press,
+        ; and never let the still-held key start another take.
+        ShowState("⚠ STOPPED AT " capMin " MIN — CHECK THE END", "B45309")
+        waitRelease()
+        return
+    }
     FlashState(AUTO_PASTE && pasted ? "✓ PASTED" : "✓ READY", "15803D", 900)
 }
 

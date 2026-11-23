@@ -6109,9 +6109,8 @@ right lower quadrant"></textarea>
 
   async function startRecordingWork() {
     if (recording || stopping || finishing) return;
-    // A new press: the last click's "Too short" leaves the title NOW, so the
-    // AutoHotkey bar can never read it as this press's outcome (hotkey.ahk
-    // trusts "Too short" only once the title has been without it since the press).
+    // A new press: the last click's "Too short" leaves the title NOW — the
+    // title must never show an earlier take's outcome as this press's.
     if (lastStatusMark === "tap") { lastStatusMark = ""; applyWindowState(); }
     if (recovering) {
       // A saved recording is being re-uploaded and is about to write its note

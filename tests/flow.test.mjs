@@ -7633,5 +7633,135 @@ console.log('--- scenario 59: report a mistake ---');
   dom59b.window.close();
 }
 
+// ===== Scenario 62: a release that beats the mic's start (2026-11-23) =====
+// The owner: a quick click "doesn't need such a crazy loud and persistent
+// failure". Tracing it found a worse case behind it: when the page has to
+// start the mic afresh (the window was hidden behind Cerner), an AutoHotkey
+// click's F14 could arrive while startRecording was still awaiting the mic.
+// The F14 branch saw "not recording" and treated it as idle, so the release
+// was LOST and the take began after the last F14 — a mic nobody was holding,
+// whose words would reach the clipboard on the next press. Now the release
+// latches a stop and the take ends the moment the recorder starts; it is
+// timed from the press to the RELEASE (not to the end of a slow mic start), so
+// a click stays a quiet "Too short", and a held press stays loud.
+console.log('--- scenario 62: a release that arrives while the mic is still starting ---');
+{
+  const st62 = { auto: true, pending: [], recorders: 0, posts: 0, vibes: [] };
+  const dom62 = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+      win.navigator.vibrate = (p) => { st62.vibes.push(JSON.stringify(p)); return true; };
+      Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true });
+      // A fresh getUserMedia that the test releases by hand: the slow mic start.
+      win.navigator.mediaDevices = { getUserMedia: () => {
+        micTrack.readyState = 'live'; micTrack.muted = false;
+        if (st62.auto) return Promise.resolve(mockStream);
+        return new Promise((res) => st62.pending.push(() => res(mockStream)));
+      }, addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; st62.recorders++; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = (url) => {
+        if (String(url).includes('/api/ping')) return Promise.resolve({ ok: true, status: 204, headers: { get: () => null }, text: () => Promise.resolve('') });
+        st62.posts++;
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":""}') });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-62');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (62):', e.message); failures++; });
+    },
+  });
+  const W62 = dom62.window, D62 = W62.document;
+  const key62 = (code) => D62.dispatchEvent(new W62.KeyboardEvent('keydown', { code: code }));
+  const recording62 = () => D62.getElementById('recordBtn').textContent.includes('Stop');
+  const status62 = () => D62.getElementById('status').textContent.trim();
+  const failBeeps62 = () => st62.vibes.filter((v) => v === '[220,90,220]').length;
+  const slowStart62 = () => { W62.dispatchEvent(new W62.Event('pagehide')); st62.auto = false; }; // the next press rebuilds the mic
+  const micReady62 = () => { st62.auto = true; const p = st62.pending.splice(0); p.forEach((f) => f()); };
+  await sleep(250);
+  micRms = 0.0; // nothing said
+
+  // 62a: a click whose F14 arrives while the mic is still starting.
+  slowStart62();
+  W62._clip = '';
+  key62('F13');
+  await sleep(40);
+  check('s62a: the mic is still starting when the release arrives', st62.pending.length === 1 && !recording62(), st62.pending.length);
+  key62('F13'); // a stray second press during the start must not start a second take
+  key62('F14');
+  await sleep(20);
+  key62('F14'); // hotkey.ahk sends F14 twice
+  await sleep(30);
+  micReady62();
+  await sleep(450);
+  check('s62a: the mic is NOT left recording after the last F14 (the release used to be lost)', !recording62(), D62.getElementById('recordBtn').textContent);
+  check('s62a: exactly one take was started', st62.recorders === 1, st62.recorders);
+  check('s62a: the clipboard gets the sentinel (nothing stale can be pasted)', W62._clip === '##DICTATION_FAILED##', JSON.stringify(W62._clip));
+  check('s62a: it ends as a quiet "Too short", not a failure', /Too short/.test(status62()) && !D62.getElementById('status').className.includes('err'), status62());
+  check('s62a: ...with "Too short" in the title for the AutoHotkey bar', D62.title.includes('Too short'), D62.title);
+  check('s62a: ...and no fail beep', failBeeps62() === 0, st62.vibes.join(' '));
+
+  // 62b: a click whose mic took over a second to start: still a click.
+  slowStart62();
+  key62('F13');
+  await sleep(300);
+  check('s62b: a new press takes the last click\'s "Too short" out of the title at once (the AutoHotkey bar must not read it as this press)', !D62.title.includes('Too short'), D62.title);
+  key62('F14');
+  await sleep(1000);
+  check('s62b: still waiting on the mic a second later', st62.pending.length === 1 && !recording62(), st62.pending.length);
+  micReady62();
+  await sleep(450);
+  check('s62b: a click on a slow mic start is timed to its RELEASE: quiet "Too short"', /Too short/.test(status62()) && failBeeps62() === 0, status62());
+  check('s62b: not recording afterwards', !recording62());
+
+  // 62c: a HELD press (1.2 s) released before the mic started: words may have
+  // been lost, so it stays loud.
+  slowStart62();
+  key62('F13');
+  await sleep(1200);
+  key62('F14');
+  await sleep(30);
+  micReady62();
+  await sleep(450);
+  check('s62c: a held press the mic missed is LOUD', D62.getElementById('status').className.includes('err') && !/Too short/.test(status62()), status62());
+  check('s62c: ...with FAILED in the title and a fail beep', D62.title.includes('FAILED') && failBeeps62() === 1, D62.title + ' / ' + failBeeps62());
+  check('s62c: not recording afterwards', !recording62());
+
+  // 62e: the record button toggles: a second click while the mic is still
+  // starting means stop (it latches), never a second take.
+  slowStart62();
+  const rec62e = st62.recorders;
+  D62.getElementById('recordBtn').click();
+  await sleep(40);
+  D62.getElementById('recordBtn').click();
+  await sleep(30);
+  micReady62();
+  await sleep(450);
+  check('s62e: a second click during the mic start stops the take (no second take, nothing left recording)', st62.recorders === rec62e + 1 && !recording62() && /Too short/.test(status62()), (st62.recorders - rec62e) + ' / ' + status62());
+
+  // 62d: an ordinary held take afterwards still records and stops normally.
+  micRms = 0.05;
+  key62('F13');
+  await sleep(150);
+  check('s62d: the next press records', recording62());
+  key62('F14');
+  await sleep(450);
+  check('s62d: ...and its F14 stops it', !recording62());
+  dom62.window.close();
+  micRms = 0.05;
+}
+
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
 process.exit(failures ? 1 : 0);

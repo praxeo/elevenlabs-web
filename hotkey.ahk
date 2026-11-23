@@ -309,8 +309,9 @@ ReturnFocus() {
 ; when the dictation window loses focus (the browser cannot write the clipboard
 ; without it) and says so, instead of silently running out the 165 s clock.
 ; It also says when the page cannot reach its server (the page keeps trying,
-; and sends the recording again once it can).
-WaitForTranscript(label := "TRANSCRIBING…") {
+; and sends the recording again once it can). staleShort is cleared once the
+; title has been seen without the last click's "Too short" (see RunTake).
+WaitForTranscript(label, &staleShort) {
     global CLIP_TIMEOUT, DICT_HWND
     deadline := A_TickCount + CLIP_TIMEOUT * 1000
     shown := label
@@ -321,6 +322,8 @@ WaitForTranscript(label := "TRANSCRIBING…") {
         if (A_TickCount < nextLook)
             continue
         nextLook := A_TickCount + 500
+        if !InStr(DictTitle(), "Too short", true)
+            staleShort := false
         if !WinActive("ahk_id " DICT_HWND)
             want := "⚠ REFOCUS DICTATION", color := "7C2D12"
         else if TitleHas("OFFLINE")
@@ -378,6 +381,13 @@ RunTake(isHeld, waitRelease) {
         return
     }
 
+    ; staleShort: the title still shows the LAST click's "Too short". Until the
+    ; title has been seen without it, a "Too short" cannot be this press's
+    ; outcome (a press the page refused would otherwise read as a quiet click).
+    ; The page drops it from the title the moment a press arrives, so it is
+    ; normally cleared on the first look below — even when the mic is slow to
+    ; start and the page never shows REC before the release.
+    staleShort := InStr(DictTitle(), "Too short", true) > 0
     Send("{F13}")
     ShowState("● RECORDING", "B91C1C")
     Sleep(SPINUP)
@@ -386,13 +396,9 @@ RunTake(isHeld, waitRelease) {
     ; While you talk, the page's title says when it cannot reach its server, so
     ; a long dictation into a dead connection is known while it is spoken —
     ; not three minutes later.
-    ; sawTake: the page's title showed THIS take recording or working. Only
-    ; such a press can end as a quiet "Too short" — a press the page refused
-    ; before recording leaves the previous take's title up for a moment.
     startTick := A_TickCount
     capped := false
     offline := false
-    sawTake := false
     nextLook := A_TickCount
     while isHeld() {
         if (A_TickCount - startTick > HOLD_CAP_MS) {
@@ -402,8 +408,8 @@ RunTake(isHeld, waitRelease) {
         if (A_TickCount >= nextLook) {
             nextLook := A_TickCount + 100
             t := DictTitle()
-            if (InStr(t, "REC", true) || InStr(t, "Working", true))
-                sawTake := true
+            if !InStr(t, "Too short", true)
+                staleShort := false
             nowOff := InStr(t, "OFFLINE", true) > 0
             if (nowOff != offline) {
                 offline := nowOff
@@ -445,10 +451,9 @@ RunTake(isHeld, waitRelease) {
     ; Keep the dictation window focused until the clipboard write lands.
     label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
     ShowState(label, "B45309")
-    t := DictTitle()
-    if (InStr(t, "REC", true) || InStr(t, "Working", true))
-        sawTake := true
-    if !WaitForTranscript(label) {
+    if !InStr(DictTitle(), "Too short", true)
+        staleShort := false
+    if !WaitForTranscript(label, &staleShort) {
         FailState("⚠ TIMED OUT")
         Fail("Dictation FAILED: no transcript after " CLIP_TIMEOUT " s. Nothing was pasted. Check the dictation window.")
         ReturnFocus()
@@ -464,9 +469,10 @@ RunTake(isHeld, waitRelease) {
     if InStr(txt, SENTINEL) {
         A_Clipboard := ""
         title := SettledTitle()
-        ; A short press the page recorded and heard no words in: it ended
-        ; quietly and says "Too short" in its title. A grey line, no sound.
-        if (!capped && sawTake && heldMs < 2000 && InStr(title, "Too short", true)) {
+        ; A short press the page heard no words in: it ended quietly and says
+        ; "Too short" in its title (this press's, not the last click's —
+        ; staleShort). A grey line, no sound.
+        if (!capped && !staleShort && heldMs < 2000 && InStr(title, "Too short", true)) {
             FlashState("TOO SHORT — NO WORDS", "4B5563", 1800)
             ReturnFocus()
             return

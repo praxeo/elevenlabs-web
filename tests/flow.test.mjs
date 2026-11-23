@@ -7751,6 +7751,42 @@ console.log('--- scenario 62: a release that arrives while the mic is still star
   await sleep(450);
   check('s62e: a second click during the mic start stops the take (no second take, nothing left recording)', st62.recorders === rec62e + 1 && !recording62() && /Too short/.test(status62()), (st62.recorders - rec62e) + ' / ' + status62());
 
+  // 62f: a click, then a REAL press while the mic is still starting: the
+  // second press continues the take that is starting (the latched stop is
+  // undone) — it used to be ignored, and the dictation was lost.
+  micRms = 0.05;
+  slowStart62();
+  const rec62f = st62.recorders, posts62f = st62.posts;
+  key62('F13');
+  await sleep(40);
+  key62('F14');          // the click's release, before the mic is ready
+  await sleep(40);
+  key62('F13');          // the real press, still before the mic is ready
+  await sleep(40);
+  micReady62();
+  await sleep(300);
+  check('s62f: the second press records once the mic is ready (it is not dropped)', recording62(), D62.getElementById('recordBtn').textContent + ' / ' + status62());
+  await sleep(900);
+  key62('F14');
+  await sleep(450);
+  check('s62f: ...one take, stopped by the second release, and sent', st62.recorders === rec62f + 1 && !recording62() && st62.posts === posts62f + 1, (st62.recorders - rec62f) + ' takes / ' + (st62.posts - posts62f) + ' uploads');
+
+  // 62g: the record button the same way: start, stop (before the mic), start
+  // again (before the mic) = recording.
+  slowStart62();
+  D62.getElementById('recordBtn').click();
+  await sleep(30);
+  D62.getElementById('recordBtn').click();
+  await sleep(30);
+  D62.getElementById('recordBtn').click();
+  await sleep(30);
+  micReady62();
+  await sleep(300);
+  check('s62g: start / stop / start before the mic is ready leaves it recording', recording62(), status62());
+  D62.getElementById('recordBtn').click();
+  await sleep(450);
+  check('s62g: ...and the next click stops it', !recording62());
+
   // 62d: an ordinary held take afterwards still records and stops normally.
   micRms = 0.05;
   key62('F13');

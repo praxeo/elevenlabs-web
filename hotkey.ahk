@@ -5,7 +5,9 @@ SendMode("Event")              ; reliable while the PTT key is physically held
 SetKeyDelay(0, 10)
 
 ; ===== CONFIG =====
-SPINUP         := 80           ; ms before speaking (mic is kept warm by the browser)
+SPINUP         := 80           ; ms before the bar looks at the page (the desktop keeps the mic warm)
+MIC_WAIT_MS    := 3000         ; the page has not started recording this long after the press:
+                               ; the bar says the mic did NOT start (talking now is not recorded)
 MIN_HOLD       := 200          ; a tap shorter than this records nothing and ends quietly (grey
                                ; bar, no sound). Measured AFTER window activation + SPINUP, so the
                                ; real threshold is ~280 ms+.
@@ -61,6 +63,8 @@ BUSY        := false
 PREV_HWND   := 0               ; the window you were in when the press started
 SPACE_GUARD := false           ; swallows a still-held Space after a Ctrl+Space take
 X1_WAITING  := false           ; a back-button press is waiting to see if a second one follows
+PHASE       := ""              ; "hold" while a take records, "wait" while it is being transcribed
+WARNED_PRESS := false          ; a press made during the wait was told it records nothing (cleared once let go)
 
 ; ===== On-screen state bar =====
 StateGui := ""
@@ -346,12 +350,34 @@ WaitForTranscript(label := "TRANSCRIBING…") {
 ; isHeld()      → true while the PTT key/chord/button is physically held
 ; waitRelease() → blocks until the PTT key is physically released
 PushToTalk(isHeld, waitRelease) {
-    global DICT_HWND, BUSY
+    global DICT_HWND, BUSY, PHASE, WARNED_PRESS
     ; A back-button Enter still waiting to fire was meant for Cerner; once the
     ; take focuses the dictation window it would land there instead.
     CancelPendingEnter()
-    if BUSY {                          ; another take (e.g. via the other hotkey) is running
+    if BUSY {
+        ; Another take owns the dictation window. NEVER block here: this thread
+        ; interrupts that take's, which cannot go on until this one returns (it
+        ; used to wait for this key's release, freezing the other take's
+        ; clipboard watch). During that take's hold this is just the key's
+        ; auto-repeat. While it is still being transcribed, THIS press records
+        ; nothing — it used to be swallowed without a word, so a dictation
+        ; spoken then was simply lost (2026-11-24). Say so at once.
+        if (PHASE = "wait" && !WARNED_PRESS) {
+            WARNED_PRESS := true
+            ShowState("⚠ WAIT — NOT RECORDING", "B91C1C")
+            ErrBeep()
+            SetTimer(ClearWarnedPress, 50)
+        }
+        return
+    }
+    if WARNED_PRESS {
+        ; Still the press made during the previous take's wait (CapsLock's
+        ; auto-repeat brings it here once that take is done). A take started
+        ; now would begin in the middle of what is being said and lose its
+        ; start without a word: let go, then press again.
+        ShowState("⚠ LET GO, THEN PRESS AGAIN", "B91C1C")
         waitRelease()
+        HideState()
         return
     }
     if (!DICT_HWND || !WinExist("ahk_id " DICT_HWND)) {
@@ -361,6 +387,7 @@ PushToTalk(isHeld, waitRelease) {
         return
     }
     BUSY := true
+    PHASE := "hold"
     try {
         RunTake(isHeld, waitRelease)
     } catch as err {
@@ -368,15 +395,28 @@ PushToTalk(isHeld, waitRelease) {
         Fail("Dictation script error: " err.Message " — nothing was pasted.")
     } finally {
         BUSY := false                  ; can never stick, whatever happened above
+        PHASE := ""
+    }
+}
+
+; True while any push-to-talk input is physically held.
+AnyPttHeld() => GetKeyState("CapsLock", "P") || GetKeyState("XButton2", "P") || (GetKeyState("Space", "P") && GetKeyState("Ctrl", "P"))
+
+ClearWarnedPress() {
+    global WARNED_PRESS
+    if !AnyPttHeld() {
+        WARNED_PRESS := false
+        SetTimer(ClearWarnedPress, 0)
     }
 }
 
 RunTake(isHeld, waitRelease) {
-    global DICT_HWND, SPINUP, MIN_HOLD, CLICK_MS, HOLD_CAP_MS, CLIP_TIMEOUT
-    global STRIP_NEWLINES, TRAILING_SPACE, SENTINEL, PREV_HWND, AUTO_PASTE
+    global DICT_HWND, SPINUP, MIN_HOLD, CLICK_MS, HOLD_CAP_MS, CLIP_TIMEOUT, MIC_WAIT_MS
+    global STRIP_NEWLINES, TRAILING_SPACE, SENTINEL, PREV_HWND, AUTO_PASTE, PHASE
 
     A_Clipboard := ""
     PREV_HWND := WinActive("A")        ; remember where you were BEFORE stealing focus
+    failedBefore := InStr(DictTitle(), "FAILED", true) > 0  ; an earlier take's FAILED is not this one's
 
     if !ActivateWindow(DICT_HWND) {
         FailState("⚠ NO FOCUS")
@@ -386,16 +426,22 @@ RunTake(isHeld, waitRelease) {
     }
 
     Send("{F13}")
-    ShowState("● RECORDING", "B91C1C")
     Sleep(SPINUP)
 
     ; Wait for release via PHYSICAL key state; the cap only catches a stuck key.
-    ; While you talk, the page's title says when it cannot reach its server, so
-    ; a long dictation into a dead connection is known while it is spoken —
-    ; not three minutes later.
+    ; RECORDING is shown only once the page's title says REC — its recorder is
+    ; running. A mic the page has to open afresh can take a second or more, and
+    ; words said before the recorder starts are not recorded: the bar used to
+    ; say RECORDING at the press regardless (2026-11-24). While you talk, the
+    ; title also says when the page cannot reach its server, so a long
+    ; dictation into a dead connection is known while it is spoken.
     startTick := A_TickCount
     capped := false
     offline := false
+    recSeen := false
+    noMicWarned := false
+    micFailed := false
+    shown := ""
     nextLook := A_TickCount
     while isHeld() {
         if (A_TickCount - startTick > HOLD_CAP_MS) {
@@ -404,15 +450,45 @@ RunTake(isHeld, waitRelease) {
         }
         if (A_TickCount >= nextLook) {
             nextLook := A_TickCount + 100
-            nowOff := TitleHas("OFFLINE")
-            if (nowOff != offline) {
+            t := DictTitle()
+            if (!recSeen && InStr(t, "REC", true))
+                recSeen := true
+            nowOff := InStr(t, "OFFLINE", true) > 0
+            ; FAILED appearing now (not left over from an earlier take) is THIS
+            ; press: the mic did not start, or it died mid-take (the page's
+            ; alarm). Either way, what is said from here is not recorded.
+            failedNow := InStr(t, "FAILED", true) > 0
+            if (failedNow && !failedBefore && !micFailed) {
+                micFailed := true
+                ErrBeep()
+                Notify(recSeen ? "The microphone FAILED during this dictation. Let go and check the dictation window before trusting the text."
+                               : "The microphone did NOT start: nothing you say now is recorded. Let go and check the dictation window.")
+            }
+            failedBefore := failedNow
+            if micFailed {
+                want := recSeen ? "⚠ MIC FAILED — LET GO" : "⚠ MIC NOT STARTED — LET GO", color := "B91C1C"
+            } else if recSeen {
+                want := nowOff ? "● REC — NO CONNECTION" : "● RECORDING"
+                color := nowOff ? "9A3412" : "B91C1C"
+            } else if (A_TickCount - startTick > MIC_WAIT_MS) {
+                want := "⚠ MIC NOT STARTED — LET GO", color := "B91C1C"
+                if !noMicWarned {
+                    noMicWarned := true
+                    ErrBeep()
+                    Notify("The microphone has not started: nothing you say now is recorded. Let go, check the dictation window (a permission prompt?), then press again.")
+                }
+            } else
+                want := "○ MIC STARTING — WAIT", color := "B45309"
+            if (want != shown) {
+                shown := want
+                ShowState(want, color)
+            }
+            if (recSeen && nowOff != offline) {
                 offline := nowOff
                 if offline {
-                    ShowState("● REC — NO CONNECTION", "9A3412")
                     ErrBeep()
                     Notify("The dictation window can't reach its server. Keep going: the recording is kept, and it is sent when the connection is back.")
-                } else
-                    ShowState("● RECORDING", "B91C1C")
+                }
             }
         }
         Sleep(15)
@@ -443,6 +519,7 @@ RunTake(isHeld, waitRelease) {
     }
 
     ; Keep the dictation window focused until the clipboard write lands.
+    PHASE := "wait"                    ; a press from here on records nothing: PushToTalk says so
     label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
     ShowState(label, "B45309")
     if !WaitForTranscript(label) {
@@ -505,7 +582,15 @@ RunTake(isHeld, waitRelease) {
         ClipWait(2, 1)
     }
 
-    ; SUCCESS: silent. Hand focus back; paste only onto the exact original window.
+    ; SUCCESS: silent — unless the page says to check the text (its title reads
+    ; "Check": the mic started late so the first words may be missing, voices
+    ; were cut, or the transcript may be incomplete). Then the bar stays amber
+    ; until the next press. Read before focus leaves (the title follows the
+    ; clipboard by a moment).
+    outTitle := SettledTitle()
+    checkIt := InStr(outTitle, "Check", true) > 0
+    redIt := InStr(outTitle, "FAILED", true) > 0   ; text came back, but the page says something went wrong
+    ; Hand focus back; paste only onto the exact original window.
     pasted := ReturnFocus()
     if (AUTO_PASTE && pasted)
         Send("^v")
@@ -514,6 +599,16 @@ RunTake(isHeld, waitRelease) {
         ; and never let the still-held key start another take.
         ShowState("⚠ STOPPED AT " capMin " MIN — CHECK THE END", "B45309")
         waitRelease()
+        return
+    }
+    if redIt {
+        FailState(AUTO_PASTE && pasted ? "⚠ PASTED — VERIFY IT" : "⚠ COPIED — VERIFY IT")
+        Fail("Copied, but the dictation window reports a PROBLEM with this take (the mic dropped, or the text is partial). Verify it before using it.")
+        return
+    }
+    if checkIt {
+        ShowState(AUTO_PASTE && pasted ? "⚠ PASTED — CHECK IT" : "⚠ READY — CHECK IT", "B45309")
+        Notify("Copied, but CHECK it: the dictation window says why (e.g. the mic started late and the first words may be missing).")
         return
     }
     FlashState(AUTO_PASTE && pasted ? "✓ PASTED" : "✓ READY", "15803D", 900)
@@ -548,6 +643,12 @@ ClearSpaceGuard() {
     Notify("Dictation window registered:`n" (title != "" ? title : "(untitled window)"))
 }
 
+; Two threads per push-to-talk hotkey: a press (or CapsLock's auto-repeat)
+; while a take runs must reach PushToTalk, which ignores a repeat during the
+; hold and SAYS that a press during the transcription wait records nothing.
+; With one thread it was dropped before any code ran.
+#MaxThreadsPerHotkey 2
+
 ; ===== Push-to-talk #1: hold CapsLock =====
 *CapsLock::PushToTalk(CapsHeld, CapsRelease)
 
@@ -570,6 +671,7 @@ $^Space::
 ; ===== Push-to-talk #3: hold the mouse's Forward button (XButton2) =====
 ; Identical pipeline. The button never does browser-Forward while this runs.
 *XButton2::PushToTalk(X2Held, X2Release)
+#MaxThreadsPerHotkey 1
 
 ; ===== Mouse Back button (XButton1) =====
 ; Once: Enter. Twice within DBLCLICK_MS: click where the pointer is, then paste.

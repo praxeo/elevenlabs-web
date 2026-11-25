@@ -4265,7 +4265,9 @@ right lower quadrant"></textarea>
     updateRecoverChip();
     if (journalRecoverBtn) journalRecoverBtn.disabled = false;
     if (!r.ok || !r.text || !r.text.trim()) {
-      setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try again.", "err");
+      setStatus(r.ok
+        ? "The retry came back with NO words again — this recording may hold no speech. It is KEPT: try again, listen to it in Diagnostics, or Discard it."
+        : "Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try again.", "err");
       failBeep();
       return; // keep pendingRecovery + the journal record for another attempt
     }
@@ -4434,6 +4436,9 @@ right lower quadrant"></textarea>
   }
 
   async function copyText(text) {
+    // Any other copy (a note's Copy, a newer delivery) supersedes a held one:
+    // the held text is in its note, and the clipboard now holds what was chosen.
+    if (pendingCopyText && text !== pendingCopyText) { pendingCopyText = ""; pendingCopyUntil = 0; pendingCopyMsg = ""; }
     const ok = await clipboardWrite(text);
     setStatus(ok ? "Copied to clipboard."
                  : (bigButtonActive() ? "Clipboard copy failed — tap Copy again."
@@ -6159,8 +6164,11 @@ right lower quadrant"></textarea>
           ? "Allow it in Settings → Safari → Microphone (or the aA menu → Website Settings), then reload."
           : "Open the site settings (the icon at the left of the address/title bar), set Microphone to Allow, then press again."), "err");
     } else if (micPermState === "prompt") {
-      if (atBoot && !micEverGranted) {
-        setStatus("Press record once and allow the microphone when the browser asks.", "");
+      if (isLikelyIOS()) {
+        // Safari's default "Ask" reads "prompt" at every launch: not news, and
+        // a warning on every launch would teach the warning away.
+      } else if (!micEverGranted) {
+        if (statusIsBootHint) setStatus("Press record once and allow the microphone when the browser asks.", "");
       } else {
         setStatus("The microphone permission has lapsed — the next press will ASK for it. Answer the browser's prompt with Allow" +
           (isLikelyIOS() ? "" : " (choose Allow on every visit, not just this time)") + ".", "warn");
@@ -6224,7 +6232,9 @@ right lower quadrant"></textarea>
       // sentinel, no beep, nothing — while the AutoHotkey bar waited 165 s.
       // Nothing was recorded, so this is the loud pre-capture failure.
       try { if (mediaRecorder && mediaRecorder.state !== "inactive" && !recording) mediaRecorder.stop(); } catch (e) {}
+      if (recording && stopRequested) { stopRequested = false; try { stopRecording(); } catch (e) {} } // the release already came
       if (!recording) {
+        try { if (!bigButtonActive()) releaseWakeLock(); } catch (e) {}
         try { sessionFinalized = true; } catch (e) {}
         try { await writeSentinel(); } catch (e) {}
         setStatus("Recording did NOT start — internal error (" + String((err && err.message) || err).slice(0, 120) +
@@ -6538,7 +6548,11 @@ right lower quadrant"></textarea>
       return;
     }
 
+    // Bound to THIS recorder: one finalized by the stop backstop may still fire
+    // late events while the next take records, and they must not touch it.
+    const thisRecorder = mediaRecorder;
     mediaRecorder.ondataavailable = (e) => {
+      if (thisRecorder !== mediaRecorder) return;
       if (e.data && e.data.size > 0) {
         chunks.push(e.data);
         journalAppend(e.data); // crash-safe mirror to IndexedDB (best-effort, non-blocking)
@@ -6546,7 +6560,7 @@ right lower quadrant"></textarea>
       }
     };
     mediaRecorder.onstop = () => {
-      if (sessionFinalized) return;
+      if (thisRecorder !== mediaRecorder || sessionFinalized) return;
       finalizeSession(false);
     };
     // Loudness evidence for the speaker filter, in the recording's own time
@@ -6642,10 +6656,11 @@ right lower quadrant"></textarea>
       // used to leave the page on "Stopping…" forever with every press queued
       // behind it. Finalize with the chunks already delivered (the timeslice
       // hands one over every second) and say the end may be missing.
-      var mySeq = sessionSeq;
+      var mySeq = sessionSeq, myRecorder = mediaRecorder;
       setTimeout(function () {
         if (sessionFinalized || mySeq !== sessionSeq) return;
         recorderStopLost = true;
+        try { myRecorder.ondataavailable = null; myRecorder.onstop = null; } catch (e) {} // it may still fire, late
         finalizeSession(false);
       }, RECORDER_STOP_BACKSTOP_MS);
     } else {
@@ -6954,7 +6969,7 @@ right lower quadrant"></textarea>
       // mic heard speech on this take: keep the recording for Retry instead of
       // deleting it (an empty result, or a body that was not JSON — a proxy or
       // block page — used to discard the only copy). Still the loud failure.
-      var keptEmpty = !quietTap && speechDetected && armUploadRecovery(blob, "the service returned no words", recMs, "no-words");
+      var keptEmpty = !quietTap && speechDetected && gateOpenMs >= 800 && armUploadRecovery(blob, "the service returned no words", recMs, "no-words");
       if (keptEmpty && takeTimings) takeTimings.errKind = "no-words";
       await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap, missedStart: missedStart,
         keepJournal: keptEmpty, recoverable: keptEmpty });
@@ -7213,7 +7228,13 @@ right lower quadrant"></textarea>
         // moment this window is focused again — the AutoHotkey bar says
         // "REFOCUS DICTATION" and is still waiting for it — but only while that
         // wait can still be running (a later press must never get THIS text).
-        if (!joinedSessionCode) holdCopyForFocus(cleaned, label + " copied (after you clicked back into this window). Done!");
+        if (!joinedSessionCode) holdCopyForFocus(cleaned,
+          (opts.unexpected || micAlarmFired)
+            ? { msg: "⚠ Copied (after you clicked back into this window) — but this take had a problem: " +
+                (opts.unexpected ? "the text may be PARTIAL" : "the mic signal dropped") + ". Verify it before pasting!" + noteSuffix, cls: "err", beep: "fail" }
+            : opts.degraded
+              ? { msg: label + " copied (after you clicked back into this window)." + noteSuffix, cls: "warn", beep: "warn" }
+              : { msg: label + " copied (after you clicked back into this window). Done!" + noteSuffix, cls: "ok", beep: "done" });
         setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet. Click this window and it will copy itself (or use Copy on the note).", "err");
         failBeep();
       } else if (opts.unexpected) {
@@ -8431,9 +8452,11 @@ right lower quadrant"></textarea>
   // only until just before hotkey.ahk's own wait (CLIP_TIMEOUT, 165 s from the
   // release) can have ended — after that, the focus that brings the window
   // back may be the NEXT press, and this text must never become its result.
-  function holdCopyForFocus(text, msg) {
+  // outcome: { msg, cls, beep } — what the take would have said had its copy
+  // worked (a degraded take stays degraded, a partial one stays red).
+  function holdCopyForFocus(text, outcome) {
     pendingCopyText = text;
-    pendingCopyMsg = msg || "";
+    pendingCopyMsg = outcome || "";
     pendingCopyUntil = (pressEndedAt || Date.now()) + 150000;
   }
 
@@ -8452,13 +8475,20 @@ right lower quadrant"></textarea>
     if (pendingCopyUntil && Date.now() > pendingCopyUntil) { pendingCopyText = ""; pendingCopyUntil = 0; return; }
     if (recording || stopping || finishing || startInFlight) return;
     var text = pendingCopyText;
-    copyText(text).then(function(ok) {
-      if (!ok || pendingCopyText !== text) return;
+    var out = (pendingCopyMsg && typeof pendingCopyMsg === "object") ? pendingCopyMsg
+      : { msg: "Phone transcript copied. Done!", cls: "ok", beep: "done" };
+    // The outcome's status (and so the window title) goes up BEFORE the
+    // clipboard changes: hotkey.ahk reads the title the moment the clipboard
+    // lands, and the red "copy FAILED" one must not be what it reads.
+    var redMsg = statusEl.textContent, redCls = lastStatusCls;
+    setStatus(out.msg, out.cls);
+    clipboardWrite(text).then(function (ok) {
+      if (pendingCopyText !== text) return;
+      if (!ok) { setStatus(redMsg, redCls || "err"); return; } // still not focused: the red status (and the hold) stay
       pendingCopyText = "";
-      setStatus(pendingCopyMsg || "Phone transcript copied. Done!", "ok");
       pendingCopyMsg = "";
       pendingCopyUntil = 0;
-      doneBeep();
+      if (out.beep === "fail") failBeep(); else if (out.beep === "warn") warnBeep(); else doneBeep();
     });
   }
 

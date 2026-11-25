@@ -1,6 +1,8 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 SetCapsLockState("AlwaysOff")
+A_MaxHotkeysPerInterval := 1000  ; CapsLock auto-repeat reaches PushToTalk (2 threads per hotkey):
+                                 ; the default 70 per 2 s could pop a modal warning mid-dictation
 SendMode("Event")              ; reliable while the PTT key is physically held
 SetKeyDelay(0, 10)
 
@@ -374,10 +376,10 @@ PushToTalk(isHeld, waitRelease) {
         ; Still the press made during the previous take's wait (CapsLock's
         ; auto-repeat brings it here once that take is done). A take started
         ; now would begin in the middle of what is being said and lose its
-        ; start without a word: let go, then press again.
-        ShowState("⚠ LET GO, THEN PRESS AGAIN", "B91C1C")
+        ; start without a word, so it waits for the release. The bar is left
+        ; alone: it shows the previous take's outcome (a failure stays up), and
+        ; this press was already told it records nothing.
         waitRelease()
-        HideState()
         return
     }
     if (!DICT_HWND || !WinExist("ahk_id " DICT_HWND)) {
@@ -416,7 +418,13 @@ RunTake(isHeld, waitRelease) {
 
     A_Clipboard := ""
     PREV_HWND := WinActive("A")        ; remember where you were BEFORE stealing focus
-    failedBefore := InStr(DictTitle(), "FAILED", true) > 0  ; an earlier take's FAILED is not this one's
+    ; The page's title is readable only when the registered window IS the
+    ; dictation page (its title always says "Dictation"). A remote-desktop
+    ; client's title never says REC: there, the bar works as it did before the
+    ; title cues (RECORDING at the press), never as a dead mic.
+    pageTitle := DictTitle()
+    titleOk := InStr(pageTitle, "Dictation", true) > 0
+    failedBefore := InStr(pageTitle, "FAILED", true) > 0  ; an earlier take's FAILED is not this one's
 
     if !ActivateWindow(DICT_HWND) {
         FailState("⚠ NO FOCUS")
@@ -438,7 +446,7 @@ RunTake(isHeld, waitRelease) {
     startTick := A_TickCount
     capped := false
     offline := false
-    recSeen := false
+    recSeen := !titleOk                ; no readable title: trust the press, as before
     noMicWarned := false
     micFailed := false
     shown := ""
@@ -450,7 +458,7 @@ RunTake(isHeld, waitRelease) {
         }
         if (A_TickCount >= nextLook) {
             nextLook := A_TickCount + 100
-            t := DictTitle()
+            t := titleOk ? DictTitle() : ""
             if (!recSeen && InStr(t, "REC", true))
                 recSeen := true
             nowOff := InStr(t, "OFFLINE", true) > 0
@@ -494,6 +502,7 @@ RunTake(isHeld, waitRelease) {
         Sleep(15)
     }
     heldMs := A_TickCount - startTick
+    PHASE := "wait"                    ; from the release on, a new press records nothing: PushToTalk says so
 
     ; Stop recording. Refocus FIRST and verify — never fire F14 into Cerner.
     if (!ActivateWindow(DICT_HWND) && !ActivateWindow(DICT_HWND)) {
@@ -519,7 +528,6 @@ RunTake(isHeld, waitRelease) {
     }
 
     ; Keep the dictation window focused until the clipboard write lands.
-    PHASE := "wait"                    ; a press from here on records nothing: PushToTalk says so
     label := capped ? "⚠ STOPPED AT " capMin " MIN — TRANSCRIBING…" : "TRANSCRIBING…"
     ShowState(label, "B45309")
     if !WaitForTranscript(label) {
@@ -587,9 +595,11 @@ RunTake(isHeld, waitRelease) {
     ; were cut, or the transcript may be incomplete). Then the bar stays amber
     ; until the next press. Read before focus leaves (the title follows the
     ; clipboard by a moment).
-    outTitle := SettledTitle()
+    outTitle := titleOk ? SettledTitle() : ""
     checkIt := InStr(outTitle, "Check", true) > 0
-    redIt := InStr(outTitle, "FAILED", true) > 0   ; text came back, but the page says something went wrong
+    ; text came back, but the page says something went wrong ("LINK DOWN" is
+    ; the page's FAILED while a phone link is also down)
+    redIt := InStr(outTitle, "FAILED", true) > 0 || InStr(outTitle, "LINK DOWN", true) > 0
     ; Hand focus back; paste only onto the exact original window.
     pasted := ReturnFocus()
     if (AUTO_PASTE && pasted)

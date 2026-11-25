@@ -8013,12 +8013,43 @@ console.log('--- scenario 63: desktop mic stays warm; a mic start that hangs or 
   W63._clip = '';
   W63.dispatchEvent(new W63.Event('focus'));
   await sleep(20);
+  st63.text = 'Next patient note.';
   key63('F13');
   await sleep(450);
   check('s63h: a focus that is the start of the next press does not paste the held text', W63._clip === '', JSON.stringify(W63._clip));
   key63('F14'); await sleep(20); key63('F14');
   await sleep(600);
-  check('s63h: ...and that press delivers its own text', W63._clip === st63.text + ' ', JSON.stringify(W63._clip));
+  check('s63h: ...and that press delivers its OWN text', W63._clip === 'Next patient note. ', JSON.stringify(W63._clip));
+  st63.text = 'Plan discussed with the patient.';
+
+  // A copy the clinician makes themselves (a note's Copy) beats a held one:
+  // the click that focuses the window must not have its copy overwritten.
+  clipDown63 = true;
+  await take63(1200);
+  await sleep(600);
+  clipDown63 = false;
+  W63._clip = '';
+  W63.dispatchEvent(new W63.Event('focus'));
+  const olderCard63 = D63.querySelectorAll('#deskNotes .bnote')[1];
+  const olderText63 = olderCard63 ? olderCard63.querySelector('.bnote-text').textContent : '';
+  if (olderCard63) olderCard63.querySelector('.bnote-copy').click();
+  await sleep(450);
+  check('s63h: a note\'s own Copy, clicked as the window is focused, is not overwritten by the held text', olderText63 && W63._clip === olderText63, JSON.stringify(W63._clip) + ' vs ' + JSON.stringify(olderText63));
+
+  // A DEGRADED take whose copy failed stays degraded when it lands on focus
+  // (the review-found bug: it used to become a clean "Done!" with a done beep).
+  micTrack.readyState = 'ended';
+  st63.mode = 1500;
+  clipDown63 = true;
+  await take63(2600);
+  await sleep(600);
+  clipDown63 = false;
+  st63.mode = 'auto';
+  const warnH63 = beeps63('[90,90,90]'), doneH63 = beeps63('[40,60,40]');
+  W63.dispatchEvent(new W63.Event('focus'));
+  await sleep(450);
+  check('s63h: a degraded take copied on focus is still degraded (warn, "first words", Check title) — never Done!', W63._clip === st63.text + ' ' && cls63().includes('warn') && /first words/i.test(status63()) && !/Done!/.test(status63()) && D63.title.includes('Check'), status63() + ' / ' + D63.title);
+  check('s63h: ...with a warn beep, not a done beep', beeps63('[90,90,90]') === warnH63 + 1 && beeps63('[40,60,40]') === doneH63, st63.vibes.slice(-2).join(' '));
   dom63.window.close();
 
   // 63i: a recorder that never reports its stop (an interrupted stream) still
@@ -8120,9 +8151,10 @@ console.log('--- scenario 63: desktop mic stays warm; a mic start that hangs or 
     await sleep(900);
     check('s63k: leaving the app mid-hold stops that take (its release never comes)', btn.getAttribute('data-mode') !== 'stop', btn.getAttribute('data-mode'));
     st63.mode = 'auto';
+    const recK = st63.recorders;
     ptr('pointerdown', 8);
     await sleep(400);
-    check('s63k: ...and the next tap works (the button is not owned by the lost finger)', btn.getAttribute('data-mode') === 'stop', btn.getAttribute('data-mode'));
+    check('s63k: ...and the next tap starts a NEW take (the button is not owned by the lost finger)', btn.getAttribute('data-mode') === 'stop' && st63.recorders === recK + 1, btn.getAttribute('data-mode') + ' / ' + (st63.recorders - recK) + ' new takes');
     ptr('pointerup', 8);
     ptr('pointerdown', 8); ptr('pointerup', 8);
     await sleep(600);

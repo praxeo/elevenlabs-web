@@ -6220,8 +6220,16 @@ right lower quadrant"></textarea>
   // recorder yet: an F14 arriving then used to read as "idle" and be dropped,
   // so the take began after the last F14 — a mic nobody was holding — and a
   // second press could start a second, overlapping take.
+  //
+  // Each press first asks the browser to wake a suspended AudioContext with
+  // the press's OWN user activation (2026-11-23, "now mic isn't working" right
+  // after a reload). A page that has had no click yet gets its boot warm-up's
+  // context suspended, and Chrome leaves that resume() PENDING, not rejected:
+  // without this every press joined the stuck warm-up and the mic start ran
+  // out its deadline. The call is unawaited; the bounded waits below decide.
   async function startRecording() {
     if (recording || stopping || finishing || startInFlight) return;
+    try { if (audioCtx && audioCtx.state === "suspended") audioCtx.resume().catch(function () {}); } catch (e) {}
     startInFlight = true;
     updatePhoneChrome(); // the phone's button shows the start (busy), not the idle record dot
     try {

@@ -7811,6 +7811,57 @@ console.log('--- scenario 62: a release that arrives while the mic is still star
   check('s62d: ...and its F14 stops it', !recording62());
   dom62.window.close();
   micRms = 0.05;
+
+  // 62i: after a reload with no click yet, the browser leaves the page's
+  // AudioContext suspended and the boot warm-up's resume() PENDING (Chrome
+  // does not reject it). A press must wake it with its own activation —
+  // otherwise every press joins the stuck warm-up and nothing records.
+  const st62i = { allowed: false, recorders: 0 };
+  const dom62i = new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true });
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = class extends MockAudioCtx {
+        constructor() { super(); this.state = 'suspended'; this._pending = []; }
+        resume() {
+          if (!st62i.allowed) return new Promise((res) => this._pending.push(res)); // no activation yet: pending
+          this.state = 'running';
+          this._pending.splice(0).forEach((f) => f());
+          return Promise.resolve();
+        }
+      };
+      win.WebSocket = MockWS;
+      Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true });
+      win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; st62i.recorders++; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = () => Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":"Woke up."}') });
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-62i');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (62i):', e.message); failures++; });
+    },
+  });
+  await sleep(300); // the boot warm-up builds the graph and sits on the pending resume()
+  const D62i = dom62i.window.document;
+  st62i.allowed = true; // the press carries a user activation
+  D62i.dispatchEvent(new dom62i.window.KeyboardEvent('keydown', { code: 'F13' }));
+  await sleep(200);
+  check('s62i: a press wakes the audio a reload left asleep and records (it used to wait forever)', D62i.getElementById('recordBtn').textContent.includes('Stop') && st62i.recorders === 1, D62i.getElementById('recordBtn').textContent + ' / ' + D62i.getElementById('status').textContent.trim().slice(0, 80));
+  D62i.dispatchEvent(new dom62i.window.KeyboardEvent('keydown', { code: 'F14' }));
+  await sleep(400);
+  check('s62i: ...and its F14 stops it', !D62i.getElementById('recordBtn').textContent.includes('Stop'));
+  dom62i.window.close();
 }
 
 // ===== Scenario 63: the desktop mic stays warm; a mic start is bounded (2026-11-24) =====

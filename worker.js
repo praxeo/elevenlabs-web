@@ -2711,6 +2711,8 @@ right lower quadrant"></textarea>
   let lastDeliveryId    = "";   // desktop: most recent phone_delivery id (migrated into recentDeliveryIds)
   let recentDeliveryIds = [];   // desktop: ring of recent ids — dedupes BOTH room replays and retried/out-of-order re-POSTs
   let pendingCopyText   = "";   // desktop: delivery whose clipboard write failed; retried on focus
+  let pendingCopyUntil  = 0;    // a held desktop take's copy expires before hotkey.ahk's wait can end (0 = no expiry)
+  let pendingCopyMsg    = "";   // the status that replaces the red one once the held copy lands
   let joinedSessionCode = "";   // phone: code entered to join a desktop session
   let remoteCommitted   = "";   // desktop: accumulated committed text from phone
   let remoteHasDelivery = false; // desktop: phone_delivery received; suppress fallback
@@ -2799,9 +2801,19 @@ right lower quadrant"></textarea>
   // iOS leaves a track that died while the PWA was backgrounded looking alive
   // (readyState "live", muted false, no "ended" event), so audioGraphHealthy()
   // trusts a corpse and ensureAudio() reuses a dead graph on resume — the mic
-  // looks engaged but records silence. Any backgrounding sets this; ensureAudio
-  // then forces a full rebuild (a fresh getUserMedia track is genuinely live).
+  // looks engaged but records silence. A backgrounding sets this ON AN iPHONE OR
+  // THE PHONE SURFACE (backgroundingMakesMicSuspect); ensureAudio then forces a
+  // full rebuild (a fresh getUserMedia track is genuinely live).
   let audioSuspect = false;
+  // [RELIABILITY] Mic-start bookkeeping (2026-11-24). micOpenCount counts fresh
+  // getUserMedia streams assigned to the graph, so a take can tell whether its
+  // press had to open the mic (the slow, word-losing case) or found it warm.
+  let micOpenCount = 0;
+  let takeMicOpenAtPress = 0;  // micOpenCount when this take's press arrived
+  let takeStartLagMs = 0;      // press -> recorder start, this take
+  let micPermState = "";       // the Permissions API's last word on the mic ("" = unknown)
+  let micPermWatched = false;
+  let recorderStopLost = false; // this take was finalized by the backstop, not the recorder's onstop
   // ensureAudio() took the healthy-reuse fast path (vs a fresh rebuild).
   // Bookkeeping only since the press-path probe went unconditional on the phone
   // surface (probeMicAlive covers reused AND fresh graphs — a fresh iOS stream
@@ -2976,6 +2988,22 @@ right lower quadrant"></textarea>
   // pasted). The owner: "If I just click the button, I don't need to see a
   // message that dictation failed after a half second click."
   const QUIET_TAP_MS          = 1000;
+  // [RELIABILITY] (2026-11-24) A press whose microphone has not started after
+  // this long ends LOUD (sentinel + fail beep), and the next press tries the
+  // mic afresh. getUserMedia has no deadline of its own: a permission prompt
+  // nobody sees (Chrome's one-time grant expired) or a hung redirected device
+  // used to leave the start in flight forever — no outcome, and every later
+  // press a no-op until a reload.
+  const MIC_START_TIMEOUT_MS  = 5000;
+  // A desktop take whose recorder started this long after the press is
+  // delivered as degraded ("the first words may be missing — VERIFY"): the
+  // AutoHotkey bar said RECORDING at the press, and speech before the recorder
+  // starts is not in the recording. A warm mic starts in a few ms.
+  const LATE_START_WARN_MS    = 700;
+  // The recorder must report its stop within this long; past it the take is
+  // finalized anyway from the chunks it already delivered (degraded: the
+  // last second may be missing).
+  const RECORDER_STOP_BACKSTOP_MS = 4000;
   // A failed take at least this long is transcribed into a note automatically
   // once the server answers; a shorter one is quicker to redictate than to
   // find later (and a late duplicate of a redictated note would confuse).
@@ -3981,7 +4009,7 @@ right lower quadrant"></textarea>
     rescueTimer = null;
     var list = rescueCandidates();
     if (!list.length) { rescueDelay = RESCUE_RETRY_MS; return; }
-    if (recording || stopping || finishing || recovering || rescueBusy) { scheduleRescue(3000); return; }
+    if (recording || stopping || finishing || recovering || rescueBusy || startInFlight) { scheduleRescue(3000); return; }
     // A transcript that came back while a take was running lands now.
     for (var i = list.length - 1; i >= 0; i--) {
       if (list[i].rescued) { landRescue(list[i]); scheduleRescue(1000); return; }
@@ -3989,7 +4017,7 @@ right lower quadrant"></textarea>
     var rec = list[list.length - 1]; // the oldest first, so the notes land in the order they were spoken
     var p = await pingServer(REACH_TIMEOUT_MS);
     if (!p.ok) { backOffRescue(); return; }
-    if (recording || stopping || finishing || recovering || !isSavedRecording(rec)) { scheduleRescue(3000); return; }
+    if (recording || stopping || finishing || recovering || startInFlight || !isSavedRecording(rec)) { scheduleRescue(3000); return; }
     rescueBusy = rec;
     rec.tries = (rec.tries || 0) + 1;
     var fileName = (rec.blob.type || "").includes("ogg") ? "recording.ogg" : "recording.webm";
@@ -4237,7 +4265,9 @@ right lower quadrant"></textarea>
     updateRecoverChip();
     if (journalRecoverBtn) journalRecoverBtn.disabled = false;
     if (!r.ok || !r.text || !r.text.trim()) {
-      setStatus("Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try again.", "err");
+      setStatus(r.ok
+        ? "The retry came back with NO words again — this recording may hold no speech. It is KEPT: try again, listen to it in Diagnostics, or Discard it."
+        : "Recovery FAILED — the saved audio could not be transcribed (" + (r.error || "no speech") + "). It is KEPT; try again.", "err");
       failBeep();
       return; // keep pendingRecovery + the journal record for another attempt
     }
@@ -4305,7 +4335,7 @@ right lower quadrant"></textarea>
       return;
     }
     if (copied) { setStatus("Recovered dictation transcribed & copied. Verify it before pasting!" + viaText, "ok"); doneBeep(); }
-    else { setStatus("Recovered dictation saved but the clipboard copy FAILED — click 'Copy & clear'.", "err"); failBeep(); }
+    else { setStatus("Recovered dictation saved but the clipboard copy FAILED — use Copy on the note.", "err"); failBeep(); }
     updateAppendChip();
   }
 
@@ -4406,10 +4436,13 @@ right lower quadrant"></textarea>
   }
 
   async function copyText(text) {
+    // Any other copy (a note's Copy, a newer delivery) supersedes a held one:
+    // the held text is in its note, and the clipboard now holds what was chosen.
+    if (pendingCopyText && text !== pendingCopyText) { pendingCopyText = ""; pendingCopyUntil = 0; pendingCopyMsg = ""; }
     const ok = await clipboardWrite(text);
     setStatus(ok ? "Copied to clipboard."
                  : (bigButtonActive() ? "Clipboard copy failed — tap Copy again."
-                                      : "Clipboard copy failed — keep this tab focused, then click 'Copy & clear'."),
+                                      : "Clipboard copy failed — click this window, then use Copy on the note."),
               ok ? "ok" : "err");
     return ok;
   }
@@ -5428,6 +5461,11 @@ right lower quadrant"></textarea>
         // again), and "down" when a server check failed during this take.
         attempts: (typeof t.attempts === "number") ? t.attempts : null,
         reach:    t.reach || "",
+        // [RELIABILITY] (2026-11-24) press -> recorder start, and whether the
+        // press had to open the mic (a fresh getUserMedia): speech before the
+        // start is not in the recording. A warm mic starts in a few ms.
+        startMs:  (typeof t.startMs === "number") ? Math.round(t.startMs) : null,
+        micFresh: (typeof t.micFresh === "boolean") ? t.micFresh : null,
       };
       // net = what the service round trip cost us MINUS what the Worker says it
       // spent: our own network + Cloudflare overhead, the part transport work
@@ -5548,7 +5586,7 @@ right lower quadrant"></textarea>
   function timingLogTsv() {
     var cols = ["at","outcome","stage","errKind","deadline","total","flush","upload","service","net","elMs","parseMs","workerMs",
                 "download","deliver","recMs","tailMs","kb","chunks","fmt","keyterms","diarize","path","pathNote",
-                "primary","provider","fallback","hedgeMs","backupMs","spk","spkBy","spkRatio","spkCut","attempts","reach"];
+                "primary","provider","fallback","hedgeMs","backupMs","spk","spkBy","spkRatio","spkCut","attempts","reach","startMs","micFresh"];
     var out = [cols.join("\\t")];
     try {
       var log = JSON.parse(localStorage.getItem(TIMING_LOG_KEY) || "[]");
@@ -5602,6 +5640,20 @@ right lower quadrant"></textarea>
     } catch (e) {}
     try { if (typeof console !== "undefined" && console.warn) console.warn("[micfail] " + reason + diag); } catch (e) {}
     return diag;
+  }
+
+  // [RELIABILITY] Does a backgrounding make the retained mic graph suspect?
+  // Only where a track dies with NO event: iOS (the corpse that keeps reading
+  // "live"/unmuted) and the phone surface. On the desktop (2026-11-24) a hidden
+  // window is the normal state — Cerner covers it, or it is minimized — and
+  // treating that as suspect re-opened the mic at EVERY press: the AutoHotkey
+  // bar says RECORDING at once, the clinician talks, and the recorder started
+  // only when getUserMedia answered (a second or more on a remote desktop), so
+  // the first words were never recorded while the take read "Done!". A desktop
+  // track that really dies says so (readyState "ended" / muted, which
+  // audioGraphHealthy reads), and a silent one still trips the 2.5 s watchdog.
+  function backgroundingMakesMicSuspect() {
+    return isLikelyIOS() || bigButtonActive();
   }
 
   function audioGraphHealthy() {
@@ -5682,7 +5734,7 @@ right lower quadrant"></textarea>
   function micIdleSample() {
     try {
       if (!bigButtonActive() || document.visibilityState !== "visible") return;
-      if (recording || stopping || finishing) { micIdleDeadFrames = 0; return; } // sessions own the mic; the watchdog covers them
+      if (recording || stopping || finishing || startInFlight) { micIdleDeadFrames = 0; return; } // sessions own the mic (a starting one too); the watchdog covers them
       if (!analyserNode || !gateBuf || !audioGraphHealthy()) { micIdleDeadFrames = 0; setBigMicPill(""); return; } // cold or mid-rebuild: no verdict
       analyserNode.getFloatTimeDomainData(gateBuf);
       var sum = 0;
@@ -5759,21 +5811,53 @@ right lower quadrant"></textarea>
   let audioBuildSeq = 0;
   function ensureAudio() {
     if (audioBuildPromise) return audioBuildPromise; // join the build already running
-    audioBuildPromise = buildAudioGraph().catch(function (err) {
+    var token = { abandoned: false };
+    var p = buildAudioGraph().catch(function (err) {
       // "Superseded" is not a failure the CALLER should see: whatever tore the
       // graph down wants one too, and a caller that swallows this rejection
       // would go on to record with no audio graph at all. Try once more, now
-      // that the superseding teardown has settled.
-      if (err && /superseded/.test(String((err && err.message) || err))) return buildAudioGraph();
+      // that the superseding teardown has settled — unless ensureAudioWithin
+      // gave up on this build: its retry would tear down the newer build that
+      // superseded it.
+      if (!token.abandoned && err && /superseded/.test(String((err && err.message) || err))) return buildAudioGraph();
       throw err;
     });
+    p.micBuildToken = token;
+    audioBuildPromise = p;
     // Clear the latch on BOTH outcomes, and swallow nothing: callers still see
     // the rejection (startRecording's retry loop and warmWithRetry depend on it).
-    audioBuildPromise.then(
-      function () { audioBuildPromise = null; },
-      function () { audioBuildPromise = null; }
+    // Only THIS build's latch: a build abandoned by ensureAudioWithin may settle
+    // long after a newer one took the latch, and must not clear that one.
+    p.then(
+      function () { if (audioBuildPromise === p) audioBuildPromise = null; },
+      function () { if (audioBuildPromise === p) audioBuildPromise = null; }
     );
-    return audioBuildPromise;
+    return p;
+  }
+
+  // [RELIABILITY] ensureAudio with a deadline, for the press path (2026-11-24).
+  // On timeout it rejects with a MicStartTimeout error and LETS GO of the build
+  // (the latch is cleared), so the next press asks the mic afresh instead of
+  // joining a getUserMedia that may never answer. The abandoned call is not
+  // stopped: if it does answer (the clinician clicked Allow), its stream becomes
+  // the warm graph — unless a newer build has started, whose release() bumps
+  // audioBuildSeq, and then the late stream is stopped (the leak guard).
+  function ensureAudioWithin(ms) {
+    var p = ensureAudio();
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timer = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (p.micBuildToken) p.micBuildToken.abandoned = true;
+        if (audioBuildPromise === p) audioBuildPromise = null;
+        var err = new Error("the microphone did not answer within " + Math.round(ms / 1000) + " s");
+        err.name = "MicStartTimeout";
+        reject(err);
+      }, ms);
+      p.then(function (v) { if (done) return; done = true; clearTimeout(timer); resolve(v); },
+             function (e) { if (done) return; done = true; clearTimeout(timer); reject(e); });
+    });
   }
 
   async function buildAudioGraph() {
@@ -5817,6 +5901,7 @@ right lower quadrant"></textarea>
       throw new Error("audio graph rebuild superseded");
     }
     stream = freshStream;
+    micOpenCount++; // a take whose press saw this count change had to open the mic
     if (!micEverGranted) {
       micEverGranted = true; // enables the iOS re-warm fallback in tryWarmOnLoad
       saveSettingsNow();     // persisted (micGranted): a relaunched iOS PWA re-warms at boot
@@ -5829,9 +5914,9 @@ right lower quadrant"></textarea>
         // ending it. Mid-dictation the watchdog handles it loudly; while idle,
         // self-heal so the next dictation does not start on a dead mic. The
         // delay lets transient mutes (iOS often unmutes on its own) pass.
-        if (recording || stopping) return;
+        if (recording || stopping || startInFlight) return;
         setTimeout(() => {
-          if (!recording && !stopping && !audioGraphHealthy() &&
+          if (!recording && !stopping && !startInFlight && !audioGraphHealthy() &&
               document.visibilityState === "visible") {
             releaseAudio();
             tryWarmOnLoad();
@@ -6032,6 +6117,7 @@ right lower quadrant"></textarea>
     try {
       if (navigator.permissions && navigator.permissions.query) {
         const st = await navigator.permissions.query({ name: "microphone" });
+        if (st && st.state) onMicPermission(st.state, false);
         if (st.state === "granted") warmWithRetry(0);
         return;
       }
@@ -6045,13 +6131,63 @@ right lower quadrant"></textarea>
     if (micEverGranted) warmWithRetry(0);
   }
 
+  // [RELIABILITY] The browser's microphone permission, watched and SAID
+  // (2026-11-24; the owner: "issues with dropping mic permission"). Chrome's
+  // "Allow this time" grant expires after 16 h, on a reload or a discarded tab,
+  // and after 5 min hidden while the mic is not in use; a wiped remote-desktop
+  // profile starts over at every login. The warm path used to do nothing at all
+  // when the permission was not "granted", so the first sign was a press that
+  // hung on a prompt nobody saw. Now a change is said while idle, with the fix.
+  async function watchMicPermission() {
+    if (micPermWatched) return;
+    micPermWatched = true;
+    try {
+      if (!navigator.permissions || !navigator.permissions.query) return;
+      var st = await navigator.permissions.query({ name: "microphone" });
+      if (!st) return;
+      var changed = function () { onMicPermission(st.state, false); };
+      if (st.addEventListener) st.addEventListener("change", changed); else st.onchange = changed;
+      onMicPermission(st.state, true);
+    } catch (e) {}
+  }
+
+  function onMicPermission(state, atBoot) {
+    var prev = micPermState;
+    micPermState = String(state || "");
+    if (prev === micPermState) return;
+    // Never over a take's own status: the press path says what happened to it.
+    if (recording || stopping || finishing || startInFlight || recovering) return;
+    if (micPermState === "denied") {
+      setMicPill("off");
+      setStatus("The microphone is BLOCKED for this site — dictation cannot record. " +
+        (isLikelyIOS()
+          ? "Allow it in Settings → Safari → Microphone (or the aA menu → Website Settings), then reload."
+          : "Open the site settings (the icon at the left of the address/title bar), set Microphone to Allow, then press again."), "err");
+    } else if (micPermState === "prompt") {
+      if (isLikelyIOS()) {
+        // Safari's default "Ask" reads "prompt" at every launch: not news, and
+        // a warning on every launch would teach the warning away.
+      } else if (!micEverGranted) {
+        if (statusIsBootHint) setStatus("Press record once and allow the microphone when the browser asks.", "");
+      } else {
+        setStatus("The microphone permission has lapsed — the next press will ASK for it. Answer the browser's prompt with Allow" +
+          (isLikelyIOS() ? "" : " (choose Allow on every visit, not just this time)") + ".", "warn");
+      }
+    } else if (micPermState === "granted" && (prev === "prompt" || prev === "denied")) {
+      setStatus("Microphone allowed — ready to dictate.", "");
+      tryWarmOnLoad();
+    }
+  }
+
   // iOS hands the audio session back late after foregrounding: a getUserMedia
   // issued immediately on return can fail and then succeed moments later. A
   // single silent attempt leaves a cold mic until the next manual press, so
   // retry on a short backoff before giving up (loudly).
   let warmRetryTimer = null;
   function warmWithRetry(attempt) {
-    if (recording || stopping) return;
+    // Never while a take is starting: a rebuild then would tear down the graph
+    // the take is about to record from (the start owns the mic until it records).
+    if (recording || stopping || startInFlight) return;
     if (warmRetryTimer) { clearTimeout(warmRetryTimer); warmRetryTimer = null; }
     ensureAudio().catch(() => {
       if (attempt >= 4) {
@@ -6087,10 +6223,27 @@ right lower quadrant"></textarea>
   async function startRecording() {
     if (recording || stopping || finishing || startInFlight) return;
     startInFlight = true;
+    updatePhoneChrome(); // the phone's button shows the start (busy), not the idle record dot
     try {
       await startRecordingWork();
+    } catch (err) {
+      // [RELIABILITY] (2026-11-24) Every press ENDS: an exception before the
+      // recorder ran used to end the press with no outcome at all — no
+      // sentinel, no beep, nothing — while the AutoHotkey bar waited 165 s.
+      // Nothing was recorded, so this is the loud pre-capture failure.
+      try { if (mediaRecorder && mediaRecorder.state !== "inactive" && !recording) mediaRecorder.stop(); } catch (e) {}
+      if (recording && stopRequested) { stopRequested = false; try { stopRecording(); } catch (e) {} } // the release already came
+      if (!recording) {
+        try { if (!bigButtonActive()) releaseWakeLock(); } catch (e) {}
+        try { sessionFinalized = true; } catch (e) {}
+        try { await writeSentinel(); } catch (e) {}
+        setStatus("Recording did NOT start — internal error (" + String((err && err.message) || err).slice(0, 120) +
+          "). Nothing was recorded; press again, and reload the page if it repeats." + recordMicFailure("start-crashed"), "err");
+        failBeep();
+      }
     } finally {
       startInFlight = false;
+      updatePhoneChrome();
     }
   }
 
@@ -6131,6 +6284,9 @@ right lower quadrant"></textarea>
     reachDownStreak = 0;
     pressStartedAt = Date.now();
     pressEndedAt = 0;
+    takeStartLagMs = 0;
+    recorderStopLost = false;
+    pendingCopyText = ""; pendingCopyUntil = 0; // a held failed copy never lands over a newer take
     if (rescueCancel) { try { rescueCancel(); } catch (e) {} }
     stopRequested = false;
     pendingStart = false;
@@ -6173,7 +6329,7 @@ right lower quadrant"></textarea>
       return;
     }
 
-    saveSettingsNow();
+    try { saveSettingsNow(); } catch (e) {} // storage full must never be what stops a dictation
 
     // The press path must survive iOS's late audio-session hand-back. After a
     // backgrounding, audioSuspect forces a fresh getUserMedia, and on the FIRST
@@ -6181,17 +6337,30 @@ right lower quadrant"></textarea>
     // later — without a retry here that press died with "Microphone unavailable"
     // (the "mic won't engage after returning" regression). Retry briefly; a real
     // permission denial fails fast (retrying won't change it).
+    // [RELIABILITY] The whole mic start has ONE deadline (MIC_START_TIMEOUT_MS,
+    // 2026-11-24): a getUserMedia that never answers ends this press loud
+    // instead of wedging every press after it.
+    takeMicOpenAtPress = micOpenCount;
+    const micStartDeadline = Date.now() + MIC_START_TIMEOUT_MS;
+    const slowMicTimer = setTimeout(function () {
+      if (startInFlight && !recording) setStatus("Starting the microphone…", "");
+    }, 400);
     let audioErr = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        await ensureAudio();
-        audioErr = null;
-        break;
-      } catch (e) {
-        audioErr = e;
-        if (e && (e.name === "NotAllowedError" || e.name === "SecurityError")) break;
-        if (attempt < 2) await new Promise(function (r) { setTimeout(r, 350); });
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          await ensureAudioWithin(Math.max(250, micStartDeadline - Date.now()));
+          audioErr = null;
+          break;
+        } catch (e) {
+          audioErr = e;
+          if (e && (e.name === "NotAllowedError" || e.name === "SecurityError" || e.name === "MicStartTimeout")) break;
+          if (Date.now() >= micStartDeadline - 250) break;
+          if (attempt < 2) await new Promise(function (r) { setTimeout(r, 350); });
+        }
       }
+    } finally {
+      clearTimeout(slowMicTimer);
     }
     if (audioErr) {
       await writeSentinel();
@@ -6199,8 +6368,21 @@ right lower quadrant"></textarea>
       // Name the fix, not just the error: "Permission denied" on its own left
       // the clinician with nothing to do.
       var micErrName = audioErr && audioErr.name ? String(audioErr.name) : "";
+      var onIos = isLikelyIOS();
+      if (micErrName === "MicStartTimeout") {
+        setStatus("The microphone did NOT start — nothing was recorded (no answer from the mic after " +
+          Math.round(MIC_START_TIMEOUT_MS / 1000) + " s). " +
+          (micPermState === "prompt"
+            ? "The browser is ASKING for microphone permission: answer its prompt in this window with Allow" + (onIos ? "" : " (choose Allow on every visit, not just this time)") + ", then press again."
+            : "If the browser is showing a microphone prompt in this window, choose Allow; otherwise check the mic or headset. Then press again.") +
+          recordMicFailure("mic-start-timeout"), "err");
+        failBeep();
+        return;
+      }
       var micFix = (micErrName === "NotAllowedError" || micErrName === "SecurityError")
-        ? " Allow the microphone for this site — on iPhone: Settings → Safari → Microphone (or the aA menu → Website Settings), then reload this page."
+        ? (onIos
+          ? " Allow the microphone for this site — on iPhone: Settings → Safari → Microphone (or the aA menu → Website Settings), then reload this page."
+          : " The microphone is BLOCKED for this site — open the site settings (the icon at the left of the address/title bar), set Microphone to Allow, then press again.")
         : (micErrName === "NotFoundError" ? " No microphone was found — check the device/Bluetooth headset, then press again."
         : " Close any other app using the mic, then press again.");
       setStatus("Microphone unavailable: " + (audioErr && audioErr.message ? audioErr.message : audioErr) + "." + micFix, "err");
@@ -6223,7 +6405,7 @@ right lower quadrant"></textarea>
         // No explicit releaseAudio() here: audioSuspect already makes ensureAudio
         // tear down and rebuild internally, and an extra external teardown only
         // supersedes builds that other resume handlers may have in flight.
-        try { await ensureAudio(); } catch (e) {}
+        try { await ensureAudioWithin(Math.max(1000, micStartDeadline - Date.now())); } catch (e) {}
         // A rebuild that could not produce a graph must fail LOUD rather than
         // fall through — probeMicAlive treats a missing analyser as "alive"
         // (fail-safe for a cold graph), which would otherwise start a take with
@@ -6249,7 +6431,10 @@ right lower quadrant"></textarea>
       resetMicIdleHeal(); // the mic answered a press — the idle sampler starts over
       setBigMicPill("ok");
     }
-    if (audioCtx && audioCtx.state === "suspended") { try { await audioCtx.resume(); } catch (e) {} }
+    if (audioCtx && audioCtx.state === "suspended") {
+      // Bounded: a resume that never settles must not wedge the press.
+      try { await Promise.race([audioCtx.resume(), new Promise(function (r) { setTimeout(r, 1500); })]); } catch (e) {}
+    }
     if (!audioCtx || audioCtx.state !== "running") {
       await writeSentinel();
       setStatus("Audio not running. Click page once, then try again.", "err");
@@ -6363,7 +6548,11 @@ right lower quadrant"></textarea>
       return;
     }
 
+    // Bound to THIS recorder: one finalized by the stop backstop may still fire
+    // late events while the next take records, and they must not touch it.
+    const thisRecorder = mediaRecorder;
     mediaRecorder.ondataavailable = (e) => {
+      if (thisRecorder !== mediaRecorder) return;
       if (e.data && e.data.size > 0) {
         chunks.push(e.data);
         journalAppend(e.data); // crash-safe mirror to IndexedDB (best-effort, non-blocking)
@@ -6371,7 +6560,7 @@ right lower quadrant"></textarea>
       }
     };
     mediaRecorder.onstop = () => {
-      if (sessionFinalized) return;
+      if (thisRecorder !== mediaRecorder || sessionFinalized) return;
       finalizeSession(false);
     };
     // Loudness evidence for the speaker filter, in the recording's own time
@@ -6380,6 +6569,15 @@ right lower quadrant"></textarea>
       ? { t0: Date.now(), offsetMs: 0, t: [], v: [] }
       : null;
     mediaRecorder.start(1000); // [LATENCY] timeslice: chunks land during recording, so onstop only flushes the last <1s
+    // [RELIABILITY] How long after the press the recording really began, and
+    // whether the press had to open the mic (2026-11-24): speech before this
+    // moment is not in the recording (finishBatchSession warns past
+    // LATE_START_WARN_MS on the desktop).
+    takeStartLagMs = pressStartedAt ? Math.max(0, Date.now() - pressStartedAt) : 0;
+    if (takeTimings) {
+      takeTimings.startMs = takeStartLagMs;
+      takeTimings.micFresh = micOpenCount !== takeMicOpenAtPress;
+    }
     journalStart(preferred || "audio/webm"); // begin the crash-recovery journal for this take (fire-and-forget)
     openTakeStream(mediaRecorder.mimeType || preferred || "audio/webm"); // [LATENCY] upload while the take is spoken (best-effort)
 
@@ -6452,7 +6650,19 @@ right lower quadrant"></textarea>
     stopTailTimer = null;
     if (sessionFinalized) return; // an unexpected failure already finalized this take
     if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); }
+      try { mediaRecorder.stop(); } catch (e) { finalizeSession(true); return; }
+      // [RELIABILITY] (2026-11-24) Backstop: the take normally ends in the
+      // recorder's onstop. One that never fires it (an interrupted iOS stream)
+      // used to leave the page on "Stopping…" forever with every press queued
+      // behind it. Finalize with the chunks already delivered (the timeslice
+      // hands one over every second) and say the end may be missing.
+      var mySeq = sessionSeq, myRecorder = mediaRecorder;
+      setTimeout(function () {
+        if (sessionFinalized || mySeq !== sessionSeq) return;
+        recorderStopLost = true;
+        try { myRecorder.ondataavailable = null; myRecorder.onstop = null; } catch (e) {} // it may still fire, late
+        finalizeSession(false);
+      }, RECORDER_STOP_BACKSTOP_MS);
     } else {
       finalizeSession(false);
     }
@@ -6697,11 +6907,14 @@ right lower quadrant"></textarea>
     // essentially nothing) has nothing to send. Anything louder is sent: a
     // quiet word can sit below the speech light and still be a word.
     const tapUnheard = quietTap && noSignal && !bigButtonActive();
+    // The release arrived before the recorder started (the mic was still
+    // starting through the whole press): nothing of the press was recorded.
+    const missedStart = Boolean(pressEndedAt && recStartedAt && pressEndedAt <= recStartedAt + 30);
     if (!blob || blob.size < 1024 || tapUnheard) {
       // Gate never opened / instant tap: nothing worth uploading. Cancel the
       // stream mid-body so ElevenLabs never gets a request to transcribe or bill.
       if (streamed) abandonTakeStream(streamed, "nothing to transcribe");
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap });
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap, missedStart: missedStart });
       return;
     }
 
@@ -6752,7 +6965,14 @@ right lower quadrant"></textarea>
     updateLiveDisplay();
 
     if (!r.text || !r.text.trim()) {
-      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap });
+      // [RELIABILITY] (2026-11-24) The service answered with NO words, but the
+      // mic heard speech on this take: keep the recording for Retry instead of
+      // deleting it (an empty result, or a body that was not JSON — a proxy or
+      // block page — used to discard the only copy). Still the loud failure.
+      var keptEmpty = !quietTap && speechDetected && gateOpenMs >= 800 && armUploadRecovery(blob, "the service returned no words", recMs, "no-words");
+      if (keptEmpty && takeTimings) takeTimings.errKind = "no-words";
+      await deliverFinalText("", { unexpected: unexpected, lowLevel: lowLevel, noSignal: noSignal, quietTap: quietTap, missedStart: missedStart,
+        keepJournal: keptEmpty, recoverable: keptEmpty });
       return;
     }
 
@@ -6799,6 +7019,19 @@ right lower quadrant"></textarea>
         " gateOpen:" + Math.round(gateOpenMs / 1000) + "s" +
         " deadBand:" + Math.round(deadBandMs / 1000) + "s" +
         " blob:" + Math.round(blob.size / 1024) + "KB chunks:" + chunks.length + "]");
+    }
+
+    if (recorderStopLost) {
+      degraded = true;
+      note = (note ? note + " " : "") + "⚠ The recorder did not finish cleanly — the LAST second may be missing. VERIFY the end of this note.";
+    }
+    // A desktop take whose recorder started late: the AutoHotkey bar said
+    // RECORDING at the press, so the first words may be missing from the
+    // recording itself. The text is real, but never a clean "Done!".
+    if (!bigButtonActive() && takeStartLagMs > LATE_START_WARN_MS) {
+      degraded = true;
+      note = (note ? note + " " : "") + "⚠ The microphone took " + (takeStartLagMs / 1000).toFixed(1) +
+        " s to start after the press — the FIRST words may be missing. VERIFY the start of this note.";
     }
 
     await deliverFinalText(cleanTranscript(latestText), {
@@ -6861,6 +7094,14 @@ right lower quadrant"></textarea>
         if (opts.autoRescue && pendingRecovery) pendingRecovery.outcomeSeq = outcomeSeq; // this status is that recording's own
       } else if (micAlarmFired) {
         setStatus("No speech detected — the microphone never produced a signal. Check the mic." + recordMicFailure("no-speech-mic-alarm"), "err");
+      } else if (opts.missedStart) {
+        // The release came before the recorder existed: the mic was still
+        // starting for the whole press, so nothing at all was recorded. Say
+        // THAT — "the mic produced no signal" blamed a working mic for a late
+        // start (2026-11-24).
+        setStatus("Nothing was recorded — the microphone started only after you let go (" +
+          (takeStartLagMs / 1000).toFixed(1) + " s after the press). Redictate: press, and talk once it shows RECORDING." +
+          recordMicFailure("missed-start"), "err");
       } else if (opts.noSignal) {
         // The mic delivered essentially ZERO signal (peak < FLATLINE_RMS) but the
         // press was too short to trip the 2.5 s flatline watchdog — the iOS
@@ -6886,7 +7127,9 @@ right lower quadrant"></textarea>
         // The diagnostic carries the audio-graph state (incl. ec:on|off + peak)
         // so a silent take that finalizes via the quick-release no-speech path
         // — never tripping the held-take watchdog — still reports why.
-        setStatus("No speech detected — nothing transcribed; sentinel copied." + recordMicFailure("no-speech-quick-release"), "err");
+        setStatus("No speech detected — nothing transcribed; sentinel copied." +
+          (opts.recoverable ? " The mic DID hear speech, so your RECORDING was saved — use 'Retry the upload' above." : "") +
+          recordMicFailure(opts.recoverable ? "no-words-from-service" : "no-speech-quick-release"), "err");
       }
       failBeep();
       stampTake("delivered");
@@ -6978,9 +7221,21 @@ right lower quadrant"></textarea>
                     : "Transcript saved — queueing for the desktop…")
           : (copied ? "Transcript copied here and sent to the desktop — confirming delivery…"
                     : "Transcript sent to the desktop — confirming delivery… (no local phone copy; " +
-                      (phoneLayout ? "tap Copy on the note" : "tap 'Copy & clear'") + " if you need it here)")) + noteSuffix, "warn");
+                      "tap Copy on the note if you need it here)")) + noteSuffix, "warn");
       } else if (!copied) {
-        setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet; click 'Copy & clear'.", "err");
+        // The window was not focused when the text landed (the clinician
+        // clicked back into Cerner during the upload). Hold it and copy it the
+        // moment this window is focused again — the AutoHotkey bar says
+        // "REFOCUS DICTATION" and is still waiting for it — but only while that
+        // wait can still be running (a later press must never get THIS text).
+        if (!joinedSessionCode) holdCopyForFocus(cleaned,
+          (opts.unexpected || micAlarmFired)
+            ? { msg: "⚠ Copied (after you clicked back into this window) — but this take had a problem: " +
+                (opts.unexpected ? "the text may be PARTIAL" : "the mic signal dropped") + ". Verify it before pasting!" + noteSuffix, cls: "err", beep: "fail" }
+            : opts.degraded
+              ? { msg: label + " copied (after you clicked back into this window)." + noteSuffix, cls: "warn", beep: "warn" }
+              : { msg: label + " copied (after you clicked back into this window). Done!" + noteSuffix, cls: "ok", beep: "done" });
+        setStatus("Transcript saved but clipboard copy FAILED — do NOT paste yet. Click this window and it will copy itself (or use Copy on the note).", "err");
         failBeep();
       } else if (opts.unexpected) {
         setStatus(opts.unexpectedMsg || "⚠ Connection lost mid-dictation — PARTIAL transcript copied. Verify it before pasting!", "err");
@@ -7421,7 +7676,7 @@ right lower quadrant"></textarea>
   // classes only — never a URL, a header or any text.
   var TIMING_REPORT_KEYS = ["at", "outcome", "stage", "errKind", "deadline", "recMs", "total", "upload", "service",
     "elMs", "kb", "keyterms", "diarize", "path", "pathNote", "primary", "provider", "fallback", "attempts", "reach",
-    "spk", "spkBy", "spkCut"];
+    "spk", "spkBy", "spkCut", "startMs", "micFresh"];
   function trimTimingRow(row) {
     var out = {};
     TIMING_REPORT_KEYS.forEach(function (k) { if (row && row[k] !== undefined) out[k] = row[k]; });
@@ -7471,7 +7726,7 @@ right lower quadrant"></textarea>
   async function sendAutoReport() {
     autoReportTimer = null;
     if (!autoReportQueue.length) return;
-    if (recording || stopping || finishing || recovering || rescueBusy) { flushAutoReports(10000); return; }
+    if (recording || stopping || finishing || recovering || rescueBusy || startInFlight) { flushAutoReports(10000); return; }
     var item = autoReportQueue[0];
     var sent = false;
     try {
@@ -8186,24 +8441,56 @@ right lower quadrant"></textarea>
       } else {
         // Clipboard writes need document focus, and this tab is usually behind
         // Citrix/Cerner when a delivery lands. Hold the text; retry on refocus.
-        pendingCopyText = combined;
+        pendingCopyText = combined; pendingCopyUntil = 0; pendingCopyMsg = "";
         setStatus("⚠ Phone transcript received but clipboard copy FAILED — click this window and it will copy itself. Do NOT paste before that!", "err");
         failBeep();
       }
     });
   }
 
+  // A desktop take whose copy failed: held for the focus retry below, but
+  // only until just before hotkey.ahk's own wait (CLIP_TIMEOUT, 165 s from the
+  // release) can have ended — after that, the focus that brings the window
+  // back may be the NEXT press, and this text must never become its result.
+  // outcome: { msg, cls, beep } — what the take would have said had its copy
+  // worked (a degraded take stays degraded, a partial one stays red).
+  function holdCopyForFocus(text, outcome) {
+    pendingCopyText = text;
+    pendingCopyMsg = outcome || "";
+    pendingCopyUntil = (pressEndedAt || Date.now()) + 150000;
+  }
+
   // Retry a held delivery the moment this tab can write the clipboard again.
+  // After a short pause: hotkey.ahk activates this window right BEFORE it
+  // sends F13, so a focus can be the start of the next press — whose
+  // startRecordingWork drops the held text — and that text must never land as
+  // the new take's result.
   window.addEventListener("focus", function() {
     if (!pendingCopyText) return;
-    var text = pendingCopyText;
-    copyText(text).then(function(ok) {
-      if (!ok || pendingCopyText !== text) return;
-      pendingCopyText = "";
-      setStatus("Phone transcript copied. Done!", "ok");
-      doneBeep();
-    });
+    var held = pendingCopyText;
+    setTimeout(function () { retryHeldCopy(held); }, 300);
   });
+  function retryHeldCopy(held) {
+    if (!pendingCopyText || pendingCopyText !== held) return;
+    if (pendingCopyUntil && Date.now() > pendingCopyUntil) { pendingCopyText = ""; pendingCopyUntil = 0; return; }
+    if (recording || stopping || finishing || startInFlight) return;
+    var text = pendingCopyText;
+    var out = (pendingCopyMsg && typeof pendingCopyMsg === "object") ? pendingCopyMsg
+      : { msg: "Phone transcript copied. Done!", cls: "ok", beep: "done" };
+    // The outcome's status (and so the window title) goes up BEFORE the
+    // clipboard changes: hotkey.ahk reads the title the moment the clipboard
+    // lands, and the red "copy FAILED" one must not be what it reads.
+    var redMsg = statusEl.textContent, redCls = lastStatusCls;
+    setStatus(out.msg, out.cls);
+    clipboardWrite(text).then(function (ok) {
+      if (pendingCopyText !== text) return;
+      if (!ok) { setStatus(redMsg, redCls || "err"); return; } // still not focused: the red status (and the hold) stay
+      pendingCopyText = "";
+      pendingCopyMsg = "";
+      pendingCopyUntil = 0;
+      if (out.beep === "fail") failBeep(); else if (out.beep === "warn") warnBeep(); else doneBeep();
+    });
+  }
 
   function handlePhoneSessionMessage(msg) {
     if (!msg || !msg.message_type) return;
@@ -9360,10 +9647,12 @@ right lower quadrant"></textarea>
     if (bigBtnEl) {
       // An icon, not a word (the CSS draws it from data-mode); the words ride
       // aria-label / title for screen readers and a long-press hint.
-      var mode = (recording && !stopping) ? "stop" : (stopping || finishing) ? "busy" : (tnote ? "add" : "record");
+      // While the mic is still starting (startInFlight) the button is "busy",
+      // not the idle record dot: words said then are not recorded yet.
+      var mode = (recording && !stopping) ? "stop" : (stopping || finishing || startInFlight) ? "busy" : (tnote ? "add" : "record");
       if (bigBtnEl.getAttribute("data-mode") !== mode) {
         var words = mode === "stop" ? "Stop recording"
-          : mode === "busy" ? "Working…"
+          : mode === "busy" ? (startInFlight ? "Starting the microphone…" : "Working…")
           : mode === "add" ? "Record a take to add to the note"
           : "Record: tap to start and stop, or hold while you talk";
         bigBtnEl.textContent = "";
@@ -9432,6 +9721,12 @@ right lower quadrant"></textarea>
     // release is caught at the document even if the finger slid off the button.
     document.addEventListener("pointerup", bigBtnRelease);
     document.addEventListener("pointercancel", bigBtnRelease);
+    // Leaving the app mid-press: its release will never arrive, and the button
+    // used to stay owned by that finger — every later tap ignored until a
+    // relaunch (2026-11-24). Treat it as the cancel it is.
+    var releaseOnLeave = function () { if (bigBtnPointerId !== null) bigBtnRelease({ type: "pointercancel" }); };
+    window.addEventListener("pagehide", releaseOnLeave);
+    document.addEventListener("visibilitychange", function () { if (document.visibilityState !== "visible") releaseOnLeave(); });
   }
 
   // Phone notes layout controls (the per-note buttons are wired in buildNoteCard).
@@ -9700,17 +9995,21 @@ right lower quadrant"></textarea>
 
   keytermsEl.addEventListener("input", updateKeytermHint);
 
-  noiseSuppressEl.addEventListener("change", () => {
+  // A capture constraint changed: rebuild the graph for it — but never under a
+  // take that is starting or recording (releaseAudio would silently end its
+  // capture, and the watchdog with it). Then the next press rebuilds instead.
+  function rebuildAudioForConstraints() {
+    if (recording || stopping || startInFlight) { audioSuspect = true; return; }
     releaseAudio();
     tryWarmOnLoad();
-  });
+  }
+  noiseSuppressEl.addEventListener("change", rebuildAudioForConstraints);
 
   // Echo cancellation flips the iOS capture path (voice-processing unit vs plain
   // mic), so the graph must be rebuilt for the new constraint to take effect.
   echoCancelEl.addEventListener("change", () => {
     saveSettings();
-    releaseAudio();
-    tryWarmOnLoad();
+    rebuildAudioForConstraints();
   });
 
   appendModeEl.addEventListener("change", updateAppendChip);
@@ -9845,7 +10144,7 @@ right lower quadrant"></textarea>
   // pagehide fires on iOS PWA suspend/app-switch even when visibilitychange and
   // beforeunload don't — it is also a backgrounding, so the audio graph must be
   // treated as suspect (and rebuilt) on return. See ensureAudio / audioSuspect.
-  window.addEventListener("pagehide", () => { audioSuspect = true; });
+  window.addEventListener("pagehide", () => { if (backgroundingMakesMicSuspect()) audioSuspect = true; });
 
   // Re-engage the mic when the app comes back: bfcache restores and slept
   // tabs can leave a dead MediaStream behind that looks alive.
@@ -9860,8 +10159,10 @@ right lower quadrant"></textarea>
       // Backgrounding: iOS can silently kill the mic track while it keeps
       // reporting "live"/unmuted. Mark the graph suspect so the next
       // ensureAudio() rebuilds from a fresh getUserMedia instead of reusing a
-      // corpse that records silence (the resume silent-capture bug).
-      audioSuspect = true;
+      // corpse that records silence (the resume silent-capture bug). iPhone /
+      // phone surface only: on the desktop it re-opened the mic at every press
+      // after Cerner covered the window, losing the first words (2026-11-24).
+      if (backgroundingMakesMicSuspect()) audioSuspect = true;
       return;
     }
     backgroundFlush(); // a queued phone delivery may now reach a reconnected desktop
@@ -9873,7 +10174,7 @@ right lower quadrant"></textarea>
     // Reopened/focused while idle: re-engage a mic iOS reclaimed while hidden
     // (audioSuspect forces a real rebuild inside ensureAudio). Mid-session we
     // leave the live graph alone (the lock above is enough).
-    if (!recording && !stopping && !finishing) tryWarmOnLoad();
+    if (!recording && !stopping && !finishing && !startInFlight) tryWarmOnLoad();
   });
 
   // Standalone PWAs (iOS home-screen installs) sometimes fire only focus —
@@ -9885,7 +10186,7 @@ right lower quadrant"></textarea>
     pollDesktopStatus(); // phone: refresh the presence pill on app-switch return
     if (wakeLockDesired()) acquireWakeLock(); // keep the phone surface awake on app-switch return
     resetMicIdleHeal(); // a fresh visit gets a fresh heal budget
-    if (!recording && !stopping && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
+    if (!recording && !stopping && !finishing && !startInFlight && (audioSuspect || !audioGraphHealthy())) tryWarmOnLoad();
   });
 
   // The link healing is the cue to retry: drain the phone delivery queue the
@@ -9894,7 +10195,7 @@ right lower quadrant"></textarea>
 
   if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
     navigator.mediaDevices.addEventListener("devicechange", () => {
-      if (!recording && !stopping && !audioGraphHealthy()) {
+      if (!recording && !stopping && !startInFlight && !audioGraphHealthy()) {
         releaseAudio();
         tryWarmOnLoad();
       }
@@ -9929,6 +10230,7 @@ right lower quadrant"></textarea>
   renderHistory();
   updateAppendChip();
   tryWarmOnLoad();
+  watchMicPermission(); // say a lapsed or blocked mic permission while idle, not at the next press
 })();
 </script>
 </body>

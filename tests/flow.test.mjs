@@ -1015,7 +1015,7 @@ console.log('--- scenario 20: phone link resilience ---');
   check('s20: clipboard untouched by the failed copy', !(w20._clip || '').includes('Blocked note.'), JSON.stringify(w20._clip));
   clipFail = false;
   w20.dispatchEvent(new w20.Event('focus'));
-  await sleep(30);
+  await sleep(400); // the retry waits 300 ms (a focus can be the start of an AutoHotkey press)
   check('s20: refocus retries the copy', (w20._clip || '').includes('Blocked note.'), JSON.stringify(w20._clip));
   check('s20: refocus success status', status20().includes('Done!'), status20());
 
@@ -1663,28 +1663,34 @@ doc.getElementById('recordBtn').click();
 await sleep(300);
 check('s23r: the reused-graph dictation delivers', clipboard.includes('Reuse note.'), JSON.stringify(clipboard));
 
-// Background the PWA (pagehide on iOS): the track still reports "live"/unmuted
-// (the iOS corpse), but the next press MUST rebuild rather than record silence.
+// Background the page (pagehide). On an iPhone the track still reports
+// "live"/unmuted while dead (the iOS corpse), so the next press there MUST
+// rebuild — scenario 63f covers that on an iPhone page. THIS page is a desktop
+// (2026-11-24): a hidden window is its normal state behind Cerner, and
+// re-opening the mic at every press lost the first words, so a desktop
+// backgrounding keeps the warm mic.
 w.dispatchEvent(new w.Event('pagehide'));
 fetchQueue.push({ status: 200, body: { text: 'Resumed note.' } });
-micTrack.readyState = 'live'; micTrack.muted = false; // looks alive — the bug condition
+micTrack.readyState = 'live'; micTrack.muted = false;
 const gumResumeBefore = gumCalls;
 doc.getElementById('recordBtn').click();
 await sleep(60);
-check('s23r: a backgrounded graph is REBUILT despite looking healthy (the resume bug fix)', gumCalls === gumResumeBefore + 1, gumCalls - gumResumeBefore);
+check('s23r: on the desktop a backgrounded graph that is still live is KEPT (no re-open at the press)', gumCalls === gumResumeBefore, gumCalls - gumResumeBefore);
 doc.getElementById('recordBtn').click();
 await sleep(300);
-check('s23r: dictation works after the forced rebuild', clipboard.includes('Resumed note.'), JSON.stringify(clipboard));
+check('s23r: dictation works on the kept graph', clipboard.includes('Resumed note.'), JSON.stringify(clipboard));
 
-// visibilitychange -> hidden also marks the graph suspect.
+// visibilitychange -> hidden: the same on the desktop. A track that really
+// died says so (readyState "ended") and IS rebuilt at the next press.
 Object.defineProperty(doc, 'visibilityState', { value: 'hidden', configurable: true });
 doc.dispatchEvent(new w.Event('visibilitychange'));
+micTrack.readyState = 'ended';
 Object.defineProperty(doc, 'visibilityState', { value: 'visible', configurable: true });
 fetchQueue.push({ status: 200, body: { text: 'Hidden note.' } });
 const gumHiddenBefore = gumCalls;
 doc.getElementById('recordBtn').click();
 await sleep(60);
-check('s23r: visibilitychange->hidden also forces a rebuild', gumCalls === gumHiddenBefore + 1, gumCalls - gumHiddenBefore);
+check('s23r: a track that died while hidden is rebuilt at the next press', gumCalls === gumHiddenBefore + 1, gumCalls - gumHiddenBefore);
 doc.getElementById('recordBtn').click();
 await sleep(300);
 
@@ -3128,7 +3134,13 @@ console.log('--- scenario 31m: mic levers + silent-capture telemetry ---');
   check('s31m: quick-release no-speech copies the sentinel', clipboard === '##DICTATION_FAILED##', JSON.stringify(clipboard));
   check('s31m: quick-release no-speech surfaces the audio-graph diagnostic', status().includes('ec:') && status().includes('gain:') && status().includes('peak:'), status());
   const flog2 = JSON.parse(w.localStorage.getItem('scribe_v2_micfail_v9') || '[]');
-  check('s31m: quick-release no-speech logged with its reason', !!(flog2[0] && flog2[0].reason === 'no-speech-quick-release'), JSON.stringify(flog2[0]));
+  // The mic read speech level here (micRms 0.05) and the service sent back no
+  // words: since 2026-11-24 the recording is KEPT for Retry (scenario 63g), and
+  // the diagnostic says the words were lost at the service.
+  check('s31m: quick-release no-speech logged with its reason', !!(flog2[0] && flog2[0].reason === 'no-words-from-service'), JSON.stringify(flog2[0]));
+  check('s31m: ...and, since the mic heard speech, the recording is offered for Retry', doc.getElementById('journalRecover').style.display !== 'none', doc.getElementById('journalRecover').style.display);
+  doc.getElementById('journalDiscardBtn').click(); // leave no saved recording behind for the scenarios that follow
+  await sleep(50);
 
   // Reload round-trip: a fresh boot reads the persisted levers via loadSettings.
   const rDom = new JSDOM(html, {
@@ -7688,7 +7700,9 @@ console.log('--- scenario 62: a release that arrives while the mic is still star
   const recording62 = () => D62.getElementById('recordBtn').textContent.includes('Stop');
   const status62 = () => D62.getElementById('status').textContent.trim();
   const failBeeps62 = () => st62.vibes.filter((v) => v === '[220,90,220]').length;
-  const slowStart62 = () => { W62.dispatchEvent(new W62.Event('pagehide')); st62.auto = false; }; // the next press rebuilds the mic
+  // The next press has to open the mic afresh: its track ended (on the desktop
+  // a mere backgrounding no longer re-opens it — scenario 63).
+  const slowStart62 = () => { micTrack.readyState = 'ended'; st62.auto = false; };
   const micReady62 = () => { st62.auto = true; const p = st62.pending.splice(0); p.forEach((f) => f()); };
   await sleep(250);
   micRms = 0.0; // nothing said
@@ -7797,6 +7811,356 @@ console.log('--- scenario 62: a release that arrives while the mic is still star
   check('s62d: ...and its F14 stops it', !recording62());
   dom62.window.close();
   micRms = 0.05;
+}
+
+// ===== Scenario 63: the desktop mic stays warm; a mic start is bounded (2026-11-24) =====
+// The owner: "Freezes, has issues with dropping mic permission, still losing
+// dictations." Two causes reproduced here. (1) The iOS corpse guard — any
+// backgrounding marks the graph suspect — also ran on the Windows desktop, so
+// every press after Cerner covered the window RE-OPENED the mic: the recorder
+// started only when getUserMedia answered, the words said before it were not
+// recorded, and the take still ended as a clean "Done!". (2) getUserMedia had
+// no deadline: one that never answers (a permission prompt nobody sees after
+// Chrome's one-time grant expired, a hung redirected device) left the start
+// in flight forever — no sentinel, every later press a no-op (the AutoHotkey
+// bar sat on TRANSCRIBING for 165 s per press) until a reload.
+console.log('--- scenario 63: desktop mic stays warm; a mic start that hangs or lags is loud ---');
+{
+  const st63 = { mode: 'auto', gum: 0, recorders: 0, posts: 0, vibes: [], startAt: 0, text: 'Plan discussed with the patient.' };
+  const perm63 = { state: 'granted', onchange: null, _ls: [], addEventListener(ev, fn) { if (ev === 'change') this._ls.push(fn); }, removeEventListener() {} };
+  const setPerm63 = (s) => { perm63.state = s; if (perm63.onchange) perm63.onchange({}); perm63._ls.forEach((f) => f({})); };
+  const mk63 = (ua) => new JSDOM(html, {
+    runScripts: 'dangerously', url: 'https://dictation.test/',
+    beforeParse(win) {
+      win.isSecureContext = true;
+      if (ua) Object.defineProperty(win.navigator, 'userAgent', { value: ua, configurable: true });
+      Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true, writable: true });
+      win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+      win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+      win.navigator.vibrate = (p) => { st63.vibes.push(JSON.stringify(p)); return true; };
+      Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true });
+      Object.defineProperty(win.navigator, 'permissions', { value: { query: () => Promise.resolve(perm63) }, configurable: true });
+      win.navigator.mediaDevices = { getUserMedia: () => {
+        st63.gum++;
+        if (st63.mode === 'hang') return new Promise(() => {});
+        const ready = () => { micTrack.readyState = 'live'; micTrack.muted = false; return mockStream; };
+        if (st63.mode === 'auto') return Promise.resolve(ready());
+        return new Promise((res) => setTimeout(() => res(ready()), st63.mode));
+      }, addEventListener() {} };
+      win.MediaRecorder = class {
+        constructor() { this.state = 'inactive'; st63.recorders++; }
+        static isTypeSupported() { return false; }
+        start() { this.state = 'recording'; st63.startAt = Date.now(); }
+        stop() {
+          if (this.state === 'inactive') return;
+          this.state = 'inactive';
+          if (this.ondataavailable) this.ondataavailable({ data: new win.Blob([new Uint8Array(4096)], { type: 'audio/webm' }) });
+          if (this.onstop) this.onstop();
+        }
+      };
+      win.fetch = (url) => {
+        if (String(url).includes('/api/ping')) return Promise.resolve({ ok: true, status: 204, headers: { get: () => null }, text: () => Promise.resolve('') });
+        st63.posts++;
+        return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve(JSON.stringify({ text: st63.text })) });
+      };
+      win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+      win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-63');
+      win.addEventListener('error', (e) => { console.log('PAGE ERROR (63):', e.message); failures++; });
+    },
+  });
+  micTrack.readyState = 'live'; micTrack.muted = false; micRms = 0.05;
+  const dom63 = mk63();
+  const W63 = dom63.window, D63 = W63.document;
+  const key63 = (code) => D63.dispatchEvent(new W63.KeyboardEvent('keydown', { code: code }));
+  const status63 = () => D63.getElementById('status').textContent.trim();
+  const cls63 = () => D63.getElementById('status').className;
+  const recording63 = () => D63.getElementById('recordBtn').textContent.includes('Stop');
+  const beeps63 = (pat) => st63.vibes.filter((v) => v === pat).length;
+  const lastRow63 = () => { try { return JSON.parse(W63.localStorage.getItem('scribe_v2_timing_v9') || '[]')[0] || {}; } catch (e) { return {}; } };
+  // What the AutoHotkey press does to the window: Cerner covered it (hidden),
+  // then WinActivate brings it back (visible + focus) right before F13.
+  const coverAndActivate63 = () => {
+    D63.visibilityState = 'hidden'; D63.dispatchEvent(new W63.Event('visibilitychange'));
+    W63.dispatchEvent(new W63.Event('blur'));
+    D63.visibilityState = 'visible'; D63.dispatchEvent(new W63.Event('visibilitychange'));
+    W63.dispatchEvent(new W63.Event('focus'));
+  };
+  const take63 = async (holdMs) => { key63('F13'); await sleep(holdMs); key63('F14'); await sleep(20); key63('F14'); };
+  await sleep(300);
+  check('s63: the desktop warms the mic once at boot', st63.gum === 1, st63.gum);
+
+  // 63a: covered by Cerner, then pressed: the warm mic is used as it is.
+  const gum63a = st63.gum;
+  coverAndActivate63();
+  await sleep(5);
+  const t63a = Date.now();
+  key63('F13');
+  await sleep(120);
+  check('s63a: a press after the window was covered does NOT re-open the mic (it stays warm on the desktop)', st63.gum === gum63a, (st63.gum - gum63a) + ' getUserMedia');
+  check('s63a: ...so the recorder starts at the press', recording63() && st63.startAt && st63.startAt - t63a < 100, st63.startAt ? (st63.startAt - t63a) + ' ms' : 'not started');
+  await sleep(900); key63('F14'); await sleep(20); key63('F14');
+  await sleep(500);
+  check('s63a: ...and the take is a clean Done!', W63._clip === st63.text + ' ' && cls63().includes('ok') && !/first words/i.test(status63()), status63());
+  check('s63a: the timing row records the press-to-recorder time and that the mic was already open', typeof lastRow63().startMs === 'number' && lastRow63().startMs < 100 && lastRow63().micFresh === false, JSON.stringify({ s: lastRow63().startMs, f: lastRow63().micFresh }));
+
+  // 63b: the mic has to be opened afresh (its track ended) and takes 1.5 s:
+  // the words said in that gap are not in the recording, so the take is
+  // delivered but DEGRADED — never a clean Done!.
+  micTrack.readyState = 'ended';
+  st63.mode = 1500;
+  const warn63b = beeps63('[90,90,90]'), done63b = beeps63('[40,60,40]');
+  W63._clip = '';
+  await take63(2600);
+  await sleep(600);
+  check('s63b: a slow mic start still records and delivers the text', W63._clip === st63.text + ' ', JSON.stringify(W63._clip));
+  check('s63b: ...but says the FIRST words may be missing (warn + VERIFY), not Done!', cls63().includes('warn') && /first words/i.test(status63()) && /VERIFY/.test(status63()), status63());
+  check('s63b: ...with a warn beep and no done beep', beeps63('[90,90,90]') === warn63b + 1 && beeps63('[40,60,40]') === done63b, st63.vibes.slice(-3).join(' '));
+  check('s63b: ...and "Check" in the title for the AutoHotkey bar', D63.title.includes('Check'), D63.title);
+  check('s63b: the timing row says the mic was opened afresh and how late it started', lastRow63().micFresh === true && lastRow63().startMs >= 1400, JSON.stringify({ s: lastRow63().startMs, f: lastRow63().micFresh }));
+
+  // 63c: getUserMedia never answers (a permission prompt nobody sees). The take
+  // must end LOUD within the mic-start deadline — sentinel, red, fail beep —
+  // and the app must be free for the next press.
+  micTrack.readyState = 'ended';
+  st63.mode = 'hang';
+  W63._clip = 'STALE';
+  const fail63c = beeps63('[220,90,220]');
+  const t63c = Date.now();
+  await take63(1200);
+  for (let i = 0; i < 80 && W63._clip === 'STALE'; i++) await sleep(100);
+  const waited63c = Date.now() - t63c;
+  check('s63c: a mic that never starts ends the take with the sentinel (nothing stale can be pasted)', W63._clip === '##DICTATION_FAILED##', JSON.stringify(W63._clip));
+  check('s63c: ...within the mic-start deadline (not the 165 s the AutoHotkey bar would wait)', waited63c < 7000, waited63c + ' ms');
+  check('s63c: ...LOUD: red status saying the mic did not start, with what to do about a permission prompt', cls63().includes('err') && /microphone did not start/i.test(status63()) && /Allow/.test(status63()), status63());
+  check('s63c: ...a fail beep and FAILED in the title', beeps63('[220,90,220]') === fail63c + 1 && D63.title.includes('FAILED'), D63.title);
+  check('s63c: ...not recording', !recording63());
+
+  // 63d: the mic works again: the very next press records and delivers.
+  st63.mode = 'auto';
+  const rec63d = st63.recorders, posts63d = st63.posts;
+  W63._clip = '';
+  await take63(1100);
+  await sleep(600);
+  check('s63d: after a hung mic start the next press records (the app is not wedged)', st63.recorders === rec63d + 1 && st63.posts === posts63d + 1, (st63.recorders - rec63d) + ' takes / ' + (st63.posts - posts63d) + ' uploads');
+  check('s63d: ...and delivers its text', W63._clip === st63.text + ' ', JSON.stringify(W63._clip) + ' / ' + status63());
+
+  // 63e: Chrome's mic permission drops back to "ask" (a one-time grant
+  // expired) while idle: said at once, in words, with the fix.
+  setPerm63('prompt');
+  await sleep(50);
+  check('s63e: a permission that drops to "ask" is said while idle', cls63().includes('warn') && /microphone permission/i.test(status63()) && /Allow/.test(status63()), status63());
+  setPerm63('granted');
+  await sleep(300);
+  check('s63e: ...and granting it again clears the warning (and re-warms the mic)', !cls63().includes('warn') && !cls63().includes('err') && /microphone/i.test(status63()), status63());
+  setPerm63('denied');
+  await sleep(50);
+  check('s63e: a BLOCKED microphone is said in red', cls63().includes('err') && /blocked/i.test(status63()), status63());
+  setPerm63('granted');
+  await sleep(300);
+
+  // 63g: the service answers with NO words, but the mic heard speech: the
+  // recording is KEPT for Retry (it used to be deleted with the "No speech"
+  // failure), the take counts as a failure, and the Retry delivers it.
+  micTrack.readyState = 'live'; micTrack.muted = false; micRms = 0.05;
+  st63.mode = 'auto';
+  st63.text = '';
+  W63._clip = '';
+  await take63(1500);
+  await sleep(600);
+  check('s63g: an empty answer on a take that heard speech is still the loud failure (sentinel, red)', W63._clip === '##DICTATION_FAILED##' && cls63().includes('err'), status63());
+  check('s63g: ...but says the RECORDING was saved', /RECORDING was saved/.test(status63()), status63());
+  check('s63g: ...and offers Retry on the banner', D63.getElementById('journalRecover').style.display !== 'none' && /Retry/.test(D63.getElementById('journalRecoverBtn').textContent), D63.getElementById('journalRecover').style.display);
+  check('s63g: ...logged as a failure (no-words), so it reports itself', lastRow63().errKind === 'no-words', JSON.stringify(lastRow63().errKind));
+  st63.text = 'Recovered words.';
+  D63.getElementById('journalRecoverBtn').click();
+  await sleep(600);
+  check('s63g: the Retry delivers the kept recording', W63._clip === 'Recovered words. ', JSON.stringify(W63._clip) + ' / ' + status63());
+  st63.text = 'Plan discussed with the patient.';
+
+  // 63h: the clipboard write fails because the window lost focus during the
+  // upload (the clinician clicked back into Cerner). Clicking back into the
+  // window copies it — the AutoHotkey bar says "REFOCUS DICTATION" and is still
+  // waiting for exactly that — instead of the bar sitting out its 165 s.
+  let clipDown63 = true;
+  Object.defineProperty(W63.navigator, 'clipboard', { value: { writeText: (t) => { if (clipDown63) return Promise.reject(new Error('Document is not focused.')); W63._clip = t; return Promise.resolve(); } }, configurable: true });
+  W63._clip = '';
+  await take63(1200);
+  await sleep(600);
+  check('s63h: a copy that fails is LOUD and names the fix that exists (no "Copy & clear" button any more)', cls63().includes('err') && /Click this window/.test(status63()) && !/Copy & clear/.test(status63()), status63());
+  clipDown63 = false;
+  W63.dispatchEvent(new W63.Event('focus'));
+  await sleep(450);
+  check('s63h: focusing the window copies it', W63._clip === st63.text + ' ' && cls63().includes('ok'), JSON.stringify(W63._clip) + ' / ' + status63());
+  // A failed copy held past the AutoHotkey wait must NOT land on a later focus
+  // (that focus may be the next press, and the text would become its result).
+  clipDown63 = true;
+  await take63(1200);
+  await sleep(600);
+  clipDown63 = false;
+  W63._clip = 'NEXT';
+  const realNow63 = W63.Date.now;
+  W63.Date.now = () => realNow63() + 200000;
+  W63.dispatchEvent(new W63.Event('focus'));
+  await sleep(450);
+  W63.Date.now = realNow63;
+  check('s63h: a held copy expires before the AutoHotkey wait can have ended (a later focus does not paste it)', W63._clip === 'NEXT', JSON.stringify(W63._clip));
+  // The AutoHotkey press: WinActivate (focus) then F13 a moment later. The
+  // held text must never land as the NEW take's result.
+  clipDown63 = true;
+  await take63(1200);
+  await sleep(600);
+  clipDown63 = false;
+  W63._clip = '';
+  W63.dispatchEvent(new W63.Event('focus'));
+  await sleep(20);
+  st63.text = 'Next patient note.';
+  key63('F13');
+  await sleep(450);
+  check('s63h: a focus that is the start of the next press does not paste the held text', W63._clip === '', JSON.stringify(W63._clip));
+  key63('F14'); await sleep(20); key63('F14');
+  await sleep(600);
+  check('s63h: ...and that press delivers its OWN text', W63._clip === 'Next patient note. ', JSON.stringify(W63._clip));
+  st63.text = 'Plan discussed with the patient.';
+
+  // A copy the clinician makes themselves (a note's Copy) beats a held one:
+  // the click that focuses the window must not have its copy overwritten.
+  clipDown63 = true;
+  await take63(1200);
+  await sleep(600);
+  clipDown63 = false;
+  W63._clip = '';
+  W63.dispatchEvent(new W63.Event('focus'));
+  const olderCard63 = D63.querySelectorAll('#deskNotes .bnote')[1];
+  const olderText63 = olderCard63 ? olderCard63.querySelector('.bnote-text').textContent : '';
+  if (olderCard63) olderCard63.querySelector('.bnote-copy').click();
+  await sleep(450);
+  check('s63h: a note\'s own Copy, clicked as the window is focused, is not overwritten by the held text', olderText63 && W63._clip === olderText63, JSON.stringify(W63._clip) + ' vs ' + JSON.stringify(olderText63));
+
+  // A DEGRADED take whose copy failed stays degraded when it lands on focus
+  // (the review-found bug: it used to become a clean "Done!" with a done beep).
+  micTrack.readyState = 'ended';
+  st63.mode = 1500;
+  clipDown63 = true;
+  await take63(2600);
+  await sleep(600);
+  clipDown63 = false;
+  st63.mode = 'auto';
+  const warnH63 = beeps63('[90,90,90]'), doneH63 = beeps63('[40,60,40]');
+  W63.dispatchEvent(new W63.Event('focus'));
+  await sleep(450);
+  check('s63h: a degraded take copied on focus is still degraded (warn, "first words", Check title) — never Done!', W63._clip === st63.text + ' ' && cls63().includes('warn') && /first words/i.test(status63()) && !/Done!/.test(status63()) && D63.title.includes('Check'), status63() + ' / ' + D63.title);
+  check('s63h: ...with a warn beep, not a done beep', beeps63('[90,90,90]') === warnH63 + 1 && beeps63('[40,60,40]') === doneH63, st63.vibes.slice(-2).join(' '));
+  dom63.window.close();
+
+  // 63i: a recorder that never reports its stop (an interrupted stream) still
+  // ends the take, from the chunks it already delivered, as degraded.
+  {
+    const st = { stopFires: false, startThrows: false, clipOk: true };
+    const d = new JSDOM(html, {
+      runScripts: 'dangerously', url: 'https://dictation.test/',
+      beforeParse(win) {
+        win.isSecureContext = true;
+        Object.defineProperty(win.document, 'visibilityState', { value: 'visible', configurable: true, writable: true });
+        win.URL.createObjectURL = () => 'blob:mock'; win.URL.revokeObjectURL = () => {};
+        win.AudioContext = MockAudioCtx; win.WebSocket = MockWS;
+        win.navigator.vibrate = () => true;
+        Object.defineProperty(win.navigator, 'clipboard', { value: { writeText: (t) => { win._clip = t; return Promise.resolve(); } }, configurable: true });
+        win.navigator.mediaDevices = { getUserMedia: () => { micTrack.readyState = 'live'; micTrack.muted = false; return Promise.resolve(mockStream); }, addEventListener() {} };
+        win.MediaRecorder = class {
+          constructor() { this.state = 'inactive'; }
+          static isTypeSupported() { return false; }
+          start() { if (st.startThrows) throw new Error('recorder start refused'); this.state = 'recording'; const self = this; this._t = setInterval(() => { if (self.ondataavailable) self.ondataavailable({ data: new win.Blob([new Uint8Array(2048)], { type: 'audio/webm' }) }); }, 300); }
+          stop() { if (this.state === 'inactive') return; this.state = 'inactive'; clearInterval(this._t); if (st.stopFires && this.onstop) this.onstop(); }
+        };
+        win.fetch = (url) => {
+          if (String(url).includes('/api/ping')) return Promise.resolve({ ok: true, status: 204, headers: { get: () => null }, text: () => Promise.resolve('') });
+          return Promise.resolve({ ok: true, status: 200, headers: { get: () => null }, text: () => Promise.resolve('{"text":"Wound is healing well."}') });
+        };
+        win.localStorage.setItem('scribe_v2_settings_v9', JSON.stringify({ saveApiKey: true, micGranted: true }));
+        win.localStorage.setItem('elevenlabs_api_key_browser_v9', 'k-63i');
+        win.addEventListener('error', (e) => { console.log('PAGE ERROR (63i):', e.message); failures++; });
+      },
+    });
+    const Wi = d.window, Di = d.window.document;
+    const keyi = (code) => Di.dispatchEvent(new Wi.KeyboardEvent('keydown', { code: code }));
+    const sti = () => Di.getElementById('status').textContent.trim();
+    await sleep(300);
+    keyi('F13'); await sleep(1500); keyi('F14'); await sleep(20); keyi('F14');
+    await sleep(1500);
+    check('s63i: while the recorder has not reported its stop, the take is still ending', /Stopping/.test(sti()), sti());
+    await sleep(3500);
+    check('s63i: a recorder that never reports its stop still ends the take (backstop) and delivers', Wi._clip === 'Wound is healing well. ', JSON.stringify(Wi._clip) + ' / ' + sti());
+    check('s63i: ...degraded: the LAST second may be missing (never a clean Done!)', Di.getElementById('status').className.includes('warn') && /LAST second/.test(sti()), sti());
+    st.stopFires = true;
+    keyi('F13'); await sleep(1200); keyi('F14'); await sleep(20); keyi('F14');
+    await sleep(700);
+    check('s63i: the next take works normally (nothing stuck)', /Done!/.test(sti()) && !/LAST second/.test(sti()), sti());
+
+    // 63j: an exception while the take is starting (here the recorder refuses
+    // to start) used to end the press with NO outcome. Now it is loud.
+    st.startThrows = true;
+    Wi._clip = 'STALE';
+    keyi('F13'); await sleep(300); keyi('F14'); await sleep(20); keyi('F14');
+    await sleep(400);
+    check('s63j: a start that throws is a loud failure with the sentinel (not a silent press)', Wi._clip === '##DICTATION_FAILED##' && Di.getElementById('status').className.includes('err') && /did NOT start/.test(sti()), JSON.stringify(Wi._clip) + ' / ' + sti());
+    st.startThrows = false;
+    keyi('F13'); await sleep(1200); keyi('F14'); await sleep(20); keyi('F14');
+    await sleep(700);
+    check('s63j: ...and the next press records', /Done!/.test(sti()), sti());
+    d.window.close();
+  }
+
+  // 63f: on an iPhone the corpse guard is unchanged — a backgrounding still
+  // forces a fresh getUserMedia on the next press.
+  st63.gum = 0; st63.mode = 'auto';
+  micTrack.readyState = 'live'; micTrack.muted = false;
+  const domI = mk63('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1');
+  const WI = domI.window, DI = WI.document;
+  await sleep(300);
+  const gumI = st63.gum;
+  WI.dispatchEvent(new WI.Event('pagehide'));
+  DI.getElementById('recordBtn').click();
+  await sleep(150);
+  check('s63f: on iOS a backgrounded graph is still rebuilt on the next press (corpse guard kept)', st63.gum === gumI + 1, (st63.gum - gumI) + ' getUserMedia');
+  DI.getElementById('recordBtn').click();
+  await sleep(500);
+  domI.window.close();
+
+  // 63k: the phone layout: the button shows "busy" while the mic is starting
+  // (not the idle record dot), and a hold abandoned by leaving the app frees
+  // the button (it used to stay owned by a finger whose release never came).
+  {
+    st63.mode = 400; st63.gum = 0;
+    const domP = mk63('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1');
+    const WP = domP.window, DP = WP.document;
+    DP.getElementById('bigButtonMode') && (DP.getElementById('bigButtonMode').value = 'always');
+    DP.getElementById('bigButtonMode') && DP.getElementById('bigButtonMode').dispatchEvent(new WP.Event('change'));
+    await sleep(800);
+    const btn = DP.getElementById('bigBtn');
+    const ptr = (type, id) => { const e = new WP.Event(type, { bubbles: true }); e.pointerId = id; btn.dispatchEvent(e); };
+    micTrack.readyState = 'ended'; // the press must open the mic (400 ms)
+    ptr('pointerdown', 7);
+    await sleep(120);
+    check('s63k: while the phone mic is starting the button is busy, not the idle record dot', btn.getAttribute('data-mode') === 'busy', btn.getAttribute('data-mode'));
+    await sleep(900);
+    check('s63k: ...and it is recording once the mic is up', btn.getAttribute('data-mode') === 'stop', btn.getAttribute('data-mode'));
+    // The app is left mid-hold: no pointerup ever comes.
+    DP.visibilityState = 'hidden'; DP.dispatchEvent(new WP.Event('visibilitychange'));
+    await sleep(600);
+    DP.visibilityState = 'visible'; DP.dispatchEvent(new WP.Event('visibilitychange'));
+    await sleep(900);
+    check('s63k: leaving the app mid-hold stops that take (its release never comes)', btn.getAttribute('data-mode') !== 'stop', btn.getAttribute('data-mode'));
+    st63.mode = 'auto';
+    const recK = st63.recorders;
+    ptr('pointerdown', 8);
+    await sleep(400);
+    check('s63k: ...and the next tap starts a NEW take (the button is not owned by the lost finger)', btn.getAttribute('data-mode') === 'stop' && st63.recorders === recK + 1, btn.getAttribute('data-mode') + ' / ' + (st63.recorders - recK) + ' new takes');
+    ptr('pointerup', 8);
+    ptr('pointerdown', 8); ptr('pointerup', 8);
+    await sleep(600);
+    domP.window.close();
+  }
+  micTrack.readyState = 'live'; micTrack.muted = false; micRms = 0.05;
 }
 
 console.log(failures === 0 ? 'ALL SCENARIOS PASSED' : failures + ' FAILURES');
